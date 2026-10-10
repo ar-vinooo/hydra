@@ -28,6 +28,12 @@ struct PerfStats {
     std::atomic<u64> raster_skips{0};
     std::atomic<u64> texture_sync_scans{0};
     std::atomic<u64> texture_sync_skips{0};
+    std::atomic<u64> register_writes{0};
+    std::atomic<u64> register_write_skips{0};
+    std::atomic<u64> render_encoders{0};
+    std::atomic<u64> blit_encoders{0};
+    std::atomic<u64> buffer_snapshots{0};
+    std::atomic<u64> buffer_snapshot_bytes{0};
 
     static PerfStats& instance() {
         static PerfStats stats;

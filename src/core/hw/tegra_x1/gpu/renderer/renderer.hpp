@@ -75,6 +75,12 @@ class IRenderer {
 
     // Buffer
     virtual BufferBase* createBuffer(u64 size) = 0;
+    // Immutable CPU-uploaded snapshots avoid interrupting a render encoder.
+    // Backends may decline large buffers or retain the original copy path.
+    virtual BufferBase*
+    createCpuBufferSnapshot([[maybe_unused]] ztd::Range<uptr> range) {
+        return nullptr;
+    }
     virtual BufferBase* allocateTemporaryBuffer(const u64 size) = 0;
     virtual void freeTemporaryBuffer(BufferBase* buffer) = 0;
 

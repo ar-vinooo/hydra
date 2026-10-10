@@ -31,6 +31,8 @@ CommandBuffer::~CommandBuffer() {
     if (PerfStats::isEnabled()) {
         PerfStats::instance().raster_updates += raster_updates;
         PerfStats::instance().raster_skips += raster_skips;
+        PerfStats::instance().render_encoders += render_encoders;
+        PerfStats::instance().blit_encoders += blit_encoders;
         PerfStats::instance().command_buffers++;
         command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
             const auto dt = cb->GPUEndTime() - cb->GPUStartTime();
@@ -76,6 +78,7 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Render;
+    ++render_encoders;
     encoder_state.render_pass = render_pass_descriptor;
     encoder_state.render = {};
 
@@ -93,6 +96,7 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoder() {
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Blit;
+    ++blit_encoders;
 
     return getBlitCommandEncoderUnchecked();
 }

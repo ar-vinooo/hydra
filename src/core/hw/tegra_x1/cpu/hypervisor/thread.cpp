@@ -6,6 +6,8 @@
 #include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/mmu.hpp"
+#include "core/hw/tegra_x1/cpu/register_write_filter.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/wall_clock.hpp"
 
 #define MMU (*static_cast<Mmu*>(mmu))
@@ -311,21 +313,33 @@ void Thread::serializeState() {
         state.v[i] = getSimdFpReg(i);
     state.fpcr = static_cast<u32>(getReg(HV_REG_FPCR));
     state.fpsr = static_cast<u32>(getReg(HV_REG_FPSR));
+    exit_register_state = state;
 }
 
 void Thread::deserializeState() {
-    for (u8 i = 0; i < 29; i++)
-        setReg(hv_reg_t(HV_REG_X0 + i), state.r[i]);
-    setReg(HV_REG_FP, state.fp);
-    setReg(HV_REG_LR, state.lr);
+    static const bool disable_filter =
+        std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") != nullptr;
+    const auto writes = restoreRegisterBank(
+        state,
+        !disable_filter && exit_register_state ? &*exit_register_state
+                                               : nullptr,
+        [&](u8 index, u64 value) {
+            const auto reg = index == 29   ? HV_REG_FP
+                             : index == 30 ? HV_REG_LR
+                                           : hv_reg_t(HV_REG_X0 + index);
+            setReg(reg, value);
+        },
+        [&](u8 index, u128 value) { setSimdFpReg(index, value); });
+    if (gpu::PerfStats::isEnabled()) {
+        gpu::PerfStats::instance().register_writes += writes;
+        gpu::PerfStats::instance().register_write_skips += 63 - writes;
+    }
     setSysReg(HV_SYS_REG_SP_EL0, state.sp);
     if (exception)
         setSysReg(HV_SYS_REG_ELR_EL1, state.pc);
     else
         setReg(HV_REG_PC, state.pc);
     setReg(HV_REG_CPSR, state.pstate);
-    for (u8 i = 0; i < 32; i++)
-        setSimdFpReg(i, state.v[i]);
     setReg(HV_REG_FPCR, state.fpcr);
     setReg(HV_REG_FPSR, state.fpsr);
 }

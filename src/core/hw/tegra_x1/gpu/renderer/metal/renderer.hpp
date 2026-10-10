@@ -60,6 +60,7 @@ class Renderer : public IRenderer {
 
     // Buffer
     BufferBase* createBuffer(u64 size) override;
+    BufferBase* createCpuBufferSnapshot(ztd::Range<uptr> range) override;
     BufferBase* allocateTemporaryBuffer(const u64 size) override;
     void freeTemporaryBuffer(BufferBase* buffer) override;
     BufferBase* allocateTextureUploadBuffer(u64 size) override;

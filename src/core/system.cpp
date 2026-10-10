@@ -533,6 +533,27 @@ void System::progressFrame(u32 width, u32 height,
             LOG_INFO(Other, "TEXTURE: {} synchronization scans, {} skipped",
                      stats.texture_sync_scans.exchange(0),
                      stats.texture_sync_skips.exchange(0));
+            LOG_INFO(Other, "CPU registers: {} writes, {} skipped",
+                     stats.register_writes.exchange(0),
+                     stats.register_write_skips.exchange(0));
+            u64 cached_buffer_bytes;
+            {
+                auto& cache = gpu.getRenderer().getBufferCache();
+                std::scoped_lock lock(cache.getMutex());
+                cached_buffer_bytes = cache.getCachedBytes();
+            }
+            LOG_INFO(
+                Other,
+                "BUFFERS: {:.1f} MiB cached, {} snapshots ({:.1f} MiB/s) | "
+                "encoders {:.1f} render, {:.1f} blit/frame",
+                static_cast<f64>(cached_buffer_bytes) / (1024.0 * 1024.0),
+                stats.buffer_snapshots.exchange(0),
+                static_cast<f64>(stats.buffer_snapshot_bytes.exchange(0)) /
+                    (1024.0 * 1024.0) / elapsed,
+                static_cast<f64>(stats.render_encoders.exchange(0)) /
+                    std::max(frames, 1.0),
+                static_cast<f64>(stats.blit_encoders.exchange(0)) /
+                    std::max(frames, 1.0));
             LOG_INFO(Other,
                      "PERF: {:.1f} fps | pfifo (CPU encode) {:.2f} ms/frame, "
                      "{:.1f} lists/frame | present wait {:.2f} ms/frame | "

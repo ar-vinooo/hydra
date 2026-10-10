@@ -10,9 +10,8 @@ namespace hydra::hw::tegra_x1::gpu::renderer {
 
 class IRenderer;
 
-// TODO: also release the buffer
 struct BufferEntry {
-    BufferBase* buffer{nullptr};
+    std::shared_ptr<BufferBase> buffer;
     ztd::Range<uptr> range;
     std::optional<ztd::Range<uptr>> invalidation_range;
     bool inline_copy{false}; // TODO: implement
@@ -23,6 +22,14 @@ class BufferCache {
   public:
     explicit BufferCache(IRenderer& renderer_) : renderer{renderer_} {}
     ~BufferCache();
+
+    u64 getCachedBytes() const {
+        u64 bytes = 0;
+        for (const auto& [key, entry] : entries)
+            if (entry.buffer)
+                bytes += entry.buffer->getSize();
+        return bytes;
+    }
 
     BufferView get(ICommandBuffer* command_buffer, ztd::Range<uptr> range);
 

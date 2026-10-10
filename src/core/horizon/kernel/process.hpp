@@ -71,6 +71,7 @@ class Process : public SynchronizationObject {
 
     void start();
     void stop();
+    void joinThreads();
 
     void supervisorPause();
     void supervisorResume();

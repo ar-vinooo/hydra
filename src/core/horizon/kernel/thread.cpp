@@ -6,9 +6,17 @@
 namespace hydra::horizon::kernel {
 
 IThread::~IThread() noexcept {
-    if (!isStoppingOrStopped()) {
+    stopAndJoin();
+}
+
+void IThread::stopAndJoin() {
+    if (!thread.joinable())
+        return;
+    ASSERT(thread.get_id() != std::this_thread::get_id(), Kernel,
+           "Cannot destroy a thread from its own callback");
+    if (!isStoppingOrStopped())
         stop();
-    }
+    thread.join();
 }
 
 void IThread::start() {

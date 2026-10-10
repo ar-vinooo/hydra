@@ -5,10 +5,7 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-BufferCache::~BufferCache() {
-    for (auto& entry : entries)
-        delete entry.second.buffer;
-}
+BufferCache::~BufferCache() = default;
 
 BufferView BufferCache::get(ICommandBuffer* command_buffer,
                             ztd::Range<uptr> range) {
@@ -26,8 +23,11 @@ BufferView BufferCache::get(ICommandBuffer* command_buffer,
         }
     } else {
         // Create new buffer
-        entry.buffer = renderer.createBuffer(entry.range.getSize());
-        updateRange(command_buffer, entry, entry.range);
+        entry.buffer.reset(renderer.createCpuBufferSnapshot(entry.range));
+        if (!entry.buffer) {
+            entry.buffer.reset(renderer.createBuffer(entry.range.getSize()));
+            updateRange(command_buffer, entry, entry.range);
+        }
     }
 
     return BufferView{entry.buffer, range.getBegin() - entry.range.getBegin(),
@@ -59,7 +59,12 @@ void BufferCache::invalidateMemory(ztd::Range<uptr> range) {
 
 void BufferCache::updateRange(ICommandBuffer* command_buffer,
                               BufferEntry& entry, ztd::Range<uptr> range) {
-    if (entry.inline_copy) {
+    if (auto* snapshot = renderer.createCpuBufferSnapshot(entry.range)) {
+        // Replace the resource instead of mutating bytes the GPU may still
+        // read. BufferViews retain the old owner; Metal retains encoded GPU
+        // resources until their command buffer completes.
+        entry.buffer.reset(snapshot);
+    } else if (entry.inline_copy) {
         // Do an inline update if possible
         entry.buffer->copyFrom(range.getBegin(),
                                range.getBegin() - entry.range.getBegin(),
@@ -67,12 +72,14 @@ void BufferCache::updateRange(ICommandBuffer* command_buffer,
         entry.inline_copy = false;
     } else {
         // Copy from a temporary buffer
-        auto tmp_buffer = renderer.allocateTemporaryBuffer(range.getSize());
+        // Share the bounded upload pool used by texture uploads. Retirement
+        // waits for GPU completion before staging memory can be reused.
+        auto tmp_buffer = renderer.allocateTextureUploadBuffer(range.getSize());
         tmp_buffer->copyFrom(range.getBegin());
         entry.buffer->copyFrom(command_buffer, tmp_buffer,
                                range.getBegin() - entry.range.getBegin(), 0,
                                range.getSize());
-        renderer.freeTemporaryBuffer(tmp_buffer);
+        renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);
     }
 }
 

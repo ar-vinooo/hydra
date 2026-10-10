@@ -18,7 +18,10 @@ GuestThread::GuestThread(System& system_, Process* process,
     tls_mem = process->createTlsMemory(tls_addr);
 }
 
-GuestThread::~GuestThread() { delete tls_mem; }
+GuestThread::~GuestThread() {
+    stopAndJoin();
+    delete tls_mem;
+}
 
 uptr GuestThread::getTlsPtr() const { return tls_mem->getPtr(); }
 

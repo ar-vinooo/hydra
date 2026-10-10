@@ -145,6 +145,7 @@ void Process::stop() {
 }
 
 void Process::supervisorPause() {
+@@
     std::scoped_lock lock(thread_mutex);
     for (auto thread : threads)
         thread->supervisorPause();

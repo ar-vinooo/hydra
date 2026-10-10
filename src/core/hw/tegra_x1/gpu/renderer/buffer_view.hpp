@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
+#include <memory>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -15,6 +16,12 @@ struct BufferView {
     }
 
     bool isValid() const { return base != nullptr; }
+
+    explicit BufferView(std::shared_ptr<BufferBase> owner_, u64 offset_ = 0,
+                        u64 size_ = invalid<u64>())
+        : BufferView(owner_.get(), offset_, size_) {
+        owner = std::move(owner_);
+    }
 
     uptr getPtr() const { return base->getPtr() + offset; }
 
@@ -39,6 +46,7 @@ struct BufferView {
     }
 
   protected:
+    std::shared_ptr<BufferBase> owner;
     BufferBase* base{nullptr};
     u64 offset{0};
     u64 size{0};
@@ -47,6 +55,7 @@ struct BufferView {
     GETTER(base, getBase);
     GETTER(offset, getOffset);
     GETTER(size, getSize);
+    CONST_REF_GETTER(owner, getOwner);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

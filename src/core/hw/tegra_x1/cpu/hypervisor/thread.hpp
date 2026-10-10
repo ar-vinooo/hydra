@@ -71,6 +71,7 @@ class Thread : public IThread {
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t* exit;
     bool exception{false};
+    std::optional<ThreadState> exit_register_state;
 
     u64 interrupt_time_delta_ticks;
 

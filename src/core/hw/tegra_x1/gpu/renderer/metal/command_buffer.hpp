@@ -103,6 +103,8 @@ class CommandBuffer final : public ICommandBuffer {
     std::vector<MTL::Buffer*> retired_upload_buffers;
     u64 raster_updates{0};
     u64 raster_skips{0};
+    u64 render_encoders{0};
+    u64 blit_encoders{0};
 
   public:
     GETTER(command_buffer, getCommandBuffer);

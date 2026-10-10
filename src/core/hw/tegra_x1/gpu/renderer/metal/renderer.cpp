@@ -114,6 +114,20 @@ BufferBase* Renderer::createBuffer(u64 size) {
     return new Buffer(device, size);
 }
 
+BufferBase* Renderer::createCpuBufferSnapshot(ztd::Range<uptr> range) {
+    static const bool disabled =
+        std::getenv("HYDRA_DISABLE_BUFFER_SNAPSHOTS") != nullptr;
+    if (disabled || range.getSize() > 64 * 1024)
+        return nullptr;
+    auto* snapshot = allocateTemporaryBuffer(range.getSize());
+    snapshot->copyFrom(range.getBegin());
+    if (PerfStats::isEnabled()) {
+        PerfStats::instance().buffer_snapshots++;
+        PerfStats::instance().buffer_snapshot_bytes += range.getSize();
+    }
+    return snapshot;
+}
+
 BufferBase* Renderer::allocateTemporaryBuffer(const u64 size) {
     // TODO: use a buffer allocator instead
     auto buffer = device->newBuffer(size, MTL::ResourceStorageModeShared);

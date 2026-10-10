@@ -50,6 +50,7 @@ class IThread : public SynchronizationObject {
     ~IThread() noexcept override;
 
     void start();
+    void stopAndJoin();
 
     // Messages
     void stop() {
@@ -125,7 +126,7 @@ class IThread : public SynchronizationObject {
   private:
     i32 priority;
 
-    ThreadState state{ThreadState::Created}; // TODO: atomic?
+    std::atomic<ThreadState> state{ThreadState::Created};
 
     std::mutex msg_mutex;
     std::condition_variable msg_cv;
@@ -158,7 +159,7 @@ class IThread : public SynchronizationObject {
 
   public:
     GETTER(process, getProcess);
-    GETTER(state, getState);
+    ThreadState getState() const { return state.load(); }
 };
 
 inline thread_local IThread* tls_current_thread = nullptr;

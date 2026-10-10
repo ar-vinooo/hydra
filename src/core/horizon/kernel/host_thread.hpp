@@ -13,6 +13,7 @@ class HostThread : public IThread {
                std::string_view debug_name = "Thread")
         : IThread(process, priority, debug_name),
           run_callback{std::move(run_callback_)}, tls(TLS_SIZE) {}
+    ~HostThread() override { stopAndJoin(); }
 
     uptr getTlsPtr() const override {
         return reinterpret_cast<uptr>(tls.data());
