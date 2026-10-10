@@ -629,7 +629,12 @@ u32 TextureDescriptor::getGroupHash() const {
     hash.add(getTextureTypeClass(type));
 
     const auto& format_info = getTextureFormatInfo(format);
-    // TODO: make sure BC and ASTC formats are incompatible
+    // Equal block sizes do not imply compatible texture views: BC3, BC5,
+    // BC7 and ASTC can share a footprint but use different encodings.
+    // Keep compressed formats in separate storage groups. Uncompressed
+    // formats retain their existing bit-compatible aliasing behaviour.
+    if (format_info.block_width > 1 || format_info.block_height > 1)
+        hash.add(format);
     hash.add(format_info.bytes_per_block);
     hash.add(format_info.block_width);
     hash.add(format_info.block_height);

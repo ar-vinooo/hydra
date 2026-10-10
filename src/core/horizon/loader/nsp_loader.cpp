@@ -1,6 +1,11 @@
 #include "core/horizon/loader/nsp_loader.hpp"
+#include "core/horizon/loader/xci_loader.hpp"
 
 namespace hydra::horizon::loader {
+
+ILoader* NspLoader::create(std::string_view path) {
+    return XciLoader::createNsp(path);
+}
 
 NspLoader::NspLoader(filesystem::PartitionFilesystem pfs_)
     : pfs(std::move(pfs_)) {

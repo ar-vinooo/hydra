@@ -91,7 +91,8 @@ namespace hydra::input::apple_gc {
 namespace {
 
 std::string getDeviceName(id device) {
-    return [[device vendorName] UTF8String];
+    const char* name = [[device vendorName] UTF8String];
+    return name && name[0] ? name : "Unknown Controller";
 }
 
 } // namespace
@@ -101,11 +102,20 @@ DeviceList::DeviceList() : impl([[DeviceListImpl alloc] initWithParent:this]) {}
 DeviceList::~DeviceList() { [impl release]; }
 
 void DeviceList::addController(id controller) {
-    addDevice(getDeviceName(controller), new Controller(controller));
+    std::scoped_lock lock(controller_mutex);
+    if (controller_names.contains(controller))
+        return;
+    controller_names[controller] =
+        addUniqueDevice(getDeviceName(controller), new Controller(controller));
 }
 
 void DeviceList::removeController(id controller) {
-    removeDevice(getDeviceName(controller));
+    std::scoped_lock lock(controller_mutex);
+    const auto it = controller_names.find(controller);
+    if (it == controller_names.end())
+        return;
+    removeDevice(it->second);
+    controller_names.erase(it);
 }
 
 void DeviceList::addKeyboard(id keyboard) {

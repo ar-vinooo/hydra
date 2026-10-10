@@ -78,6 +78,15 @@ class IRenderer {
     virtual BufferBase* allocateTemporaryBuffer(const u64 size) = 0;
     virtual void freeTemporaryBuffer(BufferBase* buffer) = 0;
 
+    virtual BufferBase* allocateTextureUploadBuffer(u64 size) {
+        return allocateTemporaryBuffer(size);
+    }
+    virtual void
+    retireTextureUploadBuffer([[maybe_unused]] ICommandBuffer* command_buffer,
+                              BufferBase* buffer) {
+        freeTemporaryBuffer(buffer);
+    }
+
     // Texture
     virtual ITexture* createTexture(const TextureDescriptor& descriptor) = 0;
     virtual void blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
@@ -126,9 +135,10 @@ class IRenderer {
                               engines::Winding front_face) = 0;
 
     // DEBUG: save the current contents of a texture to a PNG file
-    virtual void debugDumpTexture([[maybe_unused]] ICommandBuffer* command_buffer,
-                                  [[maybe_unused]] ITextureView* view,
-                                  [[maybe_unused]] const std::string& path) {}
+    virtual void
+    debugDumpTexture([[maybe_unused]] ICommandBuffer* command_buffer,
+                     [[maybe_unused]] ITextureView* view,
+                     [[maybe_unused]] const std::string& path) {}
 
     // Viewport and scissor
     virtual void setViewport(u32 index, const Viewport& viewport) = 0;

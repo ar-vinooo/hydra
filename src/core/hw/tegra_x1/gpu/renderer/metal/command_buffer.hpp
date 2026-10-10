@@ -2,8 +2,14 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
+#include <memory>
+#include <optional>
+#include <span>
+#include <vector>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
+
+class UploadBufferPool;
 
 enum class EncoderType {
     None,
@@ -22,6 +28,13 @@ struct EncoderRenderState {
     MTL::DepthStencilState* depth_stencil_state{nullptr};
     MTL::CullMode cull_mode{MTL::CullModeNone};
     MTL::Winding front_face_winding{MTL::WindingClockwise};
+    std::optional<std::array<float, 3>> depth_bias;
+    std::optional<std::array<float, 4>> blend_color;
+    std::optional<std::array<u32, 2>> stencil_references;
+    std::array<MTL::Viewport, VIEWPORT_COUNT> viewports{};
+    std::array<MTL::ScissorRect, VIEWPORT_COUNT> scissors{};
+    usize viewport_count{0};
+    usize scissor_count{0};
     std::array<std::array<MtlBufferState, BUFFER_COUNT>,
                static_cast<usize>(ShaderType::Count)>
         buffers{};
@@ -61,12 +74,19 @@ class CommandBuffer final : public ICommandBuffer {
     MTL::BlitCommandEncoder* getBlitCommandEncoder();
 
     void endEncoding();
+    void retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
+                            MTL::Buffer* buffer);
 
     // Encoder state setting
     void setRenderPipelineState(MTL::RenderPipelineState* pipeline);
     void setDepthStencilState(MTL::DepthStencilState* depth_stencil_state);
     void setCullMode(MTL::CullMode cull_mode);
     void setFrontFaceWinding(MTL::Winding front_face_winding);
+    void setDepthBias(float constant, float slope, float clamp);
+    void setBlendColor(float r, float g, float b, float a);
+    void setStencilReferences(u32 front, u32 back);
+    void setViewports(std::span<const MTL::Viewport> viewports);
+    void setScissors(std::span<const MTL::ScissorRect> scissors);
     void setBuffer(MTL::Buffer* buffer, u64 offset, ShaderType shader_type,
                    u32 index);
     void setTexture(MTL::Texture* texture, ShaderType shader_type, u32 index);
@@ -79,6 +99,10 @@ class CommandBuffer final : public ICommandBuffer {
     EncoderType encoder_type{EncoderType::None};
 
     EncoderState encoder_state{};
+    std::shared_ptr<UploadBufferPool> upload_pool;
+    std::vector<MTL::Buffer*> retired_upload_buffers;
+    u64 raster_updates{0};
+    u64 raster_skips{0};
 
   public:
     GETTER(command_buffer, getCommandBuffer);

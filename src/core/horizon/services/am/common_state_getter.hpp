@@ -1,12 +1,13 @@
 #pragma once
 
 #include "core/horizon/kernel/event.hpp"
+#include "core/horizon/services/am/session.hpp"
 #include "core/horizon/services/const.hpp"
 #include "core/horizon/services/oe/const.hpp"
 
 namespace hydra::horizon::services::am {
 
-enum class OperationMode {
+enum class OperationMode : u8 {
     Handheld,
     Console,
 };
@@ -32,7 +33,7 @@ class ICommonStateGetter : public IService {
                             kernel::AppletMessage* out_message);
     STUB_REQUEST_COMMAND(disallowToEnterSleep);
     result_t getOperationMode(OperationMode* out_mode);
-    STUB_REQUEST_COMMAND(getPerformanceMode);
+    result_t getPerformanceMode(PerformanceMode* out_mode);
     result_t getDefaultDisplayResolution(System* system, i32* out_width,
                                          i32* out_height);
     result_t getDefaultDisplayResolutionChangeEvent(

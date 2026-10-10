@@ -15,6 +15,17 @@ struct PerfStats {
     std::atomic<u64> command_buffers{0};
     std::atomic<u64> draws{0};
     std::atomic<u64> frames{0};
+    std::atomic<u64> texture_upload_ns{0};
+    std::atomic<u64> texture_upload_bytes{0};
+    std::atomic<u64> upload_buffers_created{0};
+    std::atomic<u64> upload_buffers_reused{0};
+    std::atomic<u64> draw_state_ns{0};
+    std::atomic<u64> shader_compile_ns{0};
+    std::atomic<u64> shader_compiles{0};
+    std::atomic<u64> pipeline_compile_ns{0};
+    std::atomic<u64> pipeline_compiles{0};
+    std::atomic<u64> raster_updates{0};
+    std::atomic<u64> raster_skips{0};
 
     static PerfStats& instance() {
         static PerfStats stats;

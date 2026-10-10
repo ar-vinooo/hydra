@@ -67,7 +67,6 @@ void DeviceList::eventWatcher(SDL_Event* e) {
     case SDL_EVENT_KEYBOARD_ADDED: {
         if (keyboard_count++ == 0)
             connectGenericKeyboard();
-        keyboard_count++;
         break;
     }
     case SDL_EVENT_KEYBOARD_REMOVED: {
@@ -80,9 +79,11 @@ void DeviceList::eventWatcher(SDL_Event* e) {
         break;
     }
     case SDL_EVENT_GAMEPAD_REMOVED: {
-        SDL_Gamepad* gp = SDL_GetGamepadFromID(e->gdevice.which);
-        std::string name = SDL_GetGamepadName(gp);
-        removeDevice(name);
+        const auto it = controller_names.find(e->gdevice.which);
+        if (it != controller_names.end()) {
+            removeDevice(it->second);
+            controller_names.erase(it);
+        }
         break;
     }
     default:
@@ -95,10 +96,12 @@ void DeviceList::connectGenericKeyboard() {
 }
 
 void DeviceList::connectController(SDL_JoystickID id) {
+    if (controller_names.contains(id))
+        return;
     SDL_Gamepad* gp = SDL_OpenGamepad(id);
     if (gp != nullptr) {
         std::string name = SDL_GetGamepadName(gp);
-        addDevice(name, new Controller(gp));
+        controller_names[id] = addUniqueDevice(name, new Controller(gp));
     } else {
         LOG_ERROR(Input, "Failed to get controller: {}", SDL_GetError());
     }

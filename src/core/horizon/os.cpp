@@ -346,6 +346,8 @@ void OS::notifyOperationModeChanged() {
     for (auto& it : kernel.getProcessManager()) {
         it->getAppletState().sendMessage(
             kernel::AppletMessage::OperationModeChanged);
+        it->getAppletState().sendMessage(
+            kernel::AppletMessage::PerformanceModeChanged);
     }
 }
 

@@ -14,8 +14,9 @@ struct EmulationView: View {
                     do {
                         let system = try HydraSystem()
                         globalState.system = system
-                        system.loadAndStart(loader: globalState.activeGame!.loader)
+                        try system.loadAndStart(loader: globalState.activeGame!.loader)
                     } catch {
+                        globalState.system = nil
                         startupError = error.localizedDescription
                         showingStartupError = true
                     }

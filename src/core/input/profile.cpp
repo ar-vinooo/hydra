@@ -174,9 +174,9 @@ struct into<hydra::input::AnalogStickAxis> {
 namespace hydra::input {
 
 Profile::Profile(horizon::services::hid::internal::NpadIndex index_,
-                 std::string_view name_)
-    : index{index_}, name{name_} {
-    const auto path = getProfilesPath();
+                 std::string_view name_, std::string_view directory_)
+    : index{index_}, name{name_}, directory{directory_} {
+    const auto path = directory.empty() ? getProfilesPath() : directory;
     if (!std::filesystem::exists(path))
         std::filesystem::create_directory(path);
 
@@ -304,7 +304,7 @@ void Profile::loadDefaults() {
     }
 }
 
-void Profile::serialize() {
+bool Profile::serialize() {
     // TODO: check if changed?
 
     // TODO: why is the order of everything reversed in the saved config?
@@ -312,7 +312,7 @@ void Profile::serialize() {
     std::ofstream config_file(getPath());
     if (!config_file.is_open()) {
         LOG_ERROR(Common, "Failed to open npad config file");
-        return;
+        return false;
     }
 
     toml::value data(toml::table{
@@ -356,6 +356,7 @@ void Profile::serialize() {
 
     config_file << toml::format(data);
     config_file.close();
+    return !config_file.fail();
 }
 
 void Profile::deserialize() {

@@ -69,6 +69,7 @@ struct HydraApp: App {
             Settings {
                 SettingsView()
                     .environmentObject(globalState)
+                    .environmentObject(globalState)
             }
         #else
             WindowGroup {

@@ -310,21 +310,32 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
         throw std::runtime_error(
             "XCI NCA content size does not match its partition entry.");
     if (!plaintext) {
-        if (std::ranges::any_of(std::span(header).subspan(0x230, 16),
-                                [](u8 byte) { return byte != 0; }))
-            throw std::runtime_error(
-                "This XCI contains title-key encrypted content; retail "
-                "gamecard NCAs are required.");
         const auto generation = std::max(header[0x206], header[0x220]);
         const auto revision = generation == 0 ? 0 : generation - 1;
-        constexpr std::array names{"application", "ocean", "system"};
-        if (header[0x207] >= names.size())
-            throw std::runtime_error("Invalid NCA key-area index.");
-        const auto name = fmt::format("key_area_key_{}_{:02x}",
-                                      names[header[0x207]], revision);
-        const auto key = requireKey(keys, name, 16);
-        ecb(kCCDecrypt, key, std::span(header).subspan(0x300, 0x40),
-            state->key_area);
+        if (std::ranges::any_of(std::span(header).subspan(0x230, 16),
+                                [](u8 byte) { return byte != 0; })) {
+            std::string name = "encrypted_titlekey_";
+            for (const auto byte : std::span(header).subspan(0x230, 16))
+                name += fmt::format("{:02x}", byte);
+            const auto ticket = keys.find(name);
+            if (ticket == keys.end() || ticket->second.size() != 16)
+                throw std::runtime_error(
+                    "A matching common ticket is required for this NSP. "
+                    "Personalized tickets are not supported.");
+            const auto kek =
+                requireKey(keys, fmt::format("titlekek_{:02x}", revision), 16);
+            ecb(kCCDecrypt, kek, ticket->second,
+                std::span(state->key_area).subspan(0x20, 16));
+        } else {
+            constexpr std::array names{"application", "ocean", "system"};
+            if (header[0x207] >= names.size())
+                throw std::runtime_error("Invalid NCA key-area index.");
+            const auto name = fmt::format("key_area_key_{}_{:02x}",
+                                          names[header[0x207]], revision);
+            const auto key = requireKey(keys, name, 16);
+            ecb(kCCDecrypt, key, std::span(header).subspan(0x300, 0x40),
+                state->key_area);
+        }
     }
     for (usize i = 0; i < 4; ++i) {
         const auto start =

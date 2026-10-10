@@ -4,6 +4,7 @@
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
@@ -590,7 +591,8 @@ void TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
         }
 
         const auto dims = descriptor.getLevelDimensions(level);
-        const auto other_dims = other_descriptor.getLevelDimensions(other_level);
+        const auto other_dims =
+            other_descriptor.getLevelDimensions(other_level);
         const uint3 size({std::min(dims.x(), other_dims.x()),
                           std::min(dims.y(), other_dims.y()),
                           std::min(dims.z(), other_dims.z())});
@@ -684,7 +686,10 @@ void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
     size *= descriptor.layer_count;
 
     // Allocate temporary buffer
-    auto tmp_buffer = renderer.allocateTemporaryBuffer(size);
+    const auto upload_start = PerfStats::isEnabled()
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    auto tmp_buffer = renderer.allocateTextureUploadBuffer(size);
 
     const u8* in_data = reinterpret_cast<const u8*>(descriptor.ptr);
     u8* out_data = reinterpret_cast<u8*>(tmp_buffer->getPtr());
@@ -702,10 +707,10 @@ void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
     } else {
         // Levels and layers are aligned to blocks in guest memory, but packed
         // in the output
-        const u32 layer_stride = descriptor.layer_size != 0
-                                     ? descriptor.layer_size
-                                     : descriptor.getLevelOffset(
-                                           descriptor.level_count);
+        const u32 layer_stride =
+            descriptor.layer_size != 0
+                ? descriptor.layer_size
+                : descriptor.getLevelOffset(descriptor.level_count);
         u32 offset = 0;
         for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
             for (u32 level = 0; level < descriptor.level_count; level++) {
@@ -752,7 +757,15 @@ void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
     }
 
     storage.base->copyFrom(command_buffer, tmp_buffer);
-    renderer.freeTemporaryBuffer(tmp_buffer);
+    renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);
+    if (PerfStats::isEnabled()) {
+        auto& stats = PerfStats::instance();
+        stats.texture_upload_bytes += size;
+        stats.texture_upload_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - upload_start)
+                .count());
+    }
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

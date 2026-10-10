@@ -52,7 +52,7 @@ struct GameListView: View {
         .onChange(of: globalState.loaderPluginRefreshID) { _, _ in
             reloadGames()
         }
-        .alert("Unable to load XCI", isPresented: $showingLoadError) {
+        .alert("Unable to load game", isPresented: $showingLoadError) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(loadErrors.joined(separator: "\n\n"))
@@ -123,7 +123,7 @@ struct GameListView: View {
         } catch {
             // TODO: error popup
             print("Failed to load game path \(url.path(percentEncoded: false)): \(error)")
-            if url.pathExtension.lowercased() == "xci" {
+            if ["xci", "nsp"].contains(url.pathExtension.lowercased()) {
                 errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
             return

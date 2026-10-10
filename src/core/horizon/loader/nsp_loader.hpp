@@ -8,6 +8,7 @@ namespace hydra::horizon::loader {
 // HACK: assumes Homebrew NSP
 class NspLoader : public ILoader {
   public:
+    static ILoader* create(std::string_view path);
     explicit NspLoader(filesystem::IFile* file)
         : NspLoader(
               *filesystem::PartitionFilesystem().initialize<false>(file)) {}

@@ -8,6 +8,13 @@ using buffer_id_t = u64;
 
 using buffer_finished_callback_fn_t = std::function<void(buffer_id_t)>;
 
+struct StreamStats {
+    bool has_sample_clock{false};
+    u64 requested_frames{0};
+    u64 missing_frames{0};
+    u64 sample_clock_frames{0};
+};
+
 class IStream {
   public:
     IStream(PcmFormat format_, u32 sample_rate_, u16 channel_count_,
@@ -21,6 +28,8 @@ class IStream {
     virtual void stop() = 0;
 
     virtual void enqueueBuffer(buffer_id_t id, std::span<const u8> buffer) = 0;
+
+    virtual StreamStats getStats() const { return {}; }
 
     StreamState getState() const { return state; }
 

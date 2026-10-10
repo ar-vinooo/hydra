@@ -15,6 +15,10 @@ class DeviceList : public IDeviceList {
     void removeKeyboard(id keyboard);
 
   private:
+    std::mutex controller_mutex;
+    std::map<id, std::string> controller_names;
+    // Creating the observer enumerates connected controllers immediately and
+    // calls addController(). Its mutex/map must already be constructed.
     id impl;
 };
 

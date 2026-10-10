@@ -1,10 +1,12 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_depth_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
@@ -60,6 +62,9 @@ class Renderer : public IRenderer {
     BufferBase* createBuffer(u64 size) override;
     BufferBase* allocateTemporaryBuffer(const u64 size) override;
     void freeTemporaryBuffer(BufferBase* buffer) override;
+    BufferBase* allocateTextureUploadBuffer(u64 size) override;
+    void retireTextureUploadBuffer(ICommandBuffer* command_buffer,
+                                   BufferBase* buffer) override;
 
     // Texture
     ITexture* createTexture(const TextureDescriptor& descriptor) override;
@@ -163,8 +168,10 @@ class Renderer : public IRenderer {
   private:
     MTL::Device* device;
     MTL::CommandQueue* command_queue;
+    std::shared_ptr<UploadBufferPool> upload_buffer_pool;
 
     // Caches
+    BinaryArchiveCache binary_archive_cache;
     DepthStencilStateCache depth_stencil_state_cache;
     BlitPipelineCache blit_pipeline_cache;
     ClearColorPipelineCache clear_color_pipeline_cache;

@@ -456,6 +456,9 @@ add_library(hydra-core
     horizon/ui/handler_base.hpp
     audio/const.hpp
     audio/stream.hpp
+    audio/pcm_queue.hpp
+    audio/sample_clock.hpp
+    audio/sample_decoder.hpp
     audio/core.hpp
     audio/null/stream.hpp
     audio/null/core.cpp
@@ -626,6 +629,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/shader.hpp
     hw/tegra_x1/gpu/renderer/metal/pipeline.cpp
     hw/tegra_x1/gpu/renderer/metal/pipeline.hpp
+    hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.cpp
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.cpp

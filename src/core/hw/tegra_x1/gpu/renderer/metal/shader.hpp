@@ -12,9 +12,11 @@ class Shader final : public ShaderBase {
 
   private:
     MTL::Function* function{nullptr};
+    std::string cache_key;
 
   public:
     GETTER(function, getFunction);
+    const std::string& getCacheKey() const { return cache_key; }
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

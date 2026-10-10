@@ -335,7 +335,7 @@ void hydraSystemDestroy(void* system);
 
 void hydraSystemSetSurface(void* system, void* surface);
 
-void hydraSystemLoadAndStart(void* system, void* loader);
+bool hydraSystemLoadAndStart(void* system, void* loader);
 void hydraSystemRequestStop(void* system);
 void hydraSystemForceStop(void* system);
 
@@ -360,7 +360,12 @@ const void* hydraSystemTextureCacheGetTextureMemory(void* system,
                                                     uint32_t index);
 
 // Input
-// TODO
+// Returned lists are owned by the caller and must be destroyed.
+void* hydraInputGetDevices(void* system);
+void* hydraInputGetPlayerDevices(uint32_t player);
+bool hydraInputSetPlayerDevices(void* system, uint32_t player,
+                                const void* devices);
+HydraString hydraInputGetLastError();
 
 // Debugger
 

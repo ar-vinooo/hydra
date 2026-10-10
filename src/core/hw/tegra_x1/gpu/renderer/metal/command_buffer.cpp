@@ -3,6 +3,7 @@
 #include <cstdlib>
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
@@ -14,7 +15,22 @@ CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue) {
 
 CommandBuffer::~CommandBuffer() {
     endEncoding();
+    if (!retired_upload_buffers.empty()) {
+        command_buffer->addCompletedHandler(
+            [pool = std::move(upload_pool),
+             buffers =
+                 std::move(retired_upload_buffers)](MTL::CommandBuffer* cb) {
+                for (auto* buffer : buffers) {
+                    if (cb->status() == MTL::CommandBufferStatusCompleted)
+                        pool->recycle(buffer);
+                    else
+                        buffer->release();
+                }
+            });
+    }
     if (PerfStats::isEnabled()) {
+        PerfStats::instance().raster_updates += raster_updates;
+        PerfStats::instance().raster_skips += raster_skips;
         PerfStats::instance().command_buffers++;
         command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
             const auto dt = cb->GPUEndTime() - cb->GPUStartTime();
@@ -31,6 +47,14 @@ CommandBuffer::~CommandBuffer() {
     if (gpu_sync)
         command_buffer->waitUntilCompleted();
     command_buffer->release();
+}
+
+void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
+                                       MTL::Buffer* buffer) {
+    ASSERT(!upload_pool || upload_pool == pool, MetalRenderer,
+           "An upload command buffer cannot mix buffer pools");
+    upload_pool = std::move(pool);
+    retired_upload_buffers.push_back(buffer);
 }
 
 MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
@@ -125,6 +149,94 @@ void CommandBuffer::setFrontFaceWinding(MTL::Winding front_face_winding) {
     getRenderCommandEncoderUnchecked()->setFrontFacingWinding(
         front_face_winding);
     bound_front_face_winding = front_face_winding;
+}
+
+namespace {
+bool rasterCacheEnabled() {
+    static const bool enabled =
+        std::getenv("HYDRA_DISABLE_RASTER_CACHE") == nullptr;
+    return enabled;
+}
+} // namespace
+
+void CommandBuffer::setDepthBias(float constant, float slope, float clamp) {
+    const std::array<float, 3> value{constant, slope, clamp};
+    auto& cached = encoder_state.render.depth_bias;
+    if (rasterCacheEnabled() && cached && *cached == value) {
+        ++raster_skips;
+        return;
+    }
+    getRenderCommandEncoderUnchecked()->setDepthBias(constant, slope, clamp);
+    cached = value;
+    ++raster_updates;
+}
+
+void CommandBuffer::setBlendColor(float r, float g, float b, float a) {
+    const std::array<float, 4> value{r, g, b, a};
+    auto& cached = encoder_state.render.blend_color;
+    if (rasterCacheEnabled() && cached && *cached == value) {
+        ++raster_skips;
+        return;
+    }
+    getRenderCommandEncoderUnchecked()->setBlendColor(r, g, b, a);
+    cached = value;
+    ++raster_updates;
+}
+
+void CommandBuffer::setStencilReferences(u32 front, u32 back) {
+    const std::array<u32, 2> value{front, back};
+    auto& cached = encoder_state.render.stencil_references;
+    if (rasterCacheEnabled() && cached && *cached == value) {
+        ++raster_skips;
+        return;
+    }
+    getRenderCommandEncoderUnchecked()->setStencilReferenceValues(front, back);
+    cached = value;
+    ++raster_updates;
+}
+
+void CommandBuffer::setViewports(std::span<const MTL::Viewport> values) {
+    ASSERT(!values.empty() && values.size() <= VIEWPORT_COUNT, MetalRenderer,
+           "Invalid raster rectangle count {}", values.size());
+    auto& cached = encoder_state.render;
+    const auto equal = [](const MTL::Viewport& a, const MTL::Viewport& b) {
+        return a.originX == b.originX && a.originY == b.originY &&
+               a.width == b.width && a.height == b.height &&
+               a.znear == b.znear && a.zfar == b.zfar;
+    };
+    if (rasterCacheEnabled() && cached.viewport_count == values.size() &&
+        std::equal(values.begin(), values.end(), cached.viewports.begin(),
+                   equal)) {
+        ++raster_skips;
+        return;
+    }
+    getRenderCommandEncoderUnchecked()->setViewports(values.data(),
+                                                     values.size());
+    std::copy(values.begin(), values.end(), cached.viewports.begin());
+    cached.viewport_count = values.size();
+    ++raster_updates;
+}
+
+void CommandBuffer::setScissors(std::span<const MTL::ScissorRect> values) {
+    ASSERT(!values.empty() && values.size() <= VIEWPORT_COUNT, MetalRenderer,
+           "Invalid raster rectangle count {}", values.size());
+    auto& cached = encoder_state.render;
+    const auto equal = [](const MTL::ScissorRect& a,
+                          const MTL::ScissorRect& b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width &&
+               a.height == b.height;
+    };
+    if (rasterCacheEnabled() && cached.scissor_count == values.size() &&
+        std::equal(values.begin(), values.end(), cached.scissors.begin(),
+                   equal)) {
+        ++raster_skips;
+        return;
+    }
+    getRenderCommandEncoderUnchecked()->setScissorRects(values.data(),
+                                                        values.size());
+    std::copy(values.begin(), values.end(), cached.scissors.begin());
+    cached.scissor_count = values.size();
+    ++raster_updates;
 }
 
 void CommandBuffer::setBuffer(MTL::Buffer* buffer, u64 offset,

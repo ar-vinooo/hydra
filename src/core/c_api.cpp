@@ -9,6 +9,7 @@
 #include "core/horizon/ui/handler_base.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
+#include "core/input/player_assignment.hpp"
 #include "core/system.hpp"
 
 #define HYDRA_EXPORT extern "C" __attribute__((visibility("default")))
@@ -17,6 +18,7 @@ namespace {
 
 thread_local std::string system_error;
 thread_local std::string filesystem_error;
+thread_local std::string input_error;
 
 HydraString hydraStringFromStringView(std::string_view str) {
     return HydraString{.data = str.data(), .size = str.size()};
@@ -858,9 +860,16 @@ HYDRA_EXPORT void hydraSystemSetSurface(void* system, void* surface) {
     reinterpret_cast<hydra::System*>(system)->setSurface(surface);
 }
 
-HYDRA_EXPORT void hydraSystemLoadAndStart(void* system, void* loader) {
-    reinterpret_cast<hydra::System*>(system)->loadAndStart(
-        reinterpret_cast<hydra::horizon::loader::ILoader*>(loader));
+HYDRA_EXPORT bool hydraSystemLoadAndStart(void* system, void* loader) {
+    system_error.clear();
+    try {
+        reinterpret_cast<hydra::System*>(system)->loadAndStart(
+            reinterpret_cast<hydra::horizon::loader::ILoader*>(loader));
+        return true;
+    } catch (const std::exception& error) {
+        system_error = error.what();
+        return false;
+    }
 }
 
 HYDRA_EXPORT void hydraSystemRequestStop(void* system) {
@@ -941,6 +950,103 @@ hydraSystemTextureCacheGetTextureMemory(void* system, uint32_t index) {
                 .getRenderer()
                 .getTextureCache()
                 .getMemory(index);
+}
+
+// Input
+HYDRA_EXPORT void* hydraInputGetDevices(void* system) {
+    try {
+        input_error.clear();
+        auto names =
+            system ? reinterpret_cast<hydra::System*>(system)
+                         ->getInputDeviceManager()
+                         .getControllerNames()
+                   : hydra::input::DeviceManager::getAvailableControllerNames();
+        return new std::vector<std::string>(std::move(names));
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT void* hydraInputGetPlayerDevices(uint32_t player) {
+    try {
+        input_error.clear();
+        if (player >= 8)
+            throw std::runtime_error("Invalid player number");
+        const auto& profiles = hydra::CONFIG_INSTANCE.getInputProfiles();
+        std::vector<std::string> devices;
+        if (player < profiles.size() && !profiles[player].empty()) {
+            hydra::input::Profile profile(
+                static_cast<hydra::horizon::services::hid::internal::NpadIndex>(
+                    player),
+                profiles[player]);
+            devices = profile.getDeviceNames();
+        }
+        return new std::vector<std::string>(std::move(devices));
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT bool hydraInputSetPlayerDevices(void* system, uint32_t player,
+                                             const void* devices) {
+    try {
+        input_error.clear();
+        if (system && reinterpret_cast<hydra::System*>(system)->isRunning())
+            throw std::runtime_error(
+                "Stop the game before changing player assignments");
+        if (player >= 8 || !devices)
+            throw std::runtime_error("Invalid player assignment");
+        const auto selected =
+            *reinterpret_cast<const std::vector<std::string>*>(devices);
+        auto& configured = hydra::CONFIG_INSTANCE.getInputProfiles();
+        auto updated = configured;
+        updated.resize(hydra::horizon::services::hid::NPAD_COUNT);
+        std::array<std::optional<hydra::input::Profile>, 8> profiles;
+        hydra::input::PlayerDevices original;
+        for (uint32_t i = 0; i < 8; i++) {
+            if (i != player && updated[i].empty())
+                continue;
+            const auto index =
+                static_cast<hydra::horizon::services::hid::internal::NpadIndex>(
+                    i);
+            auto name = updated[i];
+            if (name.empty()) {
+                name = fmt::format("Hydra Player {}", i + 1);
+                const auto path =
+                    fmt::format("{}/input_profiles/{}.toml",
+                                hydra::CONFIG_INSTANCE.getAppDataPath(), name);
+                if (!std::filesystem::exists(path))
+                    name = "Default";
+            }
+            profiles[i].emplace(index, name);
+            if (!updated[i].empty())
+                original[i] = profiles[i]->getDeviceNames();
+        }
+        auto assigned = original;
+        hydra::input::assignPlayerDevices(assigned, player, selected);
+        for (uint32_t i = 0; i < 8; i++) {
+            if (i != player && assigned[i] == original[i])
+                continue;
+            // Dedicated profiles preserve mappings without editing Default or
+            // another player's shared source profile.
+            const auto name = fmt::format("Hydra Player {}", i + 1);
+            if (!profiles[i]->saveAs(name, assigned[i]))
+                throw std::runtime_error("Unable to save controller profile");
+            updated[i] = assigned[i].empty() ? "" : name;
+        }
+        configured = std::move(updated);
+        hydra::CONFIG_INSTANCE.serialize();
+        return true;
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return false;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraInputGetLastError() {
+    return hydraStringFromStringView(input_error);
 }
 
 // Debugger

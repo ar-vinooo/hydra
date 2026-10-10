@@ -9,8 +9,10 @@ namespace hydra::horizon::loader {
 class XciLoader final : public NcaLoader {
   public:
     static XciLoader* create(std::string_view path);
+    static XciLoader* createNsp(std::string_view path);
 
   private:
+    static XciLoader* createPackage(std::string_view path, bool nsp);
     explicit XciLoader(std::shared_ptr<filesystem::NcaFile> program);
     std::shared_ptr<filesystem::NcaFile> program_file;
     std::unique_ptr<filesystem::MemoryFile> control_file;

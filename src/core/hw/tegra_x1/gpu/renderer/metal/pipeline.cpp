@@ -1,12 +1,16 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
 
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
+#include <optional>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-Pipeline::Pipeline(MTL::Device* device, const PipelineDescriptor& descriptor)
+Pipeline::Pipeline(MTL::Device* /*device*/,
+                   const PipelineDescriptor& descriptor,
+                   BinaryArchiveCache& binary_archive_cache)
     : PipelineBase(descriptor) {
     MTL::RenderPipelineDescriptor* pipeline_descriptor =
         MTL::RenderPipelineDescriptor::alloc()->init();
@@ -142,8 +146,16 @@ Pipeline::Pipeline(MTL::Device* device, const PipelineDescriptor& descriptor)
     }
 
     // Pipeline
-    NS::Error* error;
-    pipeline = device->newRenderPipelineState(pipeline_descriptor, &error);
+    std::optional<ScopedPerfTimer> compile_timer;
+    if (PerfStats::isEnabled()) {
+        compile_timer.emplace(PerfStats::instance().pipeline_compile_ns);
+        PerfStats::instance().pipeline_compiles++;
+    }
+    NS::Error* error = nullptr;
+    pipeline = binary_archive_cache.createPipeline(
+        pipeline_descriptor, &error,
+        fmt::format("{}:{}", vertex_shader->getCacheKey(),
+                    fragment_shader->getCacheKey()));
     pipeline_descriptor->release();
     if (error != nullptr) {
         LOG_ERROR(MetalRenderer, "Failed to create pipeline: {}",

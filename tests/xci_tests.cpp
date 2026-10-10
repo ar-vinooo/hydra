@@ -261,6 +261,66 @@ int main(int argc, char** argv) {
             check(!loader::ILoader::getLastError().empty(),
                   "XCI error lacks explanation");
         }
+        for (const auto* filename : {"base.nsp", "BASE.NSP", "ticket.nsp"}) {
+            auto result =
+                loader::ILoader::createFromPath((dir / filename).string());
+            check(result.has_value(), "Valid NSP was rejected");
+            std::unique_ptr<loader::ILoader> game(*result);
+            check(game->getTitleId() == 0x0100000000001000 &&
+                      game->hasExeFs() && game->hasRomFs(),
+                  "Wrong NSP program or filesystems");
+        }
+        for (const auto* filename :
+             {"update-only.nsp", "multiple-base.nsp", "truncated.nsp",
+              "bad-offset.nsp", "no-program.nsp", "bad-ticket.nsp",
+              "conflicting-ticket.nsp"}) {
+            check(!loader::ILoader::createFromPath((dir / filename).string()),
+                  "Invalid NSP was accepted");
+            check(!loader::ILoader::getLastError().empty(),
+                  "NSP failure lacks explanation");
+        }
+        const auto game32_result =
+            loader::ILoader::createFromPath((dir / "32-bit.nsp").string());
+        check(game32_result.has_value(),
+              "32-bit title must remain visible in the library");
+        std::unique_ptr<loader::ILoader> game32(*game32_result);
+        check(!game32->getUnsupportedReason().empty() && game32->hasRomFs(),
+              "32-bit compatibility reason or metadata missing");
+        auto rights_source = std::make_shared<filesystem::DiskFile>(
+            (dir / "rights-encrypted.nca").string());
+        const auto rights_header = filesystem::NcaFile::readHeader(
+            *rights_source, 0, rights_source->getSize(), keys, plaintext);
+        filesystem::NcaFile rights_file(rights_source, 0,
+                                        rights_source->getSize(), rights_header,
+                                        plaintext, keys);
+        std::unique_ptr<ztd::io::IStream> rights_stream(
+            rights_file.open(filesystem::FileOpenFlags::Read));
+        std::vector<u8> rights_actual(rights_file.getSize());
+        rights_stream->readToSpan(std::span(rights_actual));
+        filesystem::DiskFile rights_expected(
+            (dir / "rights-expected.nca").string());
+        std::unique_ptr<ztd::io::IStream> rights_expected_stream(
+            rights_expected.open(filesystem::FileOpenFlags::Read));
+        std::vector<u8> rights_reference(rights_expected.getSize());
+        rights_expected_stream->readToSpan(std::span(rights_reference));
+        check(rights_actual == rights_reference,
+              "Ticket title-key decryption differs from independent AES "
+              "reference");
+        auto missing_title_key = keys;
+        std::erase_if(missing_title_key, [](const auto& entry) {
+            return entry.first.starts_with("encrypted_titlekey_");
+        });
+        bool missing_ticket_rejected = false;
+        try {
+            filesystem::NcaFile missing(rights_source, 0,
+                                        rights_source->getSize(), rights_header,
+                                        plaintext, missing_title_key);
+        } catch (const std::exception&) {
+            missing_ticket_rejected = true;
+        }
+        check(missing_ticket_rejected, "Missing matching ticket was accepted");
+        std::cout << "PASS: NSP detection, malformed packages/tickets, "
+                     "title-key AES reference\n";
         check(!loader::ILoader::createFromPath(""), "Empty path accepted");
         check(!loader::ILoader::createFromPath((dir / "not-a-game").string()),
               "Extensionless file accepted");
@@ -277,17 +337,19 @@ int main(int argc, char** argv) {
                 game->extractExeFs((dir / "real-exefs").string());
             std::unique_ptr<services::ns::ApplicationControlProperty> nacp(
                 game->loadNacp());
-            check(nacp != nullptr, "Real XCI control metadata missing");
+            check(nacp != nullptr, "Real package control metadata missing");
             u32 width = 0;
             u32 height = 0;
             auto icon = game->loadIcon(width, height);
             check(icon != nullptr && width != 0 && height != 0,
-                  "Real XCI icon missing");
+                  "Real package icon missing");
             std::free(icon);
-            std::cout << "PASS: real XCI title " << std::hex
+            std::cout << "PASS: real package title " << std::hex
                       << game->getTitleId() << ", " << nacp->titles[0].name
                       << ", icon " << std::dec << width << 'x' << height
                       << '\n';
+            if (!game->getUnsupportedReason().empty())
+                std::cout << "Compatibility: " << game->getUnsupportedReason() << '\n';
         }
         if (argc >= 4 &&
             std::string_view(argv[3]) == "--check-firmware-lifetime") {

@@ -14,7 +14,7 @@ result_t IAudioRendererManager::openAudioRenderer(
     u64 work_buffer_size, u64 aruid) {
     (void)aruid;
 
-    addService(*ctx, new IAudioRenderer(params, work_buffer_size));
+    addService(*ctx, new IAudioRenderer(ctx->system, params, work_buffer_size));
     return RESULT_SUCCESS;
 }
 

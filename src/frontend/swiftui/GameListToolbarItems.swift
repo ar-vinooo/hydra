@@ -2,14 +2,15 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 private let switchType = UTType(exportedAs: "com.samoz256.switch-document", conformingTo: .data)
+private let nspType = UTType(filenameExtension: "nsp", conformingTo: .data) ?? .data
 private let xciType = UTType(filenameExtension: "xci", conformingTo: .data) ?? .data
 #if os(macOS)
-    private let allowedContentTypes: [UTType] = [.folder, switchType, xciType]
+    private let allowedContentTypes: [UTType] = [.folder, switchType, xciType, nspType]
 
     private let installFirmwarePlacement = ToolbarItemPlacement.confirmationAction
     private let addGamePlacement = ToolbarItemPlacement.confirmationAction
 #else
-    private let allowedContentTypes: [UTType] = [switchType, xciType]  // No game folders on iOS
+    private let allowedContentTypes: [UTType] = [switchType, xciType, nspType]  // No game folders on iOS
 
     private let installFirmwarePlacement = ToolbarItemPlacement.topBarLeading
     private let addGamePlacement = ToolbarItemPlacement.topBarTrailing
@@ -84,6 +85,12 @@ struct GameListToolbarItems: ToolbarContent {
                 .alert("Failed to import firmware", isPresented: $showingFirmwareImportError) {
                     Button("OK", role: .cancel) {}
                 }
+            }
+        }
+
+        ToolbarItem(placement: addGamePlacement) {
+            Button("Refresh games", systemImage: "arrow.clockwise") {
+                globalState.loaderPluginRefreshID += 1
             }
         }
 

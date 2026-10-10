@@ -8,7 +8,7 @@ namespace hydra::input {
 class Profile {
   public:
     Profile(horizon::services::hid::internal::NpadIndex index_,
-            std::string_view name_);
+            std::string_view name_, std::string_view directory_ = {});
 
     void reset() {
         button_mappings = {};
@@ -17,12 +17,19 @@ class Profile {
 
     void loadDefaults();
 
-    void serialize();
+    bool serialize();
     void deserialize();
+
+    bool saveAs(std::string_view new_name, std::vector<std::string> devices) {
+        name = new_name;
+        device_names = std::move(devices);
+        return serialize();
+    }
 
   private:
     horizon::services::hid::internal::NpadIndex index;
     std::string name;
+    std::string directory;
 
     std::vector<std::string> device_names;
     std::vector<CodeButtonMapping> button_mappings;
@@ -35,7 +42,9 @@ class Profile {
     }
 
     std::string getPath() const {
-        return fmt::format("{}/{}.toml", getProfilesPath(), name);
+        return fmt::format("{}/{}.toml",
+                           directory.empty() ? getProfilesPath() : directory,
+                           name);
     }
 
   public:

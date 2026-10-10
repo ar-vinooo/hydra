@@ -32,6 +32,7 @@ class ILoader {
     ZTD_MAKE_DEFAULT_MOVABLE(ILoader);
 
     virtual u64 getTitleId() const { return invalid<u64>(); }
+    virtual std::string_view getUnsupportedReason() const { return {}; }
 
     virtual void loadProcess(System& system, kernel::Process* process) = 0;
     horizon::services::ns::ApplicationControlProperty* loadNacp();

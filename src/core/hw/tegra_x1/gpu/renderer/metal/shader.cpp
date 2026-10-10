@@ -1,14 +1,24 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
 
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <atomic>
 #include <fstream>
+#include <optional>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
     : ShaderBase(descriptor) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(descriptor.code.data(),
+              static_cast<CC_LONG>(descriptor.code.size()), digest);
+    cache_key = fmt::format("{}:{}:invariant-no-fast-math:", descriptor.type,
+                            descriptor.backend);
+    for (const auto byte : digest)
+        cache_key += fmt::format("{:02x}", byte);
     // Options
     NS_STACK_SCOPED MTL::CompileOptions* options =
         MTL::CompileOptions::alloc()->init();
@@ -20,6 +30,11 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
         options->setPreserveInvariance(true);
 
     // Library
+    std::optional<ScopedPerfTimer> compile_timer;
+    if (PerfStats::isEnabled()) {
+        compile_timer.emplace(PerfStats::instance().shader_compile_ns);
+        PerfStats::instance().shader_compiles++;
+    }
     MTL::Library* library;
     switch (descriptor.backend) {
     case ShaderBackend::Msl: {
@@ -38,12 +53,12 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
             out << source;
         }
 
-        NS::Error* error;
+        NS::Error* error = nullptr;
         library = device->newLibrary(toNsString(source), options, &error);
-        if (error != nullptr) {
+        if (library == nullptr) {
             LOG_ERROR(MetalRenderer, "Failed to create Metal library: {}",
-                      error->localizedDescription()->utf8String());
-            error->release(); // TODO: autorelease
+                      error ? error->localizedDescription()->utf8String()
+                            : "unknown error");
             return;
         }
         break;
@@ -55,13 +70,14 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
                                  ^{
                                  });
 
-        NS::Error* error;
+        NS::Error* error = nullptr;
         // TODO: options
         library = device->newLibrary(dispatch_data, &error);
-        if (error != nullptr) {
+        dispatch_release(dispatch_data);
+        if (library == nullptr) {
             LOG_ERROR(MetalRenderer, "Failed to create Metal library: {}",
-                      error->localizedDescription()->utf8String());
-            error->release(); // TODO: autorelease
+                      error ? error->localizedDescription()->utf8String()
+                            : "unknown error");
             return;
         }
         break;
@@ -78,6 +94,9 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
     library->release();
 }
 
-Shader::~Shader() { function->release(); }
+Shader::~Shader() {
+    if (function)
+        function->release();
+}
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -9,6 +9,7 @@
 #include "core/horizon/loader/nca_loader.hpp"
 #include "core/horizon/loader/nro_loader.hpp"
 #include "core/horizon/loader/nso_loader.hpp"
+#include "core/horizon/loader/nsp_loader.hpp"
 #include "core/horizon/loader/nx_loader.hpp"
 #include "core/horizon/loader/plugins/manager.hpp"
 #include "core/horizon/loader/xci_loader.hpp"
@@ -106,12 +107,13 @@ ILoader::createFromPath(std::string_view path,
     } else {
         if (!std::filesystem::is_regular_file(path))
             return std::nullopt;
-        if (ext == ".xci") {
+        if (ext == ".xci" || ext == ".nsp") {
             try {
-                return XciLoader::create(path);
+                return ext == ".nsp" ? NspLoader::create(path)
+                                     : XciLoader::create(path);
             } catch (const std::exception& error) {
                 last_error = error.what();
-                LOG_ERROR(Loader, "Failed to load XCI: {}", last_error);
+                LOG_ERROR(Loader, "Failed to load {}: {}", ext, last_error);
                 return std::nullopt;
             }
         }

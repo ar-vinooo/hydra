@@ -5,9 +5,12 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+class BinaryArchiveCache;
+
 class Pipeline final : public PipelineBase {
   public:
-    Pipeline(MTL::Device* device, const PipelineDescriptor& descriptor);
+    Pipeline(MTL::Device* device, const PipelineDescriptor& descriptor,
+             BinaryArchiveCache& binary_archive_cache);
     ~Pipeline() override;
 
     // Getters

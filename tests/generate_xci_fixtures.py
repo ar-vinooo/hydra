@@ -149,7 +149,54 @@ def main(directory):
     broken[0xC00:0xC04] = b"BAD!"
     (directory / "bad-exefs.xci").write_bytes(cartridge([("base.nca", broken)]))
     (directory / "not-a-game").write_bytes(b"test")
-    print("Generated synthetic XCI/AES fixtures in", directory)
+    (directory / "base.nsp").write_bytes(partition([("base.nca", program)], False))
+    (directory / "BASE.NSP").write_bytes(partition([("base.nca", program)], False))
+    (directory / "update-only.nsp").write_bytes(partition([("update.nca", update)], False))
+    (directory / "multiple-base.nsp").write_bytes(partition([("one.nca", program), ("two.nca", program)], False))
+    (directory / "truncated.nsp").write_bytes(b"PFS0")
+    bad_nsp = bytearray(partition([("base.nca", program)], False))
+    put(bad_nsp, 16, "Q", 2**64 - 1)
+    (directory / "bad-offset.nsp").write_bytes(bad_nsp)
+    (directory / "no-program.nsp").write_bytes(partition([("notes.txt", b"test")], False))
+    ticket = bytearray(0x2c0)
+    put(ticket, 0, "I", 0x010004)
+    ticket[0x180:0x190] = bytes(range(16))
+    ticket[0x2a0:0x2b0] = bytes(range(16, 32))
+    (directory / "ticket.nsp").write_bytes(partition([("base.nca", program), ("common.tik", ticket)], False))
+    conflicting = bytearray(ticket)
+    conflicting[0x180] ^= 1
+    (directory / "conflicting-ticket.nsp").write_bytes(partition([("base.nca", program), ("one.tik", ticket), ("two.tik", conflicting)], False))
+    (directory / "bad-ticket.nsp").write_bytes(partition([("base.nca", program), ("common.tik", ticket[:0x180])], False))
+
+    program32 = bytearray(program)
+    # Locate the actual NPDM in the generated ExeFS rather than depending on
+    # its string-table length/alignment.
+    npdm_start = program32.find(b"META", 0xc00)
+    program32[npdm_start + 0xc] = 0
+    (directory / "32-bit.nsp").write_bytes(partition([("base.nca", program32)], False))
+
+    # Independent title-key AES-ECB + AES-CTR fixture (synthetic keys only).
+    title_kek = bytes(range(128, 144))
+    title_key = bytes(range(144, 160))
+    rights_id = bytes(range(16, 32))
+    rights_plain = bytearray(plain)
+    rights_plain[0x230:0x240] = rights_id
+    rights_plain[0x240:0x280] = bytes(0x40)
+    put(rights_plain, 0x240, "II", 0xc00 // 512, 0x1000 // 512)
+    rights_plain[0x300:0x340] = bytes(0x40)
+    rights_plain[0x404] = 3
+    rights_encrypted = bytearray(rights_plain)
+    counter = bytes(rights_plain[0x540:0x548][::-1]) + (0xc00 // 16).to_bytes(8, "big")
+    rights_encrypted[0xc00:0x1000] = encrypt(title_key, modes.CTR(counter), rights_plain[0xc00:0x1000])
+    for i in range(6):
+        start = i * 512
+        rights_encrypted[start:start + 512] = encrypt(header_key, modes.XTS(i.to_bytes(16, "big")), rights_plain[start:start + 512])
+    (directory / "rights-encrypted.nca").write_bytes(rights_encrypted)
+    (directory / "rights-expected.nca").write_bytes(rights_plain)
+    with (directory / "prod.keys").open("a") as f:
+        f.write("titlekek_00 = " + title_kek.hex() + "\n")
+        f.write("encrypted_titlekey_" + rights_id.hex() + " = " + encrypt(title_kek, modes.ECB(), title_key).hex() + "\n")
+    print("Generated synthetic XCI/NSP/AES fixtures in", directory)
 
 
 if __name__ == "__main__":

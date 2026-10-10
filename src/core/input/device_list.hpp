@@ -14,6 +14,25 @@ class IDeviceList {
 
     virtual void pumpEvents() {}
 
+    std::vector<std::string> getControllerNames() {
+        std::scoped_lock lock(mutex);
+        std::vector<std::string> names;
+        for (const auto& [name, device] : devices)
+            if (device->actsAsController())
+                names.push_back(name);
+        return names;
+    }
+
+    std::string addUniqueDevice(std::string_view base, IDevice* device) {
+        std::scoped_lock lock(mutex);
+        std::string name(base);
+        for (u32 number = 2; devices.contains(name); number++)
+            name = fmt::format("{} ({})", base, number);
+        devices.emplace(name, device);
+        LOG_INFO(Input, "Device connected: {}", name);
+        return name;
+    }
+
     void addDevice(std::string_view name, IDevice* device) {
         std::scoped_lock lock(mutex);
         const auto res = devices.emplace(name, device);

@@ -935,7 +935,55 @@ struct HydraUser: MutableHandleStruct {
 }
 
 // Emulation context
+func inputDeviceNames(system: HydraSystem?) throws -> [String] {
+    guard let list = hydraInputGetDevices(system?.handle) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+    defer { hydraStringListDestroy(list) }
+    return (0..<hydraStringListGetCount(list)).map {
+        String(withHydraString: hydraStringListGet(list, $0))
+    }
+}
+
+func inputPlayerDevices(_ player: Int) throws -> [String] {
+    guard let list = hydraInputGetPlayerDevices(UInt32(player)) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+    defer { hydraStringListDestroy(list) }
+    return (0..<hydraStringListGetCount(list)).map {
+        String(withHydraString: hydraStringListGet(list, $0))
+    }
+}
+
+func inputSetPlayerDevices(_ player: Int, devices: [String], system: HydraSystem?) throws {
+    let list = hydraCreateStringList()
+    defer { hydraStringListDestroy(list) }
+    for device in devices {
+        device.withHydraString { hydraStringListAppend(list, $0) }
+    }
+    guard hydraInputSetPlayerDevices(system?.handle, UInt32(player), list) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+}
+
 class HydraSystem: MutableHandleClass {
+    #if os(macOS)
+        private var emulationActivity: NSObjectProtocol?
+
+        private func beginEmulationActivity() {
+            guard emulationActivity == nil else { return }
+            emulationActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                reason: "Running game emulation with real-time audio")
+        }
+
+        private func endEmulationActivity() {
+            guard let activity = emulationActivity else { return }
+            ProcessInfo.processInfo.endActivity(activity)
+            emulationActivity = nil
+        }
+    #endif
+
     init() throws {
         guard let handle = hydraCreateSystem() else {
             throw HydraLoaderError.loadFailed(String(withHydraString: hydraSystemGetLastError()))
@@ -945,6 +993,9 @@ class HydraSystem: MutableHandleClass {
 
     deinit {
         hydraSystemDestroy(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     var surface: UnsafeMutableRawPointer {
@@ -957,8 +1008,16 @@ class HydraSystem: MutableHandleClass {
         }
     }
 
-    func loadAndStart(loader: HydraLoader) {
-        hydraSystemLoadAndStart(self.handle, loader.handle)
+    func loadAndStart(loader: HydraLoader) throws {
+        #if os(macOS)
+            beginEmulationActivity()
+        #endif
+        guard hydraSystemLoadAndStart(self.handle, loader.handle) else {
+            #if os(macOS)
+                endEmulationActivity()
+            #endif
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraSystemGetLastError()))
+        }
     }
 
     func requestStop() {
@@ -967,13 +1026,22 @@ class HydraSystem: MutableHandleClass {
 
     func forceStop() {
         hydraSystemForceStop(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     func pause() {
         hydraSystemPause(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     func resume() {
+        #if os(macOS)
+            beginEmulationActivity()
+        #endif
         hydraSystemResume(self.handle)
     }
 

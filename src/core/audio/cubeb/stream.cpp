@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "core/audio/cubeb/core.hpp"
+#include "core/audio/sample_clock.hpp"
 
 namespace hydra::audio::cubeb {
 
@@ -22,8 +23,16 @@ cubeb_sample_format toCubebFormat(const PcmFormat format) {
 }
 
 cubeb_channel_layout toCubebLayout(u16 channel_count) {
-    // TODO: correct?
-    return (channel_count >= 2 ? CUBEB_LAYOUT_STEREO : CUBEB_LAYOUT_MONO);
+    switch (channel_count) {
+    case 1:
+        return CUBEB_LAYOUT_MONO;
+    case 2:
+        return CUBEB_LAYOUT_STEREO;
+    case 6:
+        return CUBEB_LAYOUT_3F2_LFE;
+    default:
+        return CUBEB_LAYOUT_UNDEFINED;
+    }
 }
 
 } // namespace
@@ -34,11 +43,10 @@ Stream::Stream(Core& core_, PcmFormat format, u32 sample_rate,
     : IStream(format, sample_rate, channel_count,
               std::move(buffer_finished_callback)),
       core{core_} {
-    // TODO: allow different channel counts
-    if (channel_count != 2)
+    if (channel_count != 1 && channel_count != 2 && channel_count != 6)
         LOG_NOT_IMPLEMENTED(Cubeb, "Channel count {}", channel_count);
 
-    cubeb_stream_params params;
+    cubeb_stream_params params{};
     params.format = toCubebFormat(format);
     params.rate = sample_rate;
     params.channels = channel_count;
@@ -65,8 +73,25 @@ void Stream::stop() {
 }
 
 void Stream::enqueueBuffer(buffer_id_t id, std::span<const u8> buffer) {
-    std::unique_lock lock(buffer_mutex);
-    buffer_queue.emplace(id, buffer);
+    buffer_queue.enqueue(id, buffer);
+}
+
+StreamStats Stream::getStats() const {
+    std::lock_guard lock(clock_mutex);
+    const auto requested = requested_frames.load(std::memory_order_relaxed);
+    const auto elapsed =
+        callback_time == std::chrono::steady_clock::time_point{}
+            ? 0
+            : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - callback_time)
+                  .count();
+    last_sample_clock = std::max(
+        last_sample_clock,
+        interpolateSampleClock(requested, callback_frames,
+                               static_cast<u64>(std::max<i64>(elapsed, 0)),
+                               sample_rate));
+    return {true, requested, missing_frames.load(std::memory_order_relaxed),
+            last_sample_clock};
 }
 
 long Stream::dataCallback(cubeb_stream* stream, void* user_data,
@@ -77,31 +102,29 @@ long Stream::dataCallback(cubeb_stream* stream, void* user_data,
 
     auto self = reinterpret_cast<Stream*>(user_data);
 
-    std::unique_lock lock(self->buffer_mutex);
-
-    // TODO: support different formats as well
-    auto output = reinterpret_cast<i16*>(output_buffer);
-    for (u32 i = 0; i < num_frames * self->channel_count; i++) {
-        if (self->buffer_queue.empty()) {
-            // Fill the rest with silence
-            memset(output, 0,
-                   (static_cast<u32>(num_frames) * self->channel_count - i) *
-                       sizeof(i16));
-
-            break;
-        }
-
-        const auto [buffer_id, buffer] = self->buffer_queue.front();
-        const auto sample =
-            reinterpret_cast<const i16*>(buffer.data())[self->pos_in_buffer++];
-        if (self->pos_in_buffer * sizeof(i16) >= buffer.size()) {
-            self->buffer_queue.pop();
-            self->pos_in_buffer = 0;
-            self->buffer_finished_callback(buffer_id);
-        }
-
-        output[i] = sample;
+    if (num_frames <= 0)
+        return 0;
+    const usize sample_bytes = self->format == PcmFormat::Float ? 4 : 2;
+    const usize frame_bytes = self->channel_count * sample_bytes;
+    usize bytes_read = 0;
+    const auto finished = self->buffer_queue.read(
+        std::span(static_cast<u8*>(output_buffer),
+                  static_cast<usize>(num_frames) * frame_bytes),
+        &bytes_read);
+    {
+        std::lock_guard lock(self->clock_mutex);
+        self->requested_frames.fetch_add(static_cast<u64>(num_frames),
+                                         std::memory_order_relaxed);
+        self->callback_frames = static_cast<u64>(num_frames);
+        self->callback_time = std::chrono::steady_clock::now();
     }
+    self->missing_frames.fetch_add(static_cast<u64>(num_frames) -
+                                       bytes_read / frame_bytes,
+                                   std::memory_order_relaxed);
+    // No queue lock is held while notifying the producer.
+    if (self->buffer_finished_callback)
+        for (const auto id : finished)
+            self->buffer_finished_callback(id);
 
     return num_frames;
 }
@@ -114,19 +137,15 @@ void Stream::stateCallback(cubeb_stream* stream, void* user_data,
 
     switch (state) {
     case CUBEB_STATE_STARTED:
-        LOG_DEBUG(Cubeb, "Started");
         self->state = StreamState::Started;
         break;
     case CUBEB_STATE_STOPPED:
-        LOG_DEBUG(Cubeb, "Stopped");
         self->state = StreamState::Stopped;
         break;
     case CUBEB_STATE_DRAINED:
-        LOG_DEBUG(Cubeb, "Drained");
         self->state = StreamState::Drained;
         break;
     case CUBEB_STATE_ERROR:
-        LOG_DEBUG(Cubeb, "Error");
         self->state = StreamState::Error;
         break;
     }

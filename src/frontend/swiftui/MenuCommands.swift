@@ -53,7 +53,7 @@ struct MenuCommands: Commands {
             Button("Stop") {
                 globalState.isStopping = true
             }
-            Button("Switch modes") {
+            Button(globalState.isHandheldMode ? "Switch to Docked Mode" : "Switch to Handheld Mode") {
                 globalState.isHandheldMode.toggle()
             }
             .keyboardShortcut(KeyEquivalent("o"), modifiers: .command)

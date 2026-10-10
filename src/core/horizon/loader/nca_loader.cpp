@@ -45,11 +45,9 @@ NcaLoader::NcaLoader(filesystem::ContentArchive content_archive_)
     ASSERT(meta.magic == makeMagic4('M', 'E', 'T', 'A'), Loader,
            "Invalid NPDM meta magic 0x{:08x}", meta.magic);
 
-    // TODO: support 32-bit games
-    if (!any(meta.flags & NpdmFlags::Is64BitInstruction)) {
-        LOG_WARN(Loader, "32-bit games not supported");
-        return;
-    }
+    // Still load metadata for unsupported architectures so the library can
+    // display the title and explain compatibility when the user starts it.
+    is_64_bit = any(meta.flags & NpdmFlags::Is64BitInstruction);
 
     LOG_DEBUG(Loader, "Name: {}", meta.name);
     LOG_DEBUG(Loader, "Main thread priority: 0x{:02x}",

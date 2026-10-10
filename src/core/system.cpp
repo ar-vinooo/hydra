@@ -100,6 +100,8 @@ System::~System() {
 }
 
 void System::loadAndStart(horizon::loader::ILoader* loader) {
+    if (const auto reason = loader->getUnsupportedReason(); !reason.empty())
+        throw std::runtime_error(std::string(reason));
     // Process
     ASSERT(main_process == nullptr, Other, "Process already exists");
     main_process =
@@ -503,6 +505,31 @@ void System::progressFrame(u32 width, u32 height,
             const auto lists = stats.pfifo_lists.exchange(0);
             const auto cbs = stats.command_buffers.exchange(0);
             const auto draws = stats.draws.exchange(0);
+            const auto upload_ms = per_frame_ms(stats.texture_upload_ns);
+            const auto upload_bytes = stats.texture_upload_bytes.exchange(0);
+            const auto buffers_created =
+                stats.upload_buffers_created.exchange(0);
+            const auto buffers_reused = stats.upload_buffers_reused.exchange(0);
+            const auto draw_state_ms = per_frame_ms(stats.draw_state_ns);
+            const auto shader_ns = stats.shader_compile_ns.exchange(0);
+            const auto shaders = stats.shader_compiles.exchange(0);
+            const auto pipeline_ns = stats.pipeline_compile_ns.exchange(0);
+            const auto pipelines = stats.pipeline_compiles.exchange(0);
+            LOG_INFO(
+                Other,
+                "DRAW: {:.2f} ms/frame binding | raster {} updates, {} skipped "
+                "| compilation shader {} ({:.2f} ms), pipeline {} ({:.2f} ms)",
+                draw_state_ms, stats.raster_updates.exchange(0),
+                stats.raster_skips.exchange(0), shaders,
+                static_cast<f64>(shader_ns) / 1e6, pipelines,
+                static_cast<f64>(pipeline_ns) / 1e6);
+            LOG_INFO(Other,
+                     "UPLOAD: {:.2f} ms/frame | {:.1f} MiB/s | buffers {} new, "
+                     "{} reused",
+                     upload_ms,
+                     static_cast<f64>(upload_bytes) / (1024.0 * 1024.0) /
+                         elapsed,
+                     buffers_created, buffers_reused);
             LOG_INFO(Other,
                      "PERF: {:.1f} fps | pfifo (CPU encode) {:.2f} ms/frame, "
                      "{:.1f} lists/frame | present wait {:.2f} ms/frame | "

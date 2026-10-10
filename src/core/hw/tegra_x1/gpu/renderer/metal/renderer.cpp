@@ -29,8 +29,10 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 Renderer::Renderer()
     : device{MTL::CreateSystemDefaultDevice()},
       command_queue{device->newCommandQueue()},
-      depth_stencil_state_cache(device), blit_pipeline_cache(device),
-      clear_color_pipeline_cache(device), clear_depth_pipeline_cache(device) {
+      upload_buffer_pool(std::make_shared<UploadBufferPool>(device)),
+      binary_archive_cache(device), depth_stencil_state_cache(device),
+      blit_pipeline_cache(device), clear_color_pipeline_cache(device),
+      clear_depth_pipeline_cache(device) {
     // Resources
 
     // Depth stencil states
@@ -118,6 +120,29 @@ BufferBase* Renderer::allocateTemporaryBuffer(const u64 size) {
     return new Buffer(buffer);
 }
 
+BufferBase* Renderer::allocateTextureUploadBuffer(u64 size) {
+    static const bool disabled =
+        std::getenv("HYDRA_DISABLE_UPLOAD_POOL") != nullptr;
+    if (disabled) {
+        if (PerfStats::isEnabled())
+            PerfStats::instance().upload_buffers_created++;
+        return allocateTemporaryBuffer(size);
+    }
+    return new Buffer(upload_buffer_pool->acquire(size));
+}
+
+void Renderer::retireTextureUploadBuffer(ICommandBuffer* command_buffer,
+                                         BufferBase* buffer) {
+    static const bool disabled =
+        std::getenv("HYDRA_DISABLE_UPLOAD_POOL") != nullptr;
+    if (!disabled) {
+        auto* native = static_cast<Buffer*>(buffer)->getBuffer()->retain();
+        static_cast<CommandBuffer*>(command_buffer)
+            ->retireUploadBuffer(upload_buffer_pool, native);
+    }
+    delete buffer;
+}
+
 void Renderer::freeTemporaryBuffer(BufferBase* buffer) {
     auto buffer_impl = static_cast<Buffer*>(buffer);
 
@@ -169,8 +194,9 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
             return;
         }
         if (src_size.x() != dst_size.x() || src_size.y() != dst_size.y())
-            ONCE(LOG_WARN(MetalRenderer,
-                          "Scaled depth stencil blit, copying without scaling"));
+            ONCE(
+                LOG_WARN(MetalRenderer,
+                         "Scaled depth stencil blit, copying without scaling"));
 
         // Clamp the region to both textures
         const auto src_x = static_cast<u32>(src_origin.x());
@@ -178,7 +204,8 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         const auto dst_x = static_cast<u32>(dst_origin.x());
         const auto dst_y = static_cast<u32>(dst_origin.y());
         const auto width = static_cast<u32>(std::min<u64>(
-            {dst_size.x(), src_mtl->width() - std::min<u64>(src_x, src_mtl->width()),
+            {dst_size.x(),
+             src_mtl->width() - std::min<u64>(src_x, src_mtl->width()),
              dst_mtl->width() - std::min<u64>(dst_x, dst_mtl->width())}));
         const auto height = static_cast<u32>(std::min<u64>(
             {dst_size.y(),
@@ -221,8 +248,7 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         1.0));
     encoder->setVertexBytes(&dst_layer, sizeof(dst_layer), 0);
     const auto src_width = static_cast<f32>(src_impl->getTexture()->width());
-    const auto src_height =
-        static_cast<f32>(src_impl->getTexture()->height());
+    const auto src_height = static_cast<f32>(src_impl->getTexture()->height());
     BlitParams params = {
         .src_offset = {static_cast<f32>(src_origin.x()) / src_width,
                        static_cast<f32>(src_origin.y()) / src_height},
@@ -365,7 +391,7 @@ void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
     command_buffer_impl->setCullMode(MTL::CullModeNone);
     command_buffer_impl->setDepthStencilState(
         depth_stencil_state_clear_stencil);
-    encoder->setStencilReferenceValue(value & 0xff);
+    command_buffer_impl->setStencilReferences(value & 0xff, value & 0xff);
     struct {
         u32 layer_id;
         float value;
@@ -381,7 +407,7 @@ ShaderBase* Renderer::createShader(const ShaderDescriptor& descriptor) {
 }
 
 PipelineBase* Renderer::createPipeline(const PipelineDescriptor& descriptor) {
-    return new Pipeline(device, descriptor);
+    return new Pipeline(device, descriptor, binary_archive_cache);
 }
 
 void Renderer::bindPipeline(const PipelineBase* pipeline) {
@@ -404,10 +430,9 @@ void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
             ? std::min(static_cast<u32>(texture->mipmapLevelCount()), 5u)
             : 1u;
     for (u32 level = 0; level < level_count; level++)
-        debugDumpTextureLevel(command_buffer, view, level,
-                              level == 0 ? path
-                                         : fmt::format("{}_mip{}.png", path,
-                                                       level));
+        debugDumpTextureLevel(
+            command_buffer, view, level,
+            level == 0 ? path : fmt::format("{}_mip{}.png", path, level));
 }
 
 void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
@@ -504,9 +529,11 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
                             for (u32 c = 0; c < 3; c++) {
                                 if (c0 > c1) {
                                     palette[2][c] = static_cast<u8>(
-                                        (2 * palette[0][c] + palette[1][c]) / 3);
+                                        (2 * palette[0][c] + palette[1][c]) /
+                                        3);
                                     palette[3][c] = static_cast<u8>(
-                                        (palette[0][c] + 2 * palette[1][c]) / 3);
+                                        (palette[0][c] + 2 * palette[1][c]) /
+                                        3);
                                 } else {
                                     palette[2][c] = static_cast<u8>(
                                         (palette[0][c] + palette[1][c]) / 2);
@@ -596,8 +623,8 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
                         reinterpret_cast<const _Float16*>(data)[i]);
                     rgba[i] = (i % 4 == 3)
                                   ? 255
-                                  : static_cast<u8>(
-                                        std::clamp(v, 0.0f, 1.0f) * 255.0f);
+                                  : static_cast<u8>(std::clamp(v, 0.0f, 1.0f) *
+                                                    255.0f);
                 }
                 break;
             default: {
@@ -825,7 +852,8 @@ void Renderer::setRenderPipelineState(CommandBuffer* command_buffer) const {
 
 void Renderer::setDepthStencilState(CommandBuffer* command_buffer) {
     // Depth testing without a depth attachment is invalid in Metal
-    const bool has_depth = getDepthStencilPixelFormat() != MTL::PixelFormatInvalid;
+    const bool has_depth =
+        getDepthStencilPixelFormat() != MTL::PixelFormatInvalid;
     DepthStencilStateDescriptor descriptor{
         .depth_test_enabled = state.depth_test_enabled && has_depth,
         .depth_write_enabled = state.depth_write_enabled && has_depth,
@@ -947,7 +975,10 @@ bool Renderer::canDraw() const {
 }
 
 void Renderer::bindDrawState(CommandBuffer* command_buffer) {
-    auto encoder = getRenderCommandEncoder(command_buffer);
+    const auto start = PerfStats::isEnabled()
+                           ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    getRenderCommandEncoder(command_buffer);
 
     // States
     setRenderPipelineState(command_buffer);
@@ -958,16 +989,18 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
     command_buffer->setFrontFaceWinding(state.front_face_winding);
 
     // Stencil reference
-    encoder->setStencilReferenceValues(state.stencil.front.ref & 0xff,
-                                       state.stencil.back.ref & 0xff);
+    command_buffer->setStencilReferences(state.stencil.front.ref & 0xff,
+                                         state.stencil.back.ref & 0xff);
 
     // Depth bias
-    encoder->setDepthBias(state.depth_bias_constant, state.depth_bias_slope,
-                          state.depth_bias_clamp);
+    command_buffer->setDepthBias(state.depth_bias_constant,
+                                 state.depth_bias_slope,
+                                 state.depth_bias_clamp);
 
     // Blend constant
-    encoder->setBlendColor(state.blend_constant.x(), state.blend_constant.y(),
-                           state.blend_constant.z(), state.blend_constant.w());
+    command_buffer->setBlendColor(
+        state.blend_constant.x(), state.blend_constant.y(),
+        state.blend_constant.z(), state.blend_constant.w());
 
     // Viewport and scissor
     MTL::Viewport viewports[VIEWPORT_COUNT];
@@ -999,8 +1032,8 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
         }
         scissors[i] = MTL::ScissorRect(x, y, width, height);
     }
-    encoder->setViewports(viewports, SIZEOF_ARRAY(viewports));
-    encoder->setScissorRects(scissors, SIZEOF_ARRAY(scissors));
+    command_buffer->setViewports(viewports);
+    command_buffer->setScissors(scissors);
 
     // Resources
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++)
@@ -1016,6 +1049,11 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
         for (u32 i = 0; i < TEXTURE_COUNT; i++)
             setTexture(command_buffer, ShaderType(shader_type), i);
     }
+    if (PerfStats::isEnabled())
+        PerfStats::instance().draw_state_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count());
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal
