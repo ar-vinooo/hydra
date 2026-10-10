@@ -42,7 +42,7 @@ Gpu::Gpu() noexcept
 
 void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
     if (method == 0x0) { // SetEngine
-        ASSERT_DEBUG(subchannel <= SUBCHANNEL_COUNT, Gpu,
+        ASSERT_DEBUG(subchannel < SUBCHANNEL_COUNT, Gpu,
                      "Invalid subchannel {}", subchannel);
 
         const auto set_object_arg = std::bit_cast<SetObjectArg>(arg);
@@ -80,8 +80,11 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
     }
 
     const auto engine = getEngineAtSubchannel(subchannel);
-    if (!engine)
-        LOG_FATAL(Gpu, "Invalid subchannel {}", subchannel);
+    if (!engine) {
+        ONCE(LOG_WARN(Gpu, "No engine bound to subchannel {} (method: {:#x})",
+                      subchannel, method));
+        return;
+    }
 
     (*engine)->method(method, arg);
 }

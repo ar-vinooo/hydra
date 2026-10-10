@@ -61,6 +61,10 @@ class Emitter {
                               const ir::Value& srcB) = 0;
     virtual void emitFma(const ir::Value& dst, const ir::Value& srcA,
                          const ir::Value& srcB, const ir::Value& srcC) = 0;
+    virtual void emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
+                                    const ir::Value& mask) = 0;
+    virtual void emitSwizzleAdd(const ir::Value& dst, const ir::Value& src_a,
+                                const ir::Value& src_b, u32 swizzle) = 0;
     virtual void emitMin(const ir::Value& dst, const ir::Value& srcA,
                          const ir::Value& srcB) = 0;
     virtual void emitMax(const ir::Value& dst, const ir::Value& srcA,
@@ -146,7 +150,8 @@ class Emitter {
                                    const ir::Value& cmp_value,
                                    const ir::Value& lod) = 0;
     virtual void emitTextureGather(const ir::Value& dst, u32 const_buffer_index,
-                                   const ir::Value& coords, u8 component) = 0;
+                                   const ir::Value& coords, u8 component,
+                                   const ir::Value& cmp_value) = 0;
     virtual void emitTextureQueryDimension(const ir::Value& dst,
                                            u32 const_buffer_index,
                                            u32 dimension) = 0;

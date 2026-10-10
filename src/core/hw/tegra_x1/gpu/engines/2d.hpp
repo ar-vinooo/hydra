@@ -92,8 +92,12 @@ class TwoD : public EngineWithRegsBase<Regs2D> {
     void copy(const u32 index, const u32 pixels_from_memory_src_y0_int);
 
     // Helpers
-    renderer::ITextureView* getTexture(const Texture2DInfo& info,
-                                       renderer::TextureUsage usage);
+    renderer::TextureDescriptor
+    getTextureDescriptor(const Texture2DInfo& info) const;
+    renderer::ITextureView*
+    getTexture(const Texture2DInfo& info, renderer::TextureUsage usage,
+               std::optional<renderer::TextureFormat> format_override =
+                   std::nullopt);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

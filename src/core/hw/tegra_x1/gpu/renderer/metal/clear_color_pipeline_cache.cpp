@@ -68,9 +68,17 @@ MTL::RenderPipelineState* ClearColorPipelineCache::create(
 
     // Pipeline
     pipeline_descriptor->setFragmentFunction(fragment_clear_color);
+    // The descriptor is shared, so reset state from previous pipelines
+    // Other attachments must be declared too, but are not written to
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
+        auto attachment = pipeline_descriptor->colorAttachments()->object(i);
+        attachment->setPixelFormat(descriptor.pixel_formats[i]);
+        attachment->setWriteMask(MTL::ColorWriteMaskNone);
+    }
+    setDepthStencilPixelFormat(pipeline_descriptor,
+                               descriptor.depth_stencil_pixel_format);
     auto color_attachment = pipeline_descriptor->colorAttachments()->object(
         descriptor.render_target_id);
-    color_attachment->setPixelFormat(descriptor.pixel_format);
 
     MTL::ColorWriteMask mask = MTL::ColorWriteMaskNone;
     if ((descriptor.mask & ZTD_BIT(0)) != 0u)
@@ -99,9 +107,11 @@ MTL::RenderPipelineState* ClearColorPipelineCache::create(
 u32 ClearColorPipelineCache::hash(
     const ClearColorPipelineDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
-    hash.add(descriptor.pixel_format);
+    for (const auto pixel_format : descriptor.pixel_formats)
+        hash.add(pixel_format);
     hash.add(descriptor.render_target_id);
     hash.add(descriptor.mask);
+    hash.add(descriptor.depth_stencil_pixel_format);
     return hash.toHashCode();
 }
 

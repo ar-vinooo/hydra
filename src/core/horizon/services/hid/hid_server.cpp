@@ -37,6 +37,7 @@ IHidServer::setSupportedNpadStyleSet(System* system,
                                      Aligned<NpadStyleSet, 8> style_set,
                                      kernel::AppletResourceUserId aruid) {
     APPLET_RESOURCE(aruid).setSupportedStyleSet(style_set);
+    APPLET_RESOURCE(aruid).setupNpads();
     return RESULT_SUCCESS;
 }
 
@@ -51,12 +52,14 @@ IHidServer::getSupportedNpadStyleSet(System* system,
 result_t IHidServer::setSupportedNpadIdType(
     System* system, kernel::AppletResourceUserId aruid,
     InBuffer<BufferAttr::HipcPointer> in_types_buffer) {
+    APPLET_RESOURCE(aruid).clearSupportedNpads();
     while (in_types_buffer.stream->getSeek() <
            in_types_buffer.stream->getSize()) {
         const auto index =
             internal::toNpadIndex(in_types_buffer.stream->read<NpadIdType>());
         APPLET_RESOURCE(aruid).setNpadSupported(index, true);
     }
+    APPLET_RESOURCE(aruid).setupNpads();
     return RESULT_SUCCESS;
 }
 

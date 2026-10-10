@@ -119,6 +119,16 @@ class IRenderer {
     virtual void setDepthTestEnabled(bool enabled) = 0;
     virtual void setDepthWriteEnabled(bool enabled) = 0;
     virtual void setDepthCompareOp(engines::CompareOp op) = 0;
+    virtual void setBlendConstant(const float4 color) = 0;
+    virtual void setDepthBias(f32 constant, f32 slope, f32 clamp) = 0;
+    virtual void setStencilState(const StencilState& stencil) = 0;
+    virtual void setCullState(bool enabled, engines::CullFaceMode mode,
+                              engines::Winding front_face) = 0;
+
+    // DEBUG: save the current contents of a texture to a PNG file
+    virtual void debugDumpTexture([[maybe_unused]] ICommandBuffer* command_buffer,
+                                  [[maybe_unused]] ITextureView* view,
+                                  [[maybe_unused]] const std::string& path) {}
 
     // Viewport and scissor
     virtual void setViewport(u32 index, const Viewport& viewport) = 0;

@@ -27,6 +27,11 @@ u32 ShaderCache::hash(const GuestShaderDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
     hash.add(descriptor.stage);
     hash.add(descriptor.code_ptr);
+    for (const auto& [index, format] :
+         descriptor.state.buffer_texture_formats) {
+        hash.add(index);
+        hash.add(format);
+    }
 
     // Take a few samples from the code
     // TODO: this should be limited by the size of the code
@@ -47,10 +52,13 @@ u32 ShaderCache::hash(const GuestShaderDescriptor& descriptor) {
             hash.add(vertex_attrib_state.size);
             hash.add(vertex_attrib_state.type);
         }
+        hash.add(descriptor.state.fragment_input_mask);
+        hash.add(descriptor.state.depth_zero_to_one);
     }
 
     // Color target data types
     if (descriptor.stage == engines::ShaderStage::Fragment) {
+        hash.add(descriptor.state.debug_highlight);
         for (const auto& color_target_data_type :
              descriptor.state.color_target_data_types) {
             hash.add(color_target_data_type);

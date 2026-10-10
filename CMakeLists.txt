@@ -237,3 +237,10 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif ()
 
 add_subdirectory(src)
+
+option(HYDRA_XCI_TESTS "Build XCI loader regression tests" OFF)
+if (HYDRA_XCI_TESTS)
+    add_executable(hydra-xci-tests tests/xci_tests.cpp)
+    target_include_directories(hydra-xci-tests PRIVATE src src/ztd/src)
+    target_link_libraries(hydra-xci-tests PRIVATE hydra-core hydra-common hydra_compile_options)
+endif ()

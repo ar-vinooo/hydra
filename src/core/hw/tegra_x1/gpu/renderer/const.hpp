@@ -383,6 +383,10 @@ struct ResourceMapping {
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
     // TODO: storage buffers
     std::map<u32, u32> textures;
+    // Texture type the shader declares for each binding
+    std::map<u32, TextureType> texture_types;
+    // Fragment shader user inputs (bit per location)
+    u32 stage_input_mask{0};
     // TODO: images
 
     ResourceMapping() {
@@ -424,10 +428,38 @@ struct ColorTargetState {
     BlendFactor dst_alpha_factor;
 };
 
+enum class StencilOp {
+    Keep,
+    Zero,
+    Replace,
+    IncrSat,
+    DecrSat,
+    Invert,
+    Incr,
+    Decr,
+};
+
+struct StencilFaceState {
+    engines::CompareOp func{engines::CompareOp::Always};
+    StencilOp fail_op{StencilOp::Keep};
+    StencilOp depth_fail_op{StencilOp::Keep};
+    StencilOp pass_op{StencilOp::Keep};
+    u32 ref{0};
+    u32 func_mask{0xff};
+    u32 write_mask{0xff};
+};
+
+struct StencilState {
+    bool enabled{false};
+    StencilFaceState front{};
+    StencilFaceState back{};
+};
+
 struct PipelineDescriptor {
     ShaderBase* shaders[static_cast<usize>(ShaderType::Count)];
     VertexState vertex_state;
     ColorTargetState color_target_states[COLOR_TARGET_COUNT];
+    TextureFormat depth_stencil_format{TextureFormat::Invalid};
 };
 
 usize getVertexFormatSize(engines::VertexAttribSize size);

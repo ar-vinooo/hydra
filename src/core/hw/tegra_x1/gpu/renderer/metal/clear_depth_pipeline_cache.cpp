@@ -50,9 +50,16 @@ ClearDepthPipelineCache::ClearDepthPipelineCache(MTL::Device* device_)
 void ClearDepthPipelineCache::destroy() { pipeline_descriptor->release(); }
 
 MTL::RenderPipelineState*
-ClearDepthPipelineCache::create(MTL::PixelFormat pixel_format) {
+ClearDepthPipelineCache::create(
+    const ClearDepthPipelineDescriptor& descriptor) {
     // Pipeline
-    pipeline_descriptor->setDepthAttachmentPixelFormat(pixel_format);
+    setDepthStencilPixelFormat(pipeline_descriptor,
+                               descriptor.depth_stencil_pixel_format);
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
+        auto attachment = pipeline_descriptor->colorAttachments()->object(i);
+        attachment->setPixelFormat(descriptor.color_pixel_formats[i]);
+        attachment->setWriteMask(MTL::ColorWriteMaskNone);
+    }
 
     NS::Error* error;
     auto pipeline = device->newRenderPipelineState(pipeline_descriptor, &error);
@@ -65,8 +72,13 @@ ClearDepthPipelineCache::create(MTL::PixelFormat pixel_format) {
     return pipeline;
 }
 
-u32 ClearDepthPipelineCache::hash(MTL::PixelFormat pixel_format) {
-    return static_cast<u32>(pixel_format);
+u32 ClearDepthPipelineCache::hash(
+    const ClearDepthPipelineDescriptor& descriptor) {
+    ztd::hash::XxHash32 hash;
+    hash.add(descriptor.depth_stencil_pixel_format);
+    for (const auto pixel_format : descriptor.color_pixel_formats)
+        hash.add(pixel_format);
+    return hash.toHashCode();
 }
 
 void ClearDepthPipelineCache::destroyElement(

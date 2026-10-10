@@ -20,6 +20,11 @@ struct TextureStorage {
     ITexture* base{nullptr};
     SmallCache<u32, ITextureView*> view_cache;
     TextureCacheTimePoint update_timestamp;
+    // Last time this texture was rendered to
+    TextureCacheTimePoint gpu_written_timestamp;
+    // Last time the guest modified this texture, in memory that also contains
+    // render targets
+    TextureCacheTimePoint cpu_modified_timestamp;
 
     void markUpdated() { update_timestamp = TextureCacheClock::now(); }
 };
@@ -79,6 +84,12 @@ class TextureCache {
                        TextureUsage usage);
 
     void invalidateMemory(ztd::Range<uptr> range);
+
+    // Returns the format of a depth stencil texture at the same address with
+    // the same dimensions and pixel size as the descriptor, if there is one.
+    // Games copy depth buffers with the 2D engine using color formats.
+    std::optional<TextureFormat>
+    findDepthStencilAlias(const TextureDescriptor& descriptor);
 
     // Debug
     usize getMemoryCount() const { return entries.size(); }

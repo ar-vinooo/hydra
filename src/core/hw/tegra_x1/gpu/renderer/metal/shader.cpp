@@ -2,6 +2,9 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 
+#include <atomic>
+#include <fstream>
+
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
@@ -23,6 +26,17 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor)
         // TODO: doesn't this copy the contents?
         std::string source;
         source.assign(descriptor.code.begin(), descriptor.code.end());
+
+        // DEBUG: dump shaders when HYDRA_DUMP_SHADERS is set to a directory
+        if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
+            static std::atomic<u32> dump_index{0};
+            std::ofstream out(
+                fmt::format("{}/{:04}_{}_{}.metal", dump_dir, dump_index++,
+                            descriptor.type,
+                            fmt::ptr(static_cast<ShaderBase*>(this))),
+                std::ios::binary);
+            out << source;
+        }
 
         NS::Error* error;
         library = device->newLibrary(toNsString(source), options, &error);

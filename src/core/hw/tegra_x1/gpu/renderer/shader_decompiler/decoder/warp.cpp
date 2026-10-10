@@ -11,12 +11,17 @@ void emitShuffle(DecoderContext& context, pred_t pred, bool pred_inv,
 
     const auto src_a_v = ir::Value::createRegister(src_a);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_NOT_IMPLEMENTED(
-        ShaderDecompiler, "mode: {}, src_a: {}, src_b: {}, src_c: {}", mode,
-        src_a_v, src_b, src_c);
-    // HACK
-    const auto res = src_a_v;
+    ir::Value res = src_a_v;
+    if (mode == ShuffleMode::Bfly &&
+        context.decomp_context.type == ShaderType::Fragment) {
+        // Butterfly shuffles within a quad are used to compute derivatives
+        res = context.builder.opQuadShuffleXor(src_a_v, src_b);
+    } else {
+        // TODO: implement
+        LOG_FUNC_WITH_ARGS_NOT_IMPLEMENTED(
+            ShaderDecompiler, "mode: {}, src_a: {}, src_b: {}, src_c: {}",
+            mode, src_a_v, src_b, src_c);
+    }
     const auto pred_res = ir::Value::createConstantB(true);
 
     context.builder.opCopy(ir::Value::createRegister(dst), res);

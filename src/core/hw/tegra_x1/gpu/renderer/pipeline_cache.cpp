@@ -42,6 +42,7 @@ u32 PipelineCache::hash(const PipelineDescriptor& descriptor) {
     // Color targets
     for (const auto& color_target_state : descriptor.color_target_states) {
         hash.add(color_target_state.format);
+        hash.add(color_target_state.write_mask);
         hash.add(color_target_state.blend_enabled);
         if (color_target_state.blend_enabled) {
             hash.add(color_target_state.rgb_op);
@@ -52,6 +53,8 @@ u32 PipelineCache::hash(const PipelineDescriptor& descriptor) {
             hash.add(color_target_state.dst_alpha_factor);
         }
     }
+
+    hash.add(descriptor.depth_stencil_format);
 
     return hash.toHashCode();
 }

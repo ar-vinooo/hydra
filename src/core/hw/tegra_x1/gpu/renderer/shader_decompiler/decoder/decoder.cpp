@@ -87,9 +87,7 @@ void Decoder::parseNextInstruction() {
     INST(0xf0f0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("depbar");
     }
-    INST(0xf0c8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("mov");
-    }
+    INST(0xf0c8000000000000, 0xfff8000000000000) { EMIT(S2R); }
     INST(0xf0c0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("r2b");
     }
@@ -203,8 +201,39 @@ void Decoder::parseNextInstruction() {
     INST(0xe350000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("cont");
     }
-    INST(0xe340000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("brk");
+    INST(0xe340000000000000, 0xfff0000000000000) { // brk
+        // TODO: ccc
+        const auto pred = static_cast<pred_t>(extractBits(inst, 16, 3));
+        const auto pred_inv = static_cast<bool>(extractBits(inst, 19, 1));
+
+        if (crnt_block->break_point_stack.empty()) {
+            LOG_ERROR(ShaderDecompiler, "No break point in stack");
+            return;
+        }
+
+        const auto target = crnt_block->break_point_stack.top();
+        if (pred == PT) {
+            if (!pred_inv) {
+                // Pop and then inherit
+                crnt_block->break_point_stack.pop();
+                inheritSyncPoints(target);
+
+                context.builder.opBranch(target);
+                endBlock();
+            }
+        } else { // Conditional
+            // Inherit for the continuation block, then pop and inherit for
+            // break block
+            inheritSyncPoints(pc + 1);
+            crnt_block->break_point_stack.pop();
+            inheritSyncPoints(target);
+
+            context.builder.opBranchConditional(
+                notIf(context.builder, ir::Value::createPredicate(pred),
+                      pred_inv),
+                target, pc + 1);
+            endBlock();
+        }
     }
     INST(0xe330000000000000, 0xfff0000000000000) { EMIT(Kil); }
     INST(0xe320000000000000, 0xfff0000000000000) {
@@ -251,8 +280,14 @@ void Decoder::parseNextInstruction() {
     INST(0xe2a0000000000020, 0xfff0000000000020) {
         COMMENT_NOT_IMPLEMENTED("pbk");
     }
-    INST(0xe2a0000000000000, 0xfff0000000000020) {
-        COMMENT_NOT_IMPLEMENTED("pbk");
+    INST(0xe2a0000000000000, 0xfff0000000000020) { // pbk
+        const auto target = static_cast<u32>(
+            static_cast<i32>(pc) +
+            signExtend<i32, 24>(static_cast<i32>(extractBits(inst, 20, 24))) /
+                static_cast<i32>(sizeof(instruction_t)) +
+            1);
+
+        pushBreakPoint(target);
     }
     INST(0xe290000000000020, 0xfff0000000000020) {
         COMMENT_NOT_IMPLEMENTED("ssy");
@@ -543,8 +578,24 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x5180000000000000, 0xff80000000000000) { EMIT(FfmaRC); }
     INST(0x5100000000000000, 0xff80000000000000) { EMIT(XmadRC); }
-    INST(0x50f8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("fswzadd");
+    INST(0x50f8000000000000, 0xfff8000000000000) { // fswzadd
+        // TODO: ndv, rounding, ftz, cc
+        const auto pred = static_cast<pred_t>(extractBits(inst, 16, 3));
+        const auto pred_inv = static_cast<bool>(extractBits(inst, 19, 1));
+        const auto dst = static_cast<reg_t>(extractBits(inst, 0, 8));
+        const auto src_a = static_cast<reg_t>(extractBits(inst, 8, 8));
+        const auto src_b = static_cast<reg_t>(extractBits(inst, 20, 8));
+        const auto swizzle = static_cast<u32>(extractBits(inst, 28, 8));
+
+        const auto conditional =
+            handlePredCond(context.builder, pred, pred_inv);
+        const auto res = context.builder.opSwizzleAdd(
+            ir::Value::createRegister(src_a, ir::ScalarType::F32),
+            ir::Value::createRegister(src_b, ir::ScalarType::F32), swizzle);
+        context.builder.opCopy(
+            ir::Value::createRegister(dst, ir::ScalarType::F32), res);
+        if (conditional)
+            context.builder.opEndIf();
     }
     INST(0x50f0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("vsetp");

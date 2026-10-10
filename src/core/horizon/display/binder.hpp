@@ -120,7 +120,8 @@ struct Binder {
     void addBuffer(i32 slot, const GraphicBuffer& buff);
     i32 getAvailableSlot();
     void queueBuffer(System& system, i32 slot, const BqBufferInput& input);
-    i32 consumeBuffer(BqBufferInput& out_input);
+    // out_gpu_fence: number of GPU submissions that render the buffer
+    i32 consumeBuffer(BqBufferInput& out_input, u64& out_gpu_fence);
     void unqueueAllBuffers();
 
     const GraphicBuffer& getBuffer(i32 slot) {
@@ -139,7 +140,7 @@ struct Binder {
 
     Buffer buffers[MAX_BINDER_BUFFER_COUNT];
     u32 buffer_count = 0;
-    std::queue<std::pair<i32, BqBufferInput>> queued_buffers;
+    std::queue<std::tuple<i32, BqBufferInput, u64>> queued_buffers;
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
 

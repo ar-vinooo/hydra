@@ -150,6 +150,7 @@ class Process : public SynchronizationObject {
 
     hw::tegra_x1::cpu::IMmu* getMmu() const { return mmu.get(); }
     hw::tegra_x1::cpu::IMemory* getHeapMemory() const { return heap_mem.get(); }
+    u64 getUsedUserMemorySize() const;
 
   private:
     System& system;

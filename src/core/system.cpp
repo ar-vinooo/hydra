@@ -1,5 +1,8 @@
 #include "core/system.hpp"
 
+#include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
+
 #include <fmt/chrono.h>
 #include <stb_image_write.h>
 
@@ -477,6 +480,40 @@ void System::progressFrame(u32 width, u32 height,
     // Acquire present textures
     bool acquired =
         os.getDisplayDriver().acquirePresentTextures(command_buffer);
+    if (acquired)
+        hw::tegra_x1::gpu::FrameTracer::instance().onPresent();
+
+    // DEBUG: performance statistics
+    if (acquired && hw::tegra_x1::gpu::PerfStats::isEnabled()) {
+        auto& stats = hw::tegra_x1::gpu::PerfStats::instance();
+        stats.frames++;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<f64>(now - last).count();
+        if (elapsed >= 2.0) {
+            last = now;
+            const auto frames = static_cast<f64>(stats.frames.exchange(0));
+            const auto per_frame_ms = [&](std::atomic<u64>& counter) {
+                return static_cast<f64>(counter.exchange(0)) / 1e6 /
+                       std::max(frames, 1.0);
+            };
+            const auto pfifo_ms = per_frame_ms(stats.pfifo_busy_ns);
+            const auto wait_ms = per_frame_ms(stats.present_wait_ns);
+            const auto gpu_ms = per_frame_ms(stats.gpu_ns);
+            const auto lists = stats.pfifo_lists.exchange(0);
+            const auto cbs = stats.command_buffers.exchange(0);
+            const auto draws = stats.draws.exchange(0);
+            LOG_INFO(Other,
+                     "PERF: {:.1f} fps | pfifo (CPU encode) {:.2f} ms/frame, "
+                     "{:.1f} lists/frame | present wait {:.2f} ms/frame | "
+                     "Metal GPU {:.2f} ms/frame, {:.1f} cmdbufs/frame | {:.0f} "
+                     "draws/frame",
+                     frames / elapsed, pfifo_ms,
+                     static_cast<f64>(lists) / std::max(frames, 1.0), wait_ms,
+                     gpu_ms, static_cast<f64>(cbs) / std::max(frames, 1.0),
+                     static_cast<f64>(draws) / std::max(frames, 1.0));
+        }
+    }
 
     // Render pass
     os.getDisplayDriver().present(command_buffer, compositor, width, height);

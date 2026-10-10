@@ -31,6 +31,7 @@ void LangEmitter::start() {
 
     // State
     enterScope("struct State");
+    write("float4 dbg;"); // DEBUG: captured register values
     write("Reg r[256];");
     write("bool p[8];"); // TODO: is the size correct?
     // TODO: move this to the backend
@@ -63,6 +64,7 @@ void LangEmitter::finish() {
 void LangEmitter::emitMainFunctionPrologue() {
     // State
     writeStatement("State state");
+    writeStatement("state.dbg = float4(0.0)");
 
     // Inputs
     // TODO: these are provided in the shader header, no need for analysis
@@ -87,12 +89,24 @@ void LangEmitter::emitMainFunctionPrologue() {
     case ShaderType::Vertex:
         for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
             const auto vertex_attrib_state = state.vertex_attrib_states[i];
-            if (vertex_attrib_state.type == engines::VertexAttribType::None)
-                continue;
 
-            // HACK: how are attributes disabled?
-            if (vertex_attrib_state.is_fixed)
+            // Attributes without a vertex buffer read as (0, 0, 0, 1)
+            if (vertex_attrib_state.type == engines::VertexAttribType::None ||
+                vertex_attrib_state.is_fixed) {
+                const bool is_int =
+                    vertex_attrib_state.type ==
+                        engines::VertexAttribType::Uint ||
+                    vertex_attrib_state.type == engines::VertexAttribType::Sint;
+                for (u8 c = 0; c < 4; c++) {
+                    const auto attr = getAttrMemoryStr(
+                        {RZ, 0x80u + i * 0x10u + c * 0x4u, true});
+                    writeStatement("{} = {}", attr,
+                                   c != 3     ? "0u"
+                                   : is_int   ? "1u"
+                                              : "0x3f800000u");
+                }
                 continue;
+            }
 
             // TODO: only set if the Rendered backend doesn't support scaled
             // attributes
@@ -318,6 +332,31 @@ void LangEmitter::emitBlock(const ir::Function& func, const ir::Block& block) {
     write("float4 f;");
     exitScope("temp");
     writeNewline();
+
+    // DEBUG: capture registers at the start of a block, set with
+    // HYDRA_DEBUG_CAPTURE="<block label>:<reg>,<reg>,<reg>"
+    if (context.type == ShaderType::Fragment && state.debug_highlight) {
+        static const std::string capture = [] {
+            const char* env = std::getenv("HYDRA_DEBUG_CAPTURE");
+            return std::string(env != nullptr ? env : "");
+        }();
+        const auto colon = capture.find(':');
+        if (colon != std::string::npos &&
+            std::strtoul(capture.substr(0, colon).c_str(), nullptr, 0) ==
+                static_cast<u32>(block.getLabel())) {
+            std::vector<std::string> regs;
+            std::string rest = capture.substr(colon + 1);
+            for (usize pos = 0; pos <= rest.size();) {
+                const auto next = rest.find(',', pos);
+                regs.push_back(rest.substr(pos, next - pos));
+                if (next == std::string::npos)
+                    break;
+                pos = next + 1;
+            }
+            for (usize i = 0; i < regs.size() && i < 4; i++)
+                writeStatement("state.dbg[{}] = state.r[{}]._f32", i, regs[i]);
+        }
+    }
 
     for (const auto& instruction : block.getInstructions())
         emitInstruction(instruction);

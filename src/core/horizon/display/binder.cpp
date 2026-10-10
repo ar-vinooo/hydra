@@ -43,9 +43,12 @@ i32 Binder::getAvailableSlot() {
 }
 
 void Binder::queueBuffer(System& system, i32 slot, const BqBufferInput& input) {
+    // Fences are not implemented, so remember how much GPU work has been
+    // submitted to wait for it before presenting
+    const auto gpu_fence = system.getGpu().getPfifo().getSubmittedCount();
     {
         std::scoped_lock lock(queue_mutex);
-        queued_buffers.emplace(slot, input);
+        queued_buffers.emplace(slot, input, gpu_fence);
         buffers[slot].queued = true;
     }
 
@@ -61,7 +64,7 @@ void Binder::queueBuffer(System& system, i32 slot, const BqBufferInput& input) {
     system.getGpu().getRenderer().notifyDebugFrameBoundary();
 }
 
-i32 Binder::consumeBuffer(BqBufferInput& out_input) {
+i32 Binder::consumeBuffer(BqBufferInput& out_input, u64& out_gpu_fence) {
     i32 slot;
     {
         // Wait for a buffer to become available
@@ -74,9 +77,11 @@ i32 Binder::consumeBuffer(BqBufferInput& out_input) {
             return -1;
 
         // Get the first queued buffer
-        const auto [tmp_slot, tmp_input] = queued_buffers.front();
+        const auto [tmp_slot, tmp_input, tmp_gpu_fence] =
+            queued_buffers.front();
         slot = tmp_slot;
         out_input = tmp_input;
+        out_gpu_fence = tmp_gpu_fence;
 
         queued_buffers.pop();
         buffers[slot].queued = false;
@@ -97,7 +102,7 @@ void Binder::unqueueAllBuffers() {
 
         // Unqueue all
         while (!queued_buffers.empty()) {
-            const auto [slot, input] = queued_buffers.front();
+            const auto [slot, input, gpu_fence] = queued_buffers.front();
             queued_buffers.pop();
             buffers[slot].queued = false;
         }

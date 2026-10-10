@@ -91,6 +91,12 @@ class Renderer : public IRenderer {
     void setDepthTestEnabled(bool enabled) override;
     void setDepthWriteEnabled(bool enabled) override;
     void setDepthCompareOp(engines::CompareOp op) override;
+    void setBlendConstant(const float4 color) override;
+    void setDepthBias(f32 constant, f32 slope, f32 clamp) override;
+    void setStencilState([[maybe_unused]] const StencilState& stencil) override {}
+    void setCullState([[maybe_unused]] bool enabled,
+                      [[maybe_unused]] engines::CullFaceMode mode,
+                      [[maybe_unused]] engines::Winding front_face) override {}
 
     // Viewport and scissor
     void setViewport(u32 index, const Viewport& viewport) override;

@@ -8,7 +8,9 @@ The emulator is still in very early stages. A few games and homebrew apps work p
 
 ![Showcase](img/showcase.png)
 
-Only the NRO, NCA and NX formats are supported. You can convert an NSP file to NCA with [this tool](https://github.com/SamoZ256/switch-extract-macos), and NSP to NX with [this tool](https://github.com/SamoZ256/herakles).
+NRO, decrypted NCA, NX and XCI formats are supported. You can convert an NSP file to NCA with [this tool](https://github.com/SamoZ256/switch-extract-macos), and NSP to NX with [this tool](https://github.com/SamoZ256/herakles).
+
+For XCI gamecards, use **Import Keys** in the SwiftUI toolbar or Settings > General to import `prod.keys` from your console, then use **Add Game** to select the XCI. The loader reads and decrypts the base game directly from the cartridge file, without extracting a second copy. Keys are stored locally at `~/Library/Application Support/Hydra/keys/prod.keys`; `~/.switch/prod.keys` is also supported. The key file must contain `header_key` and the matching `key_area_key_application_XX` (or ocean/system) entries. NCA3 with AES-CTR, AES-XTS or plaintext sections is supported. Bundled updates, DLC, title-key encrypted content, compressed/sparse sections and multi-game selection are not supported yet. Loading a gamecard does not guarantee emulation compatibility.
 
 In order to run official games, you will need to download a set of patches to prevent crashes. You can get the patches together with a guide on how to install them [here](https://github.com/SamoZ256/hydra-patches).
 
@@ -51,7 +53,27 @@ You can find a config file at `~/Library/Application Support/Hydra/config.toml` 
 
 Some games require firmware files from a Nintendo Switch console to function properly. The firmware files need to be decrypted, which can be done with [this tool](https://github.com/SamoZ256/switch-extract-macos).
 
-To use the firmware, set the `firmware_path` option in the config file to the path of the decrypted firmware files.
+On macOS, open Settings > System and use **Choose Firmware Folder…** to select an extracted folder containing `.nca` files. You can also set the `firmware_path` option in the config file to that directory. Firmware errors are shown in Settings while keeping the firmware controls available. Encrypted NCA3 firmware can also be read after importing `prod.keys`, provided it contains the keys for that firmware's generation. A missing key is reported when starting emulation.
+
+### XCI loader tests
+
+Build with `-DHYDRA_XCI_TESTS=ON`, install Python `cryptography` for the test fixture generator, then run:
+
+```sh
+python3 tests/generate_xci_fixtures.py build/xci-fixtures
+./build/bin/hydra-xci-tests build/xci-fixtures
+```
+
+The tests use synthetic data and independent AES fixtures to check random reads, decryption cache boundaries, malformed input, wrong/missing keys and base-game selection. An optional second argument tests a local XCI's filesystems, control metadata and icon.
+
+On macOS, the boot regression tests need the app bundle's resources and your configured firmware. Run the test executable inside the bundle:
+
+```sh
+cp build/bin/hydra-xci-tests build/bin/Hydra.app/Contents/MacOS/
+./build/bin/Hydra.app/Contents/MacOS/hydra-xci-tests build/xci-fixtures /path/to/game.xci --check-firmware-lifetime
+```
+
+This also checks firmware font lifetime, incomplete firmware errors, heap accounting, Hypervisor physical address limits, controller availability, GPU map handle reuse and GPU address lookup boundaries/overlap precedence. For performance testing, disable **Debug logging** in Settings > Debug; normal and error logs remain available. Use a Release build to measure gameplay speed. The Debug build is intended for diagnostics.
 
 ## Contributing
 

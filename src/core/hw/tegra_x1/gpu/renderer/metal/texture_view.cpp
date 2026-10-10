@@ -24,24 +24,6 @@ TextureView::TextureView(Texture* base, const TextureViewDescriptor& descriptor)
 
     auto type = descriptor.type;
 
-    // Demote array types to non-array types if possible
-    switch (type) {
-    case TextureType::_1DArray:
-        if (descriptor.layers.getSize() == 1)
-            type = TextureType::_1D;
-        break;
-    case TextureType::_2DArray:
-        if (descriptor.layers.getSize() == 1)
-            type = TextureType::_2D;
-        break;
-    case TextureType::CubeArray:
-        if (descriptor.layers.getSize() == 6)
-            type = TextureType::Cube;
-        break;
-    default:
-        break;
-    }
-
     texture = base->getTexture()->newTextureView(
         toMtlPixelFormat(descriptor.format), toMtlTextureType(type),
         NS::Range(descriptor.levels.getBegin(), descriptor.levels.getSize()),

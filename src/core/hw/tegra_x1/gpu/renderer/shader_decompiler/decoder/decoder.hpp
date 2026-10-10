@@ -15,6 +15,7 @@ struct Block {
     BlockStatus status{BlockStatus::Unvisited};
     // TODO: rework this
     std::stack<label_t> sync_point_stack;
+    std::stack<label_t> break_point_stack;
 };
 
 class Decoder {
@@ -70,10 +71,15 @@ class Decoder {
         crnt_block->sync_point_stack.push(sync_point);
     }
 
+    void pushBreakPoint(label_t break_point) {
+        crnt_block->break_point_stack.push(break_point);
+    }
+
     void inheritSyncPoints(label_t label) {
         auto& block = ensureBlock(label);
         // TODO: if the block already has sync points, make sure they match
         block.sync_point_stack = crnt_block->sync_point_stack;
+        block.break_point_stack = crnt_block->break_point_stack;
     }
 };
 

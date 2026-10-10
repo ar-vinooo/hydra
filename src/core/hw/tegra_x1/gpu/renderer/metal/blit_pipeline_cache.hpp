@@ -8,6 +8,7 @@ struct BlitParams {
     float2 src_offset;
     float2 src_scale;
     f32 opacity;
+    f32 _padding; // Match MSL struct size (aligned to float2)
 };
 
 struct BlitPipelineDescriptor {

@@ -15,6 +15,9 @@
 
 namespace {
 
+thread_local std::string system_error;
+thread_local std::string filesystem_error;
+
 HydraString hydraStringFromStringView(std::string_view str) {
     return HydraString{.data = str.data(), .size = str.size()};
 }
@@ -66,7 +69,7 @@ HYDRA_EXPORT uint32_t hydraStringViewListGetCount(const void* list) {
 }
 
 HYDRA_EXPORT HydraString hydraStringViewListGet(const void* list,
-                                                 uint32_t index) {
+                                                uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<const std::vector<std::string_view>*>(list)->at(
             index));
@@ -103,7 +106,7 @@ HYDRA_EXPORT uint32_t hydraStringToStringMapGetCount(const void* map) {
 }
 
 HYDRA_EXPORT HydraString hydraStringToStringMapGetKey(const void* map,
-                                                       uint32_t index) {
+                                                      uint32_t index) {
     auto it = reinterpret_cast<const std::map<std::string, std::string>*>(map)
                   ->begin();
     std::advance(it, index);
@@ -111,15 +114,15 @@ HYDRA_EXPORT HydraString hydraStringToStringMapGetKey(const void* map,
 }
 
 HYDRA_EXPORT HydraString hydraStringToStringMapGetValue(const void* map,
-                                                         uint32_t index) {
+                                                        uint32_t index) {
     auto it = reinterpret_cast<const std::map<std::string, std::string>*>(map)
                   ->begin();
     std::advance(it, index);
     return hydraStringFromStringView(it->second);
 }
 
-HYDRA_EXPORT HydraString
-hydraStringToStringMapGetValueByKey(const void* map, HydraString key) {
+HYDRA_EXPORT HydraString hydraStringToStringMapGetValueByKey(const void* map,
+                                                             HydraString key) {
     return hydraStringFromStringView(
         reinterpret_cast<const std::map<std::string, std::string>*>(map)->at(
             std::string(stringViewFromHydraString(key))));
@@ -389,7 +392,20 @@ hydraLoaderPluginOptionConfigGetPathContentTypes(const void* config) {
 
 // Filesystem
 HYDRA_EXPORT void* hydraCreateFilesystem() {
-    return new hydra::horizon::filesystem::Filesystem();
+    filesystem_error.clear();
+    try {
+        return new hydra::horizon::filesystem::Filesystem();
+    } catch (const std::exception& error) {
+        filesystem_error = error.what();
+        using namespace hydra;
+        LOG_ERROR(Filesystem, "Unable to load firmware for settings: {}",
+                  error.what());
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraFilesystemGetLastError() {
+    return hydraStringFromStringView(filesystem_error);
 }
 
 HYDRA_EXPORT void hydraFilesystemDestroy(void* fs) {
@@ -406,8 +422,14 @@ HYDRA_EXPORT void hydraFileClose(void* file) {
 }
 
 HYDRA_EXPORT void* hydraCreateContentArchive(void* file) {
-    return new hydra::horizon::filesystem::ContentArchive(
-        reinterpret_cast<hydra::horizon::filesystem::IFile*>(file));
+    try {
+        return new hydra::horizon::filesystem::ContentArchive(
+            reinterpret_cast<hydra::horizon::filesystem::IFile*>(file));
+    } catch (const std::exception& error) {
+        using namespace hydra;
+        LOG_ERROR(Loader, "Could not read NCA: {}", error.what());
+        return nullptr;
+    }
 }
 
 HYDRA_EXPORT void hydraContentArchiveDestroy(void* content_archive) {
@@ -425,8 +447,18 @@ hydraContentArchiveGetContentType(void* content_archive) {
 
 // Time zone manager
 HYDRA_EXPORT void* hydraCreateTimeZoneManager(void* filesystem) {
-    return new hydra::horizon::services::timesrv::internal::TimeZoneManager(
-        *static_cast<hydra::horizon::filesystem::Filesystem*>(filesystem));
+    filesystem_error.clear();
+    if (!filesystem) {
+        filesystem_error = "Filesystem is unavailable.";
+        return nullptr;
+    }
+    try {
+        return new hydra::horizon::services::timesrv::internal::TimeZoneManager(
+            *static_cast<hydra::horizon::filesystem::Filesystem*>(filesystem));
+    } catch (const std::exception& error) {
+        filesystem_error = error.what();
+        return nullptr;
+    }
 }
 
 HYDRA_EXPORT void hydraTimeZoneManagerDestroy(void* manager) {
@@ -444,7 +476,7 @@ HYDRA_EXPORT uint32_t hydraTimeZoneManagerGetLocationCount(void* manager) {
 }
 
 HYDRA_EXPORT HydraString hydraTimeZoneManagerGetLocation(void* manager,
-                                                          uint32_t index) {
+                                                         uint32_t index) {
     // HACK
     auto it =
         static_cast<
@@ -475,6 +507,11 @@ HYDRA_EXPORT void hydraLoaderDestroy(void* loader) {
     delete reinterpret_cast<hydra::horizon::loader::ILoader*>(loader);
 }
 
+HYDRA_EXPORT HydraString hydraLoaderGetLastError() {
+    return hydraStringFromStringView(
+        hydra::horizon::loader::ILoader::getLastError());
+}
+
 HYDRA_EXPORT uint64_t hydraLoaderGetTitleId(void* loader) {
     return reinterpret_cast<hydra::horizon::loader::ILoader*>(loader)
         ->getTitleId();
@@ -496,8 +533,7 @@ HYDRA_EXPORT bool hydraLoaderHasIcon(const void* loader) {
         ->hasIcon();
 }
 
-HYDRA_EXPORT void hydraLoaderExtractIcon(const void* loader,
-                                         HydraString path) {
+HYDRA_EXPORT void hydraLoaderExtractIcon(const void* loader, HydraString path) {
     reinterpret_cast<const hydra::horizon::loader::ILoader*>(loader)
         ->extractIcon(stringViewFromHydraString(path));
 }
@@ -590,8 +626,8 @@ hydraLoaderPluginGetSupportedFormatCount(const void* plugin) {
             .size());
 }
 
-HYDRA_EXPORT HydraString
-hydraLoaderPluginGetSupportedFormat(const void* plugin, uint32_t index) {
+HYDRA_EXPORT HydraString hydraLoaderPluginGetSupportedFormat(const void* plugin,
+                                                             uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<const hydra::horizon::loader::plugins::Plugin*>(plugin)
             ->getSupportedFormats()[index]);
@@ -681,7 +717,7 @@ HYDRA_EXPORT uint32_t hydraUserManagerGetUserCount(void* user_manager) {
 }
 
 HYDRA_EXPORT HydraU128 hydraUserManagerGetUserId(void* user_manager,
-                                                  uint32_t index) {
+                                                 uint32_t index) {
     return std::bit_cast<HydraU128>(
         reinterpret_cast<
             hydra::horizon::services::account::internal::UserManager*>(
@@ -725,7 +761,7 @@ HYDRA_EXPORT uint32_t hydraUserManagerGetAvatarCount(void* user_manager) {
 }
 
 HYDRA_EXPORT HydraString hydraUserManagerGetAvatarPath(void* user_manager,
-                                                        uint32_t index) {
+                                                       uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<
             hydra::horizon::services::account::internal::UserManager*>(
@@ -795,7 +831,22 @@ class UiHandler : public hydra::horizon::ui::IHandler {
 };
 
 HYDRA_EXPORT void* hydraCreateSystem() {
-    return new hydra::System(*(new UiHandler()));
+    system_error.clear();
+    auto handler = std::make_unique<UiHandler>();
+    try {
+        auto system = new hydra::System(*handler);
+        handler.release();
+        return system;
+    } catch (const std::exception& error) {
+        system_error = error.what();
+        using namespace hydra;
+        LOG_ERROR(Loader, "Unable to initialize emulation: {}", system_error);
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraSystemGetLastError() {
+    return hydraStringFromStringView(system_error);
 }
 
 HYDRA_EXPORT void hydraSystemDestroy(void* system) {

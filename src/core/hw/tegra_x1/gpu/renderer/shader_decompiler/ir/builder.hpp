@@ -47,6 +47,16 @@ class Builder {
         return addInstruction(Opcode::Multiply, src_a.getType(),
                               {src_a, src_b});
     }
+    // Value of the neighbouring pixel in the 2x2 quad (lane ^ mask)
+    Value opQuadShuffleXor(const Value& src, const Value& mask) {
+        return addInstruction(Opcode::QuadShuffleXor, ScalarType::U32,
+                              {src, mask});
+    }
+    // a * LUT_A[mode] + b * LUT_B[mode], mode = swizzle >> (quad lane * 2)
+    Value opSwizzleAdd(const Value& src_a, const Value& src_b, u32 swizzle) {
+        return addInstruction(Opcode::SwizzleAdd, ScalarType::F32,
+                              {src_a, src_b, Value::createRawValue(swizzle)});
+    }
     Value opFma(const Value& src_a, const Value& src_b, const Value& src_c) {
         ASSERT_DEBUG(src_a.getType() == src_b.getType(), ShaderDecompiler,
                      "Type mismatch for fma ({} != {})", src_a.getType(),
@@ -368,7 +378,8 @@ class Builder {
     }
     // TODO: more args
     Value opTextureGather(u32 const_buffer_index, const Value& coords,
-                          u8 component) {
+                          u8 component,
+                          const Value& cmp_value = Value::createUndefined()) {
         ASSERT_DEBUG(coords.getType().isVector() &&
                          coords.getType().isFloatingPoint(),
                      ShaderDecompiler,
@@ -379,7 +390,8 @@ class Builder {
         return addInstruction(Opcode::TextureGather,
                               Type::createVector(ScalarType::F32, 4),
                               {Value::createRawValue(const_buffer_index),
-                               coords, Value::createRawValue(component)});
+                               coords, Value::createRawValue(component),
+                               cmp_value});
     }
     Value opTextureQueryDimension(u32 const_buffer_index, u32 dimension) {
         return addInstruction(Opcode::TextureQueryDimension, ScalarType::U32,

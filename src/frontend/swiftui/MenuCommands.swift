@@ -95,8 +95,9 @@ struct MenuCommands: Commands {
     }
 
     func addFirmwareApplet(url: URL) {
+        guard url.pathExtension.lowercased() == "nca" else { return }
         let file = HydraFile(path: url.path(percentEncoded: false))
-        let contentArchive = HydraContentArchive(file: file)
+        guard let contentArchive = try? HydraContentArchive(file: file) else { return }
 
         if contentArchive.contentType
             != HYDRA_CONTENT_ARCHIVE_CONTENT_TYPE_PROGRAM

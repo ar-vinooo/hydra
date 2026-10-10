@@ -66,7 +66,9 @@ void AppletResource::setupNpads() {
         // TODO: auto-remap ProController to JoyDual and vice-versa
 
         // Check if supported
-        if (supported_npads[i] && !any(supported_style_sets & style_set))
+        const auto& profiles = CONFIG_INSTANCE.getInputProfiles();
+        if (i >= profiles.size() || profiles[i].empty() ||
+            !supported_npads[i] || !any(supported_style_sets & style_set))
             style_set = NpadStyleSet::None;
 
         npads[i].setup(style_set);
@@ -87,7 +89,9 @@ void AppletResource::updateTouch(
     u32 index = 0;
     for (const auto& [finger_id, touch_state] : new_state) {
         state.touches[index++] = {
-            .finger_id = finger_id, .x = touch_state.x, .y = touch_state.y,
+            .finger_id = finger_id,
+            .x = touch_state.x,
+            .y = touch_state.y,
             // TODO: more
         };
     }

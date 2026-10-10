@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 
+#include <stb_image_write.h>
+
 #include "common/config.hpp"
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
@@ -41,6 +43,22 @@ Renderer::Renderer()
         device->newDepthStencilState(depth_stencil_descriptor);
     depth_stencil_descriptor->release();
 
+    // Clear stencil (depth untouched)
+    {
+        auto desc = MTL::DepthStencilDescriptor::alloc()->init();
+        auto stencil = MTL::StencilDescriptor::alloc()->init();
+        stencil->setStencilCompareFunction(MTL::CompareFunctionAlways);
+        stencil->setStencilFailureOperation(MTL::StencilOperationReplace);
+        stencil->setDepthFailureOperation(MTL::StencilOperationReplace);
+        stencil->setDepthStencilPassOperation(MTL::StencilOperationReplace);
+        stencil->setWriteMask(0xff);
+        desc->setFrontFaceStencil(stencil);
+        desc->setBackFaceStencil(stencil);
+        depth_stencil_state_clear_stencil = device->newDepthStencilState(desc);
+        stencil->release();
+        desc->release();
+    }
+
     // Sampler states
 
     // Nearest
@@ -64,6 +82,7 @@ Renderer::~Renderer() {
     nearest_sampler->release();
 
     depth_stencil_state_always_and_write->release();
+    depth_stencil_state_clear_stencil->release();
 
     // TODO: destroy caches here?
 
@@ -117,7 +136,6 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
                            u32 level_count, u32 layer_count) {
     // TODO: what about 3D textures?
     (void)src_level;
-    (void)src_layer;
     (void)dst_level;
     (void)level_count;
     (void)layer_count;
@@ -126,6 +144,56 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         static_cast<CommandBuffer*>(command_buffer);
     const auto src_impl = static_cast<TextureView*>(src);
     const auto dst_impl = static_cast<TextureView*>(dst);
+
+    // Depth stencil textures can't be render targets of the color blit
+    // pipeline, so copy them directly. Scaling is not supported in this case
+    const auto src_mtl = src_impl->getTexture();
+    const auto dst_mtl = dst_impl->getTexture();
+    const auto is_depth_stencil = [](MTL::PixelFormat format) {
+        switch (format) {
+        case MTL::PixelFormatDepth16Unorm:
+        case MTL::PixelFormatDepth32Float:
+        case MTL::PixelFormatDepth24Unorm_Stencil8:
+        case MTL::PixelFormatDepth32Float_Stencil8:
+        case MTL::PixelFormatStencil8:
+            return true;
+        default:
+            return false;
+        }
+    };
+    if (is_depth_stencil(dst_mtl->pixelFormat()) ||
+        is_depth_stencil(src_mtl->pixelFormat())) {
+        if (src_mtl->pixelFormat() != dst_mtl->pixelFormat()) {
+            ONCE(LOG_NOT_IMPLEMENTED(
+                MetalRenderer, "Depth stencil blit between different formats"));
+            return;
+        }
+        if (src_size.x() != dst_size.x() || src_size.y() != dst_size.y())
+            ONCE(LOG_WARN(MetalRenderer,
+                          "Scaled depth stencil blit, copying without scaling"));
+
+        // Clamp the region to both textures
+        const auto src_x = static_cast<u32>(src_origin.x());
+        const auto src_y = static_cast<u32>(src_origin.y());
+        const auto dst_x = static_cast<u32>(dst_origin.x());
+        const auto dst_y = static_cast<u32>(dst_origin.y());
+        const auto width = static_cast<u32>(std::min<u64>(
+            {dst_size.x(), src_mtl->width() - std::min<u64>(src_x, src_mtl->width()),
+             dst_mtl->width() - std::min<u64>(dst_x, dst_mtl->width())}));
+        const auto height = static_cast<u32>(std::min<u64>(
+            {dst_size.y(),
+             src_mtl->height() - std::min<u64>(src_y, src_mtl->height()),
+             dst_mtl->height() - std::min<u64>(dst_y, dst_mtl->height())}));
+        if (width == 0 || height == 0)
+            return;
+
+        auto blit_encoder = command_buffer_impl->getBlitCommandEncoder();
+        blit_encoder->copyFromTexture(
+            src_mtl, src_layer, 0, MTL::Origin(src_x, src_y, 0),
+            MTL::Size(width, height, 1), dst_mtl, dst_layer, 0,
+            MTL::Origin(dst_x, dst_y, 0));
+        return;
+    }
 
     // Render pass
     NS_STACK_SCOPED auto render_pass_descriptor =
@@ -137,6 +205,8 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         MTL::LoadActionLoad); // TODO: use don't care if blitting to the whole
                               // texture
     color_attachment->setStoreAction(MTL::StoreActionStore);
+    render_pass_descriptor->setRenderTargetArrayLength(
+        getRenderTargetArrayLength(dst_impl->getTexture()));
 
     auto encoder =
         command_buffer_impl->createRenderCommandEncoder(render_pass_descriptor);
@@ -150,15 +220,15 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         static_cast<f64>(dst_size.x()), static_cast<f64>(dst_size.y()), 0.0,
         1.0));
     encoder->setVertexBytes(&dst_layer, sizeof(dst_layer), 0);
+    const auto src_width = static_cast<f32>(src_impl->getTexture()->width());
+    const auto src_height =
+        static_cast<f32>(src_impl->getTexture()->height());
     BlitParams params = {
-        .src_offset = {static_cast<f32>(src_origin.x()) /
-                           static_cast<f32>(src_size.x()),
-                       static_cast<f32>(src_origin.y()) /
-                           static_cast<f32>(src_size.y())},
-        .src_scale =
-            float2(src_size) /
-            float2({static_cast<f32>(src_impl->getTexture()->width()),
-                    static_cast<f32>(src_impl->getTexture()->height())}),
+        .src_offset = {static_cast<f32>(src_origin.x()) / src_width,
+                       static_cast<f32>(src_origin.y()) / src_height},
+        .src_scale = {static_cast<f32>(src_size.x()) / src_width,
+                      static_cast<f32>(src_size.y()) / src_height},
+        .opacity = 1.0f,
     };
     encoder->setFragmentBytes(&params, sizeof(params), 0);
     encoder->setFragmentTexture(src_impl->getTexture(),
@@ -211,10 +281,14 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
 
-    command_buffer_impl->setRenderPipelineState(clear_color_pipeline_cache.find(
-        {.pixel_format = toMtlPixelFormat(texture->getDescriptor().format),
-         .render_target_id = render_target_id,
-         .mask = mask}));
+    ClearColorPipelineDescriptor pipeline_descriptor{
+        .render_target_id = render_target_id,
+        .mask = mask,
+        .depth_stencil_pixel_format = getDepthStencilPixelFormat()};
+    getColorPixelFormats(pipeline_descriptor.pixel_formats);
+    command_buffer_impl->setRenderPipelineState(
+        clear_color_pipeline_cache.find(pipeline_descriptor));
+    command_buffer_impl->setCullMode(MTL::CullModeNone);
     // TODO: set viewport and scissor
     encoder->setVertexBytes(&render_target_id, sizeof(render_target_id), 0);
     encoder->setFragmentBytes(&color, sizeof(color), 0);
@@ -246,8 +320,13 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
 
-    command_buffer_impl->setRenderPipelineState(clear_depth_pipeline_cache.find(
-        toMtlPixelFormat(texture->getDescriptor().format)));
+    ClearDepthPipelineDescriptor pipeline_descriptor{
+        .depth_stencil_pixel_format =
+            toMtlPixelFormat(texture->getDescriptor().format)};
+    getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
+    command_buffer_impl->setRenderPipelineState(
+        clear_depth_pipeline_cache.find(pipeline_descriptor));
+    command_buffer_impl->setCullMode(MTL::CullModeNone);
     command_buffer_impl->setDepthStencilState(
         depth_stencil_state_always_and_write);
     // TODO: set viewport and scissor
@@ -263,9 +342,38 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
 
 void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
                             const u32 value) {
-    (void)command_buffer;
-    ONCE(LOG_FUNC_WITH_ARGS_NOT_IMPLEMENTED(
-        MetalRenderer, "layer: {}, value: {:#x}", layer, value));
+    const auto command_buffer_impl =
+        static_cast<CommandBuffer*>(command_buffer);
+    auto texture = static_cast<TextureView*>(
+        state.render_pass->getDescriptor().depth_stencil_target.texture);
+    if (texture == nullptr || !hasStencilAttachment())
+        return;
+
+    // TODO: layer
+    (void)layer;
+
+    auto encoder = getRenderCommandEncoder(command_buffer_impl);
+
+    // Draw a full screen triangle that replaces the stencil value, while
+    // keeping depth intact
+    ClearDepthPipelineDescriptor pipeline_descriptor{
+        .depth_stencil_pixel_format =
+            toMtlPixelFormat(texture->getDescriptor().format)};
+    getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
+    command_buffer_impl->setRenderPipelineState(
+        clear_depth_pipeline_cache.find(pipeline_descriptor));
+    command_buffer_impl->setCullMode(MTL::CullModeNone);
+    command_buffer_impl->setDepthStencilState(
+        depth_stencil_state_clear_stencil);
+    encoder->setStencilReferenceValue(value & 0xff);
+    struct {
+        u32 layer_id;
+        float value;
+    } params = {.layer_id = 0, .value = 0.0f};
+    encoder->setVertexBytes(&params, sizeof(params), 0);
+    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                            static_cast<NS::UInteger>(0),
+                            static_cast<NS::UInteger>(3));
 }
 
 ShaderBase* Renderer::createShader(const ShaderDescriptor& descriptor) {
@@ -286,6 +394,292 @@ void Renderer::setDepthTestEnabled(bool enabled) {
 
 void Renderer::setDepthWriteEnabled(bool enabled) {
     state.depth_write_enabled = enabled;
+}
+
+void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
+                                ITextureView* view, const std::string& path) {
+    auto texture = static_cast<TextureView*>(view)->getTexture();
+    const u32 level_count =
+        texture->textureType() == MTL::TextureTypeCube
+            ? std::min(static_cast<u32>(texture->mipmapLevelCount()), 5u)
+            : 1u;
+    for (u32 level = 0; level < level_count; level++)
+        debugDumpTextureLevel(command_buffer, view, level,
+                              level == 0 ? path
+                                         : fmt::format("{}_mip{}.png", path,
+                                                       level));
+}
+
+void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
+                                     ITextureView* view, u32 level,
+                                     const std::string& path) {
+    auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
+    auto texture = static_cast<TextureView*>(view)->getTexture();
+    const auto texture_type = texture->textureType();
+    if (texture_type != MTL::TextureType2D &&
+        texture_type != MTL::TextureType2DArray &&
+        texture_type != MTL::TextureTypeCube)
+        return;
+    // Cube faces are stitched horizontally
+    const u32 slice_count = texture_type == MTL::TextureTypeCube ? 6 : 1;
+
+    const auto pixel_format = texture->pixelFormat();
+    const bool is_bc1 = pixel_format == MTL::PixelFormatBC1_RGBA ||
+                        pixel_format == MTL::PixelFormatBC1_RGBA_sRGB;
+    u32 bpp = 0;
+    switch (pixel_format) {
+    case MTL::PixelFormatBC1_RGBA:
+    case MTL::PixelFormatBC1_RGBA_sRGB:
+        break;
+    case MTL::PixelFormatR8Unorm:
+        bpp = 1;
+        break;
+    case MTL::PixelFormatRG8Unorm:
+    case MTL::PixelFormatR16Float:
+    case MTL::PixelFormatDepth16Unorm:
+        bpp = 2;
+        break;
+    case MTL::PixelFormatRGBA8Unorm:
+    case MTL::PixelFormatRGBA8Unorm_sRGB:
+    case MTL::PixelFormatBGRA8Unorm:
+    case MTL::PixelFormatBGRA8Unorm_sRGB:
+    case MTL::PixelFormatR32Float:
+    case MTL::PixelFormatRG16Float:
+    case MTL::PixelFormatDepth32Float:
+    case MTL::PixelFormatRGB10A2Unorm:
+        bpp = 4;
+        break;
+    case MTL::PixelFormatRGBA16Float:
+        bpp = 8;
+        break;
+    default:
+        return;
+    }
+
+    const u32 width = std::max(static_cast<u32>(texture->width()) >> level, 1u);
+    const u32 height =
+        std::max(static_cast<u32>(texture->height()) >> level, 1u);
+    const u32 bytes_per_row =
+        is_bc1 ? std::max((width + 3) / 4, 1u) * 8 : width * bpp;
+    const u32 rows = is_bc1 ? std::max((height + 3) / 4, 1u) : height;
+    const usize image_size = static_cast<usize>(bytes_per_row) * rows;
+    auto buffer = device->newBuffer(image_size * slice_count,
+                                    MTL::ResourceStorageModeShared);
+
+    auto encoder = command_buffer_impl->getBlitCommandEncoder();
+    for (u32 slice = 0; slice < slice_count; slice++)
+        encoder->copyFromTexture(texture, slice, level, MTL::Origin(0, 0, 0),
+                                 MTL::Size(width, height, 1), buffer,
+                                 image_size * slice, bytes_per_row, image_size);
+
+    command_buffer_impl->getCommandBuffer()->addCompletedHandler(
+        [=](MTL::CommandBuffer*) {
+            const auto all_data =
+                reinterpret_cast<const u8*>(buffer->contents());
+
+            // BC1: decode every slice into a horizontally stitched image
+            if (is_bc1) {
+                const u32 out_width = width * slice_count;
+                std::vector<u8> out(static_cast<usize>(out_width) * height * 4,
+                                    255);
+                const auto expand565 = [](u16 c, u8* rgb) {
+                    rgb[0] = static_cast<u8>(((c >> 11) & 0x1f) * 255 / 31);
+                    rgb[1] = static_cast<u8>(((c >> 5) & 0x3f) * 255 / 63);
+                    rgb[2] = static_cast<u8>((c & 0x1f) * 255 / 31);
+                };
+                for (u32 slice = 0; slice < slice_count; slice++) {
+                    const u8* blocks = all_data + image_size * slice;
+                    for (u32 by = 0; by < rows; by++) {
+                        for (u32 bx = 0; bx < bytes_per_row / 8; bx++) {
+                            const u8* block =
+                                blocks + by * bytes_per_row + bx * 8;
+                            u16 c0, c1;
+                            u32 indices;
+                            std::memcpy(&c0, block, 2);
+                            std::memcpy(&c1, block + 2, 2);
+                            std::memcpy(&indices, block + 4, 4);
+                            u8 palette[4][3];
+                            expand565(c0, palette[0]);
+                            expand565(c1, palette[1]);
+                            for (u32 c = 0; c < 3; c++) {
+                                if (c0 > c1) {
+                                    palette[2][c] = static_cast<u8>(
+                                        (2 * palette[0][c] + palette[1][c]) / 3);
+                                    palette[3][c] = static_cast<u8>(
+                                        (palette[0][c] + 2 * palette[1][c]) / 3);
+                                } else {
+                                    palette[2][c] = static_cast<u8>(
+                                        (palette[0][c] + palette[1][c]) / 2);
+                                    palette[3][c] = 0;
+                                }
+                            }
+                            for (u32 py = 0; py < 4; py++) {
+                                for (u32 px = 0; px < 4; px++) {
+                                    const u32 x = bx * 4 + px;
+                                    const u32 y = by * 4 + py;
+                                    if (x >= width || y >= height)
+                                        continue;
+                                    const u32 index =
+                                        (indices >> (2 * (py * 4 + px))) & 0x3;
+                                    u8* dst = &out[(static_cast<usize>(y) *
+                                                        out_width +
+                                                    slice * width + x) *
+                                                   4];
+                                    dst[0] = palette[index][0];
+                                    dst[1] = palette[index][1];
+                                    dst[2] = palette[index][2];
+                                }
+                            }
+                        }
+                    }
+                }
+                stbi_write_png(path.c_str(), static_cast<int>(out_width),
+                               static_cast<int>(height), 4, out.data(),
+                               static_cast<int>(out_width * 4));
+                buffer->release();
+                return;
+            }
+
+            const auto data = all_data;
+            const usize pixel_count = static_cast<usize>(width) * height;
+            std::vector<u8> rgba(pixel_count * 4, 255);
+
+            // Single and dual channel data is normalized to its range
+            const auto read_channel = [&](usize i, u32 c) -> f32 {
+                switch (pixel_format) {
+                case MTL::PixelFormatR8Unorm:
+                    return data[i] / 255.0f;
+                case MTL::PixelFormatRG8Unorm:
+                    return data[i * 2 + c] / 255.0f;
+                case MTL::PixelFormatR16Float:
+                    return static_cast<f32>(
+                        reinterpret_cast<const _Float16*>(data)[i]);
+                case MTL::PixelFormatDepth16Unorm:
+                    return reinterpret_cast<const u16*>(data)[i] / 65535.0f;
+                case MTL::PixelFormatR32Float:
+                case MTL::PixelFormatDepth32Float:
+                    return reinterpret_cast<const f32*>(data)[i];
+                case MTL::PixelFormatRG16Float:
+                    return static_cast<f32>(
+                        reinterpret_cast<const _Float16*>(data)[i * 2 + c]);
+                default:
+                    return 0.0f;
+                }
+            };
+
+            switch (pixel_format) {
+            case MTL::PixelFormatRGBA8Unorm:
+            case MTL::PixelFormatRGBA8Unorm_sRGB:
+                std::memcpy(rgba.data(), data, pixel_count * 4);
+                for (usize i = 0; i < pixel_count; i++)
+                    rgba[i * 4 + 3] = 255;
+                break;
+            case MTL::PixelFormatBGRA8Unorm:
+            case MTL::PixelFormatBGRA8Unorm_sRGB:
+                for (usize i = 0; i < pixel_count; i++) {
+                    rgba[i * 4 + 0] = data[i * 4 + 2];
+                    rgba[i * 4 + 1] = data[i * 4 + 1];
+                    rgba[i * 4 + 2] = data[i * 4 + 0];
+                }
+                break;
+            case MTL::PixelFormatRGB10A2Unorm:
+                for (usize i = 0; i < pixel_count; i++) {
+                    const u32 v = reinterpret_cast<const u32*>(data)[i];
+                    rgba[i * 4 + 0] = static_cast<u8>((v & 0x3ff) >> 2);
+                    rgba[i * 4 + 1] = static_cast<u8>(((v >> 10) & 0x3ff) >> 2);
+                    rgba[i * 4 + 2] = static_cast<u8>(((v >> 20) & 0x3ff) >> 2);
+                }
+                break;
+            case MTL::PixelFormatRGBA16Float:
+                for (usize i = 0; i < pixel_count * 4; i++) {
+                    const f32 v = static_cast<f32>(
+                        reinterpret_cast<const _Float16*>(data)[i]);
+                    rgba[i] = (i % 4 == 3)
+                                  ? 255
+                                  : static_cast<u8>(
+                                        std::clamp(v, 0.0f, 1.0f) * 255.0f);
+                }
+                break;
+            default: {
+                const u32 channels =
+                    (pixel_format == MTL::PixelFormatRG8Unorm ||
+                     pixel_format == MTL::PixelFormatRG16Float)
+                        ? 2
+                        : 1;
+                for (u32 c = 0; c < channels; c++) {
+                    f32 min = std::numeric_limits<f32>::max();
+                    f32 max = std::numeric_limits<f32>::lowest();
+                    for (usize i = 0; i < pixel_count; i++) {
+                        const f32 v = read_channel(i, c);
+                        if (!std::isfinite(v))
+                            continue;
+                        min = std::min(min, v);
+                        max = std::max(max, v);
+                    }
+                    const f32 range = max > min ? max - min : 1.0f;
+                    for (usize i = 0; i < pixel_count; i++) {
+                        f32 v = read_channel(i, c);
+                        if (!std::isfinite(v))
+                            v = min;
+                        const u8 b = static_cast<u8>(
+                            std::clamp((v - min) / range, 0.0f, 1.0f) * 255.0f);
+                        if (channels == 1) {
+                            rgba[i * 4 + 0] = rgba[i * 4 + 1] =
+                                rgba[i * 4 + 2] = b;
+                        } else {
+                            rgba[i * 4 + c] = b;
+                            rgba[i * 4 + 2] = 0;
+                        }
+                    }
+                }
+                break;
+            }
+            }
+
+            stbi_write_png(path.c_str(), static_cast<int>(width),
+                           static_cast<int>(height), 4, rgba.data(),
+                           static_cast<int>(width * 4));
+            buffer->release();
+        });
+}
+
+void Renderer::setStencilState(const StencilState& stencil) {
+    state.stencil = stencil;
+}
+
+bool Renderer::hasStencilAttachment() const {
+    switch (getDepthStencilPixelFormat()) {
+    case MTL::PixelFormatDepth24Unorm_Stencil8:
+    case MTL::PixelFormatDepth32Float_Stencil8:
+    case MTL::PixelFormatStencil8:
+    case MTL::PixelFormatX24_Stencil8:
+    case MTL::PixelFormatX32_Stencil8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Renderer::setCullState(bool enabled, engines::CullFaceMode mode,
+                            engines::Winding front_face) {
+    if (!enabled) {
+        state.cull_mode = MTL::CullModeNone;
+        return;
+    }
+
+    // TODO: front and back culling should discard all polygons
+    state.cull_mode = toMtlCullMode(mode);
+    state.front_face_winding = toMtlWinding(front_face);
+}
+
+void Renderer::setDepthBias(f32 constant, f32 slope, f32 clamp) {
+    state.depth_bias_constant = constant;
+    state.depth_bias_slope = slope;
+    state.depth_bias_clamp = clamp;
+}
+
+void Renderer::setBlendConstant(const float4 color) {
+    state.blend_constant = color;
 }
 
 void Renderer::setDepthCompareOp(engines::CompareOp op) {
@@ -395,6 +789,30 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
                                    instance_count, base_vertex, base_instance);
 }
 
+void Renderer::getColorPixelFormats(
+    MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const {
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
+        const auto texture =
+            state.render_pass != nullptr
+                ? state.render_pass->getDescriptor().color_targets[i].texture
+                : nullptr;
+        out_pixel_formats[i] =
+            texture != nullptr
+                ? toMtlPixelFormat(texture->getDescriptor().format)
+                : MTL::PixelFormatInvalid;
+    }
+}
+
+MTL::PixelFormat Renderer::getDepthStencilPixelFormat() const {
+    if (state.render_pass == nullptr)
+        return MTL::PixelFormatInvalid;
+    const auto texture =
+        state.render_pass->getDescriptor().depth_stencil_target.texture;
+    if (texture == nullptr)
+        return MTL::PixelFormatInvalid;
+    return toMtlPixelFormat(texture->getDescriptor().format);
+}
+
 MTL::RenderCommandEncoder*
 Renderer::getRenderCommandEncoder(CommandBuffer* command_buffer) const {
     return command_buffer->getRenderCommandEncoder(
@@ -406,10 +824,15 @@ void Renderer::setRenderPipelineState(CommandBuffer* command_buffer) const {
 }
 
 void Renderer::setDepthStencilState(CommandBuffer* command_buffer) {
+    // Depth testing without a depth attachment is invalid in Metal
+    const bool has_depth = getDepthStencilPixelFormat() != MTL::PixelFormatInvalid;
     DepthStencilStateDescriptor descriptor{
-        .depth_test_enabled = state.depth_test_enabled,
-        .depth_write_enabled = state.depth_write_enabled,
+        .depth_test_enabled = state.depth_test_enabled && has_depth,
+        .depth_write_enabled = state.depth_write_enabled && has_depth,
         .depth_compare_op = state.depth_compare_op,
+        .stencil_enabled = state.stencil.enabled && hasStencilAttachment(),
+        .stencil_front = state.stencil.front,
+        .stencil_back = state.stencil.back,
     };
 
     command_buffer->setDepthStencilState(
@@ -449,9 +872,12 @@ void Renderer::setUniformBuffer(CommandBuffer* command_buffer,
 void Renderer::setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
                           u32 index) {
     const auto texture = state.textures[static_cast<u32>(shader_type)][index];
-    if (texture.texture_view != nullptr)
-        command_buffer->setTexture(texture.texture_view->getTexture(),
-                                   shader_type, index);
+    // Unbind empty slots, otherwise the shader would sample a stale texture
+    // from a previous draw. Null textures read as zero, like a null descriptor
+    command_buffer->setTexture(texture.texture_view != nullptr
+                                   ? texture.texture_view->getTexture()
+                                   : nullptr,
+                               shader_type, index);
     if (texture.sampler != nullptr)
         command_buffer->setSampler(texture.sampler->getSampler(), shader_type,
                                    index);
@@ -527,15 +953,21 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
     setRenderPipelineState(command_buffer);
     setDepthStencilState(command_buffer);
 
-    // TODO
-    /*
-    if (REGS_3D.cull_face_enabled) {
-        SetCullMode(ToMtlCullMode(REGS_3D.cull_face_mode));
-        SetFrontFaceWinding(ToMtlWinding(REGS_3D.front_face_winding));
-    } else {
-        SetCullMode(MTL::CullModeNone);
-    }
-    */
+    // Culling
+    command_buffer->setCullMode(state.cull_mode);
+    command_buffer->setFrontFaceWinding(state.front_face_winding);
+
+    // Stencil reference
+    encoder->setStencilReferenceValues(state.stencil.front.ref & 0xff,
+                                       state.stencil.back.ref & 0xff);
+
+    // Depth bias
+    encoder->setDepthBias(state.depth_bias_constant, state.depth_bias_slope,
+                          state.depth_bias_clamp);
+
+    // Blend constant
+    encoder->setBlendColor(state.blend_constant.x(), state.blend_constant.y(),
+                           state.blend_constant.z(), state.blend_constant.w());
 
     // Viewport and scissor
     MTL::Viewport viewports[VIEWPORT_COUNT];
@@ -551,9 +983,21 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
                                      static_cast<f64>(viewport.depth_far));
 
         // Scissor
+        // Metal requires the scissor to lie within the render pass
         const auto& scissor = state.scissors[i];
-        scissors[i] = MTL::ScissorRect(scissor.origin.x(), scissor.origin.y(),
-                                       scissor.size.x(), scissor.size.y());
+        u32 x = scissor.origin.x();
+        u32 y = scissor.origin.y();
+        u32 width = scissor.size.x();
+        u32 height = scissor.size.y();
+        if (state.render_pass) {
+            const auto rp_width = state.render_pass->getWidth();
+            const auto rp_height = state.render_pass->getHeight();
+            x = std::min(x, rp_width);
+            y = std::min(y, rp_height);
+            width = std::min(width, rp_width - x);
+            height = std::min(height, rp_height - y);
+        }
+        scissors[i] = MTL::ScissorRect(x, y, width, height);
     }
     encoder->setViewports(viewports, SIZEOF_ARRAY(viewports));
     encoder->setScissorRects(scissors, SIZEOF_ARRAY(scissors));

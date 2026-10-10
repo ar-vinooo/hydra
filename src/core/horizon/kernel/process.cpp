@@ -101,6 +101,17 @@ void Process::createStackMemory(u64 stack_size) {
               .perm = MemoryPermission::ReadWrite});
 }
 
+u64 Process::getUsedUserMemorySize() const {
+    u64 used = tls_mem_base - TLS_REGION.getBegin();
+    for (const auto& memory : executable_mems)
+        used += memory->getSize();
+    if (main_thread_stack_mem)
+        used += main_thread_stack_mem->getSize();
+    if (heap_mem)
+        used += heap_mem->getSize();
+    return used;
+}
+
 void Process::resizeHeap(u64 size) {
     if (heap_mem == nullptr) {
         heap_mem.reset(system.getCpu().allocateMemory(size));

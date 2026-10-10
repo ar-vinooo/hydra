@@ -29,6 +29,11 @@ class Texture final : public ITexture {
 
   private:
     MTL::Texture* texture;
+    MTL::Buffer* buffer_backing = nullptr;
+
+    void copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
+                                    const u8* src, const uint3 dims,
+                                    const u32 layer, const u32 level);
 
   public:
     GETTER(texture, getTexture);

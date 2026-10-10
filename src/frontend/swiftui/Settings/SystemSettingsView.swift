@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SystemSettingsView: View {
     @State private var deviceNickname = configGetDeviceNickname()
@@ -14,6 +15,8 @@ struct SystemSettingsView: View {
     #endif
 
     @State private var systemLocations: [String] = []
+    @State private var firmwareError = ""
+    @State private var showingFirmwarePicker = false
 
     var body: some View {
         Spacer()
@@ -63,21 +66,41 @@ struct SystemSettingsView: View {
                     configSetSystemLocation(newValue)
                 }
                 .onAppear {
-                    let filesystem = HydraFilesystem()
-                    let timeZoneManager = HydraTimeZoneManager(filesystem: filesystem)
-                    self.systemLocations.reserveCapacity(timeZoneManager.locationCount)
-                    for i in 0..<timeZoneManager.locationCount {
-                        self.systemLocations.append(timeZoneManager.getLocation(at: i))
-                    }
+                    loadSystemLocations()
                 }
 
                 #if os(macOS)
                     Section("Paths") {
-                        // TODO: use file importers
                         TextField("Firmware Path", text: $firmwarePath)
                             .onChange(of: firmwarePath) { _, newValue in
                                 configSetFirmwarePath(newValue)
                             }
+                        Button("Choose Firmware Folder…") {
+                            showingFirmwarePicker = true
+                        }
+                        .fileImporter(isPresented: $showingFirmwarePicker, allowedContentTypes: [.folder]) { result in
+                            do {
+                                let url = try result.get()
+                                let scoped = url.startAccessingSecurityScopedResource()
+                                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                                let files = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
+                                guard files.contains(where: { $0.pathExtension.lowercased() == "nca" }) else {
+                                    firmwareError = "Choose an extracted firmware folder containing .nca files."
+                                    return
+                                }
+                                firmwarePath = url.path(percentEncoded: false)
+                                configSetFirmwarePath(firmwarePath)
+                                configSerialize()
+                                loadSystemLocations()
+                            } catch {
+                                firmwareError = error.localizedDescription
+                            }
+                        }
+                        if !firmwareError.isEmpty {
+                            Text(firmwareError)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         TextField("SD Card Path", text: $sdCardPath)
                             .onChange(of: sdCardPath) { _, newValue in
                                 configSetSdCardPath(newValue)
@@ -104,5 +127,23 @@ struct SystemSettingsView: View {
             Spacer()
         }
         Spacer()
+    }
+
+    private func loadSystemLocations() {
+        systemLocations.removeAll()
+        firmwareError = ""
+        do {
+            let filesystem = try HydraFilesystem()
+            let timeZoneManager = try HydraTimeZoneManager(filesystem: filesystem)
+            for i in 0..<timeZoneManager.locationCount {
+                systemLocations.append(timeZoneManager.getLocation(at: i))
+            }
+        } catch {
+            firmwareError = error.localizedDescription
+        }
+        // Keep the saved selection available even when firmware cannot be read.
+        if systemLocation != "auto" && !systemLocations.contains(systemLocation) {
+            systemLocations.append(systemLocation)
+        }
     }
 }

@@ -25,6 +25,11 @@ class Pfifo {
     void submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                        GpfifoFlags flags);
 
+    // Number of entry lists submitted so far
+    u64 getSubmittedCount();
+    // Waits till the first `count` entry lists have been executed
+    void waitForCompletion(u64 count);
+
   private:
     Gpu& gpu;
 
@@ -33,6 +38,11 @@ class Pfifo {
 
     std::queue<GpfifoEntryList> entry_lists;
     bool stop{false};
+
+    // Completion tracking
+    u64 submitted_count{0};
+    u64 completed_count{0};
+    std::condition_variable completed_cond_var;
 
     std::thread thread; // TODO: jthread
 

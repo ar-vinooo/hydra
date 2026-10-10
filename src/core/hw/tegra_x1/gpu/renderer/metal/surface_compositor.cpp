@@ -19,6 +19,7 @@ SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
     color_attachment->setLoadAction(MTL::LoadActionClear);
     color_attachment->setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
     color_attachment->setStoreAction(MTL::StoreActionStore);
+    render_pass_descriptor->setRenderTargetArrayLength(1);
 }
 
 SurfaceCompositor::~SurfaceCompositor() { render_pass_descriptor->release(); }

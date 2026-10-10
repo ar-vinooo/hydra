@@ -9,6 +9,16 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
     : RenderPassBase(descriptor) {
     render_pass_descriptor = MTL::RenderPassDescriptor::alloc()->init();
 
+    // Shaders may write render_target_array_index, so the array length must
+    // be set. Use the smallest layer count among all attachments.
+    u32 array_length = invalid<u32>();
+    const auto add_attachment = [&](MTL::Texture* texture) {
+        array_length =
+            std::min(array_length, getRenderTargetArrayLength(texture));
+        width = std::min(width, static_cast<u32>(texture->width()));
+        height = std::min(height, static_cast<u32>(texture->height()));
+    };
+
     // Color targets
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
         const auto& color_target = descriptor.color_targets[i];
@@ -20,6 +30,7 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
         color_attachment->setTexture(
             static_cast<TextureView*>(descriptor.color_targets[i].texture)
                 ->getTexture());
+        add_attachment(color_attachment->texture());
         if (color_target.load_action_clear) {
             color_attachment->setLoadAction(MTL::LoadActionClear);
             color_attachment->setClearColor(MTL::ClearColor(
@@ -45,6 +56,7 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
             depth_attachment->setTexture(
                 static_cast<TextureView*>(depth_stencil_target.texture)
                     ->getTexture());
+            add_attachment(depth_attachment->texture());
             if (depth_stencil_target.load_action_clear &&
                 depth_stencil_target.clear_data.clear_depth) {
                 depth_attachment->setLoadAction(MTL::LoadActionClear);
@@ -63,6 +75,7 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
             stencil_attachment->setTexture(
                 static_cast<TextureView*>(depth_stencil_target.texture)
                     ->getTexture());
+            add_attachment(stencil_attachment->texture());
             if (depth_stencil_target.load_action_clear &&
                 depth_stencil_target.clear_data.clear_stencil) {
                 stencil_attachment->setLoadAction(MTL::LoadActionClear);
@@ -74,6 +87,9 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
             stencil_attachment->setStoreAction(MTL::StoreActionStore);
         }
     }
+
+    if (array_length != invalid<u32>())
+        render_pass_descriptor->setRenderTargetArrayLength(array_length);
 }
 
 RenderPass::~RenderPass() { render_pass_descriptor->release(); }

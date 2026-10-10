@@ -30,7 +30,7 @@ struct MemoryMap {
     // TODO: kind
 };
 
-constexpr usize SUBCHANNEL_COUNT = 5; // TODO: correct?
+constexpr usize SUBCHANNEL_COUNT = 8;
 
 inline thread_local GMmu* tls_crnt_gmmu = nullptr;
 inline thread_local renderer::ICommandBuffer* tls_crnt_command_buffer = nullptr;
@@ -44,27 +44,53 @@ class Gpu {
     ZTD_MAKE_NON_MOVABLE(Gpu);
 
     // Memory map
-    Handle createMap(u64 size) { return memory_maps.insert(0, size).value(); }
-
-    void allocateMap(Handle handle, uptr addr, bool write) {
-        // TODO: error?
-        ZTD_ASSIGN_OR_RETURN(auto memory_map, memory_maps.get(handle));
-        memory_map->addr = addr;
-        memory_map->write = write;
+    std::expected<Handle, ztd::mem::IAllocator::Error> createMap(u64 size) {
+        try {
+            const auto raw = free_map_handles.empty() ? next_map_handle
+                                                      : free_map_handles.back();
+            if (raw == 0)
+                return std::unexpected(
+                    ztd::mem::IAllocator::Error::OutOfMemory);
+            memory_maps.emplace(
+                raw, MemoryMap{.addr = 0, .size = size, .write = false});
+            if (free_map_handles.empty())
+                ++next_map_handle;
+            else
+                free_map_handles.pop_back();
+            return Handle(raw);
+        } catch (const std::bad_alloc&) {
+            return std::unexpected(ztd::mem::IAllocator::Error::OutOfMemory);
+        }
     }
 
-    void freeMap(Handle handle) {
-        ASSERT_DEBUG(memory_maps.free(handle), Gpu, "Failed to free map {}",
-                     handle);
+    bool allocateMap(Handle handle, uptr addr, bool write) {
+        auto memory_map = getMap(handle);
+        if (!memory_map)
+            return false;
+        memory_map.value()->addr = addr;
+        memory_map.value()->write = write;
+        return true;
+    }
+
+    bool freeMap(Handle handle) {
+        if (!memory_maps.contains(handle.getRaw()))
+            return false;
+        free_map_handles.push_back(handle.getRaw());
+        memory_maps.erase(handle.getRaw());
+        return true;
     }
 
     std::optional<MemoryMap*> getMap(Handle handle) {
-        return memory_maps.get(handle);
+        auto it = memory_maps.find(handle.getRaw());
+        if (it == memory_maps.end())
+            return std::nullopt;
+        return &it->second;
     }
 
     // Engines
     std::optional<engines::EngineBase*> getEngineAtSubchannel(u32 subchannel) {
-        if (subchannel > SUBCHANNEL_COUNT)
+        if (subchannel >= SUBCHANNEL_COUNT || !subchannels[subchannel] ||
+            *subchannels[subchannel] == nullptr)
             return std::nullopt;
         return subchannels[subchannel];
     }
@@ -74,7 +100,7 @@ class Gpu {
     void subchannelFlushMacro(u32 subchannel) {
         const auto engine = getEngineAtSubchannel(subchannel);
         if (!engine)
-            LOG_FATAL(Gpu, "Invalid subchannel {}", subchannel);
+            return;
 
         (*engine)->flushMacro();
     }
@@ -105,8 +131,10 @@ class Gpu {
 
     // Memory
     // TODO: move to nvmap
-    // TODO: dynamic pool?
-    horizon::StaticHandlePool<MemoryMap, 2048> memory_maps;
+    // Stable addresses while the table grows; no fixed 2048-map limit.
+    std::map<u32, MemoryMap> memory_maps;
+    std::vector<u32> free_map_handles;
+    u32 next_map_handle = 1;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

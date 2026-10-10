@@ -2,13 +2,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 private let switchType = UTType(exportedAs: "com.samoz256.switch-document", conformingTo: .data)
+private let xciType = UTType(filenameExtension: "xci", conformingTo: .data) ?? .data
 #if os(macOS)
-    private let allowedContentTypes: [UTType] = [.folder, switchType]
+    private let allowedContentTypes: [UTType] = [.folder, switchType, xciType]
 
     private let installFirmwarePlacement = ToolbarItemPlacement.confirmationAction
     private let addGamePlacement = ToolbarItemPlacement.confirmationAction
 #else
-    private let allowedContentTypes: [UTType] = [switchType]  // No game folders on iOS
+    private let allowedContentTypes: [UTType] = [switchType, xciType]  // No game folders on iOS
 
     private let installFirmwarePlacement = ToolbarItemPlacement.topBarLeading
     private let addGamePlacement = ToolbarItemPlacement.topBarTrailing
@@ -84,6 +85,10 @@ struct GameListToolbarItems: ToolbarContent {
                     Button("OK", role: .cancel) {}
                 }
             }
+        }
+
+        ToolbarItem(placement: addGamePlacement) {
+            KeysImportButton()
         }
 
         ToolbarItem(placement: addGamePlacement) {

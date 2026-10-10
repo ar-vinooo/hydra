@@ -3,6 +3,7 @@
 #include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 
 namespace hydra::hw::tegra_x1::gpu {
@@ -72,8 +73,12 @@ T read(uptr& gpu_addr) {
 Pfifo::Pfifo(Gpu& gpu_) : gpu{gpu_}, thread(&Pfifo::threadFunc, this) {}
 
 Pfifo::~Pfifo() {
-    stop = true;
+    {
+        std::scoped_lock lock(mutex);
+        stop = true;
+    }
     cond_var.notify_all();
+    completed_cond_var.notify_all();
     thread.join();
 }
 
@@ -86,9 +91,24 @@ void Pfifo::submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
         entry_lists.emplace(
             gmmu, std::vector<GpfifoEntry>(entries.begin(), entries.end()),
             flags);
+        submitted_count++;
     }
 
     cond_var.notify_all();
+}
+
+u64 Pfifo::getSubmittedCount() {
+    std::scoped_lock lock(mutex);
+    return submitted_count;
+}
+
+void Pfifo::waitForCompletion(u64 count) {
+    ScopedPerfTimer timer(PerfStats::instance().present_wait_ns);
+    std::unique_lock lock(mutex);
+    // Time out to avoid hanging the presentation if the GPU gets stuck
+    completed_cond_var.wait_for(lock, std::chrono::milliseconds(250), [&] {
+        return stop || completed_count >= count;
+    });
 }
 
 void Pfifo::threadFunc() {
@@ -97,28 +117,35 @@ void Pfifo::threadFunc() {
 
     std::unique_lock lock(mutex);
     while (true) {
-        cond_var.wait(lock);
+        cond_var.wait(lock, [&] { return stop || !entry_lists.empty(); });
         if (stop)
             break;
 
         // Process entry lists
         while (!entry_lists.empty()) {
-            const auto entry_list = entry_lists.front();
+            const auto entry_list = std::move(entry_lists.front());
             entry_lists.pop();
 
             lock.unlock();
 
             // Entries
             // TODO: flags
-            tls_crnt_gmmu = &entry_list.gmmu;
-            tls_crnt_command_buffer = gpu.getRenderer().createCommandBuffer();
-            for (const auto& entry : entry_list.entries)
-                submitEntry(entry);
-            delete tls_crnt_command_buffer;
-            tls_crnt_command_buffer = nullptr;
-            tls_crnt_gmmu = nullptr;
+            {
+                ScopedPerfTimer timer(PerfStats::instance().pfifo_busy_ns);
+                PerfStats::instance().pfifo_lists++;
+                tls_crnt_gmmu = &entry_list.gmmu;
+                tls_crnt_command_buffer =
+                    gpu.getRenderer().createCommandBuffer();
+                for (const auto& entry : entry_list.entries)
+                    submitEntry(entry);
+                delete tls_crnt_command_buffer;
+                tls_crnt_command_buffer = nullptr;
+                tls_crnt_gmmu = nullptr;
+            }
 
             lock.lock();
+            completed_count++;
+            completed_cond_var.notify_all();
         }
     }
 
@@ -146,26 +173,29 @@ void Pfifo::submitEntry(const GpfifoEntry entry) {
 }
 
 bool Pfifo::submitCommand(uptr& gpu_addr) {
-    const auto header = read<CommandHeader>(gpu_addr);
+    const auto raw_header = read<u32>(gpu_addr);
+    const auto header = std::bit_cast<CommandHeader>(raw_header);
     LOG_DEBUG(
         Gpu, "Method: {:#x}, subchannel: {}, arg: {:#x}, secondary opcode: {}",
         header.method, header.subchannel, header.arg, header.secondary_opcode);
 
-    // HACK
-    if (header.subchannel >= SUBCHANNEL_COUNT) {
-        ONCE(LOG_WARN(Gpu, "Invalid subchannel {}", header.subchannel));
-        return false;
-    }
-
     u32 offset = header.method;
     switch (header.secondary_opcode) {
-    case SecondaryOpcode::Grp0UseTert: {
-        const auto tert = static_cast<TertiaryOpcode>(header.arg & 0x3);
-        // NOLINTNEXTLINE(readability-trivial-switch)
-        switch (tert) {
-        default:
-            ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Tertiary opcode {}", tert));
-            break;
+    case SecondaryOpcode::Grp0UseTert:
+    case SecondaryOpcode::Grp2UseTert: {
+        const auto tert = static_cast<TertiaryOpcode>(extractBits(raw_header, 16, 2));
+        if (tert == TertiaryOpcode::Grp0IncMethod) {
+            // Old style method header: address in bytes and an 11-bit count
+            const bool increment =
+                header.secondary_opcode == SecondaryOpcode::Grp0UseTert;
+            u32 method = extractBits(raw_header, 2, 11);
+            const u32 count = extractBits(raw_header, 18, 11);
+            for (u32 i = 0; i < count; i++)
+                processMethodArg(header.subchannel, gpu_addr, method,
+                                 increment);
+            offset = method;
+        } else {
+            // Subdevice mask operations, only a single GPU is emulated
         }
         break;
     }
@@ -173,16 +203,6 @@ bool Pfifo::submitCommand(uptr& gpu_addr) {
         for (u32 i = 0; i < header.arg; i++)
             processMethodArg(header.subchannel, gpu_addr, offset, true);
         break;
-    case SecondaryOpcode::Grp2UseTert: {
-        const auto tert = static_cast<TertiaryOpcode>(header.arg & 0x3);
-        // NOLINTNEXTLINE(readability-trivial-switch)
-        switch (tert) {
-        default:
-            ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Tertiary opcode {}", tert));
-            break;
-        }
-        break;
-    }
     case SecondaryOpcode::NonIncMethod:
         for (u32 i = 0; i < header.arg; i++)
             processMethodArg(header.subchannel, gpu_addr, offset, false);
@@ -194,6 +214,8 @@ bool Pfifo::submitCommand(uptr& gpu_addr) {
         for (u32 i = 0; i < header.arg; i++)
             processMethodArg(header.subchannel, gpu_addr, offset, i == 0);
         break;
+    case SecondaryOpcode::EndPbSegment:
+        return false;
     default:
         LOG_NOT_IMPLEMENTED(Gpu, "Secondary opcode {}",
                             header.secondary_opcode);

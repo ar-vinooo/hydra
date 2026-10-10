@@ -14,9 +14,14 @@ class RenderPass final : public RenderPassBase {
     MTL::RenderPassDescriptor* getRenderPassDescriptor() const {
         return render_pass_descriptor;
     }
+    u32 getWidth() const { return width; }
+    u32 getHeight() const { return height; }
 
   private:
     MTL::RenderPassDescriptor* render_pass_descriptor;
+    // Smallest attachment size (scissors must not exceed it)
+    u32 width{invalid<u32>()};
+    u32 height{invalid<u32>()};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

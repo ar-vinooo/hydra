@@ -25,8 +25,9 @@ struct EmulationToolbarItems: ToolbarContent {
                 Button("Stop", systemImage: "stop") {
                     globalState.isStopping = true
                 }
+                .disabled(globalState.system == nil)
                 .onAppear {
-                    isRunning = globalState.system!.isRunning()
+                    isRunning = globalState.system?.isRunning() ?? false
                 }
             }
 

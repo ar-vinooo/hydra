@@ -23,6 +23,7 @@ class ILoader {
     static std::optional<ILoader*> createFromPath(
         std::string_view path,
         std::optional<plugins::Manager*> plugin_manager_opt = std::nullopt);
+    static std::string_view getLastError();
 
     ILoader() noexcept = default;
     virtual ~ILoader() noexcept = default;

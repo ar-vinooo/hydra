@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Hypervisor/Hypervisor.h>
+#include <mutex>
 
 #include "core/hw/tegra_x1/cpu/const.hpp"
 
@@ -42,12 +43,12 @@ enum class ApFlags : u64 {
     UserNoneKernelReadExecute = (1ull << UXN_SHIFT) | (2ull << AP_SHIFT),
     UserReadKernelReadExecute = (1ull << UXN_SHIFT) | (3ull << AP_SHIFT),
 
-    UserNoneKernelReadWrite =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (0ull << AP_SHIFT),
-    UserNoneKernelRead =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (2ull << AP_SHIFT),
-    UserReadKernelRead =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (3ull << AP_SHIFT),
+    UserNoneKernelReadWrite = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (0ull << AP_SHIFT),
+    UserNoneKernelRead = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (2ull << AP_SHIFT),
+    UserReadKernelRead = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (3ull << AP_SHIFT),
 };
 
 constexpr u64 AP_FLAGS_MASK =
@@ -56,9 +57,10 @@ constexpr u64 AP_FLAGS_MASK =
 inline uptr allocateVmMemory(u64 size) {
     ASSERT_ALIGNMENT(size, APPLE_PAGE_SIZE, Hypervisor, "size")
 
-    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ASSERT(ptr != MAP_FAILED, Hypervisor, "Failed to allocate memory: {:#x}", errno);
-
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT(ptr != MAP_FAILED, Hypervisor, "Failed to allocate memory: {:#x}",
+           errno);
     return reinterpret_cast<uptr>(ptr);
 }
 

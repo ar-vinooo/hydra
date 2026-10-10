@@ -1,5 +1,9 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 
+#include <cstdlib>
+
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
+
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue) {
@@ -10,9 +14,22 @@ CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue) {
 
 CommandBuffer::~CommandBuffer() {
     endEncoding();
+    if (PerfStats::isEnabled()) {
+        PerfStats::instance().command_buffers++;
+        command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
+            const auto dt = cb->GPUEndTime() - cb->GPUStartTime();
+            if (dt > 0.0)
+                PerfStats::instance().gpu_ns +=
+                    static_cast<u64>(dt * 1'000'000'000.0);
+        });
+    }
     command_buffer->commit();
-    // HACK: wait until completed
-    command_buffer->waitUntilCompleted();
+    // Command buffers execute in commit order on the same queue, so there is no
+    // need to wait for the GPU. HYDRA_GPU_SYNC=1 restores the old behaviour
+    // for debugging.
+    static const bool gpu_sync = std::getenv("HYDRA_GPU_SYNC") != nullptr;
+    if (gpu_sync)
+        command_buffer->waitUntilCompleted();
     command_buffer->release();
 }
 
@@ -38,6 +55,7 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
 
     encoder_type = EncoderType::Render;
     encoder_state.render_pass = render_pass_descriptor;
+    encoder_state.render = {};
 
     return getRenderCommandEncoderUnchecked();
 }

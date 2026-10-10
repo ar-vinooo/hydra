@@ -36,9 +36,8 @@ const u32 exception_trampoline[] = {
 } // namespace
 
 VirtualMachine::VirtualMachine() {
-    // HACK: since we're mapping our address space to the HV's "physical"
-    // space 1:1, we have to extend their space to include all of ours
-    // (or as close as possible as we can)
+    // Use the available guest physical address width. Host allocations are
+    // translated separately and need not fit inside this address space.
     auto config = hv_vm_config_create();
     uint32_t max_bits;
     HV_ASSERT_SUCCESS(hv_vm_config_get_max_ipa_size(&max_bits));
@@ -63,12 +62,13 @@ Cpu::Cpu()
     // simplicity reasons
 
     // Kernel memory
-    kernel_page_table.map(
-        0x0, ztd::Range<uptr>::fromSize(kernel_mem.getPtr(), KERNEL_MEM_SIZE),
-        {.type = horizon::kernel::MemoryType::Kernel,
-         .attr = horizon::kernel::MemoryAttribute::None,
-         .perm = horizon::kernel::MemoryPermission::Execute},
-        ApFlags::UserNoneKernelReadExecute);
+    kernel_page_table.map(0x0,
+                          ztd::Range<uptr>::fromSize(
+                              kernel_mem.getPhysicalAddress(), KERNEL_MEM_SIZE),
+                          {.type = horizon::kernel::MemoryType::Kernel,
+                           .attr = horizon::kernel::MemoryAttribute::None,
+                           .perm = horizon::kernel::MemoryPermission::Execute},
+                          ApFlags::UserNoneKernelReadExecute);
 
     for (u64 offset = 0; offset < 0x780; offset += 0x80) {
         memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() + offset),

@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.hpp"
 
+#include <bit>
+
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
@@ -52,6 +54,30 @@ void emitMovI(DecoderContext& context, InstMovI inst) {
 void emitMov32I(DecoderContext& context, InstMov32I inst) {
     emitMove(context, inst.pred, inst.pred_inv, inst.dst,
              ir::Value::createConstantU(inst.imm));
+}
+
+void emitS2R(DecoderContext& context, InstS2R inst) {
+    constexpr u32 SR_LANE_ID = 0x00;
+    constexpr u32 SR_Y_DIRECTION = 0x12;
+
+    u32 value = 0;
+    switch (static_cast<u32>(inst.sr)) {
+    case SR_Y_DIRECTION:
+        // TODO: -1.0 when the window origin flips Y
+        value = std::bit_cast<u32>(1.0f);
+        break;
+    case SR_LANE_ID:
+        // TODO: lane ID
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Lane ID");
+        break;
+    default:
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Special register {:#x}",
+                            static_cast<u32>(inst.sr));
+        break;
+    }
+
+    emitMove(context, inst.pred, inst.pred_inv, inst.dst,
+             ir::Value::createConstantU(value));
 }
 
 void emitSelR(DecoderContext& context, InstSelR inst) {

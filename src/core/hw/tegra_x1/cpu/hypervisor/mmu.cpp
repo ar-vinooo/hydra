@@ -99,7 +99,11 @@ void Mmu::map(vaddr_t dst_va, ztd::Range<uptr> range,
               const horizon::kernel::MemoryState state) {
     ASSERT_ALIGNMENT(dst_va, GUEST_PAGE_SIZE, Hypervisor, "destination VA");
     ASSERT_ALIGNMENT(range.getSize(), GUEST_PAGE_SIZE, Hypervisor, "size");
-    user_page_table.map(dst_va, range, state, toApFlags(state.perm));
+    const auto physical =
+        PhysicalMemory::instance().fromHost(range.getBegin(), range.getSize());
+    user_page_table.map(dst_va,
+                        ztd::Range<uptr>::fromSize(physical, range.getSize()),
+                        state, toApFlags(state.perm));
 }
 
 // HACK: this assumes that the whole src range is stored contiguously in
@@ -127,7 +131,9 @@ void Mmu::protect(ztd::Range<vaddr_t> range,
     user_page_table.setMemoryPermission(range, perm, toApFlags(perm));
 }
 
-uptr Mmu::unmapAddr(vaddr_t va) const { return user_page_table.unmapAddr(va); }
+uptr Mmu::unmapAddr(vaddr_t va) const {
+    return PhysicalMemory::instance().toHost(user_page_table.unmapAddr(va));
+}
 
 MemoryRegion Mmu::queryRegion(vaddr_t va) const {
     auto region = user_page_table.queryRegion(va);

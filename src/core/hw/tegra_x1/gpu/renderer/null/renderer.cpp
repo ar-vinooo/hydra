@@ -98,6 +98,12 @@ void Renderer::setDepthTestEnabled([[maybe_unused]] bool enabled) {}
 void Renderer::setDepthWriteEnabled([[maybe_unused]] bool enabled) {}
 void Renderer::setDepthCompareOp([[maybe_unused]] engines::CompareOp op) {}
 
+void Renderer::setBlendConstant([[maybe_unused]] const float4 color) {}
+
+void Renderer::setDepthBias([[maybe_unused]] f32 constant,
+                            [[maybe_unused]] f32 slope,
+                            [[maybe_unused]] f32 clamp) {}
+
 // Viewport and scissor
 void Renderer::setViewport([[maybe_unused]] u32 index,
                            [[maybe_unused]] const Viewport& viewport) {}

@@ -36,6 +36,31 @@ void Copy::launchDma(const u32 index, const LaunchDMAData data) {
         }
     }
 
+    // DEBUG: log copies
+    {
+        static u32 debug_count = 0;
+        if (debug_count++ < 400)
+            LOG_INFO(Engines,
+                     "DEBUG DMA: in={:#x} out={:#x} src_layout={} "
+                     "dst_layout={} stride_in={} stride_out={} line_length={} "
+                     "line_count={} remap={} | dst: stride={} height={} "
+                     "depth={} layer={} origin=({}, {}) block_h={} | src: "
+                     "stride={} height={} origin=({}, {})",
+                     static_cast<u64>(regs.offset_in),
+                     static_cast<u64>(regs.offset_out),
+                     static_cast<u32>(data.src_memory_layout),
+                     static_cast<u32>(data.dst_memory_layout), regs.stride_in,
+                     regs.stride_out, regs.line_length_in, regs.line_count,
+                     static_cast<bool>(data.remap_enable), regs.dst.stride,
+                     regs.dst.height, regs.dst.depth, regs.dst.layer,
+                     static_cast<u32>(regs.dst.origin.x),
+                     static_cast<u32>(regs.dst.origin.y),
+                     static_cast<u32>(regs.dst.block_size.height),
+                     regs.src.stride, regs.src.height,
+                     static_cast<u32>(regs.src.origin.x),
+                     static_cast<u32>(regs.src.origin.y));
+    }
+
     const auto src_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_in);
     const auto dst_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_out);
     if (data.src_memory_layout == MemoryLayout::Pitch) {

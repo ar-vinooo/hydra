@@ -91,7 +91,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
     switch (target) {
     case TextureSampleTarget::_1DLodZero:
         type = TextureType::_1D;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         coords.push_back(RA());
         lod = ir::Value::createConstantF(0.0f);
         break;
@@ -102,28 +102,28 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_2DLodZero:
         type = TextureType::_2D;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RB());
         lod = ir::Value::createConstantF(0.0f);
         break;
     case TextureSampleTarget::_2DLodLevel:
         type = TextureType::_2D;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RA());
         lod = RB();
         break;
     case TextureSampleTarget::_2DDepthCompare:
         type = TextureType::_2D;
-        flags = TextureSampleFlags::DepthCompare;
+        flags |= TextureSampleFlags::DepthCompare;
         coords.push_back(RA());
         coords.push_back(RA());
         cmp_value = RB();
         break;
     case TextureSampleTarget::_2DLodLevelDepthCompare:
         type = TextureType::_2D;
-        flags = TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RA());
         cmp_value = RB();
@@ -131,7 +131,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_2DLodZeroDepthCompare:
         type = TextureType::_2D;
-        flags = TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RA());
         cmp_value = RB();
@@ -145,7 +145,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_2DArrayLodZero:
         type = TextureType::_2DArray;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         array_index = RA();
         coords.push_back(RA());
         coords.push_back(RB());
@@ -153,7 +153,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_2DArrayLodZeroDepthCompare:
         type = TextureType::_2DArray;
-        flags = TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
         array_index = RA();
         coords.push_back(RA());
         coords.push_back(RB());
@@ -168,7 +168,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_3DLodZero:
         type = TextureType::_3D;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RA());
         coords.push_back(RB());
@@ -182,7 +182,7 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::CubeLodLevel:
         type = TextureType::Cube;
-        flags = TextureSampleFlags::Lod;
+        flags |= TextureSampleFlags::Lod;
         coords.push_back(RA());
         coords.push_back(RA());
         coords.push_back(RB());
@@ -206,13 +206,12 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: ndv, nodep, dc, dst_pred, aoffi, lod, lc
+// TODO: ndv, nodep, dst_pred, aoffi, lc, LOD bias
 void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
                         bool int_coords, TextureDimension dim, reg_t dst,
                         u8 component_mask, reg_t src_a, reg_t src_b,
-                        u32 cbuf_index) {
-    (void)src_b;
-
+                        u32 cbuf_index, Lod lod_mode = Lod{},
+                        bool aoffi = false, bool dc = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
 #define RA() ir::Value::createRegister(src_a++, ir::ScalarType::F32)
@@ -272,50 +271,96 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     }
 
+    // Extra operands in register B: LOD/bias, offset, depth reference
+    ir::Value lod = ir::Value::createUndefined();
+    switch (lod_mode) {
+    case Lod::Lz:
+        flags |= TextureSampleFlags::Lod;
+        lod = ir::Value::createConstantF(0.0f);
+        break;
+    case Lod::Ll:
+    case Lod::Lla:
+        flags |= TextureSampleFlags::Lod;
+        lod = RB();
+        break;
+    case Lod::Lb:
+    case Lod::Lba:
+        // TODO: LOD bias
+        src_b++;
+        break;
+    default:
+        break;
+    }
+    if (aoffi) {
+        // TODO: offsets
+        src_b++;
+    }
+    ir::Value cmp_value = ir::Value::createUndefined();
+    if (dc) {
+        flags |= TextureSampleFlags::DepthCompare;
+        cmp_value = RB();
+    }
+
     const auto coords_v =
         context.builder.opVectorConstruct(ir::ScalarType::F32, coords);
     ir::Value res = context.builder.opTextureSample(
-        cbuf_index, type, flags, array_index, coords_v,
-        ir::Value::createUndefined(), ir::Value::createUndefined());
+        cbuf_index, type, flags, array_index, coords_v, cmp_value, lod);
     copyTextureResult(context.builder, dst, res, component_mask);
 
     if (conditional)
         context.builder.opEndIf();
 }
 
-// TODO: dim, ndv, nodep, dc, offset, lc, dst_pred
+// TODO: dim, ndv, nodep, offset, lc, dst_pred
 void emitTextureGather(DecoderContext& context, pred_t pred, bool pred_inv,
                        TextureComponent component, reg_t dst, u8 component_mask,
-                       reg_t src_a, reg_t src_b, u32 cbuf_index) {
-    // TODO: src B
-    (void)src_b;
-
+                       reg_t src_a, reg_t src_b, u32 cbuf_index,
+                       bool has_offset = false, bool dc = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     const auto coords_v = context.builder.opVectorConstruct(
         ir::ScalarType::F32,
         {ir::Value::createRegister(src_a + 0, ir::ScalarType::F32),
          ir::Value::createRegister(src_a + 1, ir::ScalarType::F32)});
-    const auto res = context.builder.opTextureGather(cbuf_index, coords_v,
-                                                     toTexComponent(component));
+
+    // Register B: offset, depth reference
+    if (has_offset)
+        src_b++; // TODO: offsets
+    const auto cmp_value =
+        dc ? ir::Value::createRegister(src_b, ir::ScalarType::F32)
+           : ir::Value::createUndefined();
+
+    const auto res = context.builder.opTextureGather(
+        cbuf_index, coords_v, toTexComponent(component), cmp_value);
     copyTextureResult(context.builder, dst, res, component_mask);
 
     if (conditional)
         context.builder.opEndIf();
 }
 
-// TODO: nodep, dc, aoffi
+// TODO: nodep, offsets
 void emitTextureGather2(DecoderContext& context, pred_t pred, bool pred_inv,
                         TextureComponent component, reg_t dst0, reg_t dst1,
-                        reg_t src_a, reg_t src_b, u32 cbuf_index) {
+                        reg_t src_a, reg_t src_b, u32 cbuf_index,
+                        bool aoffi = false, bool dc = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
+    // With extra operands, both coordinates are in register A and register B
+    // holds the offset and depth reference
+    const bool extra_operands = aoffi || dc;
     const auto coords_v = context.builder.opVectorConstruct(
         ir::ScalarType::F32,
         {ir::Value::createRegister(src_a, ir::ScalarType::F32),
-         ir::Value::createRegister(src_b, ir::ScalarType::F32)});
-    const auto res = context.builder.opTextureGather(cbuf_index, coords_v,
-                                                     toTexComponent(component));
+         ir::Value::createRegister(extra_operands ? reg_t(src_a + 1) : src_b,
+                                   ir::ScalarType::F32)});
+    if (aoffi)
+        src_b++; // TODO: offsets
+    const auto cmp_value =
+        dc ? ir::Value::createRegister(src_b, ir::ScalarType::F32)
+           : ir::Value::createUndefined();
+
+    const auto res = context.builder.opTextureGather(
+        cbuf_index, coords_v, toTexComponent(component), cmp_value);
     copyTextureResult(context.builder, {dst0 + 0, dst0 + 1, dst1 + 0, dst1 + 1},
                       res, 0b1111);
 
@@ -345,20 +390,21 @@ void emitTlds(DecoderContext& context, InstTlds inst) {
 void emitTex(DecoderContext& context, InstTex inst) {
     emitTextureSample2(context, inst.pred, inst.pred_inv, false, inst.dim,
                        inst.dst, inst.write_mask, inst.src_a, inst.src_b,
-                       inst.cbuf_index);
+                       inst.cbuf_index, inst.lod, inst.aoffi, inst.dc);
 }
 
 void emitTld4(DecoderContext& context, InstTld4 inst) {
     // TODO: why does this mess up SMO title screen?
     emitTextureGather(context, inst.pred, inst.pred_inv, inst.component,
                       inst.dst, inst.write_mask, inst.src_a, inst.src_b,
-                      inst.cbuf_index);
+                      inst.cbuf_index, inst.offset != TextureOffset{},
+                      inst.dc);
 }
 
 void emitTld4s(DecoderContext& context, InstTld4s inst) {
     emitTextureGather2(context, inst.pred, inst.pred_inv, inst.component,
                        inst.dst0, inst.dst1, inst.src_a, inst.src_b,
-                       inst.cbuf_index);
+                       inst.cbuf_index, inst.aoffi, inst.dc);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

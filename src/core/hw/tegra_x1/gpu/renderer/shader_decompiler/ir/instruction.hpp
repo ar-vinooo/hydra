@@ -72,6 +72,10 @@ enum class Opcode {
     // Exit
     Exit,
     Discard,
+
+    // Quad (fragment shaders)
+    QuadShuffleXor,
+    SwizzleAdd,
 };
 
 constexpr usize MAX_INSTRUCTION_OPERANDS = 8;
@@ -120,7 +124,8 @@ ENABLE_ENUM_FORMATTING(
     "branch", BranchConditional, "branch_cond", VectorExtract, "vec_extract",
     VectorInsert, "vec_insert", VectorConstruct, "vec_construct", TextureSample,
     "tex_sample", TextureGather, "tex_gather", TextureQueryDimension,
-    "tex_query_dim", Exit, "exit", Discard, "discard")
+    "tex_query_dim", Exit, "exit", Discard, "discard", QuadShuffleXor,
+    "quad_shuffle_xor", SwizzleAdd, "swizzle_add")
 
 template <>
 struct fmt::formatter<

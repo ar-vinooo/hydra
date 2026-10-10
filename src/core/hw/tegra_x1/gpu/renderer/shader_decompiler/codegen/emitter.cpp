@@ -41,6 +41,14 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         emitFma(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
                 inst.getOperand(2));
         break;
+    case ir::Opcode::QuadShuffleXor:
+        emitQuadShuffleXor(inst.getDst(), inst.getOperand(0),
+                           inst.getOperand(1));
+        break;
+    case ir::Opcode::SwizzleAdd:
+        emitSwizzleAdd(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
+                       inst.getOperand(2).getRawValue<u32>());
+        break;
     case ir::Opcode::Min:
         emitMin(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
         break;
@@ -184,7 +192,8 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
     case ir::Opcode::TextureGather:
         emitTextureGather(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
                           inst.getOperand(1),
-                          inst.getOperand(2).getRawValue<u8>());
+                          inst.getOperand(2).getRawValue<u8>(),
+                          inst.getOperand(3));
         break;
     case ir::Opcode::TextureQueryDimension:
         emitTextureQueryDimension(inst.getDst(),

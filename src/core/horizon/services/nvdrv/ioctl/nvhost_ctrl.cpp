@@ -68,8 +68,8 @@ NvResult NvHostCtrl::getConfig(std::array<char, 0x41> name,
 
 NvResult NvHostCtrl::syncptWaitEvent(u32 id, u32 tresh, i32 timeout,
                                      u32* out_value) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "ID: {}, treshold: {}, timeout: {}",
-                               id, tresh, timeout);
+    ONCE(LOG_FUNC_WITH_ARGS_STUBBED(
+        Services, "ID: {}, treshold: {}, timeout: {}", id, tresh, timeout));
 
     // HACK
     *out_value = 0;
@@ -78,8 +78,8 @@ NvResult NvHostCtrl::syncptWaitEvent(u32 id, u32 tresh, i32 timeout,
 
 NvResult NvHostCtrl::syncptWaitEventEx(u32 id, u32 tresh, i32 timeout,
                                        InOutSingle<u32> out_value) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "ID: {}, treshold: {}, timeout: {}",
-                               id, tresh, timeout);
+    ONCE(LOG_FUNC_WITH_ARGS_STUBBED(
+        Services, "ID: {}, treshold: {}, timeout: {}", id, tresh, timeout));
 
     // HACK
     out_value = 0;

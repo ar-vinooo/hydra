@@ -65,10 +65,12 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                 case ir::Opcode::TextureGather: {
                     const auto const_buffer_index =
                         instruction.getOperand(0).getRawValue<u32>();
-                    // TODO: is_depth
+                    const bool is_depth =
+                        instruction.getOperand(3).getKind() !=
+                        ir::ValueKind::Undefined;
                     handleTextureAccess(const_buffer_index,
                                         TextureInfo{.type = TextureType::_2D,
-                                                    .is_depth = false});
+                                                    .is_depth = is_depth});
                     break;
                 }
                 // TODO: TextureQueryDimension?

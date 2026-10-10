@@ -13,8 +13,9 @@ DEFINE_SERVICE_COMMAND_TABLE(
     setRestartMessageEnabled, 16, setOutOfFocusSuspendingEnabled, 19,
     setAlbumImageOrientation, 40, createManagedDisplayLayer, 41,
     isSystemBufferSharingEnabled, 44, createManagedDisplaySeparableLayer, 50,
-    setHandlesRequestToDisplay, 62, setIdleTimeDetectionExtension, 80,
-    setWirelessPriorityMode, 91, getAccumulatedSuspendedTickChangedEvent)
+    setHandlesRequestToDisplay, 62, setIdleTimeDetectionExtension, 63,
+    getIdleTimeDetectionExtension, 80, setWirelessPriorityMode, 91,
+    getAccumulatedSuspendedTickChangedEvent)
 
 ISelfController::ISelfController()
     : library_applet_launchable_event{
@@ -81,7 +82,15 @@ result_t ISelfController::createManagedDisplaySeparableLayer(
 
 result_t
 ISelfController::setIdleTimeDetectionExtension(IdleTimeDetectionExtension ext) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "extension: {}", ext);
+    if (ext > IdleTimeDetectionExtension::ExtendedUnsafe)
+        return MAKE_RESULT(Svc, kernel::Error::InvalidEnumValue);
+    idle_time_detection_extension = ext;
+    return RESULT_SUCCESS;
+}
+
+result_t ISelfController::getIdleTimeDetectionExtension(
+    IdleTimeDetectionExtension* out_ext) {
+    *out_ext = idle_time_detection_extension;
     return RESULT_SUCCESS;
 }
 

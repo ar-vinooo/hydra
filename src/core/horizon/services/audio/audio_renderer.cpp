@@ -160,13 +160,14 @@ IAudioRenderer::IAudioRenderer(const AudioRendererParameters& params_,
     : params{params_}, work_buffer_size{work_buffer_size_},
       event{new kernel::Event(false, "IAudioRenderer event")} {
     voices.resize(params.voice_count);
+    voice_states.resize(params.voice_count);
 
-    // HACK: create a thread that signals the handle every so often
+    // HACK: create a thread that signals the handle every audio frame (5ms)
     new std::thread([&] {
         GET_CURRENT_PROCESS_DEBUGGER().registerThisThread("Audren signal");
         while (true) {
             event->signal();
-            std::this_thread::sleep_for(std::chrono::microseconds(2));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
         GET_CURRENT_PROCESS_DEBUGGER().unregisterThisThread();
     });
@@ -237,12 +238,25 @@ result_t IAudioRenderer::requestUpdateImpl(
             mempool.new_state = MemPoolState::Detached;
             break;
         default:
-            ONCE(LOG_NOT_IMPLEMENTED(Services, "Memory pool state {}",
-                                     mempool_in.state));
-            mempool.new_state = MemPoolState::Released; // mempool_in.state;
+            // Other states don't change
+            mempool.new_state = mempool_in.state;
             break;
         }
         out_stream->write(mempool);
+    }
+
+    // Audio frames rendered since the last update (5ms each)
+    constexpr auto FRAME_DURATION = std::chrono::milliseconds(5);
+    const auto now = std::chrono::steady_clock::now();
+    u32 frame_count = 0;
+    if (last_update_time == std::chrono::steady_clock::time_point{}) {
+        last_update_time = now;
+    } else {
+        frame_count = static_cast<u32>(
+            std::min<i64>((now - last_update_time) / FRAME_DURATION, 20));
+        last_update_time += frame_count * FRAME_DURATION;
+        if (now - last_update_time > 20 * FRAME_DURATION)
+            last_update_time = now;
     }
 
     // Voices
@@ -252,29 +266,79 @@ result_t IAudioRenderer::requestUpdateImpl(
         const auto voice_in = in_stream->read<VoiceInfoIn>();
 
         VoiceInfoOut& voice = voices[i];
+        VoiceState& state = voice_states[i];
         if (voice_in.is_new) {
-            voice.played_sample_count = 0;
-            voice.num_wave_buffers_consumed = 0;
-        } else if (voice_in.play_state == VoicePlayState::Started) {
-            // HACK
-            if (voice_in.wave_buffer_count >=
-                SIZEOF_ARRAY(voice_in.wave_buffers)) {
-                ONCE(LOG_WARN(Services,
-                              "Voice {} has invalid wave buffer count {:#x}", i,
-                              voice_in.wave_buffer_count));
-                continue;
-            }
-
-            for (u32 j = 0; j < voice_in.wave_buffer_count; j++) {
-                voice.played_sample_count +=
-                    (voice_in.wave_buffers[j].end_sample_offset -
-                     voice_in.wave_buffers[j].start_sample_offset) /
-                    2;
-                voice.num_wave_buffers_consumed++;
-            }
-        } else {
-            ONCE(LOG_NOT_IMPLEMENTED(Services, "Voice"));
+            voice = {};
+            state = {};
         }
+
+        // Receive new wave buffers
+        for (u32 j = 0; j < SIZEOF_ARRAY(voice_in.wave_buffers); j++) {
+            const auto& wave_buffer = voice_in.wave_buffers[j];
+            if (wave_buffer.sent_to_server)
+                continue;
+
+            state.slots[j] = {
+                .valid = wave_buffer.end_sample_offset >
+                         wave_buffer.start_sample_offset,
+                .start = wave_buffer.start_sample_offset,
+                .end = wave_buffer.end_sample_offset,
+                .is_looping = wave_buffer.is_looping,
+            };
+            if (j == state.crnt_slot)
+                state.offset = wave_buffer.start_sample_offset;
+        }
+
+        if (!voice_in.is_used) {
+            // Nothing to do
+        } else if (voice_in.play_state == VoicePlayState::Started) {
+            // Consume samples
+            const u32 sample_rate = voice_in.sample_rate != 0
+                                        ? voice_in.sample_rate
+                                        : params.sample_rate;
+            const f32 pitch = voice_in.pitch > 0.0f ? voice_in.pitch : 1.0f;
+            u64 sample_count = static_cast<u64>(
+                static_cast<f64>(frame_count) * params.sample_count *
+                sample_rate / params.sample_rate * static_cast<f64>(pitch));
+            for (u32 guard = 0; sample_count != 0 && guard < 64; guard++) {
+                auto& slot = state.slots[state.crnt_slot];
+                if (!slot.valid)
+                    break;
+
+                if (state.offset < slot.start || state.offset > slot.end)
+                    state.offset = slot.start;
+                const u64 taken =
+                    std::min<u64>(sample_count, slot.end - state.offset);
+                state.offset += static_cast<u32>(taken);
+                voice.played_sample_count += taken;
+                sample_count -= taken;
+
+                if (state.offset >= slot.end) {
+                    if (slot.is_looping) {
+                        state.offset = slot.start;
+                    } else {
+                        slot.valid = false;
+                        voice.num_wave_buffers_consumed++;
+                        state.crnt_slot = (state.crnt_slot + 1) %
+                                          SIZEOF_ARRAY(state.slots);
+                        state.offset = state.slots[state.crnt_slot].start;
+                    }
+                }
+            }
+        } else if (voice_in.play_state == VoicePlayState::Stopped) {
+            // Release all wave buffers
+            for (auto& slot : state.slots) {
+                if (slot.valid) {
+                    slot.valid = false;
+                    voice.num_wave_buffers_consumed++;
+                }
+            }
+            voice.played_sample_count = 0;
+            state.crnt_slot = 0;
+            state.offset = 0;
+        }
+        // Paused: nothing to do
+
         out_stream->write(voice);
     }
 

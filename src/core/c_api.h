@@ -165,7 +165,7 @@ uint32_t hydraStringToStringMapGetCount(const void* map);
 HydraString hydraStringToStringMapGetKey(const void* map, uint32_t index);
 HydraString hydraStringToStringMapGetValue(const void* map, uint32_t index);
 HydraString hydraStringToStringMapGetValueByKey(const void* map,
-                                                 HydraString key);
+                                                HydraString key);
 void hydraStringToStringMapRemoveAll(void* map);
 void hydraStringToStringMapSetByKey(void* map, HydraString key,
                                     HydraString value);
@@ -244,6 +244,7 @@ hydraLoaderPluginOptionConfigGetPathContentTypes(const void* config);
 
 // Filesystem
 void* hydraCreateFilesystem();
+HydraString hydraFilesystemGetLastError(void);
 void hydraFilesystemDestroy(void* fs);
 
 void* hydraOpenFile(HydraString path);
@@ -262,6 +263,7 @@ HydraString hydraTimeZoneManagerGetLocation(void* manager, uint32_t index);
 
 // Loader
 void* hydraCreateLoaderFromPath(HydraString path, void* plugin_manager);
+HydraString hydraLoaderGetLastError(void);
 void hydraLoaderDestroy(void* loader);
 uint64_t hydraLoaderGetTitleId(void* loader);
 void* hydraLoaderLoadNacp(void* loader);
@@ -290,7 +292,7 @@ HydraString hydraLoaderPluginGetName(const void* plugin);
 HydraString hydraLoaderPluginGetDisplayVersion(const void* plugin);
 uint32_t hydraLoaderPluginGetSupportedFormatCount(const void* plugin);
 HydraString hydraLoaderPluginGetSupportedFormat(const void* plugin,
-                                                 uint32_t index);
+                                                uint32_t index);
 uint32_t hydraLoaderPluginGetOptionConfigCount(const void* plugin);
 const void* hydraLoaderPluginGetOptionConfig(const void* plugin,
                                              uint32_t index);
@@ -328,6 +330,7 @@ void hydraUserSetAvatarPath(void* user, HydraString path);
 
 // System
 void* hydraCreateSystem();
+HydraString hydraSystemGetLastError(void);
 void hydraSystemDestroy(void* system);
 
 void hydraSystemSetSurface(void* system, void* surface);

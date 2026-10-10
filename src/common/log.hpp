@@ -231,6 +231,14 @@ class Logger {
                 // Message
                 fmt::print(f, std::forward<T>(args)...);
                 fmt::print("\n");
+                // Keep redirected logs live without a syscall for every GPU
+                // instruction when verbose debug logging is enabled.
+                const auto now = std::chrono::steady_clock::now();
+                if (level != LogLevel::Debug ||
+                    now - last_stdout_flush >= std::chrono::milliseconds(100)) {
+                    std::fflush(stdout);
+                    last_stdout_flush = now;
+                }
                 break;
             }
             case LogOutput::File: {
@@ -290,6 +298,7 @@ class Logger {
     LogOutput output{LogOutput::StdOut};
 
     clock_t::time_point start_time;
+    std::chrono::steady_clock::time_point last_stdout_flush{};
 
     void ensureOutputStream();
 };

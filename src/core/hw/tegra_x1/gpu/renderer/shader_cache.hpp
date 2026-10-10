@@ -9,6 +9,14 @@ class ShaderBase;
 class IRenderer;
 
 struct GuestShaderState {
+    std::map<u32, TextureFormat> buffer_texture_formats;
+    // User inputs read by the fragment shader, which the vertex shader must
+    // write (bit per location)
+    u32 fragment_input_mask{0};
+    // DEBUG: output a solid color from the fragment shader
+    bool debug_highlight{false};
+    // Clip space Z is already in the [0, 1] range
+    bool depth_zero_to_one{false};
     engines::VertexAttribState vertex_attrib_states[VERTEX_ATTRIB_COUNT];
     ColorDataType color_target_data_types[COLOR_TARGET_COUNT] = {
         ColorDataType::Invalid};

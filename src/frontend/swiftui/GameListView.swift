@@ -11,6 +11,8 @@ struct GameListView: View {
     @Binding var viewMode: ViewMode
 
     @State private var games: [Game] = []
+    @State private var showingLoadError = false
+    @State private var loadErrors: [String] = []
 
     private let gridColumns = [
         GridItem(.adaptive(minimum: 180), spacing: 16)
@@ -42,24 +44,37 @@ struct GameListView: View {
             }
         }
         .onAppear {
-            games = GameListView.createGameList(gamePaths: globalState.gamePaths, loaderPluginManager: self.globalState.loaderPluginManager)
+            reloadGames()
         }
         .onChange(of: globalState.gamePaths) { _, newValue in
-            games = GameListView.createGameList(gamePaths: newValue, loaderPluginManager: self.globalState.loaderPluginManager)
+            reloadGames()
         }
         .onChange(of: globalState.loaderPluginRefreshID) { _, _ in
-            games = GameListView.createGameList(gamePaths: globalState.gamePaths, loaderPluginManager: self.globalState.loaderPluginManager)
+            reloadGames()
+        }
+        .alert("Unable to load XCI", isPresented: $showingLoadError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(loadErrors.joined(separator: "\n\n"))
         }
     }
 
-    static func createGameList(gamePaths: [String], loaderPluginManager: HydraLoaderPluginManager?) -> [Game] {
+    private func reloadGames() {
+        var errors: [String] = []
+        games = GameListView.createGameList(gamePaths: globalState.gamePaths,
+            loaderPluginManager: globalState.loaderPluginManager, errors: &errors)
+        loadErrors = errors
+        showingLoadError = !errors.isEmpty
+    }
+
+    static func createGameList(gamePaths: [String], loaderPluginManager: HydraLoaderPluginManager?, errors: inout [String]) -> [Game] {
         // Get all games
         var games: [Game] = []
         for gamePath in gamePaths {
             do {
                 let url = try resolveUrl(URL(fileURLWithPath: gamePath))
 
-                try processUrl(games: &games, url: url, loaderPluginManager: loaderPluginManager)
+                try processUrl(games: &games, url: url, loaderPluginManager: loaderPluginManager, errors: &errors)
             } catch {
                 // TODO: error popup
                 print("Failed to load game path \(gamePath): \(error)")
@@ -72,10 +87,10 @@ struct GameListView: View {
         return games
     }
 
-    static func processUrl(games: inout [Game], url: URL, loaderPluginManager: HydraLoaderPluginManager?) throws {
+    static func processUrl(games: inout [Game], url: URL, loaderPluginManager: HydraLoaderPluginManager?, errors: inout [String]) throws {
         // Check if the URL is a game
         if url.pathExtension != "" {
-            tryAddGame(games: &games, url: url, loaderPluginManager: loaderPluginManager)
+            tryAddGame(games: &games, url: url, loaderPluginManager: loaderPluginManager, errors: &errors)
             return
         }
 
@@ -97,17 +112,20 @@ struct GameListView: View {
         let urls = try FileManager.default.contentsOfDirectory(
             at: url, includingPropertiesForKeys: nil)
         for url in urls {
-            try processUrl(games: &games, url: url, loaderPluginManager: loaderPluginManager)
+            try processUrl(games: &games, url: url, loaderPluginManager: loaderPluginManager, errors: &errors)
         }
     }
 
-    static func tryAddGame(games: inout [Game], url: URL, loaderPluginManager: HydraLoaderPluginManager?) {
+    static func tryAddGame(games: inout [Game], url: URL, loaderPluginManager: HydraLoaderPluginManager?, errors: inout [String]) {
         do {
             let game = try Game(url: url, loaderPluginManager: loaderPluginManager)
             games.append(game)
         } catch {
             // TODO: error popup
             print("Failed to load game path \(url.path(percentEncoded: false)): \(error)")
+            if url.pathExtension.lowercased() == "xci" {
+                errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
             return
         }
     }

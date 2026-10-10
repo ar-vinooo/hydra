@@ -170,9 +170,10 @@ struct RenderTarget {
     u32 padding[6];
 };
 
+// Depth mode (clip space Z range)
 enum class ViewportZClip : u32 {
     MinusOneToOne,
-    OneToOne,
+    ZeroToOne,
 };
 
 enum class WindowOriginFlags : u32 {
@@ -609,13 +610,22 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     getColorTargetTexture(u32 render_target_index) const;
     renderer::ITextureView* getDepthStencilTargetTexture() const;
     renderer::RenderPassBase* getRenderPass() const;
+    // DEBUG: frame tracer
+    void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
+    void debugLogoDraw(u32 count);
+    bool isHighlightedDraw() const;
+
     renderer::Viewport getViewport(u32 index);
     renderer::Scissor getScissor(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
-    renderer::ShaderBase* getShader(ShaderStage stage);
+    renderer::ShaderBase* getShader(ShaderStage stage,
+                                    u32 fragment_input_mask = 0);
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
-    renderer::ITextureView* getTexture(const TextureImageControl& tic) const;
+    renderer::ITextureView*
+    getTexture(const TextureImageControl& tic,
+               std::optional<renderer::TextureType> shader_type =
+                   std::nullopt) const;
     renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc) const;
 
     void configureShaderStage(const ShaderStage stage,

@@ -10,7 +10,12 @@ DEFINE_IOCTL_TABLE(NvMap,
                                             0x09, param, 0x0e, getId))
 
 NvResult NvMap::create(System* system, u32 size, Handle* out_handle) {
-    *out_handle = system->getGpu().createMap(size).getRaw();
+    if (size == 0)
+        return NvResult::InvalidSize;
+    const auto handle = system->getGpu().createMap(size);
+    if (!handle)
+        return NvResult::InsufficientMemory;
+    *out_handle = handle->getRaw();
     return NvResult::Success;
 }
 
@@ -28,25 +33,33 @@ NvResult NvMap::alloc(System* system, Handle handle, u32 heap_mask, u32 flags,
     (void)kind;
 
     // TODO: flags?
-    system->getGpu().allocateMap(handle, addr, flags == 1);
+    if (!system->getGpu().allocateMap(handle, addr, flags == 1))
+        return NvResult::BadParameter;
     inout_alignment = hw::tegra_x1::gpu::GPU_PAGE_SIZE; // TODO: correct?
     return NvResult::Success;
 }
 
 NvResult NvMap::free(System* system, Aligned<Handle, 8> handle,
                      gpu_vaddr_t* out_addr, u64* out_size, u32* out_flags) {
-    auto map = system->getGpu().getMap(handle).value();
-    system->getGpu().freeMap(handle);
+    const auto found = system->getGpu().getMap(handle);
+    if (!found)
+        return NvResult::BadParameter;
+    const auto map = **found;
+    if (!system->getGpu().freeMap(handle))
+        return NvResult::BadParameter;
 
-    *out_addr = map->addr;
-    *out_size = map->size;
-    *out_flags = map->write ? 1 : 0; // TODO: correct?
+    *out_addr = map.addr;
+    *out_size = map.size;
+    *out_flags = map.write ? 1 : 0; // TODO: correct?
     return NvResult::Success;
 }
 
 NvResult NvMap::param(System* system, Handle handle, NvMapParamType type,
                       u32* out_value) {
-    auto map = system->getGpu().getMap(handle).value();
+    const auto found = system->getGpu().getMap(handle);
+    if (!found)
+        return NvResult::BadParameter;
+    const auto map = *found;
     switch (type) {
     case NvMapParamType::Size:
         *out_value = static_cast<u32>(map->size);

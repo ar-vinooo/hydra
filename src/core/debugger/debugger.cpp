@@ -102,6 +102,19 @@ void Debugger::breakOnThisThreadImpl(const std::string_view reason) {
         guest_thread = thread.guest_thread;
     }
 
+    if (guest_thread && guest_thread->getThread()) {
+        auto* cpu_thread = guest_thread->getThread();
+        const auto& state = cpu_thread->getState();
+        LOG_ERROR(Debugger,
+                  "Guest registers x0=0x{:x}, x1=0x{:x}, x19=0x{:x}, "
+                  "x20=0x{:x}, LR=0x{:x}",
+                  state.r[0], state.r[1], state.r[19], state.r[20], state.lr);
+        cpu_thread->getStackTrace([&](vaddr_t address) {
+            LOG_ERROR(Debugger, "Guest frame 0x{:x}: {} {}", address,
+                      module_table.findSymbol(address),
+                      function_table.findSymbol(address));
+        });
+    }
     process->supervisorPause();
     notifySupervisorPaused(
         guest_thread,

@@ -102,9 +102,13 @@ void emitLoadConstant(DecoderContext& context, pred_t pred, bool pred_inv,
         unreachable();
     }
 
-    // TODO: slot addressing
-    if (address_mode != AddressMode::Il)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Slot addressing");
+    // TODO: slot addressing (mode 0 is the default and already supported)
+    if (static_cast<u32>(address_mode) != 0)
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                            "LDC address mode {} (slot: {}, reg: r{}, offset: "
+                            "{:#x})",
+                            static_cast<u32>(address_mode), cbuf_slot, src,
+                            cbuf_offset);
 
     // TODO: handle small ints
     if (size == LsSize2::U8 || size == LsSize2::S8 || size == LsSize2::U16 ||

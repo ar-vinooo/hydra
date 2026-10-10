@@ -16,9 +16,13 @@ bool Layer::acquirePresentTexture(
     auto& binder = system.getOs().getDisplayDriver().getBinder(binder_handle);
 
     BqBufferInput input;
-    i32 slot = binder.consumeBuffer(input);
+    u64 gpu_fence;
+    i32 slot = binder.consumeBuffer(input, gpu_fence);
     if (slot == -1)
         return false;
+
+    // Wait for the GPU to finish rendering the buffer
+    system.getGpu().getPfifo().waitForCompletion(gpu_fence);
     const auto& buffer = binder.getBuffer(slot);
 
     // Texture

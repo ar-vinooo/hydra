@@ -520,8 +520,11 @@ func configGetGdbWaitForClient() -> UnsafeMutablePointer<Bool> {
 
 // Filesystem
 class HydraFilesystem: MutableHandleClass {
-    init() {
-        super.init(handle: hydraCreateFilesystem())
+    init() throws {
+        guard let handle = hydraCreateFilesystem() else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraFilesystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -544,9 +547,12 @@ class HydraFile: MutableHandleClass {
 class HydraContentArchive: MutableHandleClass {
     private let file: HydraFile  // For ref counting
 
-    init(file: HydraFile) {
+    init(file: HydraFile) throws {
         self.file = file
-        super.init(handle: hydraCreateContentArchive(file.handle))
+        guard let handle = hydraCreateContentArchive(file.handle) else {
+            throw HydraLoaderError.loadFailed("Unable to read NCA. Check prod.keys and the firmware format.")
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -560,8 +566,14 @@ class HydraContentArchive: MutableHandleClass {
 
 // Time zone manager
 class HydraTimeZoneManager: MutableHandleClass {
-    init(filesystem: HydraFilesystem) {
-        super.init(handle: hydraCreateTimeZoneManager(filesystem.handle))
+    private let filesystem: HydraFilesystem
+
+    init(filesystem: HydraFilesystem) throws {
+        self.filesystem = filesystem
+        guard let handle = hydraCreateTimeZoneManager(filesystem.handle) else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraFilesystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -578,8 +590,16 @@ class HydraTimeZoneManager: MutableHandleClass {
 }
 
 // Loader
-enum HydraLoaderError: Error {
+enum HydraLoaderError: LocalizedError {
     case unsupported
+    case loadFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupported: return "This game format is not supported."
+        case .loadFailed(let message): return message
+        }
+    }
 }
 
 enum HydraLoaderContent {
@@ -595,6 +615,10 @@ class HydraLoader: MutableHandleClass {
                 hydraCreateLoaderFromPath(hydraPath, pluginManager?.handle)
             })
         else {
+            let message = String(withHydraString: hydraLoaderGetLastError())
+            if !message.isEmpty {
+                throw HydraLoaderError.loadFailed(message)
+            }
             throw HydraLoaderError.unsupported
         }
         self.init(handle: handle)
@@ -912,8 +936,11 @@ struct HydraUser: MutableHandleStruct {
 
 // Emulation context
 class HydraSystem: MutableHandleClass {
-    init() {
-        super.init(handle: hydraCreateSystem())
+    init() throws {
+        guard let handle = hydraCreateSystem() else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraSystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {

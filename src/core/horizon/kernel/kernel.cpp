@@ -209,6 +209,11 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[1] = tmp_u64;
         break;
     case 0x26: {
+        LOG_ERROR(Kernel, "Guest break at PC 0x{:x}, LR 0x{:x}", state.pc,
+                  state.lr);
+        guest_thread->getStackTrace([&](vaddr_t address) {
+            LOG_ERROR(Kernel, "Guest stack frame 0x{:x}", address);
+        });
         const vaddr_t addr = state.r[1];
         state.r[0] = break_(
             BreakReason(state.r[0]),
@@ -493,8 +498,8 @@ result_t Kernel::setThreadPriority(IThread* thread, i32 priority) {
               thread->getDebugName(), priority);
 
     // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}, priority: 0x{:x}",
-                               thread->getDebugName(), priority);
+    ONCE(LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}, priority: 0x{:x}",
+                                    thread->getDebugName(), priority));
 
     return RESULT_SUCCESS;
 }
@@ -861,8 +866,6 @@ result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
         crnt_process, crnt_thread, crnt_thread->getTlsPtr());
 
     // Wait for response
-    crnt_thread->processMessages();
-
     ASSERT_DEBUG(crnt_thread->processMessages(), Kernel,
                  "SendSyncRequest timed out");
 
@@ -964,18 +967,11 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
         // TODO: what should this be?
         out_info = 3ull * 1024ull * 1024ull * 1024ull;
         return RESULT_SUCCESS;
-    case InfoType::UsedMemorySize: {
-        // TODO: correct?
-        /*
-        u64 size = stack_mem->GetSize() + kernel_mem->GetSize() +
-                     tls_mem->GetSize() + heap_mem->GetSize();
-        for (auto executable_mem : executable_memories)
-            size += executable_mem->GetSize();
-        out_info = size;
-        */
-        out_info = 4ull * 1024ull * 1024ull;
+    case InfoType::UsedMemorySize:
+        out_info =
+            crnt_process->getUsedUserMemorySize() +
+            std::min<u64>(crnt_process->getSystemResourceSize(), 64ull * 1024);
         return RESULT_SUCCESS;
-    }
     case InfoType::DebuggerAttached:
         // TODO: make this configurable
         out_info = static_cast<u64>(true);
@@ -999,12 +995,12 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
         return RESULT_SUCCESS;
     case InfoType::TotalSystemResourceSize: {
         out_info = crnt_process->getSystemResourceSize();
+        LOG_DEBUG(Kernel, "Total system resource size: 0x{:x}", out_info);
         return RESULT_SUCCESS;
     }
     case InfoType::UsedSystemResourceSize:
-        LOG_NOT_IMPLEMENTED(Kernel, "UsedSystemResourceSize");
-        // HACK
-        out_info = 64ull * 1024ull;
+        out_info =
+            std::min<u64>(crnt_process->getSystemResourceSize(), 64ull * 1024);
         return RESULT_SUCCESS;
     case InfoType::ProgramId:
         out_info = crnt_process->getTitleId();
@@ -1015,14 +1011,11 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
         out_info = 0;
         return RESULT_SUCCESS;
     case InfoType::TotalNonSystemMemorySize:
-        LOG_NOT_IMPLEMENTED(Kernel, "TotalNonSystemMemorySize");
-        // HACK
-        out_info = 2ull * 1024ull * 1024ull * 1024ull;
+        out_info = 3ull * 1024ull * 1024ull * 1024ull -
+                   crnt_process->getSystemResourceSize();
         return RESULT_SUCCESS;
     case InfoType::UsedNonSystemMemorySize:
-        LOG_NOT_IMPLEMENTED(Kernel, "UsedNonSystemMemorySize");
-        // HACK
-        out_info = 1;
+        out_info = crnt_process->getUsedUserMemorySize();
         return RESULT_SUCCESS;
     case InfoType::IsApplication:
         // TODO: don't always return true
@@ -1096,7 +1089,7 @@ result_t Kernel::waitForAddress(IThread* crnt_thread, uptr addr,
               "0x{:x}, timeout: 0x{:08x})",
               addr, arbitration_type, value, timeout);
 
-    bool wait;
+    bool wait = false;
     {
         CriticalSectionLock cs_lock(*this);
 
@@ -1105,16 +1098,24 @@ result_t Kernel::waitForAddress(IThread* crnt_thread, uptr addr,
         switch (arbitration_type) {
         case ArbitrationType::WaitIfLessThan:
             current_value = atomicLoad(value_ptr);
-            wait = (current_value < value);
+            wait = (static_cast<i32>(current_value) < static_cast<i32>(value));
             break;
         case ArbitrationType::DecrementAndWaitIfLessThan:
-            current_value = atomicFetchSub(value_ptr, 1u);
-            wait = (current_value < value);
+            current_value = atomicLoad(value_ptr);
+            while (static_cast<i32>(current_value) < static_cast<i32>(value)) {
+                if (atomicCompareExchangeWeak(value_ptr, current_value,
+                                              current_value - 1u)) {
+                    wait = true;
+                    break;
+                }
+            }
             break;
         case ArbitrationType::WaitIfEqual:
             current_value = atomicLoad(value_ptr);
             wait = (current_value == value);
             break;
+        default:
+            return MAKE_RESULT(Svc, Error::InvalidEnumValue);
         }
 
         if (wait) {
@@ -1127,8 +1128,6 @@ result_t Kernel::waitForAddress(IThread* crnt_thread, uptr addr,
     }
 
     if (wait) {
-        crnt_thread->processMessages(timeout);
-
         result_t res = RESULT_SUCCESS;
         if (crnt_thread->processMessages(timeout)) {
             if (crnt_thread->getState() == ThreadState::Stopping) {
@@ -1142,18 +1141,17 @@ result_t Kernel::waitForAddress(IThread* crnt_thread, uptr addr,
             res = MAKE_RESULT(Svc, Error::TimedOut);
         }
 
-        // Removal is done by the signalling thread
-        /*
+        // Signalled waiters are removed by signalToAddress. Timed out or
+        // cancelled waiters must also leave the list before returning.
         {
             CriticalSectionLock cs_lock(*this);
             arbiters.remove(crnt_thread);
         }
-        */
 
         return res;
     }
 
-    return RESULT_SUCCESS;
+    return MAKE_RESULT(Svc, Error::InvalidState);
 }
 
 result_t Kernel::signalToAddress(uptr addr, SignalType signal_type, u32 value,
@@ -1163,14 +1161,40 @@ result_t Kernel::signalToAddress(uptr addr, SignalType signal_type, u32 value,
               "signal_type: {}, value: 0x{:08x}, count: {})",
               addr, signal_type, value, count);
 
-    // TODO: handle other signal types as well
-    if (signal_type != SignalType::Signal)
-        LOG_WARN(Kernel, "Unimplemented signal type {}", signal_type);
-    (void)value;
-    (void)count;
-
     CriticalSectionLock cs_lock(*this);
+    usize waiting_count = 0;
+    for (auto node = arbiters.getHead(); node; node = (*node)->getNext()) {
+        if ((*node)->get()->mutex_wait_addr == addr)
+            ++waiting_count;
+    }
+    const auto signed_count = static_cast<i32>(count);
+    if (signal_type != SignalType::Signal) {
+        u32 updated_value;
+        switch (signal_type) {
+        case SignalType::SignalAndIncrementIfEqual:
+            updated_value = value + 1u;
+            break;
+        case SignalType::SignalAndModifyBasedOnWaitingThreadCountIfEqual:
+            updated_value =
+                waiting_count == 0 ? value + 1u
+                : (signed_count <= 0 ||
+                   waiting_count <= static_cast<usize>(signed_count))
+                    ? value - 1u
+                    : value;
+            break;
+        default:
+            return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+        }
+        auto expected = value;
+        if (!atomicCompareExchangeStrong(reinterpret_cast<u32*>(addr), expected,
+                                         updated_value))
+            return MAKE_RESULT(Svc, Error::InvalidState);
+    }
+    usize signalled_count = 0;
     for (auto waiter_node = arbiters.getHead(); waiter_node.has_value();) {
+        if (signed_count > 0 &&
+            signalled_count >= static_cast<usize>(signed_count))
+            break;
         const auto waiter_node_ = waiter_node.value();
         auto waiter = waiter_node_->get();
         if (waiter->mutex_wait_addr != addr) {
@@ -1180,6 +1204,7 @@ result_t Kernel::signalToAddress(uptr addr, SignalType signal_type, u32 value,
 
         waiter->resume();
         waiter_node = arbiters.remove(waiter_node_);
+        ++signalled_count;
     }
 
     return RESULT_SUCCESS;

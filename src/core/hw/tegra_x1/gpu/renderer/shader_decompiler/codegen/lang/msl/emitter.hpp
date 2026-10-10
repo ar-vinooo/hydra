@@ -48,8 +48,13 @@ class MslEmitter final : public LangEmitter {
                            const ir::Value& array_index,
                            const ir::Value& coords, const ir::Value& cmp_value,
                            const ir::Value& lod) override;
+    void emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
+                            const ir::Value& mask) override;
+    void emitSwizzleAdd(const ir::Value& dst, const ir::Value& src_a,
+                        const ir::Value& src_b, u32 swizzle) override;
     void emitTextureGather(const ir::Value& dst, u32 const_buffer_index,
-                           const ir::Value& coords, u8 component) override;
+                           const ir::Value& coords, u8 component,
+                           const ir::Value& cmp_value) override;
     void emitTextureQueryDimension(const ir::Value& dst, u32 const_buffer_index,
                                    u32 dimension) override;
 

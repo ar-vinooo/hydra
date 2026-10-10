@@ -23,6 +23,28 @@ std::string_view pixelImapTypeToStr(PixelImapType type) {
     }
 }
 
+renderer::TextureType toRendererTextureType(TextureType type) {
+    switch (type) {
+    case TextureType::_1D:
+        return renderer::TextureType::_1D;
+    case TextureType::_1DArray:
+        return renderer::TextureType::_1DArray;
+    case TextureType::_2D:
+        return renderer::TextureType::_2D;
+    case TextureType::_2DArray:
+        return renderer::TextureType::_2DArray;
+    case TextureType::_3D:
+    case TextureType::_3DArray:
+        return renderer::TextureType::_3D;
+    case TextureType::Cube:
+        return renderer::TextureType::Cube;
+    case TextureType::CubeArray:
+        return renderer::TextureType::CubeArray;
+    default:
+        return renderer::TextureType::_2D;
+    }
+}
+
 std::string textureTypeToStr(TextureType type, bool is_depth) {
     // TODO: check if depth can be used with the type
     std::string prefix = is_depth ? "depth" : "texture";
@@ -43,6 +65,37 @@ std::string textureTypeToStr(TextureType type, bool is_depth) {
         return prefix + "cube";
     case TextureType::CubeArray:
         return prefix + "cube_array";
+    }
+}
+
+std::string textureDeclaration(const GuestShaderState& state, u32 index,
+                               const analyzer::TextureInfo& info) {
+    const auto it = state.buffer_texture_formats.find(index);
+    if (it == state.buffer_texture_formats.end())
+        return textureTypeToStr(info.type, info.is_depth) + "<float>";
+    switch (it->second) {
+    case renderer::TextureFormat::R8Uint:
+    case renderer::TextureFormat::R16Uint:
+    case renderer::TextureFormat::R32Uint:
+    case renderer::TextureFormat::RG8Uint:
+    case renderer::TextureFormat::RG16Uint:
+    case renderer::TextureFormat::RG32Uint:
+    case renderer::TextureFormat::RGBA8Uint:
+    case renderer::TextureFormat::RGBA16Uint:
+    case renderer::TextureFormat::RGBA32Uint:
+        return "texture_buffer<uint>";
+    case renderer::TextureFormat::R8Sint:
+    case renderer::TextureFormat::R16Sint:
+    case renderer::TextureFormat::R32Sint:
+    case renderer::TextureFormat::RG8Sint:
+    case renderer::TextureFormat::RG16Sint:
+    case renderer::TextureFormat::RG32Sint:
+    case renderer::TextureFormat::RGBA8Sint:
+    case renderer::TextureFormat::RGBA16Sint:
+    case renderer::TextureFormat::RGBA32Sint:
+        return "texture_buffer<int>";
+    default:
+        return "texture_buffer<float>";
     }
 }
 
@@ -90,8 +143,16 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
     // TODO: storage buffers
 
     u32 texture_index = 0;
-    for (const auto& [const_buffer_index, _] : memory_analyzer.getTextures()) {
+    for (const auto& [const_buffer_index, info] :
+         memory_analyzer.getTextures()) {
         out_resource_mapping.textures[const_buffer_index] = texture_index++;
+        out_resource_mapping.texture_types[const_buffer_index] =
+            toRendererTextureType(info.type);
+    }
+
+    if (context.type == ShaderType::Fragment) {
+        for (const auto input : memory_analyzer.getStageInputs())
+            out_resource_mapping.stage_input_mask |= 1u << input;
     }
 
     // TODO: images
@@ -100,6 +161,70 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
 void MslEmitter::emitHeader() {
     write("#include <metal_stdlib>");
     write("using namespace metal;");
+
+    // Quad helpers (lanes are laid out as 2x2 pixel quads)
+    if (context.type == ShaderType::Fragment) {
+        writeNewline();
+        // Exact value of the neighbouring lane in the quad
+        // Guest lanes are laid out as x | (y << 1) within a 2x2 quad. The host
+        // quad layout is unknown, so the neighbours are identified by their
+        // positions instead
+        write("inline ushort hydra_quad_host_mask_x(float px) {{");
+        write("    return quad_shuffle_xor(px, ushort(1)) != px ? ushort(1) : "
+              "ushort(2);");
+        write("}}");
+        write("inline uint hydra_quad_shuffle_xor(uint v, uint mask, float px) "
+              "{{");
+        write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
+        write("    const ushort y_mask = x_mask ^ ushort(3);");
+        write("    ushort host_mask = 0;");
+        write("    if ((mask & 1u) != 0u) host_mask |= x_mask;");
+        write("    if ((mask & 2u) != 0u) host_mask |= y_mask;");
+        write("    return quad_shuffle_xor(v, host_mask);");
+        write("}}");
+        write("inline float hydra_swizzle_add(float a, float b, uint swizzle, "
+              "float px, float py) {{");
+        write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
+        write("    const ushort y_mask = x_mask ^ ushort(3);");
+        write("    const uint x_bit = px > quad_shuffle_xor(px, x_mask) ? 1u : 0u;");
+        write("    const uint y_bit = py > quad_shuffle_xor(py, y_mask) ? 1u : 0u;");
+        write("    const uint lane = x_bit | (y_bit << 1);");
+        write("    const uint mode = (swizzle >> (lane * 2u)) & 3u;");
+        write("    const float lut_a[4] = {{1.0, -1.0, 1.0, 0.0}};");
+        write("    const float lut_b[4] = {{1.0, 1.0, -1.0, 1.0}};");
+        write("    return a * lut_a[mode] + b * lut_b[mode];");
+        write("}}");
+    }
+}
+
+void MslEmitter::emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
+                                    const ir::Value& mask) {
+    if (context.type != ShaderType::Fragment) {
+        // TODO: implement for other stages
+        storeValue(dst, "{}", getValueStr(src));
+        return;
+    }
+
+    storeValue(dst, "hydra_quad_shuffle_xor({}, {}, {})", getValueStr(src),
+               getValueStr(mask),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32));
+}
+
+void MslEmitter::emitSwizzleAdd(const ir::Value& dst, const ir::Value& src_a,
+                                const ir::Value& src_b, u32 swizzle) {
+    if (context.type != ShaderType::Fragment) {
+        // TODO: implement for other stages
+        storeValue(dst, "({} + {})", getValueStr(src_a), getValueStr(src_b));
+        return;
+    }
+
+    storeValue(dst, "hydra_swizzle_add({}, {}, {}u, {}, {})",
+               getValueStr(src_a), getValueStr(src_b), swizzle,
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x4, true},
+                                ir::ScalarType::F32));
 }
 
 void MslEmitter::emitTypeAliases() {
@@ -180,14 +305,22 @@ void MslEmitter::emitDeclarations() {
 
     // Stage outputs
     switch (context.type) {
-    case ShaderType::Vertex:
-        for (const auto output : memory_analyzer.getStageOutputs()) {
-            const auto sv = Sv(SvSemantic::UserInOut, output);
+    case ShaderType::Vertex: {
+        // Also declare outputs read by the fragment shader, but never written
+        // (they are zero initialized)
+        u32 output_mask = state.fragment_input_mask;
+        for (const auto output : memory_analyzer.getStageOutputs())
+            output_mask |= 1u << output;
+        for (u8 i = 0; i < 32; i++) {
+            if ((output_mask & (1u << i)) == 0)
+                continue;
+            const auto sv = Sv(SvSemantic::UserInOut, i);
             // TODO: don't hardcode the type
             write("float4 {} [[{}]];", getSvStr(sv),
                   getSvQualifierStr(sv, true));
         }
         break;
+    }
     case ShaderType::Fragment:
         for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
             const auto color_target_data_type =
@@ -217,8 +350,8 @@ void MslEmitter::emitStateBindings() {
     for (const auto& [const_buffer_index, info] :
          memory_analyzer.getTextures()) {
         // TODO: don't hardcode type
-        writeStatement("{}<float> tex{}",
-                       textureTypeToStr(info.type, info.is_depth),
+        writeStatement("{} tex{}",
+                       textureDeclaration(state, const_buffer_index, info),
                        const_buffer_index);
         writeStatement("sampler samplr{}", const_buffer_index);
     }
@@ -279,9 +412,9 @@ void MslEmitter::emitMainPrototype() {
          memory_analyzer.getTextures()) {
         const auto index = out_resource_mapping.textures[const_buffer_index];
         // TODO: don't hardcode type
-        ADD_ARG("{}<float> tex{} [[texture({})]]",
-                textureTypeToStr(info.type, info.is_depth), const_buffer_index,
-                index);
+        ADD_ARG("{} tex{} [[texture({})]]",
+                textureDeclaration(state, const_buffer_index, info),
+                const_buffer_index, index);
         ADD_ARG("sampler samplr{} [[sampler({})]]", const_buffer_index, index);
     }
 
@@ -293,7 +426,7 @@ void MslEmitter::emitMainPrototype() {
     enterScope(")");
 
     // Output
-    write("StageOut __out;");
+    write("StageOut __out = {{}};");
     writeNewline();
 
     emitMainFunctionPrologue();
@@ -306,9 +439,27 @@ void MslEmitter::emitExitReturn() {
         // WriteStatement("__out.position.y = -__out.position.y");
 
         // Convert depth from < -1, 1 > to < 0, 1 >
-        // TODO: only if enabled?
-        writeStatement(
-            "__out.position.z = (__out.position.z + __out.position.w) / 2.0");
+        if (!state.depth_zero_to_one)
+            writeStatement("__out.position.z = (__out.position.z + "
+                           "__out.position.w) / 2.0");
+    }
+
+    // DEBUG: highlight
+    if (context.type == ShaderType::Fragment && state.debug_highlight) {
+        for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
+            const auto data_type = state.color_target_data_types[i];
+            if (data_type == ColorDataType::Invalid)
+                continue;
+            const auto sv = Sv(SvSemantic::UserInOut, i);
+            static const std::string color = [] {
+                if (std::getenv("HYDRA_DEBUG_CAPTURE") != nullptr)
+                    return std::string("state.dbg.xyz * 0.5 + 0.5, 1");
+                const char* env = std::getenv("HYDRA_HIGHLIGHT_COLOR");
+                return std::string(env != nullptr ? env : "1, 0, 1, 1");
+            }();
+            writeStatement("__out.{} = vec<{}, 4>({})", getSvStr(sv),
+                           toType(data_type), color);
+        }
     }
 
     // Return
@@ -331,11 +482,12 @@ void MslEmitter::emitReciprocal(const ir::Value& dst, const ir::Value& src) {
 }
 
 void MslEmitter::emitSin(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "sin({})", getValueStr(src));
+    // Precise, since games often use sin with large arguments for noise
+    storeValue(dst, "precise::sin({})", getValueStr(src));
 }
 
 void MslEmitter::emitCos(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "cos({})", getValueStr(src));
+    storeValue(dst, "precise::cos({})", getValueStr(src));
 }
 
 void MslEmitter::emitExp2(const ir::Value& dst, const ir::Value& src) {
@@ -373,7 +525,10 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
                                    const ir::Value& lod) {
     // Flags
     const auto is_array = isTextureArray(type);
-    const auto int_coords = any(flags & TextureSampleFlags::IntCoords);
+    const auto is_buffer =
+        state.buffer_texture_formats.contains(const_buffer_index);
+    const auto int_coords =
+        is_buffer || any(flags & TextureSampleFlags::IntCoords);
     const auto depth_compare = any(flags & TextureSampleFlags::DepthCompare);
     const auto has_lod = any(flags & TextureSampleFlags::Lod);
 
@@ -381,7 +536,29 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
     std::string args;
     if (int_coords) {
         func_name = "read";
-        args = fmt::format("uint2({})", getValueStr(coords));
+        // Number of coordinates provided by the instruction
+        u32 coord_count = 1;
+        switch (type) {
+        case TextureType::_2D:
+        case TextureType::_2DArray:
+            coord_count = 2;
+            break;
+        case TextureType::_3D:
+        case TextureType::_3DArray:
+            coord_count = 3;
+            break;
+        default:
+            break;
+        }
+
+        // Buffer textures are always addressed with a single coordinate
+        const auto coords_str = getValueStr(coords);
+        if (coord_count == 1)
+            args = fmt::format("as_type<uint>({})", coords_str);
+        else if (is_buffer)
+            args = fmt::format("as_type<uint>(({}).x)", coords_str);
+        else
+            args = fmt::format("as_type<uint{}>({})", coord_count, coords_str);
         if (depth_compare) {
             // TODO: emulate
             LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Texture read depth compare");
@@ -395,23 +572,41 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
     }
 
     // Args
-    if (is_array)
+    if (is_array && !is_buffer)
         args += fmt::format(", uint({})", getValueStr(array_index));
     if (depth_compare)
         args += fmt::format(", {}", getValueStr(cmp_value));
-    if (has_lod)
-        args += fmt::format(", level({})", getValueStr(lod));
+    if (has_lod && !is_buffer) {
+        if (int_coords)
+            args += fmt::format(", as_type<uint>({})", getValueStr(lod));
+        else
+            args += fmt::format(", level({})", getValueStr(lod));
+    }
 
     std::string res =
         fmt::format("state.tex{}.{}({})", const_buffer_index, func_name, args);
     // HACK: construct float4 if sample_compare
     if (depth_compare)
         res = fmt::format("float4({}, 0.0, 0.0, 0.0)", res);
+    if (is_buffer) {
+        const auto decl = textureDeclaration(
+            state, const_buffer_index, analyzer::TextureInfo{type, false});
+        if (decl != "texture_buffer<float>")
+            res = fmt::format("as_type<float4>({})", res);
+    }
     storeValue(dst, "{}", res);
 }
 
 void MslEmitter::emitTextureGather(const ir::Value& dst, u32 const_buffer_index,
-                                   const ir::Value& coords, u8 component) {
+                                   const ir::Value& coords, u8 component,
+                                   const ir::Value& cmp_value) {
+    if (cmp_value.getKind() != ir::ValueKind::Undefined) {
+        storeValue(dst, "state.tex{}.gather_compare(state.samplr{}, {}, {})",
+                   const_buffer_index, const_buffer_index, getValueStr(coords),
+                   getValueStr(cmp_value));
+        return;
+    }
+
     storeValue(dst,
                "state.tex{}.gather(state.samplr{}, {}, int2(0), component::{})",
                const_buffer_index, const_buffer_index, getValueStr(coords),

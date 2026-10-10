@@ -1,7 +1,10 @@
 #include "core/horizon/filesystem/content_archive.hpp"
 
 #include "core/horizon/filesystem/file_view.hpp"
+#include "core/horizon/filesystem/nca_file.hpp"
 #include "core/horizon/filesystem/partition_filesystem.hpp"
+
+#include <stdexcept>
 
 namespace hydra::horizon::filesystem {
 
@@ -200,6 +203,27 @@ ENABLE_ENUM_FORMATTING(hydra::horizon::filesystem::HashType, Auto, "auto", None,
 namespace hydra::horizon::filesystem {
 
 ContentArchive::ContentArchive(IFile* file) {
+    if (file->getSize() < sizeof(Header))
+        throw std::runtime_error("Truncated NCA header.");
+    {
+        std::unique_ptr<ztd::io::IStream> probe(
+            file->open(FileOpenFlags::Read));
+        probe->seekTo(0x200);
+        if (probe->read<u32>() != makeMagic4('N', 'C', 'A', '3')) {
+            const auto keys = NcaFile::loadDefaultKeys();
+            bool plaintext;
+            auto header =
+                NcaFile::readHeader(*file, 0, file->getSize(), keys, plaintext);
+            // The caller retains ownership of the original file.
+            auto backing = std::shared_ptr<IFile>(file, [](IFile*) {});
+            decoded_file = std::make_shared<NcaFile>(std::move(backing), 0,
+                                                     file->getSize(), header,
+                                                     plaintext, keys);
+            file = decoded_file.get();
+        }
+    }
+    if (!decoded_file)
+        decoded_file = std::shared_ptr<IFile>(file, [](IFile*) {});
     auto stream = file->open(FileOpenFlags::Read);
 
     // Header
@@ -240,7 +264,7 @@ ContentArchive::ContentArchive(IFile* file) {
                 fs_header.hierarchical_sha_256_data.pfs0_region;
 
             auto partition_file =
-                new FileView(file, entry_offset + layer_region.offset,
+                new FileView(decoded_file, entry_offset + layer_region.offset,
                              layer_region.size); // TODO: free
             auto pfs = new PartitionFilesystem();
             pfs->initialize<false>(partition_file);
@@ -259,8 +283,9 @@ ContentArchive::ContentArchive(IFile* file) {
                                     .levels[IVFC_MAX_LEVEL - 1];
 
             entries.insert(
-                {"data", new FileView(file, entry_offset + level.logical_offset,
-                                      level.hash_data_size)});
+                {"data",
+                 new FileView(decoded_file, entry_offset + level.logical_offset,
+                              level.hash_data_size)});
             break;
         }
         default:

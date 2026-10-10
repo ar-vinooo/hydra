@@ -20,6 +20,8 @@ class ISelfController : public IService {
                          u32 id) override;
 
   private:
+    IdleTimeDetectionExtension idle_time_detection_extension =
+        IdleTimeDetectionExtension::Disabled;
     kernel::Event* library_applet_launchable_event;
     kernel::Event* accumulated_suspended_tick_changed_event;
 
@@ -46,6 +48,7 @@ class ISelfController : public IService {
                                                 u64* out_recording_layer_id);
     STUB_REQUEST_COMMAND(setHandlesRequestToDisplay);
     result_t setIdleTimeDetectionExtension(IdleTimeDetectionExtension ext);
+    result_t getIdleTimeDetectionExtension(IdleTimeDetectionExtension* out_ext);
     STUB_REQUEST_COMMAND(setWirelessPriorityMode);
     result_t getAccumulatedSuspendedTickChangedEvent(
         kernel::Process* process, OutHandle<HandleAttr::Copy> out_handle);

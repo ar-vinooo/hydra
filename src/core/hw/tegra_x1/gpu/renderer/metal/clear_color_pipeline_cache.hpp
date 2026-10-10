@@ -5,9 +5,11 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 struct ClearColorPipelineDescriptor {
-    MTL::PixelFormat pixel_format;
+    // Formats of all render pass color attachments
+    MTL::PixelFormat pixel_formats[COLOR_TARGET_COUNT];
     u32 render_target_id;
     u8 mask;
+    MTL::PixelFormat depth_stencil_pixel_format;
 };
 
 class ClearColorPipelineCache

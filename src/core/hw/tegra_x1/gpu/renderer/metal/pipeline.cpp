@@ -96,6 +96,12 @@ Pipeline::Pipeline(MTL::Device* device, const PipelineDescriptor& descriptor)
                   vertex_array.stride);
     }
 
+    // Depth stencil target
+    if (descriptor.depth_stencil_format != TextureFormat::Invalid)
+        setDepthStencilPixelFormat(
+            pipeline_descriptor,
+            toMtlPixelFormat(descriptor.depth_stencil_format));
+
     // Color targets
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
         const auto& color_target_state = descriptor.color_target_states[i];

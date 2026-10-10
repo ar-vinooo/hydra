@@ -31,6 +31,21 @@ class IAudioRenderer : public IService {
     u32 rendering_time_limit{0x1000}; // TODO: what should this be?
     std::vector<VoiceInfoOut> voices;
 
+    // Server side voice playback state (no actual mixing yet)
+    struct WaveBufferSlot {
+        bool valid{false};
+        u32 start{0};
+        u32 end{0};
+        bool is_looping{false};
+    };
+    struct VoiceState {
+        WaveBufferSlot slots[4];
+        u32 crnt_slot{0};
+        u32 offset{0};
+    };
+    std::vector<VoiceState> voice_states;
+    std::chrono::steady_clock::time_point last_update_time{};
+
     // Commands
     result_t requestUpdate(InBuffer<BufferAttr::MapAlias> in_buffer,
                            OutBuffer<BufferAttr::MapAlias> out_buffer,

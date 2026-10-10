@@ -26,6 +26,13 @@ struct State {
     bool depth_test_enabled;
     bool depth_write_enabled;
     engines::CompareOp depth_compare_op;
+    float4 blend_constant{};
+    f32 depth_bias_constant{0.0f};
+    f32 depth_bias_slope{0.0f};
+    f32 depth_bias_clamp{0.0f};
+    StencilState stencil{};
+    MTL::CullMode cull_mode{MTL::CullModeNone};
+    MTL::Winding front_face_winding{MTL::WindingClockwise};
     Viewport viewports[VIEWPORT_COUNT];
     Scissor scissors[VIEWPORT_COUNT];
     BufferView index_buffer;
@@ -92,6 +99,16 @@ class Renderer : public IRenderer {
     void setDepthTestEnabled(bool enabled) override;
     void setDepthWriteEnabled(bool enabled) override;
     void setDepthCompareOp(engines::CompareOp op) override;
+    void setBlendConstant(const float4 color) override;
+    void setDepthBias(f32 constant, f32 slope, f32 clamp) override;
+    void setStencilState(const StencilState& stencil) override;
+    void setCullState(bool enabled, engines::CullFaceMode mode,
+                      engines::Winding front_face) override;
+    void debugDumpTexture(ICommandBuffer* command_buffer, ITextureView* view,
+                          const std::string& path) override;
+    void debugDumpTextureLevel(ICommandBuffer* command_buffer,
+                               ITextureView* view, u32 level,
+                               const std::string& path);
 
     // Viewport and scissor
     void setViewport(u32 index, const Viewport& viewport) override;
@@ -124,6 +141,10 @@ class Renderer : public IRenderer {
     // Helpers
     MTL::RenderCommandEncoder*
     getRenderCommandEncoder(CommandBuffer* command_buffer) const;
+    void getColorPixelFormats(
+        MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const;
+    MTL::PixelFormat getDepthStencilPixelFormat() const;
+    bool hasStencilAttachment() const;
 
     // Encoder state setting
     void setRenderPipelineState(CommandBuffer* command_buffer) const;
@@ -157,6 +178,7 @@ class Renderer : public IRenderer {
 
     // Depth stencil states
     MTL::DepthStencilState* depth_stencil_state_always_and_write;
+    MTL::DepthStencilState* depth_stencil_state_clear_stencil;
 
     // Samplers
     MTL::SamplerState* nearest_sampler;
