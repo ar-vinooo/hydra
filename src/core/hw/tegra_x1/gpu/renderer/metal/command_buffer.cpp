@@ -62,9 +62,7 @@ MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
     if (render_pass_descriptor == encoder_state.render_pass)
         return getRenderCommandEncoderUnchecked();
 
-    encoder_state.render_pass = render_pass_descriptor;
-    encoder_state.render = {};
-
+    // Creating the encoder already resets all cached render state.
     return createRenderCommandEncoder(render_pass_descriptor);
 }
 

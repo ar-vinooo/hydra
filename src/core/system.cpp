@@ -530,6 +530,9 @@ void System::progressFrame(u32 width, u32 height,
                      static_cast<f64>(upload_bytes) / (1024.0 * 1024.0) /
                          elapsed,
                      buffers_created, buffers_reused);
+            LOG_INFO(Other, "TEXTURE: {} synchronization scans, {} skipped",
+                     stats.texture_sync_scans.exchange(0),
+                     stats.texture_sync_skips.exchange(0));
             LOG_INFO(Other,
                      "PERF: {:.1f} fps | pfifo (CPU encode) {:.2f} ms/frame, "
                      "{:.1f} lists/frame | present wait {:.2f} ms/frame | "

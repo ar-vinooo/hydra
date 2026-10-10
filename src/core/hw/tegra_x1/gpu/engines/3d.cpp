@@ -777,7 +777,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     };
 
     // DEBUG: dump the guest shader binary (header + code)
-    if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
+    static const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS");
+    if (dump_dir != nullptr) {
         static std::mutex dump_mutex;
         static std::set<uptr> dumped;
         std::scoped_lock lock(dump_mutex);

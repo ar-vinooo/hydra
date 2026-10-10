@@ -1,7 +1,9 @@
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 
@@ -24,6 +26,7 @@ int main() {
         // overlapping guest memory and contained mip levels from the CTR crash
         // path.
         setenv("HYDRA_GPU_SYNC", "1", 1);
+        setenv("HYDRA_PERF_STATS", "1", 1);
         setenv("HYDRA_DISABLE_SHADER_CACHE", "1", 1);
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
         std::vector<u8> guest_memory(65536, 0);
@@ -67,6 +70,80 @@ int main() {
                   TextureFormat::BC3_RGBA,
               "Contained mip lookup does not cross compressed encodings");
         commands.reset();
+
+        // A bridge merges initially separate intervals after a GPU write.
+        // Disjoint sampled textures must remain untouched, while an overlapping
+        // padded alias must receive the rendered pixels through
+        // synchronization.
+        metal::Renderer range_renderer;
+        auto& range_cache = range_renderer.getTextureCache();
+        commands.reset(range_renderer.createCommandBuffer());
+        auto target_desc =
+            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+                              false, 0, 16, 16, 1, 1, 1, 0, 0, 0);
+        auto alias_desc =
+            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+                              false, 0, 8, 16, 1, 1, 1, 0, 0, 0);
+        auto separate_desc = TextureDescriptor(ptr + 4096, TextureType::_2D,
+                                               TextureFormat::RGBA8Unorm, false,
+                                               0, 16, 16, 1, 1, 1, 0, 0, 0);
+        auto* target_view =
+            range_cache.find(commands.get(), target_desc, TextureUsage::Read);
+        auto* alias_view =
+            range_cache.find(commands.get(), alias_desc, TextureUsage::Read);
+        auto* separate_view =
+            range_cache.find(commands.get(), separate_desc, TextureUsage::Read);
+        check(target_view->getBase() != alias_view->getBase(),
+              "Padded alias exercises distinct storages");
+        auto* target = static_cast<metal::Texture*>(target_view->getBase());
+        range_cache.find(commands.get(), target_desc, TextureUsage::Write);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(target->getTexture());
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setStoreAction(MTL::StoreActionStore);
+        attachment->setClearColor(MTL::ClearColor(1, 0, 0, 1));
+        static_cast<metal::CommandBuffer*>(commands.get())
+            ->getRenderCommandEncoder(pass);
+        auto bridge =
+            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+                              true, 256, 64, 64, 1, 1, 1, 0, 0, 0);
+        range_cache.find(commands.get(), bridge, TextureUsage::Read);
+        check(range_cache.getMemoryCount() == 1,
+              "Bridge merges written and sampled memory intervals");
+        auto& stats = hw::tegra_x1::gpu::PerfStats::instance();
+        const auto skips = stats.texture_sync_skips.load();
+        range_cache.find(commands.get(), separate_desc, TextureUsage::Read);
+        if (std::getenv("HYDRA_DISABLE_TEXTURE_WRITE_FILTER") == nullptr)
+            check(stats.texture_sync_skips.load() > skips,
+                  "Disjoint texture avoids full synchronization scan");
+        const auto scans = stats.texture_sync_scans.load();
+        range_cache.find(commands.get(), alias_desc, TextureUsage::Read);
+        check(stats.texture_sync_scans.load() > scans,
+              "Overlapping alias still scans for GPU writes after merge");
+        // CPU invalidation must still upload a disjoint sampled texture.
+        std::memset(guest_memory.data() + 4096, 0x7a, separate_desc.size);
+        range_cache.invalidateMemory(separate_desc.getRange());
+        range_cache.find(commands.get(), separate_desc, TextureUsage::Read);
+        auto* pixels = range_renderer.getDevice()->newBuffer(
+            512, MTL::ResourceStorageModeShared);
+        auto* blit = static_cast<metal::CommandBuffer*>(commands.get())
+                         ->getBlitCommandEncoder();
+        auto read_pixel = [&](ITextureView* view, usize offset) {
+            auto* texture = static_cast<metal::Texture*>(view->getBase());
+            blit->copyFromTexture(texture->getTexture(), 0, 0,
+                                  MTL::Origin(0, 0, 0), MTL::Size(1, 1, 1),
+                                  pixels, offset, 256, 256);
+        };
+        read_pixel(alias_view, 0);
+        read_pixel(separate_view, 256);
+        commands.reset();
+        const auto* rgba = static_cast<const u8*>(pixels->contents());
+        const bool correct = rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0 &&
+                             rgba[3] == 255 && rgba[256] == 0x7a &&
+                             rgba[259] == 0x7a;
+        pixels->release();
+        check(correct, "GPU alias copy and CPU invalidation preserve pixels");
 
         metal::Renderer upload_renderer;
         // Two uploads encoded before submission must never share CPU-writable

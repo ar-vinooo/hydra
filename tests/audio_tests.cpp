@@ -65,6 +65,51 @@ int main() {
 
         check(framesForSampleClock(0, 0, 240) == 8,
               "Hardware clock startup lead");
+        check(consumedSampleClock(2500, 1000, 900, 400) == 1000,
+              "Only underruns since stream start are excluded");
+        check(consumedSampleClock(1100, 1000, 600, 400) == 0,
+              "Underrun correction saturates without unsigned wraparound");
+        check(consumedSampleClock(999, 1000, 300, 400) == 0,
+              "Earlier clock or missing counters cannot underflow");
+        check(elapsedDspFrames(160000, 0, 160) == 1008,
+              "Guest DSP time follows elapsed hardware time");
+        check(elapsedDspFrames(160000, 0, 160) >
+                  consumedSampleClock(160000, 0, 32000, 0) / 160 + 8,
+              "Host underrun debt does not delay guest DSP time");
+        check(elapsedDspFrames(4000, 4000, 240) == 8 &&
+                  elapsedDspFrames(0, 0, 0) == 0,
+              "DSP timeline startup and invalid frame-size bounds");
+        {
+            // Repeated callback starvation used to accumulate silence debt:
+            // hardware advanced, so production replaced missing frames even
+            // though those frames never drained the PCM queue. Simulate real
+            // queue consumption through many stalls and recoveries.
+            constexpr u64 lead = 8 * 160;
+            u64 hardware = 0, missing = 0, generated = lead, queued = lead;
+            u64 largest_queue = queued;
+            for (u32 tick = 0; tick < 20000; ++tick) {
+                const u64 requested = tick % 17 == 0 ? 4096 : 160;
+                const u64 consumed = std::min(requested, queued);
+                hardware += requested;
+                missing += requested - consumed;
+                queued -= consumed;
+                const auto pcm_clock =
+                    consumedSampleClock(hardware, 0, missing, 0);
+                const auto frames =
+                    framesForSampleClock(pcm_clock, generated, 160);
+                const u64 produced_now = static_cast<u64>(frames) * 160;
+                generated += produced_now;
+                queued += produced_now;
+                largest_queue = std::max(largest_queue, queued);
+                check(generated - pcm_clock == queued,
+                      "Producer timeline matches actual PCM still queued");
+                check(queued == lead,
+                      "Repeated underruns do not accumulate queue latency");
+            }
+            check(
+                missing > 32000 && largest_queue == lead,
+                "Queue stays bounded after more than a second of missing PCM");
+        }
         check(framesForSampleClock(0, 1920, 240) == 0,
               "Hardware clock no duplicate samples");
         check(framesForSampleClock(512, 1920, 240) == 3,

@@ -26,6 +26,8 @@ struct PerfStats {
     std::atomic<u64> pipeline_compiles{0};
     std::atomic<u64> raster_updates{0};
     std::atomic<u64> raster_skips{0};
+    std::atomic<u64> texture_sync_scans{0};
+    std::atomic<u64> texture_sync_skips{0};
 
     static PerfStats& instance() {
         static PerfStats stats;

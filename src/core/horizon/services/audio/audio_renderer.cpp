@@ -255,7 +255,7 @@ IAudioRenderer::IAudioRenderer(System& system,
                 event->signal();
                 last_signal = now;
             }
-            next_tick += std::chrono::milliseconds(2);
+            next_tick = std::max(next_tick + std::chrono::milliseconds(2), now);
             std::this_thread::sleep_until(next_tick);
         }
     });
@@ -271,7 +271,9 @@ IAudioRenderer::~IAudioRenderer() {
 result_t IAudioRenderer::start() {
     std::lock_guard lock(render_mutex);
     LOG_INFO(Services, "Audio renderer start: {} Hz", params.sample_rate);
-    sample_clock_origin = output_stream->getStats().sample_clock_frames;
+    const auto stats = output_stream->getStats();
+    sample_clock_origin = stats.sample_clock_frames;
+    missing_frames_origin = stats.missing_frames;
     produced_samples = 0;
     last_render_time = {};
     running = true;
@@ -344,10 +346,18 @@ bool IAudioRenderer::renderAudio() {
 
     const auto stream_stats = output_stream->getStats();
     if (running && stream_stats.has_sample_clock) {
-        const u64 played =
-            stream_stats.sample_clock_frames - sample_clock_origin;
-        // Keep forty milliseconds ahead of the hardware clock. Wall clocks
-        // and the device oscillator drift, so do not use wall time to pace PCM.
+        // Keep the guest's DSP time independent from host queue accounting.
+        // The initial eight-frame lead matches the renderer's startup lead.
+        elapsed_frames.store(elapsedDspFrames(stream_stats.sample_clock_frames,
+                                              sample_clock_origin,
+                                              params.sample_count),
+                             std::memory_order_relaxed);
+        const u64 played = consumedSampleClock(
+            stream_stats.sample_clock_frames, sample_clock_origin,
+            stream_stats.missing_frames, missing_frames_origin);
+        // Keep forty milliseconds ahead of consumed PCM, not silence produced
+        // by hardware underruns. Otherwise every underrun permanently grows
+        // the actual queue and eventually triggers discarded voice frames.
         frame_count = framesForSampleClock(played, produced_samples,
                                            params.sample_count, 1);
     }
@@ -357,6 +367,11 @@ bool IAudioRenderer::renderAudio() {
     // callback must not consume multiple DSP frames while holding their update
     // lock, otherwise a single queued wave is followed by artificial silence.
     frame_count = std::min(frame_count, 1u);
+    // Apply backpressure before advancing voices. A full host queue must not
+    // consume guest waves and silently discard their mixed output.
+    if (queued_samples.load(std::memory_order_relaxed) + params.sample_count >
+        params.sample_rate / 5)
+        frame_count = 0;
     // A callback jump or a delayed worker wake must not drain the guest's
     // remaining waves in a burst. Allow a small clock correction, but leave
     // enough time between DSP frames for the client to refill a consumed wave.
@@ -550,13 +565,12 @@ bool IAudioRenderer::renderAudio() {
                          queued_samples.load());
         }
     }
-    if (output_frames && queued_samples.load(std::memory_order_relaxed) <
-                             params.sample_rate / 5) {
+    if (output_frames) {
         produced_samples += output_frames;
         last_render_time = now;
-        // REV5+ reports DSP frames produced, including queued frames.
-        elapsed_frames.store(produced_samples / params.sample_count,
-                             std::memory_order_relaxed);
+        if (!stream_stats.has_sample_clock)
+            elapsed_frames.store(produced_samples / params.sample_count,
+                                 std::memory_order_relaxed);
         queued_samples.fetch_add(output_frames, std::memory_order_relaxed);
         output_stream->enqueueBuffer(
             output_frames, std::span(reinterpret_cast<const u8*>(stereo.data()),
@@ -605,12 +619,18 @@ bool IAudioRenderer::renderAudio() {
                 valid_slots += slot.valid ? 1u : 0u;
         std::fprintf(stderr,
                      "Audio timing: %u Hz, hardware %llu, produced %llu, "
-                     "missing %llu, queued %llu, valid waves %u, voice0 "
+                     "missing %llu, queued %llu, consumed clock %llu, valid "
+                     "DSP frames %llu, waves %u, voice0 "
                      "consumed %u, offset %u, slot %u\n",
                      params.sample_rate,
                      stream_stats.sample_clock_frames - sample_clock_origin,
                      produced_samples, stream_stats.missing_frames,
-                     queued_samples.load(), valid_slots,
+                     queued_samples.load(),
+                     consumedSampleClock(
+                         stream_stats.sample_clock_frames, sample_clock_origin,
+                         stream_stats.missing_frames, missing_frames_origin),
+                     elapsed_frames.load(std::memory_order_relaxed),
+                     valid_slots,
                      voices.empty() ? 0u : voices[0].num_wave_buffers_consumed,
                      voice_states.empty() ? 0u : voice_states[0].offset,
                      voice_states.empty() ? 0u : voice_states[0].crnt_slot);

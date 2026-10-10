@@ -58,6 +58,37 @@ struct TextureMem {
     TextureMemInfo info;
     SmallCache<u32, TextureGroup> cache;
 
+    // Conservative history of GPU-written address ranges. Entries contain no
+    // storage pointers, so replacing storages or merging memories is safe.
+    struct WrittenRange {
+        uptr end;
+        TextureCacheTimePoint timestamp;
+    };
+    std::map<uptr, WrittenRange> gpu_writes;
+
+    void recordGpuWrite(ztd::Range<uptr> written_range,
+                        TextureCacheTimePoint timestamp) {
+        auto [it, inserted] = gpu_writes.try_emplace(
+            written_range.getBegin(),
+            WrittenRange{written_range.getEnd(), timestamp});
+        if (!inserted) {
+            // Retain the union when a render target at this address shrinks.
+            it->second.end = std::max(it->second.end, written_range.getEnd());
+            it->second.timestamp = std::max(it->second.timestamp, timestamp);
+        }
+    }
+
+    bool hasGpuWriteSince(ztd::Range<uptr> query_range,
+                          TextureCacheTimePoint timestamp) const {
+        for (auto it = gpu_writes.begin();
+             it != gpu_writes.end() && it->first < query_range.getEnd(); ++it) {
+            if (it->second.end > query_range.getBegin() &&
+                it->second.timestamp > timestamp)
+                return true;
+        }
+        return false;
+    }
+
     // Debug
     usize getTextureGroupCount() const { return cache.getCount(); }
 

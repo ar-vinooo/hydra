@@ -41,20 +41,20 @@ u32 PipelineCache::hash(const PipelineDescriptor& descriptor) {
 
     // Color targets
     for (const auto& color_target_state : descriptor.color_target_states) {
-        hash.add(color_target_state.format);
-        hash.add(color_target_state.write_mask);
+        hash.add(static_cast<u32>(color_target_state.format));
+        hash.add(static_cast<u32>(color_target_state.write_mask));
         hash.add(color_target_state.blend_enabled);
         if (color_target_state.blend_enabled) {
-            hash.add(color_target_state.rgb_op);
-            hash.add(color_target_state.src_rgb_factor);
-            hash.add(color_target_state.dst_rgb_factor);
-            hash.add(color_target_state.alpha_op);
-            hash.add(color_target_state.src_alpha_factor);
-            hash.add(color_target_state.dst_alpha_factor);
+            hash.add(static_cast<u32>(color_target_state.rgb_op));
+            hash.add(static_cast<u32>(color_target_state.src_rgb_factor));
+            hash.add(static_cast<u32>(color_target_state.dst_rgb_factor));
+            hash.add(static_cast<u32>(color_target_state.alpha_op));
+            hash.add(static_cast<u32>(color_target_state.src_alpha_factor));
+            hash.add(static_cast<u32>(color_target_state.dst_alpha_factor));
         }
     }
 
-    hash.add(descriptor.depth_stencil_format);
+    hash.add(static_cast<u32>(descriptor.depth_stencil_format));
 
     return hash.toHashCode();
 }

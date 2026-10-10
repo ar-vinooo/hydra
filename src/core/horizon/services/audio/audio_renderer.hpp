@@ -40,6 +40,7 @@ class IAudioRenderer : public IService {
     std::atomic<u64> elapsed_frames{0};
     u64 update_count{0};
     u64 sample_clock_origin{0};
+    u64 missing_frames_origin{0};
     u64 produced_samples{0};
     u64 head_resyncs{0};
     std::chrono::steady_clock::time_point last_stats_time{};
