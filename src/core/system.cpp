@@ -3,8 +3,17 @@
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 
+#include <execinfo.h>
+#include <csignal>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#endif
 #include <fmt/chrono.h>
+#include <unistd.h>
 #include <stb_image_write.h>
+#ifdef ZTD_PLATFORM_APPLE
+#include <mach/mach.h>
+#endif
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-conversion"
@@ -92,9 +101,63 @@ System::System(horizon::ui::IHandler& ui_handler_)
       os(*this) {
     // TODO: set this elsewhere
     LOGGER_INSTANCE.setOutput(CONFIG_INSTANCE.getLogOutput());
+
+    // DEBUG: print where an uncaught exception ends the process. Uses only
+    // async-signal-safe calls, as locks may be broken at this point.
+    static const bool terminate_hook_installed = [] {
+        std::set_terminate([] {
+            constexpr char header[] = "\n[hydra] std::terminate backtrace:\n";
+            write(STDERR_FILENO, header, sizeof(header) - 1);
+            void* frames[64];
+            const int count = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, count, STDERR_FILENO);
+            abort();
+        });
+        return true;
+    }();
+    (void)terminate_hook_installed;
+    // Opt-in, best-effort diagnostics for native faults when macOS cannot
+    // produce a crash report. Normal launches retain the OS signal handlers.
+    static const bool fault_hook_installed = [] {
+        if (std::getenv("HYDRA_TRACE_FAULTS") == nullptr)
+            return false;
+        void* warmup[1];
+        backtrace(warmup, 1);
+        struct sigaction action{};
+        action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+        action.sa_sigaction = [](int signal, siginfo_t* info, void* context) {
+            constexpr char header[] = "\n[hydra] native fault backtrace:\n";
+            write(STDERR_FILENO, header, sizeof(header) - 1);
+            auto write_address = [](uptr value) {
+                char buffer[19] = {'0', 'x'};
+                constexpr char digits[] = "0123456789abcdef";
+                for (usize i = 0; i < 16; ++i)
+                    buffer[2 + i] = digits[(value >> ((15 - i) * 4)) & 0xf];
+                buffer[18] = '\n';
+                write(STDERR_FILENO, buffer, sizeof(buffer));
+            };
+            write_address(reinterpret_cast<uptr>(info->si_addr));
+#if defined(__APPLE__) && defined(__aarch64__)
+            const auto* state = static_cast<const ucontext_t*>(context);
+            write_address(state->uc_mcontext->__ss.__pc);
+#else
+            (void)context;
+#endif
+            void* frames[64];
+            const int count = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, count, STDERR_FILENO);
+            kill(getpid(), signal);
+        };
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGSEGV, &action, nullptr);
+        sigaction(SIGBUS, &action, nullptr);
+        return true;
+    }();
+    (void)fault_hook_installed;
 }
 
 System::~System() {
+    forceStop();
     // TODO: set this elsewhere
     LOGGER_INSTANCE.setOutput(LogOutput::StdOut);
 }
@@ -430,14 +493,11 @@ void System::forceStop() {
     for (auto& it : os.getKernel().getProcessManager())
         it->stop();
 
-    // Wait a small amount of time for all threads to catch up
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Check if all processes have stopped
-    if (isRunning()) {
-        // If some processes are still running, just abort
-        LOG_FATAL(Other, "Failed to stop all processes");
-    }
+    // Service workers must stop while their managers and client MMUs are alive.
+    os.shutdownServices();
+    for (auto& process : os.getKernel().getProcessManager())
+        process->joinThreads();
+    gpu.getPfifo().shutdown();
 }
 
 void System::pause() {
@@ -452,6 +512,14 @@ void System::resume() {
 
 void System::progressFrame(u32 width, u32 height,
                            bool& out_dt_average_updated) {
+    // DEBUG: dump guest threads when the trigger file appears
+    static const char* thread_dump_trigger = std::getenv("HYDRA_THREAD_DUMP");
+    if (thread_dump_trigger != nullptr && main_process != nullptr) {
+        std::error_code ec;
+        if (std::filesystem::remove(thread_dump_trigger, ec))
+            main_process->debugDumpThreads();
+    }
+
     // Pump input events
     input_device_manager.pumpEvents();
 
@@ -554,6 +622,24 @@ void System::progressFrame(u32 width, u32 height,
                     std::max(frames, 1.0),
                 static_cast<f64>(stats.blit_encoders.exchange(0)) /
                     std::max(frames, 1.0));
+            LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
+                     static_cast<f64>(stats.compute_dispatches.exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.compute_threads.exchange(0)) /
+                         std::max(frames, 1.0));
+            LOG_INFO(Other, "Shader libraries: {} prewarmed/reused hits",
+                     stats.shader_library_hits.exchange(0));
+#ifdef ZTD_PLATFORM_APPLE
+            task_vm_info_data_t memory_info{};
+            mach_msg_type_number_t memory_count = TASK_VM_INFO_COUNT;
+            if (task_info(mach_task_self(), TASK_VM_INFO,
+                          reinterpret_cast<task_info_t>(&memory_info),
+                          &memory_count) == KERN_SUCCESS)
+                LOG_INFO(Other, "Process memory footprint: {:.1f} MiB",
+                         static_cast<f64>(memory_info.phys_footprint) / (1024.0 * 1024.0));
+#endif
+            LOG_INFO(Other, "Metal resources: {:.1f} MiB allocated",
+                     static_cast<f64>(gpu.getRenderer().getAllocatedResourceBytes()) / (1024.0 * 1024.0));
             LOG_INFO(Other,
                      "PERF: {:.1f} fps | pfifo (CPU encode) {:.2f} ms/frame, "
                      "{:.1f} lists/frame | present wait {:.2f} ms/frame | "
@@ -698,9 +784,9 @@ void System::takeScreenshot() {
             static_cast<u32>(rect.size.y() * rect.size.x() * 4));
         buffer->copyFrom(command_buffer, texture, rect.origin, rect.size,
                          ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1));
+        // Wait for the copy to finish
+        gpu.getRenderer().debugSyncCommandBuffer(command_buffer);
         delete command_buffer;
-
-        // TODO: wait for the command buffer to finish
 
         // Save the image to file
         auto now = std::chrono::system_clock::now();

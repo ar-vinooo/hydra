@@ -123,7 +123,7 @@ struct GameListView: View {
         } catch {
             // TODO: error popup
             print("Failed to load game path \(url.path(percentEncoded: false)): \(error)")
-            if ["xci", "nsp"].contains(url.pathExtension.lowercased()) {
+            if ["xci", "nsp", "xcz", "nsz"].contains(url.pathExtension.lowercased()) {
                 errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
             return

@@ -40,7 +40,7 @@ NvResult NvMap::alloc(System* system, Handle handle, u32 heap_mask, u32 flags,
 }
 
 NvResult NvMap::free(System* system, Aligned<Handle, 8> handle,
-                     gpu_vaddr_t* out_addr, u64* out_size, u32* out_flags) {
+                     gpu_vaddr_t* out_addr, u32* out_size, u32* out_flags) {
     const auto found = system->getGpu().getMap(handle);
     if (!found)
         return NvResult::BadParameter;
@@ -49,7 +49,7 @@ NvResult NvMap::free(System* system, Aligned<Handle, 8> handle,
         return NvResult::BadParameter;
 
     *out_addr = map.addr;
-    *out_size = map.size;
+    *out_size = static_cast<u32>(map.size);
     *out_flags = map.write ? 1 : 0; // TODO: correct?
     return NvResult::Success;
 }

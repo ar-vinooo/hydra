@@ -73,6 +73,18 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                                                     .is_depth = is_depth});
                     break;
                 }
+                case ir::Opcode::ImageStore:
+                    handleImageAccess(
+                        instruction.getOperand(0).getRawValue<u32>(),
+                        instruction.getOperand(1).getRawValue<TextureType>(),
+                        false);
+                    break;
+                case ir::Opcode::ImageAtomic:
+                    handleImageAccess(
+                        instruction.getOperand(0).getRawValue<u32>(),
+                        instruction.getOperand(1).getRawValue<TextureType>(),
+                        true);
+                    break;
                 // TODO: TextureQueryDimension?
                 default:
                     break;
@@ -107,6 +119,16 @@ void MemoryAnalyzer::handleTextureAccess(u32 const_buffer_index,
                         res.first->second.is_depth != info.is_depth)) {
         // TODO: handle this
         LOG_WARN(ShaderDecompiler, "Texture type mismatch");
+    }
+}
+
+void MemoryAnalyzer::handleImageAccess(u32 index, TextureType type,
+                                       bool is_atomic) {
+    const auto res = images.emplace(index, ImageInfo{type, is_atomic});
+    if (!res.second) {
+        if (res.first->second.type != type)
+            LOG_WARN(ShaderDecompiler, "Image type mismatch");
+        res.first->second.is_atomic |= is_atomic;
     }
 }
 

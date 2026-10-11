@@ -69,11 +69,20 @@ class IThread : public SynchronizationObject {
                      .payload = {.resume = {.signalled = true,
                                             .signalled_obj = signalled_obj}}});
     }
-    void cancelSync() {
+    // CancelSynchronization: ends the current WaitSynchronization, or, like
+    // Horizon, makes the next one return Cancelled if the thread is not
+    // waiting yet. nn::os wakes MultiWait waiters this way.
+    void cancelSync();
+    // Unconditionally ends the current guest wait (e.g. an IPC request whose
+    // server went away)
+    void abortWait() {
         sendMessage({.type = ThreadMessageType::Resume,
                      .supervisor = false,
                      .payload = {.resume = {.signalled = false}}});
     }
+    // Bracket a WaitSynchronization; call beginSyncWait after pause()
+    void beginSyncWait();
+    void endSyncWait();
     void supervisorResume() {
         sendMessage({.type = ThreadMessageType::Resume, .supervisor = true});
     }
@@ -128,7 +137,15 @@ class IThread : public SynchronizationObject {
 
     std::atomic<ThreadState> state{ThreadState::Created};
 
+    // Serialize startup with joining a thread registered during shutdown.
+    std::mutex lifecycle_mutex;
     std::mutex msg_mutex;
+    // Set between a guest pause and the signal that ends that wait
+    bool guest_wait_armed{false};
+    // WaitSynchronization state for CancelSynchronization
+    bool sync_wait_active{false};
+    bool sync_wait_cancelled{false};
+    void pushCancelResumeLocked();
     std::condition_variable msg_cv;
     std::queue<ThreadMessage> msg_queue;
 

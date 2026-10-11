@@ -99,15 +99,88 @@ ENABLE_ENUM_FORMATTING(
 
 namespace hydra::hw::tegra_x1::cpu::hypervisor {
 
+namespace {
+
+std::atomic<u32> live_vcpu_count{0};
+
+// Start giving vCPUs back well before the hard limit of 64.
+// HYDRA_VCPU_RELEASE_THRESHOLD overrides it (0 exercises the path always).
+u32 getVcpuReleaseThreshold() {
+    static const u32 threshold = [] {
+        if (const char* env = std::getenv("HYDRA_VCPU_RELEASE_THRESHOLD"))
+            return static_cast<u32>(std::atoi(env));
+        return 40u;
+    }();
+    return threshold;
+}
+
+bool mayBlock(u64 svc_id) {
+    switch (svc_id) {
+    case 0x0b: // SleepThread
+    case 0x18: // WaitSynchronization
+    case 0x1a: // ArbitrateLock
+    case 0x1c: // WaitProcessWideKeyAtomic
+    case 0x21: // SendSyncRequest
+    case 0x34: // WaitForAddress
+    case 0x43: // ReplyAndReceive
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
 Thread::Thread(WallClock& wall_clock, Cpu& cpu_, IMmu* mmu,
                const ThreadCallbacks& callbacks, IMemory* tls_mem,
-               vaddr_t tls_mem_base)
-    : IThread(wall_clock, mmu, callbacks, tls_mem), cpu{cpu_} {
-    // Create
-    HV_ASSERT_SUCCESS(hv_vcpu_create(&vcpu, &exit, nullptr));
+               vaddr_t tls_mem_base_)
+    : IThread(wall_clock, mmu, callbacks, tls_mem), cpu{cpu_},
+      tls_mem_base{tls_mem_base_} {
+    // VTimer
+    struct mach_timebase_info info;
+    mach_timebase_info(&info);
+
+    interrupt_time_delta_ticks =
+        ((INTERRUPT_TIME * info.denom) + (info.numer - 1)) / info.numer;
+
+    // DEBUG: HYDRA_HOOK_PCS=0x...,0x... logs the first hit of each address on
+    // every thread (one-shot hardware breakpoints, at most 6)
+    if (const char* hooks = std::getenv("HYDRA_HOOK_PCS")) {
+        std::string_view list(hooks);
+        u32 slot = 0;
+        while (!list.empty() && slot < 6) {
+            const auto comma = list.find(',');
+            const auto item = list.substr(0, comma);
+            breakpoints[slot++] = std::strtoull(std::string(item).c_str(), nullptr, 16);
+            list = comma == std::string_view::npos ? "" : list.substr(comma + 1);
+        }
+    }
+
+    createVcpu();
 
     // TODO: find out what this does
     setReg(HV_REG_CPSR, 0x3c0);
+
+    // HACK: set LR to loader return address
+    // SetReg(HV_REG_LR, 0xffff0000);
+}
+
+Thread::~Thread() { releaseVcpu(false); }
+
+void Thread::createVcpu() {
+    // vCPUs may be exhausted for a moment; wait for a blocked thread to give
+    // one back
+    while (true) {
+        const auto res = hv_vcpu_create(&vcpu, &exit, nullptr);
+        if (res == HV_SUCCESS)
+            break;
+        ASSERT(res == HV_NO_RESOURCES, Hypervisor,
+               "hv_vcpu_create(&vcpu, &exit, nullptr) failed: 0x{:x}",
+               u64(res));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    has_vcpu = true;
+    live_vcpu_count++;
 
     setSysReg(HV_SYS_REG_MAIR_EL1, 0xfful);
     setSysReg(HV_SYS_REG_TCR_EL1, 0x12B5193519ul);
@@ -129,24 +202,53 @@ Thread::Thread(WallClock& wall_clock, Cpu& cpu_, IMmu* mmu,
     HV_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
     // HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_reg_accesses(vcpu, true));
 
-    // VTimer
-    struct mach_timebase_info info;
-    mach_timebase_info(&info);
+    // Registers that are not part of `state`
+    setReg(HV_REG_PC, saved_pc);
+    setSysReg(HV_SYS_REG_SPSR_EL1, saved_spsr);
+    setSysReg(HV_SYS_REG_TPIDR_EL0, saved_tpidr);
 
-    interrupt_time_delta_ticks =
-        ((INTERRUPT_TIME * info.denom) + (info.numer - 1)) / info.numer;
+    // Breakpoints
+    bool any_breakpoint = false;
+    for (u32 slot = 0; slot < MAX_BREAKPOINTS; ++slot) {
+        if (breakpoints[slot] == 0x0)
+            continue;
+        any_breakpoint = true;
+        setSysReg(hv_sys_reg_t(HV_SYS_REG_DBGBVR0_EL1 + slot * 8),
+                  breakpoints[slot]);
+        setSysReg(hv_sys_reg_t(HV_SYS_REG_DBGBCR0_EL1 + slot * 8),
+                  DBGBCR_E | (0x3 << 1) | DBGBCR_BAS | (0x0 << 20));
+    }
+    if (any_breakpoint)
+        setSysReg(HV_SYS_REG_MDSCR_EL1,
+                  getSysReg(HV_SYS_REG_MDSCR_EL1) | MDSCR_EL1_MDE);
 
     setupVTimer();
 
-    // HACK: set LR to loader return address
-    // SetReg(HV_REG_LR, 0xffff0000);
+    // Every register has to be written on the next run
+    exit_register_state.reset();
 }
 
-Thread::~Thread() { hv_vcpu_destroy(vcpu); }
+void Thread::releaseVcpu(bool save_state) {
+    if (!has_vcpu)
+        return;
+
+    // Only the owning thread may access the registers
+    if (save_state) {
+        saved_pc = getReg(HV_REG_PC);
+        saved_spsr = getSysReg(HV_SYS_REG_SPSR_EL1);
+        saved_tpidr = getSysReg(HV_SYS_REG_TPIDR_EL0);
+    }
+
+    hv_vcpu_destroy(vcpu);
+    has_vcpu = false;
+    live_vcpu_count--;
+}
 
 void Thread::run() {
     // Main run loop
     while (true) {
+        if (!has_vcpu)
+            createVcpu();
         processMessages();
 
         // Run
@@ -170,6 +272,10 @@ void Thread::run() {
 
                 switch (ec) {
                 case ExceptionClass::SvcAarch64:
+                    // Don't hold on to a vCPU while blocked if they run low
+                    if (live_vcpu_count >= getVcpuReleaseThreshold() &&
+                        mayBlock(esr & 0xffff))
+                        releaseVcpu();
                     callbacks.svc_handler(this, esr & 0xffff);
                     break;
                 case ExceptionClass::TrappedMsrMrsSystem: {
@@ -221,8 +327,12 @@ void Thread::run() {
 
                 // Set the PC to trampoline
                 // TODO: most of the time we can skip msr, find out when
-                setReg(HV_REG_PC,
-                       KERNEL_REGION_BASE + EXCEPTION_TRAMPOLINE_OFFSET);
+                constexpr u64 trampoline =
+                    KERNEL_REGION_BASE + EXCEPTION_TRAMPOLINE_OFFSET;
+                if (has_vcpu)
+                    setReg(HV_REG_PC, trampoline);
+                else
+                    saved_pc = trampoline;
                 break;
             }
             case ExceptionClass::SmcAarch64:
@@ -237,11 +347,45 @@ void Thread::run() {
                 break;
             }
             case ExceptionClass::BreakpointLowerEl: {
+                // DEBUG: one-shot hooks from HYDRA_HOOK_PCS
+                static const bool hook_mode =
+                    std::getenv("HYDRA_HOOK_PCS") != nullptr;
+                if (hook_mode) {
+                    const u64 pc = getReg(HV_REG_PC);
+                    LOG_INFO(Hypervisor,
+                             "DEBUG HOOK pc={:#x} lr={:#x} x0={:#x} x1={:#x} "
+                             "x2={:#x} x3={:#x}",
+                             pc, state.lr, state.r[0], state.r[1], state.r[2],
+                             state.r[3]);
+                    // Disable the hit breakpoint, step one instruction and
+                    // re-enable it so every call is logged
+                    for (u32 slot = 0; slot < MAX_BREAKPOINTS; ++slot) {
+                        if (breakpoints[slot] != pc)
+                            continue;
+                        setSysReg(hv_sys_reg_t(HV_SYS_REG_DBGBCR0_EL1 + slot * 8),
+                                  0x0);
+                        hook_rearm_slot = slot;
+                        setSysReg(HV_SYS_REG_MDSCR_EL1,
+                                  getSysReg(HV_SYS_REG_MDSCR_EL1) | MDSCR_EL1_SS);
+                        state.pstate |= PSTATE_SS;
+                    }
+                    break;
+                }
                 // Callback
                 callbacks.breakpoint_hit();
                 break;
             }
             case ExceptionClass::SoftwareStepLowerEl: {
+                // DEBUG: re-arm a HYDRA_HOOK_PCS breakpoint
+                if (hook_rearm_slot < MAX_BREAKPOINTS && !exception) {
+                    const auto slot = hook_rearm_slot;
+                    hook_rearm_slot = MAX_BREAKPOINTS;
+                    setSysReg(HV_SYS_REG_MDSCR_EL1,
+                              getSysReg(HV_SYS_REG_MDSCR_EL1) & ~u64(MDSCR_EL1_SS));
+                    setSysReg(hv_sys_reg_t(HV_SYS_REG_DBGBCR0_EL1 + slot * 8),
+                              DBGBCR_E | (0x3 << 1) | DBGBCR_BAS | (0x0 << 20));
+                    break;
+                }
                 // HACK: single-stepping in exceptions behaves very weirdly
                 if (exception) {
                     state.pstate |= PSTATE_SS;

@@ -1,5 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
@@ -7,7 +8,8 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue) {
+CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_)
+    : command_queue{command_queue_} {
     TMP_AUTORELEASE_POOL_BEGIN();
     command_buffer = command_queue->commandBuffer()->retain();
     TMP_AUTORELEASE_POOL_END();
@@ -41,6 +43,17 @@ CommandBuffer::~CommandBuffer() {
                     static_cast<u64>(dt * 1'000'000'000.0);
         });
     }
+    // GPU faults and timeouts are otherwise silent. This runs on a Metal
+    // dispatch thread the logger does not know about, so print directly.
+    command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
+        if (cb->status() != MTL::CommandBufferStatusError)
+            return;
+        const auto error = cb->error();
+        std::fprintf(stderr, "[Metal] Command buffer failed (code %ld): %s\n",
+                     error ? static_cast<long>(error->code()) : -1L,
+                     error ? error->localizedDescription()->utf8String()
+                           : "unknown error");
+    });
     command_buffer->commit();
     // Command buffers execute in commit order on the same queue, so there is no
     // need to wait for the GPU. HYDRA_GPU_SYNC=1 restores the old behaviour
@@ -99,6 +112,36 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoder() {
     ++blit_encoders;
 
     return getBlitCommandEncoderUnchecked();
+}
+
+MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoder() {
+    if (encoder_type == EncoderType::Compute)
+        return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
+
+    endEncoding();
+
+    TMP_AUTORELEASE_POOL_BEGIN();
+    // Serial dispatches see the results of previous ones
+    command_encoder = command_buffer->computeCommandEncoder()->retain();
+    TMP_AUTORELEASE_POOL_END();
+
+    encoder_type = EncoderType::Compute;
+
+    return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
+}
+
+f64 CommandBuffer::debugCommitAndWait() {
+    endEncoding();
+    command_buffer->commit();
+    command_buffer->waitUntilCompleted();
+    const auto ms =
+        (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) *
+        1000.0;
+    command_buffer->release();
+    TMP_AUTORELEASE_POOL_BEGIN();
+    command_buffer = command_queue->commandBuffer()->retain();
+    TMP_AUTORELEASE_POOL_END();
+    return ms;
 }
 
 void CommandBuffer::endEncoding() {

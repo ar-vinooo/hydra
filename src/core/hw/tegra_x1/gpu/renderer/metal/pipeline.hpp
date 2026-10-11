@@ -17,7 +17,7 @@ class Pipeline final : public PipelineBase {
     MTL::RenderPipelineState* getPipeline() const { return pipeline; }
 
   private:
-    MTL::RenderPipelineState* pipeline;
+    MTL::RenderPipelineState* pipeline{nullptr};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

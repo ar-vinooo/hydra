@@ -2,8 +2,6 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/const.hpp"
 
-// TODO: bindless
-
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 enum class TextureQuery {
@@ -28,6 +26,19 @@ union InstTxq {
 };
 
 void emitTxq(DecoderContext& context, InstTxq inst);
+
+// Bindless: the handle is in register src, the LOD follows it
+union InstTxqB {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<bool, 49, 1> nodep;
+    BitField64<TextureQuery, 22, 7> query;
+};
+
+void emitTxqB(DecoderContext& context, InstTxqB inst);
 
 enum class TextureComponent {
     R = 0,
@@ -117,6 +128,49 @@ union InstTex {
 
 void emitTex(DecoderContext& context, InstTex inst);
 
+// Bindless: the handle is the first register of src_b
+union InstTexB {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src_a;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> src_b;
+    BitField64<TextureDimension, 28, 3> dim;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<bool, 35, 1> ndv;
+    BitField64<bool, 36, 1> aoffi;
+    BitField64<Lod, 37, 3> lod;
+    BitField64<bool, 40, 1> lc;
+    BitField64<bool, 49, 1> nodep;
+    BitField64<bool, 50, 1> dc;
+    BitField64<pred_t, 51, 3> dst_pred;
+};
+
+void emitTexB(DecoderContext& context, InstTexB inst);
+
+// Texel fetch; the bindless variant has the handle as the first register of
+// src_b and no cbuf_index
+union InstTld {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src_a;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> src_b;
+    BitField64<TextureDimension, 28, 3> dim;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<bool, 35, 1> aoffi;
+    BitField64<u32, 36, 13> cbuf_index;
+    BitField64<bool, 49, 1> nodep;
+    BitField64<bool, 50, 1> ms;
+    BitField64<pred_t, 51, 3> dst_pred;
+    BitField64<bool, 55, 1> lod; // LL if set, LZ otherwise
+};
+
+using InstTldB = InstTld;
+
+void emitTld(DecoderContext& context, InstTld inst);
+void emitTldB(DecoderContext& context, InstTldB inst);
+
 union InstTld4 {
     BitField64<reg_t, 0, 8> dst;
     BitField64<reg_t, 8, 8> src_a;
@@ -137,6 +191,25 @@ union InstTld4 {
 
 void emitTld4(DecoderContext& context, InstTld4 inst);
 
+// Bindless: the handle is the first register of src_b
+union InstTld4B {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src_a;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> src_b;
+    BitField64<TextureDimension, 28, 3> dim;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<bool, 35, 1> ndv;
+    BitField64<TextureOffset, 36, 2> offset;
+    BitField64<TextureComponent, 38, 2> component;
+    BitField64<bool, 49, 1> nodep;
+    BitField64<bool, 50, 1> dc;
+    BitField64<pred_t, 51, 3> dst_pred;
+};
+
+void emitTld4B(DecoderContext& context, InstTld4B inst);
+
 union InstTld4s {
     BitField64<reg_t, 0, 8> dst0;
     BitField64<reg_t, 8, 8> src_a;
@@ -152,6 +225,10 @@ union InstTld4s {
 };
 
 void emitTld4s(DecoderContext& context, InstTld4s inst);
+
+// Traces a bindless handle register back to the constant buffer words it was
+// loaded from, returning the texture binding index
+std::optional<u32> trackBindlessResource(DecoderContext& context, reg_t reg);
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder
 

@@ -123,6 +123,7 @@ struct Binder {
     // out_gpu_fence: number of GPU submissions that render the buffer
     i32 consumeBuffer(BqBufferInput& out_input, u64& out_gpu_fence);
     void unqueueAllBuffers();
+    void removeBuffer(i32 slot);
 
     const GraphicBuffer& getBuffer(i32 slot) {
         std::scoped_lock lock(queue_mutex);

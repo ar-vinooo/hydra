@@ -33,6 +33,7 @@ class CodeMemory;
 class Kernel {
   public:
     explicit Kernel(System& system_);
+    ~Kernel() { process_manager.destroyAllProcesses(); }
 
     void supervisorCall(Process* crnt_process, IThread* crnt_thread,
                         hw::tegra_x1::cpu::IThread* guest_thread, u64 id);
@@ -102,7 +103,8 @@ class Kernel {
                                       IThread* crnt_thread, uptr mutex_addr,
                                       uptr var_addr, Handle self_handle,
                                       i64 timeout);
-    result_t signalProcessWideKey(Process* crnt_process, uptr addr, i32 count);
+    result_t signalProcessWideKey(Process* crnt_process, uptr addr,
+                                  i32 count, u64* out_woken = nullptr);
     void getSystemTick(u64& out_tick);
     result_t connectToNamedPort(const std::string_view name,
                                 hipc::ClientSession*& out_client_session);
@@ -114,6 +116,9 @@ class Kernel {
     result_t getInfo(Process* crnt_process, InfoType info_type, AutoObject* obj,
                      u64 info_sub_type, u64& out_info);
     result_t mapPhysicalMemory(Process* crnt_process, vaddr_t addr, u64 size);
+    result_t unmapPhysicalMemory(Process* crnt_process, vaddr_t addr,
+                                 u64 size);
+    result_t checkPhysicalMemoryRange(vaddr_t addr, u64 size);
     result_t setThreadActivity(IThread* thread, ThreadActivity activity);
     result_t getThreadContext3(IThread* thread,
                                ThreadContext& out_thread_context);

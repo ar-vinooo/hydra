@@ -130,6 +130,13 @@ struct MixInfoIn {
     u32 padding4;
 };
 
+struct MixUpdateHeader {
+    u32 magic;
+    i32 count;
+    u8 reserved[24];
+};
+static_assert(sizeof(MixUpdateHeader) == 0x20);
+
 struct SinkInfoIn {
     u8 type;
     bool is_used;
@@ -577,7 +584,7 @@ bool IAudioRenderer::renderAudio() {
                                      stereo.size() * sizeof(f32)));
     }
 
-    if (std::getenv("HYDRA_DUMP_AUDIO") &&
+    if ((std::getenv("HYDRA_DUMP_AUDIO") || std::getenv("HYDRA_AUDIO_STATS")) &&
         now - last_stats_time >= std::chrono::seconds(5)) {
         last_stats_time = now;
         u32 active = 0, paused = 0, stopped = 0;
@@ -688,7 +695,6 @@ result_t IAudioRenderer::requestUpdateImpl(
         in_header.mempools_size < mempool_count * sizeof(MemPoolInfoIn) ||
         in_header.voices_size < params.voice_count * sizeof(VoiceInfoIn) ||
         in_header.channels_size % sizeof(ChannelInfoIn) ||
-        in_header.mixes_size % sizeof(MixInfoIn) ||
         in_header.sinks_size % sizeof(SinkInfoIn)) {
         ONCE(LOG_WARN(Services,
                       "Audio update rejected: need {} output bytes, got {}, "
@@ -696,6 +702,39 @@ result_t IAudioRenderer::requestUpdateImpl(
                       output_size, out_stream->getSize(), input_end,
                       in_stream->getSize()));
         return MAKE_RESULT(Svc, kernel::Error::InvalidSize);
+    }
+
+    // REV7 sends only changed mixes, prefixed by a count header. Preserve
+    // previous mixes when subsequent updates contain no changed entries.
+    const bool sparse_mixes = params.revision >= makeMagic4('R', 'E', 'V', '7');
+    u64 mix_data_offset = mix_offset;
+    u32 mix_count = in_header.mixes_size / sizeof(MixInfoIn);
+    if (sparse_mixes) {
+        if (in_header.mixes_size < sizeof(MixUpdateHeader))
+            return MAKE_RESULT(Svc, kernel::Error::InvalidSize);
+        MixUpdateHeader update;
+        std::memcpy(&update, in_stream->getPtr() + mix_offset, sizeof(update));
+        if (update.count < 0 || static_cast<u32>(update.count) > params.submix_count + 1)
+            return MAKE_RESULT(Svc, kernel::Error::InvalidSize);
+        mix_count = static_cast<u32>(update.count);
+        mix_data_offset += sizeof(update);
+    }
+    const u64 expected_mix_size = (sparse_mixes ? sizeof(MixUpdateHeader) : 0) +
+                                 static_cast<u64>(mix_count) * sizeof(MixInfoIn);
+    if (expected_mix_size != in_header.mixes_size || mix_count > params.submix_count + 1)
+        return MAKE_RESULT(Svc, kernel::Error::InvalidSize);
+    auto mixes = sparse_mixes ? render_state->mixes : std::vector<MixInfoIn>{};
+    mixes.resize(static_cast<usize>(params.submix_count) + 1);
+    std::vector<bool> updated(mixes.size());
+    for (u32 index = 0; index < mix_count; ++index) {
+        MixInfoIn mix;
+        std::memcpy(&mix, in_stream->getPtr() + mix_data_offset +
+                              static_cast<u64>(index) * sizeof(mix), sizeof(mix));
+        const u32 id = sparse_mixes ? mix.mix_id : index;
+        if (id >= mixes.size() || updated[id] || mix.buffer_count > 24)
+            return MAKE_RESULT(Svc, kernel::Error::InvalidSize);
+        updated[id] = true;
+        mixes[id] = mix;
     }
 
     update_count++;
@@ -719,9 +758,6 @@ result_t IAudioRenderer::requestUpdateImpl(
                                         sizeof(ChannelInfoIn));
     std::memcpy(channels.data(), in_stream->getPtr() + channel_offset,
                 in_header.channels_size);
-    std::vector<MixInfoIn> mixes(in_header.mixes_size / sizeof(MixInfoIn));
-    std::memcpy(mixes.data(), in_stream->getPtr() + mix_offset,
-                in_header.mixes_size);
     std::vector<SinkInfoIn> sinks(in_header.sinks_size / sizeof(SinkInfoIn));
     std::memcpy(sinks.data(), in_stream->getPtr() + sink_offset,
                 in_header.sinks_size);

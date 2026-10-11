@@ -14,6 +14,7 @@
 #include "core/horizon/services/nvdrv/ioctl/nvhost_vic.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvmap.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvsched_ctrl.hpp"
+#include "core/video/submit_trace.hpp"
 
 namespace hydra::horizon::services::nvdrv {
 
@@ -25,6 +26,8 @@ DEFINE_SERVICE_COMMAND_TABLE(INvDrvServices, 0, open, 1, ioctl, 2, close, 3,
 result_t INvDrvServices::open(InBuffer<BufferAttr::MapAlias> path_buffer,
                               u32* out_fd_id, u32* out_error) {
     auto path = path_buffer.stream->readNullTerminatedString();
+    // DEBUG: which devices the guest opens (movie playback needs nvdec/vic)
+    LOG_INFO(Services, "nvdrv open \"{}\"", path);
     Handle fd_handle;
     if (path == "/dev/nvhost-ctrl") {
         fd_handle =
@@ -171,17 +174,18 @@ result_t INvDrvServices::ioctlImpl(
         .out_stream = std::move(out_stream),
         .out_buffer_stream = std::move(out_buffer_stream),
     };
+    video::traceIoctl(fd->get()->videoEngineName(), context, code);
     NvResult result = (fd->get()->*func)(context, type, nr);
+    if (result != NvResult::Success && !fd->get()->videoEngineName().empty())
+        LOG_WARN(Services, "{} ioctl 0x{:08x} failed with device result {}",
+            fd->get()->videoEngineName(), code, static_cast<u32>(result));
 
     // Write result
     *out_result = result;
 
-    if (result != NvResult::Success)
-        return MAKE_RESULT(
-            Svc,
-            kernel::Error::NotFound); // TODO: what should this be?
-    else
-        return RESULT_SUCCESS;
+    // Device errors are returned in the nvdrv payload, not as CMIF transport
+    // errors; callers must be able to inspect Timeout/NotSupported normally.
+    return RESULT_SUCCESS;
 }
 
 } // namespace hydra::horizon::services::nvdrv

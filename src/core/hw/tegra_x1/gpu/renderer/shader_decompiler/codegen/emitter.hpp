@@ -159,6 +159,33 @@ class Emitter {
     // Exit
     virtual void emitExit() = 0;
     virtual void emitDiscard() = 0;
+
+    // Bit counting
+    virtual void emitPopCount(const ir::Value& dst, const ir::Value& src) = 0;
+    virtual void emitFindMsb(const ir::Value& dst, const ir::Value& src,
+                             bool is_signed) = 0;
+
+    // Compute
+    virtual void emitReadSystemRegister(const ir::Value& dst, u32 sr) = 0;
+    virtual void emitLoadShared(const ir::Value& dst,
+                                const ir::Value& addr) = 0;
+    virtual void emitStoreShared(const ir::Value& addr,
+                                 const ir::Value& value) = 0;
+    virtual void emitBarrier() = 0;
+    virtual void emitImageStore(u32 index, TextureType type,
+                                const ir::Value& coords,
+                                const std::array<ir::Value, 4>& values) = 0;
+    virtual void emitImageAtomic(const ir::Value& dst, u32 index,
+                                 TextureType type, u32 op,
+                                 const ir::Value& coords,
+                                 const ir::Value& value) = 0;
+
+    // Warp
+    virtual void emitVote(const ir::Value& dst, const ir::Value& pred,
+                          u32 mode) = 0;
+    virtual void emitBallot(const ir::Value& dst, const ir::Value& pred) = 0;
+    virtual void emitShuffle(const ir::Value& dst, const ir::Value& value,
+                             const ir::Value& lane) = 0;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen

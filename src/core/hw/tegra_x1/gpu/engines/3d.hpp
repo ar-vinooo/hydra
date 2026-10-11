@@ -201,6 +201,8 @@ inline renderer::ShaderType toRendererShaderType(ShaderStage stage) {
         return renderer::ShaderType::Vertex;
     case ShaderStage::Fragment:
         return renderer::ShaderType::Fragment;
+    case ShaderStage::Compute:
+        return renderer::ShaderType::Compute;
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Engines, "Shader stage {}", stage));
         return renderer::ShaderType::Count;
@@ -558,6 +560,14 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     // Getters
     const Regs3D& getRegs() const { return regs; }
 
+    // Helpers (also used by the compute engine)
+    // Write usage is for storage images
+    renderer::ITextureView*
+    getTexture(const TextureImageControl& tic,
+               std::optional<renderer::TextureType> shader_type = std::nullopt,
+               renderer::TextureUsage usage = renderer::TextureUsage::Read) const;
+    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc) const;
+
   protected:
     void macro(u32 method, u32 arg) override;
 
@@ -584,6 +594,9 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     void loadMmeStartAddressRamPointer(const u32 index, const u32 ptr);
     void loadMmeStartAddressRam(const u32 index, const u32 data);
 
+    // Instance of the current draw
+    u32 instance_index{0};
+    void beginDraw(const u32 index, const u32 arg);
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
 
@@ -609,11 +622,15 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     renderer::ITextureView*
     getColorTargetTexture(u32 render_target_index) const;
     renderer::ITextureView* getDepthStencilTargetTexture() const;
+
+    // Reads the handle a shader texture binding refers to
+    std::optional<u32> readTextureHandle(u32 stage_index,
+                                         u32 binding_index) const;
     renderer::RenderPassBase* getRenderPass() const;
     // DEBUG: frame tracer
     void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
-    void debugLogoDraw(u32 count);
     bool isHighlightedDraw() const;
+    void profileDraw(u32 count);
 
     renderer::Viewport getViewport(u32 index);
     renderer::Scissor getScissor(u32 index);
@@ -622,11 +639,6 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
                                     u32 fragment_input_mask = 0);
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
-    renderer::ITextureView*
-    getTexture(const TextureImageControl& tic,
-               std::optional<renderer::TextureType> shader_type =
-                   std::nullopt) const;
-    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc) const;
 
     void configureShaderStage(const ShaderStage stage,
                               const TextureImageControl* tex_header_pool,

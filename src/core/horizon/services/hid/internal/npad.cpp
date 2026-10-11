@@ -133,8 +133,16 @@ void Npad::setup(NpadStyleSet style_set) {
 }
 
 void Npad::update(const input::NpadState& new_state) {
-    if (state.style_set == NpadStyleSet::None)
+    const NpadCommonState neutral{};
+    const std::array lifos{
+        &state.full_key_lifo, &state.handheld_lifo, &state.joy_dual_lifo,
+        &state.joy_left_lifo, &state.joy_right_lifo, &state.palma_lifo,
+        &state.system_ext_lifo};
+    if (state.style_set == NpadStyleSet::None) {
+        for (auto* lifo : lifos)
+            lifo->writeNext(neutral);
         return;
+    }
 
     // State
     const auto analog_l = analogStickToInt(new_state.analog_l);
@@ -176,7 +184,14 @@ void Npad::update(const input::NpadState& new_state) {
         unreachable();
     }
 
-    getLifo().writeNext(new_state_entry);
+    // Guests can read any style buffer. Keep inactive styles neutral and
+    // publish the connected controller through the generic system buffer.
+    auto* active_lifo = &getLifo();
+    for (auto* lifo : lifos) {
+        lifo->writeNext(lifo == active_lifo || lifo == &state.system_ext_lifo
+                            ? new_state_entry
+                            : neutral);
+    }
 }
 
 } // namespace hydra::horizon::services::hid::internal

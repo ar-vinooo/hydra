@@ -1,8 +1,162 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.hpp"
 
+#include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/memory.hpp"
+
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
+
+// How far back to look for the instruction that defines a register
+constexpr u32 MAX_HANDLE_TRACK_DISTANCE = 1024;
+constexpr u32 MAX_HANDLE_TRACK_DEPTH = 4;
+
+bool isControlFlow(instruction_t inst) {
+    // BRA, BRX, JMP, JMX, SSY, PBK, PEXIT, CAL, JCAL, RET, BRK, CONT, SYNC,
+    // EXIT, KIL, ...
+    return (inst >> 56) == 0xe2 || (inst >> 56) == 0xe3;
+}
+
+bool isStore(instruction_t inst) {
+    // ST, STG, STL, STS, RED, ATOM(S), SUST: bits 0-7 are a source
+    return (inst & 0xe000000000000000) == 0xa000000000000000 ||
+           (inst & 0xfff8000000000000) == 0xeed8000000000000 ||
+           (inst & 0xfff8000000000000) == 0xef50000000000000 ||
+           (inst & 0xfff8000000000000) == 0xef58000000000000 ||
+           (inst & 0xfff0000000000000) == 0xebf0000000000000 ||
+           (inst & 0xfe00000000000000) == 0xec00000000000000 ||
+           (inst & 0xfff0000000000000) == 0xeb20000000000000;
+}
+
+bool isLdc(instruction_t inst) {
+    return (inst & 0xfff8000000000000) == 0xef90000000000000;
+}
+
+struct CbufWord {
+    u32 slot;
+    u32 word;
+};
+
+struct TrackedHandle {
+    CbufWord texture;
+    std::optional<CbufWord> sampler;
+};
+
+// Finds the closest instruction before pc that writes reg
+std::optional<std::pair<u64, instruction_t>>
+findDefinition(ztd::io::IStream& stream, reg_t reg, u64 pc) {
+    for (u64 distance = 1; distance <= MAX_HANDLE_TRACK_DISTANCE && distance <= pc;
+         distance++) {
+        const u64 def_pc = pc - distance;
+        if ((def_pc % 4) == 0) // Sched
+            continue;
+
+        stream.seekTo(def_pc * sizeof(instruction_t));
+        const auto inst = stream.read<instruction_t>();
+        const auto dst = static_cast<reg_t>(inst & 0xff);
+        if (isLdc(inst)) {
+            const auto ldc = std::bit_cast<InstLdc>(inst);
+            if (dst == reg ||
+                (ldc.size.get() == LsSize2::B64 && dst + 1 == reg))
+                return std::make_pair(def_pc, inst);
+            continue;
+        }
+        if (dst == reg && !isControlFlow(inst) && !isStore(inst))
+            return std::make_pair(def_pc, inst);
+    }
+
+    return std::nullopt;
+}
+
+std::optional<TrackedHandle> traceHandle(ztd::io::IStream& stream, reg_t reg,
+                                         u64 pc, u32 depth,
+                                         instruction_t& out_failed_def) {
+    if (reg == RZ || depth > MAX_HANDLE_TRACK_DEPTH)
+        return std::nullopt;
+
+    const auto def = findDefinition(stream, reg, pc);
+    if (!def)
+        return std::nullopt;
+    const auto [def_pc, inst] = *def;
+
+    // LDC Rd, c[slot][RZ + offset]
+    if (isLdc(inst)) {
+        const auto ldc = std::bit_cast<InstLdc>(inst);
+        if (ldc.src.get() != RZ || ldc.address_mode.get() != AddressMode{}) {
+            out_failed_def = inst;
+            return std::nullopt;
+        }
+        const auto dst = static_cast<reg_t>(inst & 0xff);
+        const u32 offset = ldc.cbuf_offset.get() + (dst != reg ? 4u : 0u);
+        return TrackedHandle{{ldc.cbuf_slot.get(), offset / 4}, std::nullopt};
+    }
+
+    // MOV Rd, c[slot][offset]
+    if ((inst & 0xfff8000000000000) == 0x4c98000000000000)
+        return TrackedHandle{{static_cast<u32>(extractBits(inst, 34, 5)),
+                              static_cast<u32>(extractBits(inst, 20, 14))},
+                             std::nullopt};
+
+    // MOV Rd, Rb
+    if ((inst & 0xfff8000000000000) == 0x5c98000000000000)
+        return traceHandle(stream, static_cast<reg_t>(extractBits(inst, 20, 8)),
+                           def_pc, depth + 1, out_failed_def);
+
+    // LOP.OR Rd, Ra, c[slot][offset]: texture handle combined with a separate
+    // sampler handle
+    if ((inst & 0xffc0000000000000) == 0x4c40000000000000 &&
+        extractBits(inst, 41, 2) == 1 && extractBits(inst, 39, 2) == 0) {
+        auto texture =
+            traceHandle(stream, static_cast<reg_t>(extractBits(inst, 8, 8)),
+                        def_pc, depth + 1, out_failed_def);
+        if (!texture || texture->sampler)
+            return std::nullopt;
+        texture->sampler = CbufWord{static_cast<u32>(extractBits(inst, 34, 5)),
+                                    static_cast<u32>(extractBits(inst, 20, 14))};
+        return texture;
+    }
+
+    // LOP.OR Rd, Ra, Rb
+    if ((inst & 0xfff8000000000000) == 0x5c40000000000000 &&
+        extractBits(inst, 41, 2) == 1 && extractBits(inst, 39, 2) == 0) {
+        auto a = traceHandle(stream, static_cast<reg_t>(extractBits(inst, 8, 8)),
+                             def_pc, depth + 1, out_failed_def);
+        auto b =
+            traceHandle(stream, static_cast<reg_t>(extractBits(inst, 20, 8)),
+                        def_pc, depth + 1, out_failed_def);
+        if (!a || !b || a->sampler || b->sampler)
+            return std::nullopt;
+        return TrackedHandle{a->texture, b->texture};
+    }
+
+    out_failed_def = inst;
+    return std::nullopt;
+}
+
+// Bindless instructions take the texture handle from a register. Shaders load
+// it from a constant buffer just before use, so trace the register back to
+// those loads and bind the constant buffer words like a regular texture.
+std::optional<u32> trackBindlessHandle(DecoderContext& context, reg_t reg) {
+    auto& stream = *context.code_stream;
+    const u64 saved_seek = stream.getSeek();
+    const u64 crnt_pc = saved_seek / sizeof(instruction_t) - 1;
+
+    instruction_t failed_def = 0x0;
+    const auto handle = traceHandle(stream, reg, crnt_pc, 0, failed_def);
+    stream.seekTo(saved_seek);
+
+    if (handle && (!handle->sampler || handle->sampler->slot == handle->texture.slot))
+        return makeTrackedTextureIndex(
+            handle->texture.slot, handle->texture.word,
+            handle->sampler ? handle->sampler->word
+                            : TRACKED_TEXTURE_NO_SAMPLER);
+
+    LOG_WARN(ShaderDecompiler,
+             "Failed to trace bindless texture handle in {} (pc: {:#x}, "
+             "defined by: {:#018x})",
+             reg, crnt_pc, failed_def);
+    return std::nullopt;
+}
 
 // TODO: nodep
 void emitTextureQuery(DecoderContext& context, pred_t pred, bool pred_inv,
@@ -401,10 +555,61 @@ void emitTld4(DecoderContext& context, InstTld4 inst) {
                       inst.dc);
 }
 
+void emitTxqB(DecoderContext& context, InstTxqB inst) {
+    const auto index = trackBindlessHandle(context, inst.src);
+    if (!index)
+        return;
+    emitTextureQuery(context, inst.pred, inst.pred_inv, inst.query, inst.dst,
+                     inst.write_mask, static_cast<reg_t>(inst.src.get() + 1),
+                     *index);
+}
+
+void emitTexB(DecoderContext& context, InstTexB inst) {
+    const auto index = trackBindlessHandle(context, inst.src_b);
+    if (!index)
+        return;
+    emitTextureSample2(context, inst.pred, inst.pred_inv, false, inst.dim,
+                       inst.dst, inst.write_mask, inst.src_a,
+                       static_cast<reg_t>(inst.src_b.get() + 1), *index, inst.lod,
+                       inst.aoffi, inst.dc);
+}
+
+// TODO: multisample index
+void emitTld(DecoderContext& context, InstTld inst) {
+    emitTextureSample2(context, inst.pred, inst.pred_inv, true, inst.dim,
+                       inst.dst, inst.write_mask, inst.src_a, inst.src_b,
+                       inst.cbuf_index, inst.lod ? Lod::Ll : Lod::Lz,
+                       inst.aoffi);
+}
+
+void emitTldB(DecoderContext& context, InstTldB inst) {
+    const auto index = trackBindlessHandle(context, inst.src_b);
+    if (!index)
+        return;
+    emitTextureSample2(context, inst.pred, inst.pred_inv, true, inst.dim,
+                       inst.dst, inst.write_mask, inst.src_a,
+                       static_cast<reg_t>(inst.src_b.get() + 1), *index,
+                       inst.lod ? Lod::Ll : Lod::Lz, inst.aoffi);
+}
+
+void emitTld4B(DecoderContext& context, InstTld4B inst) {
+    const auto index = trackBindlessHandle(context, inst.src_b);
+    if (!index)
+        return;
+    emitTextureGather(context, inst.pred, inst.pred_inv, inst.component,
+                      inst.dst, inst.write_mask, inst.src_a,
+                      static_cast<reg_t>(inst.src_b.get() + 1), *index,
+                      inst.offset != TextureOffset{}, inst.dc);
+}
+
 void emitTld4s(DecoderContext& context, InstTld4s inst) {
     emitTextureGather2(context, inst.pred, inst.pred_inv, inst.component,
                        inst.dst0, inst.dst1, inst.src_a, inst.src_b,
                        inst.cbuf_index, inst.aoffi, inst.dc);
+}
+
+std::optional<u32> trackBindlessResource(DecoderContext& context, reg_t reg) {
+    return trackBindlessHandle(context, reg);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

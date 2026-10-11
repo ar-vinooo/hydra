@@ -37,10 +37,8 @@ class AppletResource {
 
     // Update
     void updateNpad(NpadIndex index, const input::NpadState& new_state) {
-        if (!shouldAcceptInput())
-            return;
-
-        npads[static_cast<usize>(index)].update(new_state);
+        npads[static_cast<usize>(index)].update(
+            shouldAcceptInput() ? new_state : input::NpadState{});
     }
     void updateTouch(const std::map<u32, input::TouchState>& new_state);
 

@@ -251,6 +251,45 @@ TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
     IMAGE_FORMAT_CASE(ASTC_2D_4X4, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_4x4)
     IMAGE_FORMAT_CASE_SRGB(ASTC_2D_4X4, Unorm, Unorm, Unorm, Unorm,
                            ASTC_RGBA_4x4_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_5X4, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_5x4)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_5X4, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_5x4_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_5X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_5x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_5X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_5x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_6X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_6x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_6X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_6x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_6X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_6x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_6X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_6x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X8, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x8)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X8, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x8_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X8, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x8)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X8, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x8_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X10, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x10)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X10, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x10_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_12X10, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_12x10)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_12X10, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_12x10_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_12X12, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_12x12)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_12X12, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_12x12_sRGB)
     IMAGE_FORMAT_CASE(DXN1, Unorm, Unorm, Unorm, Unorm, BC4_RUnorm)
     IMAGE_FORMAT_CASE(Z24S8, Uint, Unorm, Unorm, Unorm, Z24Unorm_S8Uint)
     IMAGE_FORMAT_CASE(Z16, Unorm, Unorm, Unorm, Unorm, Z16Unorm)
@@ -259,11 +298,34 @@ TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
     IMAGE_FORMAT_CASE(RGBA16, Float, Float, Float, Float, RGBA16Float)
     IMAGE_FORMAT_CASE(RGBA32, Float, Float, Float, Float, RGBA32Float)
     IMAGE_FORMAT_CASE(BC7U, Unorm, Unorm, Unorm, Unorm, BC7_RGBAUnorm)
+    IMAGE_FORMAT_CASE(R8, Snorm, Snorm, Snorm, Snorm, R8Snorm)
+    IMAGE_FORMAT_CASE(R8, Uint, Uint, Uint, Uint, R8Uint)
+    IMAGE_FORMAT_CASE(R8, Sint, Sint, Sint, Sint, R8Sint)
+    IMAGE_FORMAT_CASE(R16, Float, Float, Float, Float, R16Float)
+    IMAGE_FORMAT_CASE(R16, Snorm, Snorm, Snorm, Snorm, R16Snorm)
+    IMAGE_FORMAT_CASE(R16, Uint, Uint, Uint, Uint, R16Uint)
+    IMAGE_FORMAT_CASE(R16, Sint, Sint, Sint, Sint, R16Sint)
+    IMAGE_FORMAT_CASE(R32, Uint, Uint, Uint, Uint, R32Uint)
+    IMAGE_FORMAT_CASE(R32, Sint, Sint, Sint, Sint, R32Sint)
+    IMAGE_FORMAT_CASE(R32G32, Float, Float, Float, Float, RG32Float)
+    IMAGE_FORMAT_CASE(R32G32, Uint, Uint, Uint, Uint, RG32Uint)
+    IMAGE_FORMAT_CASE(R32G32, Sint, Sint, Sint, Sint, RG32Sint)
+    IMAGE_FORMAT_CASE(ARGB8, Snorm, Snorm, Snorm, Snorm, RGBA8Snorm)
+    IMAGE_FORMAT_CASE(ARGB8, Uint, Uint, Uint, Uint, RGBA8Uint)
+    IMAGE_FORMAT_CASE(ARGB8, Sint, Sint, Sint, Sint, RGBA8Sint)
+    IMAGE_FORMAT_CASE(RGBA16, Unorm, Unorm, Unorm, Unorm, RGBA16Unorm)
+    IMAGE_FORMAT_CASE(RGBA16, Snorm, Snorm, Snorm, Snorm, RGBA16Snorm)
+    IMAGE_FORMAT_CASE(RGBA16, Uint, Uint, Uint, Uint, RGBA16Uint)
+    IMAGE_FORMAT_CASE(RGBA16, Sint, Sint, Sint, Sint, RGBA16Sint)
+    IMAGE_FORMAT_CASE(RGBA32, Uint, Uint, Uint, Uint, RGBA32Uint)
+    IMAGE_FORMAT_CASE(RGBA32, Sint, Sint, Sint, Sint, RGBA32Sint)
     else {
-        LOG_FATAL(Gpu, "Image format {}, components: {}, {}, {}, {}, sRGB: {}",
+        // Usually a garbage descriptor; real hardware does not stop either
+        LOG_ERROR(Gpu, "Image format {}, components: {}, {}, {}, {}, sRGB: {}",
                   image_format_word.image_format, image_format_word.component_r,
                   image_format_word.component_g, image_format_word.component_b,
                   image_format_word.component_a, is_srgb);
+        return TextureFormat::Invalid;
     }
 
 #undef IMAGE_FORMAT_CASE

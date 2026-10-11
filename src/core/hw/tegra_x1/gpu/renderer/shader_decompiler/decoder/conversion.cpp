@@ -122,6 +122,30 @@ ir::ScalarType toType(IntegerFormat2 format) {
     }
 }
 
+// Selects the byte (or halfword) the conversion reads from the source
+ir::Value selectSourceBytes(ir::Builder& builder, const ir::Value& src,
+                            ByteSelect byte_sel, char debug_kind = 'f') {
+    if (byte_sel == ByteSelect::B0)
+        return src;
+    // DEBUG: HYDRA_NO_BYTESEL disables byte selection
+    if (const char* env = std::getenv("HYDRA_NO_BYTESEL");
+        env != nullptr && std::strchr(env, debug_kind) != nullptr) {
+        LOG_INFO(ShaderDecompiler, "DEBUG skipped byte select {} ({}, {})",
+                 debug_kind, static_cast<u32>(byte_sel), src.getType());
+        return src;
+    }
+    LOG_INFO(ShaderDecompiler, "DEBUG byte select {} ({}, {})", debug_kind,
+             static_cast<u32>(byte_sel), src.getType());
+
+    // Reinterpret the whole register, shift the selected part down and
+    // truncate it to the source type
+    auto raw = src;
+    raw.type = ir::ScalarType::U32;
+    const auto shifted = builder.opShiftRight(
+        raw, ir::Value::createConstantU(static_cast<u32>(byte_sel) * 8));
+    return builder.opCast(shifted, src.getType());
+}
+
 // TODO: write_cc
 void emitIntToInt(DecoderContext& context, pred_t pred, bool pred_inv,
                   ByteSelect byte_sel, bool saturate, reg_t dst,
@@ -129,10 +153,9 @@ void emitIntToInt(DecoderContext& context, pred_t pred, bool pred_inv,
                   bool neg) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
-    auto src_v = absNegIf(context.builder, src, abs, neg);
-    // TODO: byte selection
-    if (byte_sel != ByteSelect::B0)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Byte selection");
+    auto src_v = absNegIf(context.builder,
+                          selectSourceBytes(context.builder, src, byte_sel, 'i'),
+                          abs, neg);
 
     const auto dst_type = toType(dst_format);
     auto res = context.builder.opCast(src_v, dst_type);
@@ -152,10 +175,9 @@ void emitIntToFloat(DecoderContext& context, pred_t pred, bool pred_inv,
                     ir::Value src, bool abs, bool neg) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
-    auto src_v = absNegIf(context.builder, src, abs, neg);
-    // TODO: byte selection
-    if (byte_sel != ByteSelect::B0)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Byte selection");
+    auto src_v = absNegIf(context.builder,
+                          selectSourceBytes(context.builder, src, byte_sel),
+                          abs, neg);
 
     const auto dst_type = toType(dst_format);
     const auto res = context.builder.opCast(src_v, dst_type);

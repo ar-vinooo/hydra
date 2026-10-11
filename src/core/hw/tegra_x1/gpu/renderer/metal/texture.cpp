@@ -45,6 +45,16 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
     const auto& pixel_format_info = toMtlPixelFormatInfo(descriptor.format);
     desc->setPixelFormat(pixel_format_info.pixel_format);
 
+    // Color textures can also be written by compute shaders
+    MTL::TextureUsage write_usage = 0;
+    if (!pixel_format_info.has_depth && !pixel_format_info.has_stencil &&
+        !isTextureFormatCompressed(descriptor.format)) {
+        write_usage |= MTL::TextureUsageShaderWrite;
+        if (pixel_format_info.pixel_format == MTL::PixelFormatR32Uint ||
+            pixel_format_info.pixel_format == MTL::PixelFormatR32Sint)
+            write_usage |= MTL::TextureUsageShaderAtomic;
+    }
+
     if (descriptor.type == TextureType::_1DBuffer) {
         const auto alignment =
             device->minimumLinearTextureAlignmentForPixelFormat(
@@ -52,7 +62,7 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
         const auto bytes = align(static_cast<u64>(descriptor.size),
                                  static_cast<u64>(alignment));
         desc->setUsage(MTL::TextureUsageShaderRead |
-                       MTL::TextureUsagePixelFormatView);
+                       MTL::TextureUsagePixelFormatView | write_usage);
         buffer_backing =
             device->newBuffer(bytes, MTL::ResourceStorageModePrivate);
         texture = buffer_backing->newTexture(desc, 0, bytes);
@@ -60,7 +70,7 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
         // Guest textures can be sampled, rendered to and reinterpreted
         desc->setUsage(MTL::TextureUsageShaderRead |
                        MTL::TextureUsageRenderTarget |
-                       MTL::TextureUsagePixelFormatView);
+                       MTL::TextureUsagePixelFormatView | write_usage);
         texture = device->newTexture(desc);
     }
     desc->release();

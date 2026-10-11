@@ -107,10 +107,12 @@ ILoader::createFromPath(std::string_view path,
     } else {
         if (!std::filesystem::is_regular_file(path))
             return std::nullopt;
-        if (ext == ".xci" || ext == ".nsp") {
+        // NSZ/XCZ are NSP/XCI with zstd-compressed NCAs (NCZ).
+        if (ext == ".xci" || ext == ".nsp" || ext == ".xcz" || ext == ".nsz") {
             try {
-                return ext == ".nsp" ? NspLoader::create(path)
-                                     : XciLoader::create(path);
+                return ext == ".nsp" || ext == ".nsz"
+                           ? NspLoader::create(path)
+                           : XciLoader::create(path);
             } catch (const std::exception& error) {
                 last_error = error.what();
                 LOG_ERROR(Loader, "Failed to load {}: {}", ext, last_error);

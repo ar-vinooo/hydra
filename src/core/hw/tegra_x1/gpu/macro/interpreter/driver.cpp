@@ -66,31 +66,31 @@ u32 Driver::instAddImmediate(u8 rA, i32 imm) {
     return std::bit_cast<u32>(getRegI32(rA) + imm);
 }
 
+// Replaces a bitfield of rA with a bitfield of rB
 u32 Driver::instExtractInsert(u8 bA, u8 rA, u8 bB, u8 rB, u8 size) {
     LOG_DEBUG(Macro, "b{}: {}, r{}: 0x{:08x}, b{}: {}, r{}: 0x{:08x}, size: {}",
               rA, bA, rA, getRegU32(rA), rB, bB, rB, getRegU32(rB), size);
-    u32 mask = (1 << size) - 1;
-
-    // TODO: correct?
-    u32 value = (getRegU32(rB) >> bB) & mask;
-
-    return getRegU32(rA) + (value << bA);
+    const u32 mask = (1u << size) - 1;
+    const u32 value = (getRegU32(rB) >> bB) & mask;
+    return (getRegU32(rA) & ~(mask << bA)) | (value << bA);
 }
 
+// Extracts a bitfield of rA at the position in rB and shifts it left by bA
 u32 Driver::instExtractShiftLeftImmediate(u8 bA, u8 rA, u8 rB, u8 size) {
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Macro, "b{}: {}, r{}: 0x{:08x}, r{}: 0x{:08x}, size: {}", rA, bA, rA,
-        getRegU32(rA), rB, getRegU32(rB), size);
-
-    return 0;
+    LOG_DEBUG(Macro, "b{}: {}, r{}: 0x{:08x}, r{}: 0x{:08x}, size: {}", rA, bA,
+              rA, getRegU32(rA), rB, getRegU32(rB), size);
+    const u32 mask = (1u << size) - 1;
+    const u32 shift = getRegU32(rB) & 0x1f;
+    return ((getRegU32(rA) >> shift) & mask) << bA;
 }
 
+// Extracts a bitfield of rA at bB and shifts it left by the value in rB
 u32 Driver::instExtractShiftLeftRegister(u8 rA, u8 bB, u8 rB, u8 size) {
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Macro, "r{}: 0x{:08x}, b{}: {}, r{}: 0x{:08x}, size: {}", rA,
-        getRegU32(rA), rB, bB, rB, getRegU32(rB), size);
-
-    return 0;
+    LOG_DEBUG(Macro, "r{}: 0x{:08x}, b{}: {}, r{}: 0x{:08x}, size: {}", rA,
+              getRegU32(rA), rB, bB, rB, getRegU32(rB), size);
+    const u32 mask = (1u << size) - 1;
+    const u32 shift = getRegU32(rB) & 0x1f;
+    return ((getRegU32(rA) >> bB) & mask) << shift;
 }
 
 u32 Driver::instRead(u8 rA, u32 imm) {

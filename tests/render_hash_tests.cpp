@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
+#include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -109,9 +111,13 @@ void check(bool value, const char* message) {
 int main() {
     try {
         std::array<u8, 4096> code{};
+        GMmu gpu_mmu(nullptr);
+        gpu_mmu.map(0x10000, {reinterpret_cast<uptr>(code.data()), code.size()});
+        tls_crnt_gmmu = &gpu_mmu;
         GuestShaderDescriptor vertex{};
         vertex.stage = engines::ShaderStage::VertexB;
         vertex.code_ptr = reinterpret_cast<uptr>(code.data());
+        vertex.gpu_addr = 0x10000;
         const auto shader_base = ShaderCache::hash(vertex);
         for (u32 i = 0; i < VERTEX_ATTRIB_COUNT; ++i) {
             auto changed = vertex;

@@ -72,14 +72,17 @@ T read(uptr& gpu_addr) {
 
 Pfifo::Pfifo(Gpu& gpu_) : gpu{gpu_}, thread(&Pfifo::threadFunc, this) {}
 
-Pfifo::~Pfifo() {
+Pfifo::~Pfifo() { shutdown(); }
+
+void Pfifo::shutdown() {
     {
         std::scoped_lock lock(mutex);
         stop = true;
     }
     cond_var.notify_all();
     completed_cond_var.notify_all();
-    thread.join();
+    if (thread.joinable())
+        thread.join();
 }
 
 void Pfifo::submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
@@ -122,7 +125,7 @@ void Pfifo::threadFunc() {
             break;
 
         // Process entry lists
-        while (!entry_lists.empty()) {
+        while (!stop && !entry_lists.empty()) {
             const auto entry_list = std::move(entry_lists.front());
             entry_lists.pop();
 

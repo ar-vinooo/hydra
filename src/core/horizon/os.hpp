@@ -23,6 +23,11 @@ class IHandler;
 class OS {
   public:
     explicit OS(System& system_);
+    ~OS() { shutdownServices(); }
+    void shutdownServices() {
+        nvservices_server.stop();
+        others_server.stop();
+    }
 
     void notifyOperationModeChanged();
 

@@ -20,11 +20,15 @@ struct GuestShaderState {
     engines::VertexAttribState vertex_attrib_states[VERTEX_ATTRIB_COUNT];
     ColorDataType color_target_data_types[COLOR_TARGET_COUNT] = {
         ColorDataType::Invalid};
+    // Compute
+    u32 shared_memory_size{0};
+    std::map<u32, TextureFormat> image_formats;
 };
 
 struct GuestShaderDescriptor {
     engines::ShaderStage stage;
     uptr code_ptr;
+    uptr gpu_addr;
     GuestShaderState state;
 };
 

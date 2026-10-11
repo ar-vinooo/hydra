@@ -32,13 +32,13 @@ struct RingLifo {
     }
 
     void writeNext(const T& data) {
-        // HACK: const cast
-        const_cast<T&>(data).sampling_number =
+        T next = data;
+        next.sampling_number =
             getCurrentStorage()
                 .transform(
                     [](T* storage) { return storage->sampling_number + 1; })
                 .value_or(0);
-        write(data);
+        write(next);
     }
 
   private:

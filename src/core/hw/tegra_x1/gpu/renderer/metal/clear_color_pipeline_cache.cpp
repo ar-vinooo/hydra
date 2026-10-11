@@ -38,6 +38,7 @@ ClearColorPipelineCache::ClearColorPipelineCache(MTL::Device* device_)
     // Pipeline descriptor
     pipeline_descriptor = MTL::RenderPipelineDescriptor::alloc()->init();
     pipeline_descriptor->setVertexFunction(vertex_clear_color);
+    vertex_clear_color->release();
     pipeline_descriptor->setInputPrimitiveTopology(
         MTL::PrimitiveTopologyClassTriangle);
 }
@@ -46,21 +47,48 @@ void ClearColorPipelineCache::destroy() { pipeline_descriptor->release(); }
 
 MTL::RenderPipelineState* ClearColorPipelineCache::create(
     const ClearColorPipelineDescriptor& descriptor) {
-    // Source
+    const char* color_type = "float4";
+    switch (descriptor.pixel_formats[descriptor.render_target_id]) {
+    case MTL::PixelFormatR8Uint:
+    case MTL::PixelFormatR16Uint:
+    case MTL::PixelFormatR32Uint:
+    case MTL::PixelFormatRG8Uint:
+    case MTL::PixelFormatRG16Uint:
+    case MTL::PixelFormatRG32Uint:
+    case MTL::PixelFormatRGBA8Uint:
+    case MTL::PixelFormatRGBA16Uint:
+    case MTL::PixelFormatRGBA32Uint:
+    case MTL::PixelFormatRGB10A2Uint:
+        color_type = "uint4";
+        break;
+    case MTL::PixelFormatR8Sint:
+    case MTL::PixelFormatR16Sint:
+    case MTL::PixelFormatR32Sint:
+    case MTL::PixelFormatRG8Sint:
+    case MTL::PixelFormatRG16Sint:
+    case MTL::PixelFormatRG32Sint:
+    case MTL::PixelFormatRGBA8Sint:
+    case MTL::PixelFormatRGBA16Sint:
+    case MTL::PixelFormatRGBA32Sint:
+        color_type = "int4";
+        break;
+    default:
+        break;
+    }
+    // Clear registers hold raw bits, including for integer attachments.
     auto shader_source = fmt::format(R"(
         #include <metal_stdlib>
         using namespace metal;
 
         struct FragmentClearColorOut {{
-            float4 color [[color({})]];
+            {0} color [[color({1})]];
         }};
 
-        // TODO: choose the correct color data type
-        fragment float4 fragment_clear_color(constant float4& col [[buffer(0)]]) {{
-            return col;
+        fragment FragmentClearColorOut fragment_clear_color(constant {0}& col [[buffer(0)]]) {{
+            return FragmentClearColorOut{{col}};
         }}
     )",
-                                     descriptor.render_target_id);
+                                     color_type, descriptor.render_target_id);
 
     // Function
     auto fragment_clear_color =
@@ -93,7 +121,7 @@ MTL::RenderPipelineState* ClearColorPipelineCache::create(
 
     fragment_clear_color->release();
 
-    NS::Error* error;
+    NS::Error* error = nullptr;
     auto pipeline = device->newRenderPipelineState(pipeline_descriptor, &error);
     if (error != nullptr) {
         LOG_ERROR(MetalRenderer, "Failed to create clear color pipeline: {}",

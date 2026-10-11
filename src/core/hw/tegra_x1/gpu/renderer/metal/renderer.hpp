@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_depth_pipeline_cache.hpp"
@@ -95,6 +96,7 @@ class Renderer : public IRenderer {
                       const u32 value) override;
 
     // Shader
+    u64 getAllocatedResourceBytes() const override { return device->currentAllocatedSize(); }
     ShaderBase* createShader(const ShaderDescriptor& descriptor) override;
 
     // Pipeline
@@ -132,6 +134,12 @@ class Renderer : public IRenderer {
     // Resource unbinding
     void unbindUniformBuffers(ShaderType shader_type) override;
     void unbindTextures(ShaderType shader_type) override;
+
+    f64 debugSyncCommandBuffer(ICommandBuffer* command_buffer) override;
+
+    // Compute
+    void dispatchCompute(ICommandBuffer* command_buffer,
+                         const ComputeDispatch& dispatch) override;
 
     // Draw
     void draw(ICommandBuffer* command_buffer,
@@ -173,6 +181,7 @@ class Renderer : public IRenderer {
 
     // Caches
     BinaryArchiveCache binary_archive_cache;
+    ShaderLibraryCache shader_library_cache;
     DepthStencilStateCache depth_stencil_state_cache;
     BlitPipelineCache blit_pipeline_cache;
     ClearColorPipelineCache clear_color_pipeline_cache;
@@ -191,6 +200,9 @@ class Renderer : public IRenderer {
     // Samplers
     MTL::SamplerState* nearest_sampler;
     MTL::SamplerState* linear_sampler;
+
+    // Compute pipelines (null if creation failed)
+    std::map<MTL::Function*, MTL::ComputePipelineState*> compute_pipelines;
 
     // State
     State state;

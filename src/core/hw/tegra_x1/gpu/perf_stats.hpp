@@ -14,6 +14,8 @@ struct PerfStats {
     std::atomic<u64> gpu_ns{0};
     std::atomic<u64> command_buffers{0};
     std::atomic<u64> draws{0};
+    std::atomic<u64> compute_dispatches{0};
+    std::atomic<u64> compute_threads{0};
     std::atomic<u64> frames{0};
     std::atomic<u64> texture_upload_ns{0};
     std::atomic<u64> texture_upload_bytes{0};
@@ -22,6 +24,7 @@ struct PerfStats {
     std::atomic<u64> draw_state_ns{0};
     std::atomic<u64> shader_compile_ns{0};
     std::atomic<u64> shader_compiles{0};
+    std::atomic<u64> shader_library_hits{0};
     std::atomic<u64> pipeline_compile_ns{0};
     std::atomic<u64> pipeline_compiles{0};
     std::atomic<u64> raster_updates{0};

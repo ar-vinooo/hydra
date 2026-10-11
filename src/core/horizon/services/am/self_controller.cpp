@@ -72,11 +72,12 @@ result_t ISelfController::createManagedDisplaySeparableLayer(
                                 .getDisplayDriver()
                                 .createLayer(process, binder_handle)
                                 .getRaw();
-    // TODO: what is a recording layer?
-    *out_recording_layer_id = system->getOs()
-                                  .getDisplayDriver()
-                                  .createLayer(process, binder_handle)
-                                  .getRaw();
+    // The recording layer (screenshots and video capture) mirrors the
+    // display layer; it must not be shown or consume the display's buffers
+    auto& driver = system->getOs().getDisplayDriver();
+    const auto recording_layer = driver.createLayer(process, binder_handle);
+    driver.getLayer(recording_layer).setVisible(false);
+    *out_recording_layer_id = recording_layer.getRaw();
     return RESULT_SUCCESS;
 }
 

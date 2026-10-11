@@ -17,8 +17,11 @@ class NcaFile final : public IFile {
     static Header readHeader(IFile& file, u64 offset, u64 size,
                              const Keys& keys, bool& plaintext);
 
+    // `decrypted_body` is set for NCZ content, whose sections are stored
+    // decrypted, so no title or key-area keys are needed.
     NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
-            Header header, bool plaintext, const Keys& keys);
+            Header header, bool plaintext, const Keys& keys,
+            bool decrypted_body = false);
     ztd::io::IStream* open(FileOpenFlags flags) override;
     u64 getSize() const override;
 

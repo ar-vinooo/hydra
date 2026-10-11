@@ -20,8 +20,20 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         descriptor.shaders[static_cast<u32>(ShaderType::Vertex)]);
     const auto fragment_shader = static_cast<Shader*>(
         descriptor.shaders[static_cast<u32>(ShaderType::Fragment)]);
+    // A shader that failed to compile has no function; Metal asserts on such
+    // a descriptor, so leave the pipeline null and let draws using it be
+    // skipped
+    if (vertex_shader == nullptr || vertex_shader->getFunction() == nullptr ||
+        (fragment_shader != nullptr && fragment_shader->getFunction() == nullptr)) {
+        LOG_ERROR(MetalRenderer,
+                  "Skipping pipeline with a shader that failed to compile");
+        pipeline_descriptor->release();
+        return;
+    }
     pipeline_descriptor->setVertexFunction(vertex_shader->getFunction());
-    pipeline_descriptor->setFragmentFunction(fragment_shader->getFunction());
+    // Depth-only passes can intentionally disable the fragment stage.
+    if (fragment_shader != nullptr)
+        pipeline_descriptor->setFragmentFunction(fragment_shader->getFunction());
 
     // Vertex state
 
@@ -155,7 +167,8 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     pipeline = binary_archive_cache.createPipeline(
         pipeline_descriptor, &error,
         fmt::format("{}:{}", vertex_shader->getCacheKey(),
-                    fragment_shader->getCacheKey()));
+                    fragment_shader != nullptr ? fragment_shader->getCacheKey()
+                                               : "no-fragment"));
     pipeline_descriptor->release();
     if (error != nullptr) {
         LOG_ERROR(MetalRenderer, "Failed to create pipeline: {}",
@@ -165,6 +178,9 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     }
 }
 
-Pipeline::~Pipeline() { pipeline->release(); }
+Pipeline::~Pipeline() {
+    if (pipeline != nullptr)
+        pipeline->release();
+}
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

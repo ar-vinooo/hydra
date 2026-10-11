@@ -160,6 +160,7 @@ class LangEmitter : public Emitter {
             exitScopeImpl("");
     }
 
+    std::string getBitwiseOperandStr(const ir::Value& value);
     std::string getTypeStr(const ir::Type& type) {
         switch (type.getKind()) {
         case ir::TypeKind::Scalar: {
@@ -198,15 +199,21 @@ class LangEmitter : public Emitter {
     }
 
     template <typename T>
-    std::string getConstantStr(const T imm) {
+    static std::string getConstantStr(const T imm) {
         if constexpr (std::is_same_v<T, bool>)
             return fmt::format("({})", imm);
         else if constexpr (std::is_same_v<T, u32>)
             return fmt::format("({:#x}u)", imm);
         else if constexpr (std::is_same_v<T, i32>)
             return fmt::format("({:#x})", imm);
-        else if constexpr (std::is_same_v<T, f32>)
+        else if constexpr (std::is_same_v<T, f32>) {
+            // Infinity and NaN cannot be written as decimal literals in MSL.
+            // Preserve their IEEE bits, including the sign and NaN payload.
+            const auto bits = std::bit_cast<u32>(imm);
+            if ((bits & 0x7f800000u) == 0x7f800000u)
+                return fmt::format("(as_type<float>({:#x}u))", bits);
             return fmt::format("({:#}f)", imm);
+        }
         else
             static_assert(always_false<T>::value, "Unsupported immediate type");
     }

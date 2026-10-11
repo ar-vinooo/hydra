@@ -2,6 +2,7 @@
 
 #include "core/horizon/services/nvdrv/ioctl/fd_base.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
+#include "core/video/host1x.hpp"
 
 namespace hydra::horizon::services::nvdrv::ioctl {
 
@@ -21,20 +22,20 @@ class ChannelBase : public FdBase {
                    u32 nr) override;
 
   protected:
-    u64 user_data;
+    u64 user_data = 0;
+    std::optional<u32> video_syncpoint;
+    video::Host1xState host1x_state;
+    std::array<u32, 0x800> video_registers{};
+    virtual NvResult executeVideo(IoctlContext&) { return NvResult::Success; }
 
     // Ioctls
     // TODO: args
-    NvResult submit();
-    NvResult getSyncpoint(u32 module_id, u32* out_value);
+    NvResult submit(IoctlContext* context);
+    NvResult getSyncpoint(IoctlContext* context, u32 module_id, u32* out_value);
     NvResult getWaitBase(u32 module_id, u32* out_value);
     NvResult setSubmitTimeout(u32 timeout);
-    NvResult mapCmdBuffer(u32 num_handles, [[maybe_unused]] u32 _reserved_x4,
-                          Aligned<bool, 4> is_compressed,
-                          const MapCmdBufferHandle* handles);
-    NvResult unmapCmdBuffer(u32 num_handles, [[maybe_unused]] u32 _reserved_x4,
-                            Aligned<bool, 4> is_compressed,
-                            const UnmapCmdBufferHandle* handles);
+    NvResult mapCmdBuffer(IoctlContext* context);
+    NvResult unmapCmdBuffer(IoctlContext* context);
     NvResult setUserData(u64 data);
     NvResult getUserData(u64* out_data) const;
     NvResult setNvMapFd(u32 fd_id);
@@ -75,7 +76,7 @@ class ChannelBase : public FdBase {
     }
     NvResult setPriority(u32 priority);
     virtual NvResult getErrorNotification(u64* out_timestamp, u32* out_info32,
-                                          u16* out_info16, u64* out_status) {
+                                          u16* out_info16, u16* out_status) {
         (void)out_timestamp;
         (void)out_info32;
         (void)out_info16;

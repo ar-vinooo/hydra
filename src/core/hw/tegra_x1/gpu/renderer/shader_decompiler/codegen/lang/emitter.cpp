@@ -128,6 +128,14 @@ void LangEmitter::emitMainFunctionPrologue() {
                     writeStatement("{} = as_type<uint>({})", attr,
                                    qualified_name);
             }
+
+            // Raw float attributes default to integer components
+            const auto raw_count =
+                getRawFloatVertexAttribComponentCount(vertex_attrib_state);
+            if (raw_count != 0 && raw_count < 4)
+                writeStatement(
+                    "{} = 0x3f800000u",
+                    getAttrMemoryStr({RZ, 0x80u + i * 0x10u + 3 * 0x4u, true}));
         }
 
         ADD_INPUT_1(SvSemantic::InstanceID, invalid<u8>(), SV_INSTANCE_ID_BASE);
@@ -187,9 +195,20 @@ void LangEmitter::emitFunction(const ir::Function& func) {
     auto entry_node = analyzer::Structurize(entry_block);
     */
 
-    // Caller loop
+    // Caller loop. Bound the number of block transitions: a loop that never
+    // ends (e.g. because of an unimplemented instruction) would otherwise hang
+    // the host GPU until the OS resets it and blocks further submissions.
+    // DEBUG: HYDRA_BLOCK_GUARD overrides the limit
+    static const u32 guard_limit = [] {
+        const char* env = std::getenv("HYDRA_BLOCK_GUARD");
+        return env != nullptr
+                   ? static_cast<u32>(std::strtoul(env, nullptr, 0))
+                   : 65536u;
+    }();
     writeStatement("auto next = Block_{}::{}", func.getName(), label_t(0x0));
-    enterScope("while (next != Block_{}::None)", func.getName());
+    writeStatement("uint block_guard = 0");
+    enterScope("while (next != Block_{}::None && block_guard++ < {}u)",
+               func.getName(), guard_limit);
     enterScope("switch (next)");
     for (const auto& [label, block] : func.getBlocks()) {
         indent--;
@@ -244,6 +263,15 @@ void LangEmitter::emitFunction(const ir::Function& func) {
                         SvAccess(Sv(SvSemantic::UserInOut, i), c), true),
                     toType(color_target_data_type), getRegisterStr(i * 4 + c));
             }
+
+            // DEBUG: show pixels whose shader hit the block guard
+            static const bool guard_magenta =
+                std::getenv("HYDRA_GUARD_MAGENTA") != nullptr;
+            if (guard_magenta)
+                writeStatement(
+                    "if (block_guard >= {}u) __out.user{} = vec<{}, 4>(1, 0, "
+                    "1, 1)",
+                    guard_limit, i, toType(color_target_data_type));
         }
         break;
     default:
@@ -439,19 +467,30 @@ void LangEmitter::emitBitwiseNot(const ir::Value& dst, const ir::Value& src) {
     storeValue(dst, "(~{})", getValueStr(src));
 }
 
+// Bitwise instructions operate on raw register bits. A register last written
+// as a float must be reinterpreted, as bitwise operators reject floats.
+std::string LangEmitter::getBitwiseOperandStr(const ir::Value& value) {
+    if (value.getType() == ir::ScalarType::F32)
+        return fmt::format("as_type<uint>({})", getValueStr(value));
+    return getValueStr(value);
+}
+
 void LangEmitter::emitBitwiseAnd(const ir::Value& dst, const ir::Value& srcA,
                                  const ir::Value& srcB) {
-    storeValue(dst, "({} & {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} & {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitBitwiseOr(const ir::Value& dst, const ir::Value& srcA,
                                 const ir::Value& srcB) {
-    storeValue(dst, "({} | {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} | {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitBitwiseXor(const ir::Value& dst, const ir::Value& srcA,
                                  const ir::Value& srcB) {
-    storeValue(dst, "({} ^ {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} ^ {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitShiftLeft(const ir::Value& dst, const ir::Value& src_a,

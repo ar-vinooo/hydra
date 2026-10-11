@@ -143,13 +143,13 @@ inline ir::Value saturate2xF16If(ir::Builder& builder, const ir::Value& value,
 
 inline bool handlePredCond(ir::Builder& builder, pred_t pred, bool pred_inv) {
     if (pred == PT) {
-        if (!pred_inv) { // Always
-        } else {         // Never
-            // TODO: implement
-            LOG_FATAL(ShaderDecompiler, "Never condition encountered");
+        if (pred_inv) { // Never
+            // The instruction never executes; keep it as dead code
+            builder.opBeginIf({ir::Value::createConstantB(false)});
+            return true;
         }
 
-        return false;
+        return false; // Always
     } else { // Conditional
         builder.opBeginIf(
             {notIf(builder, ir::Value::createPredicate(pred), pred_inv)});

@@ -129,7 +129,139 @@ void emitXmad(DecoderContext& context, pred_t pred, bool pred_inv, XmadCop mode,
         context.builder.opEndIf();
 }
 
+// TODO: x, write_cc
+void emitIntegerMinMax(DecoderContext& context, pred_t pred, bool pred_inv,
+                       reg_t dst, pred_t src_pred, bool src_pred_inv,
+                       bool is_signed, reg_t src_a, ir::Value src_b) {
+    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+
+    const auto type = is_signed ? ir::ScalarType::I32 : ir::ScalarType::U32;
+    const auto src_a_v = ir::Value::createRegister(src_a, type);
+    const auto src_b_v = is_signed
+                             ? ensureIntegerSignedness<true>(context.builder, src_b)
+                             : ensureIntegerSignedness<false>(context.builder, src_b);
+    const auto min_v = context.builder.opMin(src_a_v, src_b_v);
+    const auto max_v = context.builder.opMax(src_a_v, src_b_v);
+    const auto res = context.builder.opSelect(
+        notIf(context.builder, ir::Value::createPredicate(src_pred),
+              src_pred_inv),
+        min_v, max_v);
+    context.builder.opCopy(ir::Value::createRegister(dst, type), res);
+
+    if (conditional)
+        context.builder.opEndIf();
+}
+
+ir::Value extractIadd3Half(DecoderContext& context, ir::Value value,
+                           Iadd3Half half) {
+    switch (half) {
+    case Iadd3Half::Lower:
+        return context.builder.opBitfieldExtract(
+            ensureIntegerSignedness<false>(context.builder, value),
+            ir::Value::createConstantU(0), ir::Value::createConstantU(16));
+    case Iadd3Half::Upper:
+        return context.builder.opShiftRight(
+            ensureIntegerSignedness<false>(context.builder, value),
+            ir::Value::createConstantU(16));
+    default:
+        return value;
+    }
+}
+
+// TODO: x, write_cc
+void emitIadd3(DecoderContext& context, InstIadd3Base base,
+               ir::Value src_b, Iadd3Half half_a = Iadd3Half::Full,
+               Iadd3Half half_b = Iadd3Half::Full,
+               Iadd3Half half_c = Iadd3Half::Full,
+               Iadd3Shift shift = Iadd3Shift::None) {
+    const auto conditional =
+        handlePredCond(context.builder, base.pred, base.pred_inv);
+
+    auto a = extractIadd3Half(
+        context, ir::Value::createRegister(base.src_a, ir::ScalarType::U32),
+        half_a);
+    auto b = extractIadd3Half(
+        context, ensureIntegerSignedness<false>(context.builder, src_b), half_b);
+    auto c = extractIadd3Half(
+        context, ir::Value::createRegister(base.src_c, ir::ScalarType::U32),
+        half_c);
+    a = ensureIntegerSignedness<true>(context.builder, a);
+    b = ensureIntegerSignedness<true>(context.builder, b);
+    c = ensureIntegerSignedness<true>(context.builder, c);
+    a = negIf(context.builder, a, base.neg_a);
+    b = negIf(context.builder, b, base.neg_b);
+    c = negIf(context.builder, c, base.neg_c);
+
+    auto res = context.builder.opAdd(a, b);
+    switch (shift) {
+    case Iadd3Shift::Right:
+        res = context.builder.opShiftRight(
+            ensureIntegerSignedness<false>(context.builder, res),
+            ir::Value::createConstantU(16));
+        break;
+    case Iadd3Shift::Left:
+        res = context.builder.opShiftLeft(res, ir::Value::createConstantU(16));
+        break;
+    default:
+        break;
+    }
+    res = context.builder.opAdd(ensureIntegerSignedness<true>(context.builder, res),
+                                c);
+    context.builder.opCopy(
+        ir::Value::createRegister(base.dst, ir::ScalarType::I32), res);
+
+    if (conditional)
+        context.builder.opEndIf();
+}
+
 } // namespace
+
+void emitImnmxR(DecoderContext& context, InstImnmxR inst) {
+    emitIntegerMinMax(context, inst.base.pred, inst.base.pred_inv, inst.base.dst,
+                      inst.base.src_pred, inst.base.src_pred_inv,
+                      inst.base.is_signed, inst.base.src_a,
+                      ir::Value::createRegister(inst.src_b, ir::ScalarType::I32));
+}
+
+void emitImnmxC(DecoderContext& context, InstImnmxC inst) {
+    emitIntegerMinMax(
+        context, inst.base.pred, inst.base.pred_inv, inst.base.dst,
+        inst.base.src_pred, inst.base.src_pred_inv, inst.base.is_signed,
+        inst.base.src_a,
+        ir::Value::createConstMemory(
+            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
+            ir::ScalarType::I32));
+}
+
+void emitImnmxI(DecoderContext& context, InstImnmxI inst) {
+    emitIntegerMinMax(context, inst.base.pred, inst.base.pred_inv, inst.base.dst,
+                      inst.base.src_pred, inst.base.src_pred_inv,
+                      inst.base.is_signed, inst.base.src_a,
+                      ir::Value::createConstant(
+                          getIntImm20(inst.imm20_0, inst.imm20_19, true),
+                          ir::ScalarType::I32));
+}
+
+void emitIadd3R(DecoderContext& context, InstIadd3R inst) {
+    emitIadd3(context, inst.base,
+              ir::Value::createRegister(inst.src_b, ir::ScalarType::I32),
+              inst.half_a, inst.half_b, inst.half_c, inst.shift);
+}
+
+void emitIadd3C(DecoderContext& context, InstIadd3C inst) {
+    emitIadd3(context, inst.base,
+              ir::Value::createConstMemory(
+                  CMem(inst.cbuf_slot, RZ,
+                       static_cast<u64>(inst.cbuf_offset * 4)),
+                  ir::ScalarType::I32));
+}
+
+void emitIadd3I(DecoderContext& context, InstIadd3I inst) {
+    emitIadd3(context, inst.base,
+              ir::Value::createConstant(
+                  getIntImm20(inst.imm20_0, inst.imm20_19, true),
+                  ir::ScalarType::I32));
+}
 
 void emitIaddR(DecoderContext& context, InstIaddR inst) {
     emitIadd(context, inst.base.pred, inst.base.pred_inv, inst.base.avg_mode,

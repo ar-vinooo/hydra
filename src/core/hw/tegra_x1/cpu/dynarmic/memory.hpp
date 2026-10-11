@@ -27,4 +27,18 @@ class Memory : public IMemory {
     // NOLINTEND(cppcoreguidelines-no-malloc)
 };
 
+// Host memory owned by someone else
+class ExternalMemory : public IMemory {
+  public:
+    ExternalMemory(uptr ptr_, u64 size) : IMemory(size), ptr{ptr_} {}
+
+    uptr getPtr() const override { return ptr; }
+
+  protected:
+    void resizeImpl() override {}
+
+  private:
+    uptr ptr;
+};
+
 } // namespace hydra::hw::tegra_x1::cpu::dynarmic

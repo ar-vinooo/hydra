@@ -644,14 +644,15 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
         }
     case engines::VertexAttribType::Float:
         switch (size) {
+        // Fetched as raw bits, see getRawFloatVertexAttribComponentCount
         case engines::VertexAttribSize::_1x32:
-            return MTL::VertexFormatFloat;
+            return MTL::VertexFormatUInt;
         case engines::VertexAttribSize::_2x32:
-            return MTL::VertexFormatFloat2;
+            return MTL::VertexFormatUInt2;
         case engines::VertexAttribSize::_3x32:
-            return MTL::VertexFormatFloat3;
+            return MTL::VertexFormatUInt3;
         case engines::VertexAttribSize::_4x32:
-            return MTL::VertexFormatFloat4;
+            return MTL::VertexFormatUInt4;
 
         case engines::VertexAttribSize::_1x16:
             return MTL::VertexFormatHalf;

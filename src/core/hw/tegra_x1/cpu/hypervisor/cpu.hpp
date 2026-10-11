@@ -32,6 +32,7 @@ class Cpu : public ICpu {
                           const ThreadCallbacks& callbacks, IMemory* tls_mem,
                           vaddr_t tls_mem_base) override;
     IMemory* allocateMemory(u64 size) override;
+    IMemory* wrapMemory(uptr ptr, u64 size) override;
 
   private:
     VirtualMachine vm;

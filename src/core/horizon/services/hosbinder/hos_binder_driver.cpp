@@ -243,8 +243,11 @@ void IHOSBinderDriver::transactParcelImpl(
 
         // Input buffer
         auto buffer = parcel_reader.readStrongPointer<display::GraphicBuffer>();
+        // A null buffer frees the slot
         if (buffer == nullptr) {
-            LOG_ERROR(Services, "No graphic buffer");
+            if (slot >= 0 &&
+                slot < static_cast<i32>(display::MAX_BINDER_BUFFER_COUNT))
+                binder.removeBuffer(slot);
             break;
         }
 

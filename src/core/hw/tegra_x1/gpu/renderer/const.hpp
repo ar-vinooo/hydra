@@ -375,9 +375,39 @@ using Scissor = UIntRect2D;
 enum class ShaderType {
     Vertex,
     Fragment,
+    Compute,
 
     Count,
 };
+
+// Shader types that are part of a render pipeline
+constexpr usize GRAPHICS_SHADER_TYPE_COUNT = 2;
+
+// Texture bindings normally index the bindless texture constant buffer. Bindless
+// instructions take the handle from a register instead; when the decompiler can
+// trace that register back to constant buffer loads, the binding names the
+// constant buffer slot and words explicitly. The handle may be built from a
+// texture word OR'd with a separate sampler word.
+constexpr u32 TRACKED_TEXTURE_INDEX_FLAG = 0x80000000;
+constexpr u32 TRACKED_TEXTURE_WORD_MASK = 0x1fff;
+constexpr u32 TRACKED_TEXTURE_NO_SAMPLER = TRACKED_TEXTURE_WORD_MASK;
+
+constexpr u32 makeTrackedTextureIndex(
+    u32 slot, u32 word, u32 sampler_word = TRACKED_TEXTURE_NO_SAMPLER) {
+    return TRACKED_TEXTURE_INDEX_FLAG | ((slot & 0x1f) << 26) |
+           ((word & TRACKED_TEXTURE_WORD_MASK) << 13) |
+           (sampler_word & TRACKED_TEXTURE_WORD_MASK);
+}
+constexpr bool isTrackedTextureIndex(u32 index) {
+    return (index & TRACKED_TEXTURE_INDEX_FLAG) != 0;
+}
+constexpr u32 getTrackedTextureSlot(u32 index) { return (index >> 26) & 0x1f; }
+constexpr u32 getTrackedTextureWord(u32 index) {
+    return (index >> 13) & TRACKED_TEXTURE_WORD_MASK;
+}
+constexpr u32 getTrackedSamplerWord(u32 index) {
+    return index & TRACKED_TEXTURE_WORD_MASK;
+}
 
 struct ResourceMapping {
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
@@ -385,9 +415,12 @@ struct ResourceMapping {
     std::map<u32, u32> textures;
     // Texture type the shader declares for each binding
     std::map<u32, TextureType> texture_types;
+    u32 sampler_buffer_index{invalid<u32>()};
     // Fragment shader user inputs (bit per location)
     u32 stage_input_mask{0};
-    // TODO: images
+    // Storage images (surfaces), keyed like textures
+    std::map<u32, u32> images;
+    std::map<u32, TextureType> image_types;
 
     ResourceMapping() {
         for (auto& uniform_buffer : uniform_buffers)
@@ -556,4 +589,5 @@ ENABLE_STRUCT_FORMATTING(
     swizzle_channels, "", "swizzle channels")
 
 ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::renderer::ShaderType, Vertex,
-                       "vertex", Fragment, "fragment", Count, "invalid")
+                       "vertex", Fragment, "fragment", Compute, "compute",
+                       Count, "invalid")

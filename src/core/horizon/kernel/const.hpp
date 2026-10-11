@@ -6,17 +6,19 @@ constexpr Handle CURRENT_PROCESS_PSEUDO_HANDLE = 0xffff8001;
 constexpr Handle CURRENT_THREAD_PSEUDO_HANDLE = 0xffff8000;
 
 constexpr ztd::Range<vaddr_t> ADDRESS_SPACE =
-    ztd::Range<vaddr_t>(0x10000000, 0x200000000);
+    ztd::Range<vaddr_t>(0x10000000, 0x1200000000);
 constexpr ztd::Range<vaddr_t> STACK_REGION =
     ztd::Range<vaddr_t>(0x10000000, 0x20000000);
 constexpr ztd::Range<vaddr_t> TLS_REGION =
     ztd::Range<vaddr_t>(0x20000000, 0x30000000);
-constexpr ztd::Range<vaddr_t> ALIAS_REGION =
-    ztd::Range<vaddr_t>(0x30000000, 0x40000000);
 constexpr ztd::Range<vaddr_t> EXECUTABLE_REGION =
     ztd::Range<vaddr_t>(0x40000000, 0x80000000);
 constexpr ztd::Range<vaddr_t> HEAP_REGION =
     ztd::Range<vaddr_t>(0x100000000, 0x200000000);
+// 64 GiB like a 39-bit Horizon address space. nn::os reserves address regions
+// here, e.g. UE4 reserves 62 GiB for its page cache.
+constexpr ztd::Range<vaddr_t> ALIAS_REGION =
+    ztd::Range<vaddr_t>(0x200000000, 0x1200000000);
 
 constexpr u64 HEAP_MEM_ALIGNMENT = 0x200000;
 

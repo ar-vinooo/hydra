@@ -1,4 +1,11 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/builder.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -59,6 +66,85 @@ int main(int argc, char** argv) {
         }
 
         BinaryArchiveCache cache(device, path);
+        if (mode == "many-samplers") {
+            using namespace hydra;
+            using namespace hydra::hw::tegra_x1::gpu::renderer;
+            namespace decomp = shader_decomp;
+            decomp::ir::Module module;
+            decomp::ir::Builder builder(module);
+            const auto coords = builder.opVectorConstruct(
+                decomp::ir::ScalarType::F32,
+                {decomp::ir::Value::createConstantF(0.5f),
+                 decomp::ir::Value::createConstantF(0.5f)});
+            const auto undefined = decomp::ir::Value::createUndefined();
+            for (u32 i = 0; i < 18; ++i)
+                builder.opTextureSample(i, decomp::TextureType::_2D,
+                                        decomp::TextureSampleFlags::Lod,
+                                        undefined, coords, undefined,
+                                        decomp::ir::Value::createConstantF(0));
+            builder.opExit();
+            decomp::analyzer::MemoryAnalyzer analyzer;
+            analyzer.analyze(module);
+            const decomp::DecompilerContext context{.type = ShaderType::Compute};
+            GuestShaderState state{};
+            ShaderDescriptor descriptor{};
+            descriptor.type = ShaderType::Compute;
+            descriptor.backend = ShaderBackend::Msl;
+            decomp::codegen::lang::msl::MslEmitter emitter(
+                context, analyzer, state, descriptor.code,
+                descriptor.resource_mapping);
+            emitter.emit(module);
+            check(descriptor.resource_mapping.sampler_buffer_index != invalid<u32>(),
+                  "Large shader did not use a sampler argument buffer");
+            ShaderLibraryCache libraries(device, path / "sources");
+            Shader shader(device, descriptor, libraries);
+            check(shader.getFunction() != nullptr &&
+                      shader.getSamplerEncoder() != nullptr,
+                  "Generated 18-sampler shader failed to compile");
+            const auto argument_encoder = shader.getSamplerEncoder();
+            NS_STACK_SCOPED auto buffer = device->newBuffer(
+                argument_encoder->encodedLength(), MTL::ResourceStorageModeShared);
+            NS_STACK_SCOPED auto sampler_desc = MTL::SamplerDescriptor::alloc()->init();
+            sampler_desc->setSupportArgumentBuffers(true);
+            NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_desc);
+            check(sampler != nullptr, "Argument buffer sampler creation failed");
+            argument_encoder->setArgumentBuffer(buffer, 0);
+            for (u32 i = 0; i < 18; ++i)
+                argument_encoder->setSamplerState(sampler, i);
+            std::cout << "PASS: generated 18-sampler shader and argument encoding\n";
+            return 0;
+        }
+        if (mode == "depth-only") {
+            using namespace hydra::hw::tegra_x1::gpu::renderer;
+            const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    return float4(float(id), 0, 0.5, 1);
+}
+)";
+            ShaderLibraryCache libraries(device, path / "sources");
+            ShaderDescriptor shader_descriptor{};
+            shader_descriptor.type = ShaderType::Vertex;
+            shader_descriptor.backend = hydra::ShaderBackend::Msl;
+            shader_descriptor.code.assign(source.begin(), source.end());
+            Shader vertex_shader(device, shader_descriptor, libraries);
+            check(vertex_shader.getFunction() != nullptr,
+                  "Depth-only vertex shader compilation failed");
+            PipelineDescriptor descriptor{};
+            descriptor.shaders[static_cast<unsigned>(ShaderType::Vertex)] =
+                &vertex_shader;
+            descriptor.depth_stencil_format = TextureFormat::Z32Float;
+            Pipeline depth_only(device, descriptor, cache);
+            check(depth_only.getPipeline() != nullptr,
+                  "Pipeline with disabled fragment stage failed");
+            descriptor.shaders[static_cast<unsigned>(ShaderType::Vertex)] = nullptr;
+            Pipeline missing_vertex(device, descriptor, cache);
+            check(missing_vertex.getPipeline() == nullptr,
+                  "Pipeline with missing vertex stage was accepted");
+            std::cout << "PASS: depth-only pipeline and missing vertex handling\n";
+            return 0;
+        }
         NS_STACK_SCOPED auto queue = device->newCommandQueue();
         const std::string source = R"(
 #include <metal_stdlib>

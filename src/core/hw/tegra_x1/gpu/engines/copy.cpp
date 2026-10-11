@@ -65,12 +65,36 @@ void Copy::launchDma(const u32 index, const LaunchDMAData data) {
     const auto dst_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_out);
     if (data.src_memory_layout == MemoryLayout::Pitch) {
         if (data.dst_memory_layout == MemoryLayout::Pitch) {
-            for (u32 i = 0; i < regs.line_count; i++)
-                memcpy(reinterpret_cast<void*>(
-                           dst_ptr + static_cast<uptr>(regs.stride_out * i)),
-                       reinterpret_cast<void*>(
-                           src_ptr + static_cast<uptr>(regs.stride_in * i)),
-                       regs.stride_in);
+            const u32 lines = data.multi_line_enable ? regs.line_count : 1;
+            for (u32 i = 0; i < lines; i++) {
+                uptr src_addr = static_cast<u64>(regs.offset_in) +
+                                static_cast<u64>(regs.stride_in) * i;
+                uptr dst_addr = static_cast<u64>(regs.offset_out) +
+                                static_cast<u64>(regs.stride_out) * i;
+                u64 remaining = regs.line_length_in;
+                while (remaining != 0) {
+                    uptr src_base, dst_base;
+                    const auto& src_as =
+                        tls_crnt_gmmu->findAddrImpl(src_addr, src_base);
+                    const auto& dst_as =
+                        tls_crnt_gmmu->findAddrImpl(dst_addr, dst_base);
+                    const u64 bytes = std::min(
+                        {remaining, src_as.size - (src_addr - src_base),
+                         dst_as.size - (dst_addr - dst_base)});
+                    const auto src = tls_crnt_gmmu->unmapAddr(src_addr);
+                    const auto dst = tls_crnt_gmmu->unmapAddr(dst_addr);
+                    memcpy(reinterpret_cast<void*>(dst),
+                           reinterpret_cast<const void*>(src), bytes);
+                    gpu.getRenderer().invalidateMemory(
+                        ztd::Range<uptr>::fromSize(dst, bytes),
+                        renderer::MemoryInvalidationScope::BufferCache |
+                            renderer::MemoryInvalidationScope::TextureCache);
+                    src_addr += bytes;
+                    dst_addr += bytes;
+                    remaining -= bytes;
+                }
+            }
+            return;
         } else {
             // TODO: is slice stride correct?
             // TODO: can this copy to multiple slices at once?

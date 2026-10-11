@@ -73,7 +73,11 @@ class CommandBuffer final : public ICommandBuffer {
     }
     MTL::BlitCommandEncoder* getBlitCommandEncoder();
 
+    MTL::ComputeCommandEncoder* getComputeCommandEncoder();
+
     void endEncoding();
+    // DEBUG: commit, wait and continue with a new command buffer
+    f64 debugCommitAndWait();
     void retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
                             MTL::Buffer* buffer);
 
@@ -94,6 +98,7 @@ class CommandBuffer final : public ICommandBuffer {
                     u32 index);
 
   private:
+    MTL::CommandQueue* command_queue{nullptr};
     MTL::CommandBuffer* command_buffer{nullptr};
     MTL::CommandEncoder* command_encoder{nullptr};
     EncoderType encoder_type{EncoderType::None};

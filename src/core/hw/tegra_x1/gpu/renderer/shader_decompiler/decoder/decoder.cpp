@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/decoder.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/bitfield.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/compute.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/conversion.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/exit.hpp"
@@ -31,6 +32,17 @@ void Decoder::decode() {
 
 void Decoder::parseNextInstruction() {
     const u32 pc = getPc();
+    // Control flow that leaves the shader (unsupported instructions, garbage
+    // branch targets) must not read arbitrary memory
+    const auto seek = context.code_stream->getSeek();
+    const auto size = context.code_stream->getSize();
+    if (seek > size || size - seek < sizeof(instruction_t)) {
+        LOG_ERROR(ShaderDecompiler, "Shader control flow left the code at {:#x}",
+                  pc);
+        context.builder.opExit();
+        endBlock();
+        return;
+    }
     const auto inst = context.code_stream->read<instruction_t>();
     if ((pc % 4) == 0) // Sched
         return;
@@ -66,8 +78,8 @@ void Decoder::parseNextInstruction() {
                 context.builder.opBranch(target);
                 endBlock();
             } else {
-                // TODO: how does sync behave with never?
-                LOG_FATAL(ShaderDecompiler, "Never sync");
+                // Never taken: execution falls through to the next
+                // instruction and the sync point stays on the stack
             }
         } else { // Conditional
             // Inherit for the continuation block, then pop and inherit for sync
@@ -94,9 +106,7 @@ void Decoder::parseNextInstruction() {
     INST(0xf0b8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("b2r");
     }
-    INST(0xf0a8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("bar");
-    }
+    INST(0xf0a8000000000000, 0xfff8000000000000) { emitBar(context, inst); }
     INST(0xeff0000000000000, 0xfff8000000000000) { EMIT(Sta); }
     INST(0xefe8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("pixld");
@@ -109,7 +119,8 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("al2p");
     }
     INST(0xef98000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("membar");
+        // Accesses are ordered by barriers
+        COMMENT("membar");
     }
     INST(0xef90000000000000, 0xfff8000000000000) { EMIT(Ldc); }
     INST(0xef80000000000000, 0xffe0000000000000) {
@@ -118,15 +129,11 @@ void Decoder::parseNextInstruction() {
     INST(0xef60000000000000, 0xffe0000000000000) {
         COMMENT_NOT_IMPLEMENTED("cctl");
     }
-    INST(0xef58000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("st");
-    }
+    INST(0xef58000000000000, 0xfff8000000000000) { emitSts(context, inst); }
     INST(0xef50000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("st");
     }
-    INST(0xef48000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("ld");
-    }
+    INST(0xef48000000000000, 0xfff8000000000000) { emitLds(context, inst); }
     INST(0xef40000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("ld");
     }
@@ -165,9 +172,7 @@ void Decoder::parseNextInstruction() {
     INST(0xeb40000000000000, 0xffe0000000000000) {
         COMMENT_NOT_IMPLEMENTED("sured");
     }
-    INST(0xeb20000000000000, 0xffe0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("sust");
-    }
+    INST(0xeb20000000000000, 0xffe0000000000000) { emitSust(context, inst); }
     INST(0xeb00000000000000, 0xffe0000000000000) {
         COMMENT_NOT_IMPLEMENTED("suld");
     }
@@ -177,12 +182,8 @@ void Decoder::parseNextInstruction() {
     INST(0xea80000000000000, 0xffc0000000000000) {
         COMMENT_NOT_IMPLEMENTED("suatom");
     }
-    INST(0xea60000000000000, 0xffe0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("suatom");
-    }
-    INST(0xea00000000000000, 0xffc0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("suatom");
-    }
+    INST(0xea60000000000000, 0xffe0000000000000) { emitSuatom(context, inst); }
+    INST(0xea00000000000000, 0xffc0000000000000) { emitSuatom(context, inst); }
     INST(0xe3a0000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("bpt");
     }
@@ -238,6 +239,10 @@ void Decoder::parseNextInstruction() {
     INST(0xe330000000000000, 0xfff0000000000000) { EMIT(Kil); }
     INST(0xe320000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("ret");
+        // Subroutines are not supported; do not fall through into whatever
+        // follows the return
+        context.builder.opExit();
+        endBlock();
     }
     INST(0xe310000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("longjmp");
@@ -383,31 +388,21 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("tmml");
     }
     INST(0xdf50000000000000, 0xfff8000000000000) { EMIT(Txq); }
-    INST(0xdf48000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("txq");
-    }
+    INST(0xdf48000000000000, 0xfff8000000000000) { EMIT(TxqB); }
     INST(0xdf40000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("txa");
     }
     INST(0xdf00000000000000, 0xff40000000000000) { EMIT(Tld4s); }
-    INST(0xdef8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("tld4");
-    }
-    INST(0xdeb8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("tex");
-    }
+    INST(0xdef8000000000000, 0xfff8000000000000) { EMIT(Tld4B); }
+    INST(0xdeb8000000000000, 0xfff8000000000000) { EMIT(TexB); }
     INST(0xde78000000000000, 0xfffc000000000000) {
         COMMENT_NOT_IMPLEMENTED("txd");
     }
     INST(0xde38000000000000, 0xfffc000000000000) {
         COMMENT_NOT_IMPLEMENTED("txd");
     }
-    INST(0xdd38000000000000, 0xff38000000000000) {
-        COMMENT_NOT_IMPLEMENTED("tld");
-    }
-    INST(0xdc38000000000000, 0xff38000000000000) {
-        COMMENT_NOT_IMPLEMENTED("tld");
-    }
+    INST(0xdd38000000000000, 0xff38000000000000) { EMIT(TldB); }
+    INST(0xdc38000000000000, 0xff38000000000000) { EMIT(Tld); }
     INST(0xd200000000000000, 0xf600000000000000) { EMIT(Tlds); }
     INST(0xd000000000000000, 0xf600000000000000) { EMIT(Texs); }
     INST(0xc838000000000000, 0xfc38000000000000) { EMIT(Tld4); }
@@ -453,9 +448,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("p2r");
     }
     INST(0x5ce0000000000000, 0xfff8000000000000) { EMIT(I2iR); }
-    INST(0x5cc0000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("iadd3");
-    }
+    INST(0x5cc0000000000000, 0xfff0000000000000) { EMIT(Iadd3R); }
     INST(0x5cb8000000000000, 0xfff8000000000000) { EMIT(I2fR); }
     INST(0x5cb0000000000000, 0xfff8000000000000) { EMIT(F2iR); }
     INST(0x5ca8000000000000, 0xfff8000000000000) { EMIT(F2fR); }
@@ -482,18 +475,12 @@ void Decoder::parseNextInstruction() {
     INST(0x5c38000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("imul");
     }
-    INST(0x5c30000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("flo");
-    }
+    INST(0x5c30000000000000, 0xfff8000000000000) { emitFloR(context, inst); }
     INST(0x5c28000000000000, 0xfff8000000000000) { EMIT(ShrR); }
-    INST(0x5c20000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imnmx");
-    }
+    INST(0x5c20000000000000, 0xfff8000000000000) { EMIT(ImnmxR); }
     INST(0x5c18000000000000, 0xfff8000000000000) { EMIT(IscaddR); }
     INST(0x5c10000000000000, 0xfff8000000000000) { EMIT(IaddR); }
-    INST(0x5c08000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("popc");
-    }
+    INST(0x5c08000000000000, 0xfff8000000000000) { emitPopcR(context, inst); }
     INST(0x5c00000000000000, 0xfff8000000000000) { EMIT(BfeR); }
     INST(0x5bf8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("shf");
@@ -501,9 +488,7 @@ void Decoder::parseNextInstruction() {
     INST(0x5bf0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("bfi");
     }
-    INST(0x5be0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("lop3");
-    }
+    INST(0x5be0000000000000, 0xfff8000000000000) { emitLop3R(context, inst); }
     INST(0x5bd8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("lea");
     }
@@ -603,9 +588,7 @@ void Decoder::parseNextInstruction() {
     INST(0x50e0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("vote");
     }
-    INST(0x50d8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("vote");
-    }
+    INST(0x50d8000000000000, 0xfff8000000000000) { emitVote(context, inst); }
     INST(0x50d0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("lepc");
     }
@@ -633,9 +616,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("p2r");
     }
     INST(0x4ce0000000000000, 0xfff8000000000000) { EMIT(I2iC); }
-    INST(0x4cc0000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("iadd3");
-    }
+    INST(0x4cc0000000000000, 0xfff0000000000000) { EMIT(Iadd3C); }
     INST(0x4cb8000000000000, 0xfff8000000000000) { EMIT(I2fC); }
     INST(0x4cb0000000000000, 0xfff8000000000000) { EMIT(F2iC); }
     INST(0x4ca8000000000000, 0xfff8000000000000) { EMIT(F2fC); }
@@ -662,18 +643,12 @@ void Decoder::parseNextInstruction() {
     INST(0x4c38000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("imul");
     }
-    INST(0x4c30000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("flo");
-    }
+    INST(0x4c30000000000000, 0xfff8000000000000) { emitFloC(context, inst); }
     INST(0x4c28000000000000, 0xfff8000000000000) { EMIT(ShrC); }
-    INST(0x4c20000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imnmx");
-    }
+    INST(0x4c20000000000000, 0xfff8000000000000) { EMIT(ImnmxC); }
     INST(0x4c18000000000000, 0xfff8000000000000) { EMIT(IscaddC); }
     INST(0x4c10000000000000, 0xfff8000000000000) { EMIT(IaddC); }
-    INST(0x4c08000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("popc");
-    }
+    INST(0x4c08000000000000, 0xfff8000000000000) { emitPopcC(context, inst); }
     INST(0x4c00000000000000, 0xfff8000000000000) { EMIT(BfeC); }
     INST(0x4bf0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("bfi");
@@ -713,9 +688,7 @@ void Decoder::parseNextInstruction() {
     INST(0x4000000000000000, 0xfe00000000000000) {
         COMMENT_NOT_IMPLEMENTED("vset");
     }
-    INST(0x3c00000000000000, 0xfc00000000000000) {
-        COMMENT_NOT_IMPLEMENTED("lop3");
-    }
+    INST(0x3c00000000000000, 0xfc00000000000000) { emitLop3I(context, inst); }
     INST(0x3a00000000000000, 0xfe00000000000000) {
         COMMENT_NOT_IMPLEMENTED("vmnmx");
     }
@@ -729,9 +702,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("p2r");
     }
     INST(0x38e0000000000000, 0xfef8000000000000) { EMIT(I2iI); }
-    INST(0x38c0000000000000, 0xfef0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("iadd3");
-    }
+    INST(0x38c0000000000000, 0xfef0000000000000) { EMIT(Iadd3I); }
     INST(0x38b8000000000000, 0xfef8000000000000) { EMIT(I2fI); }
     INST(0x38b0000000000000, 0xfef8000000000000) { EMIT(F2iI); }
     INST(0x38a8000000000000, 0xfef8000000000000) { EMIT(F2fI); }
@@ -758,18 +729,12 @@ void Decoder::parseNextInstruction() {
     INST(0x3838000000000000, 0xfef8000000000000) {
         COMMENT_NOT_IMPLEMENTED("imul");
     }
-    INST(0x3830000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("flo");
-    }
+    INST(0x3830000000000000, 0xfef8000000000000) { emitFloI(context, inst); }
     INST(0x3828000000000000, 0xfef8000000000000) { EMIT(ShrI); }
-    INST(0x3820000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imnmx");
-    }
+    INST(0x3820000000000000, 0xfef8000000000000) { EMIT(ImnmxI); }
     INST(0x3818000000000000, 0xfef8000000000000) { EMIT(IscaddI); }
     INST(0x3810000000000000, 0xfef8000000000000) { EMIT(IaddI); }
-    INST(0x3808000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("popc");
-    }
+    INST(0x3808000000000000, 0xfef8000000000000) { emitPopcI(context, inst); }
     INST(0x3800000000000000, 0xfef8000000000000) { EMIT(BfeI); }
     INST(0x36f8000000000000, 0xfef8000000000000) {
         COMMENT_NOT_IMPLEMENTED("shf");
@@ -835,12 +800,19 @@ void Decoder::parseNextInstruction() {
     INST(0x0c00000000000000, 0xfc00000000000000) { EMIT(Ffma32I); }
     INST(0x0800000000000000, 0xfc00000000000000) { EMIT(Fadd32I); }
     INST(0x0400000000000000, 0xfc00000000000000) { EMIT(Lop32I); }
-    INST(0x0200000000000000, 0xfe00000000000000) {
-        COMMENT_NOT_IMPLEMENTED("lop3");
-    }
+    INST(0x0200000000000000, 0xfe00000000000000) { emitLop3C(context, inst); }
     INST(0x0100000000000000, 0xfff0000000000000) { EMIT(Mov32I); }
     else {
         LOG_ERROR(ShaderDecompiler, "Unknown instruction 0x{:016x}", inst);
+        // Zeros or consecutive unknown instructions mean decoding data past
+        // the end of the shader (a lone unknown one is just unsupported)
+        const bool garbage = inst == 0x0 || last_unknown_pc + 1 == pc ||
+                             last_unknown_pc + 2 == pc;
+        last_unknown_pc = pc;
+        if (garbage) {
+            context.builder.opExit();
+            endBlock();
+        }
     }
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder
 

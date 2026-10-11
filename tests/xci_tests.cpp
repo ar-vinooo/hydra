@@ -1,14 +1,20 @@
 #include "common/common.hpp"
 
 #include <fstream>
+#include <unistd.h>
 #include <iostream>
 #include <stdexcept>
 
 #include "core/c_api.h"
 #include "core/horizon/kernel/thread.hpp"
+#include "core/horizon/kernel/shared_memory.hpp"
 #include "core/horizon/services/hid/internal/applet_resource.hpp"
 #include "core/horizon/services/hid/internal/shared_memory.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/cpu/cpu.hpp"
+#include "core/hw/tegra_x1/cpu/mmu.hpp"
+#include "core/hw/tegra_x1/gpu/engines/copy.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/decoder.hpp"
 #include "core/system.hpp"
 #ifdef HYDRA_HYPERVISOR_ENABLED
 #include "core/hw/tegra_x1/cpu/hypervisor/physical_memory.hpp"
@@ -16,6 +22,7 @@
 #include "core/horizon/filesystem/content_archive.hpp"
 #include "core/horizon/filesystem/disk_file.hpp"
 #include "core/horizon/filesystem/nca_file.hpp"
+#include "core/horizon/filesystem/ncz_file.hpp"
 #include "core/horizon/filesystem/romfs/romfs.hpp"
 #include "core/horizon/loader/loader.hpp"
 
@@ -142,8 +149,164 @@ void checkThreadWaits() {
         << "PASS: thread timeout, repeated signal waits and cancellation\n";
 }
 
+void checkShaderReadBounds() {
+    namespace decomp = hw::tegra_x1::gpu::renderer::shader_decomp;
+    std::array<u8, 7> bytes{};
+    for (const u64 seek : {0ull, 7ull, 0x1000ull}) {
+        ztd::io::MemoryStream stream(bytes);
+        stream.seekTo(seek);
+        decomp::ir::Module module;
+        decomp::ir::Builder builder(module);
+        const decomp::DecompilerContext context{
+            .type = hw::tegra_x1::gpu::renderer::ShaderType::Compute};
+        decomp::decoder::Decoder decoder({context, &stream, builder});
+        decoder.decode();
+        check(stream.getSeek() == seek,
+              "Shader decoder consumed a partial or out-of-range instruction");
+    }
+    std::cout << "PASS: shader decoder rejects partial and out-of-range reads\n";
+}
+
+void checkGpuMappings(System* test_system, kernel::Process* test_process) {
+    constexpr u64 page = hw::tegra_x1::cpu::GUEST_PAGE_SIZE;
+    constexpr vaddr_t va = 0x7000000000;
+    constexpr uptr gpu_va = 0x200000;
+    std::unique_ptr<hw::tegra_x1::cpu::IMemory> first(
+        test_system->getCpu().allocateMemory(3 * page));
+    std::unique_ptr<hw::tegra_x1::cpu::IMemory> second(
+        test_system->getCpu().wrapMemory(first->getPtr() + 2 * page, page));
+    check(second->getPtr() != first->getPtr() + page,
+          "Scattered GPU fixture must have separate backing");
+    auto* cpu_mmu = test_process->getMmu();
+    const kernel::MemoryState state{
+        kernel::MemoryType::Normal_4_0_0,
+        kernel::MemoryAttribute::None,
+        kernel::MemoryPermission::ReadWrite};
+    cpu_mmu->map(va, ztd::Range<uptr>::fromSize(first->getPtr(), page), state);
+    cpu_mmu->map(va + page,
+                 ztd::Range<uptr>::fromSize(second->getPtr(), page), state);
+    hw::tegra_x1::gpu::GMmu gpu_mmu(cpu_mmu);
+    gpu_mmu.mapBufferToAddressSpace(
+        ztd::Range<vaddr_t>::fromSize(va, 2 * page), gpu_va);
+    check(gpu_mmu.unmapAddr(gpu_va + page - 1) == first->getPtr() + page - 1 &&
+              gpu_mmu.unmapAddr(gpu_va + page) == second->getPtr(),
+          "GPU mapping treated scattered CPU pages as contiguous");
+    std::unique_ptr<hw::tegra_x1::cpu::IMemory> source(
+        test_system->getCpu().allocateMemory(2 * page));
+    cpu_mmu->map(va + 2 * page, source.get(), state);
+    gpu_mmu.mapBufferToAddressSpace(
+        ztd::Range<vaddr_t>::fromSize(va + 2 * page, 2 * page), 0x300000);
+    auto* input = reinterpret_cast<u8*>(source->getPtr());
+    for (u64 i = 0; i < 2 * page; ++i)
+        input[i] = static_cast<u8>(i * 17 + 3);
+    hw::tegra_x1::gpu::tls_crnt_gmmu = &gpu_mmu;
+    hw::tegra_x1::gpu::engines::Copy copy(test_system->getGpu());
+    copy.method(0x100, 0);
+    copy.method(0x101, 0x300000);
+    copy.method(0x102, 0);
+    copy.method(0x103, static_cast<u32>(gpu_va));
+    copy.method(0x104, 0);
+    copy.method(0x105, 0);
+    copy.method(0x106, static_cast<u32>(2 * page));
+    copy.method(0x107, 0);
+    copy.method(0xc0, 0x180); // Pitch/Pitch, one block, zero pitches/count.
+    check(std::memcmp(reinterpret_cast<const void*>(first->getPtr()), input,
+                      page) == 0 &&
+              std::memcmp(reinterpret_cast<const void*>(second->getPtr()),
+                          input + page, page) == 0,
+          "Single-block DMA omitted bytes or crossed into the wrong physical "
+          "allocation");
+    const auto shader_bytes = gpu_mmu.readMappedBytes(gpu_va, 3 * page);
+    check(shader_bytes.size() == 2 * page &&
+              std::memcmp(shader_bytes.data(), input, 2 * page) == 0,
+          "Shader snapshot crossed a mapping gap or lost scattered code");
+    const auto shader_tail = gpu_mmu.readMappedBytes(gpu_va + 2 * page - 3, 8);
+    check(shader_tail.size() == 3 &&
+              std::memcmp(shader_tail.data(), input + 2 * page - 3, 3) == 0 &&
+              gpu_mmu.readMappedBytes(gpu_va + 2 * page, 8).empty(),
+          "Shader snapshot read beyond the final mapped bytes");
+    std::memset(reinterpret_cast<void*>(first->getPtr()), 0xcc, page);
+    copy.method(0x104, 32);
+    copy.method(0x105, 64);
+    copy.method(0x106, 16);
+    copy.method(0x107, 2);
+    copy.method(0xc0, 0x380); // Two pitched lines; preserve destination padding.
+    const auto* output = reinterpret_cast<const u8*>(first->getPtr());
+    check(std::memcmp(output, input, 16) == 0 &&
+              std::memcmp(output + 64, input + 32, 16) == 0 &&
+              output[16] == 0xcc && output[80] == 0xcc,
+          "Pitched DMA copied row padding instead of line length");
+    hw::tegra_x1::gpu::tls_crnt_gmmu = nullptr;
+    cpu_mmu->unmap(ztd::Range<vaddr_t>::fromSize(va, 4 * page));
+    std::cout << "PASS: GPU mapping resolves separate physical pages\n";
+    std::cout << "PASS: single-block and padded-row DMA with scattered backing\n";
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--check-gpu-memory") {
+            checkShaderReadBounds();
+            CONFIG_INSTANCE.getCpuBackend() = CpuBackend::Dynarmic;
+            auto* system = static_cast<System*>(hydraCreateSystem());
+            check(system != nullptr, "Cannot create GPU memory test system");
+            auto* process = system->getOs()
+                                .getKernel()
+                                .getProcessManager()
+                                .createProcess("GPU memory test");
+            checkGpuMappings(system, process);
+            {
+                namespace hid = horizon::services::hid;
+                hid::internal::AppletResource resource(*system);
+                auto* memory = reinterpret_cast<hid::internal::SharedMemory*>(
+                    resource.getSharedMemory()->getPtr());
+                std::array<u64, 4> header{};
+                std::memcpy(
+                    header.data(),
+                    &memory->npad.entries[0].internal_state.full_key_lifo,
+                    sizeof(header));
+                check(header[1] == 17 && header[2] == 1 && header[3] == 1,
+                      "HID Npad ring header lacks initialized capacity");
+                std::memcpy(header.data(), &memory->touch_screen.lifo,
+                            sizeof(header));
+                check(header[1] == 17 && header[3] == 1,
+                      "HID touch ring header or neutral sample is invalid");
+                const auto keyboard = memory->keyboard.lifo.getCurrentStorage();
+                check(keyboard.has_value() && (*keyboard)->modifiers == 0 &&
+                          std::all_of(std::begin((*keyboard)->keys),
+                                      std::end((*keyboard)->keys),
+                                      [](u64 keys) { return keys == 0; }),
+                      "Guest keyboard has no neutral sample");
+                check(memory->mouse.lifo.getCurrentStorage().has_value() &&
+                          memory->debug_pad.lifo.getCurrentStorage().has_value(),
+                      "Auxiliary input devices have empty buffers");
+                auto& npad_state = memory->npad.entries[0].internal_state;
+                const auto buttons = [](auto& lifo) {
+                    return lifo.getCurrentStorage().value()->buttons;
+                };
+                hid::internal::Npad pad(npad_state);
+                pad.setup(hid::NpadStyleSet::FullKey);
+                input::NpadState pressed{};
+                pressed.buttons = hid::NpadButtons::Up;
+                pad.update(pressed);
+                check(buttons(npad_state.full_key_lifo) == hid::NpadButtons::Up &&
+                          buttons(npad_state.system_ext_lifo) == hid::NpadButtons::Up,
+                      "Connected input missing from style or generic buffer");
+                check(buttons(npad_state.handheld_lifo) == hid::NpadButtons::None,
+                      "Inactive style received connected controller input");
+                pad.update({});
+                check(buttons(npad_state.full_key_lifo) == hid::NpadButtons::None &&
+                          buttons(npad_state.system_ext_lifo) == hid::NpadButtons::None,
+                      "Released key remains in guest input buffers");
+                pad.setup(hid::NpadStyleSet::None);
+                pad.update(pressed);
+                check(buttons(npad_state.full_key_lifo) == hid::NpadButtons::None,
+                      "Disconnected controller retains pressed input");
+                std::cout << "PASS: HID ring initialization, inactive styles, "
+                             "key release and disconnect\n";
+            }
+            hydraSystemDestroy(system);
+            return 0;
+        }
         check(argc >= 2, "Usage: hydra-xci-tests FIXTURE_DIRECTORY [REAL_XCI]");
         checkThreadWaits();
         checkMmuLookup();
@@ -321,6 +484,82 @@ int main(int argc, char** argv) {
         check(missing_ticket_rejected, "Missing matching ticket was accepted");
         std::cout << "PASS: NSP detection, malformed packages/tickets, "
                      "title-key AES reference\n";
+
+        // NCZ sections are stored decrypted: only the header key is needed.
+        filesystem::DiskFile ncz_expected(
+            (dir / "ncz-expected.nca").string());
+        std::unique_ptr<ztd::io::IStream> ncz_expected_stream(
+            ncz_expected.open(filesystem::FileOpenFlags::Read));
+        std::vector<u8> ncz_reference(ncz_expected.getSize());
+        ncz_expected_stream->readToSpan(std::span(ncz_reference));
+        const filesystem::NcaFile::Keys header_only{
+            {"header_key", keys.at("header_key")}};
+        const auto ncz_cache_dir =
+            std::filesystem::temp_directory_path() /
+            fmt::format("hydra-ncz-test-{}", ::getpid());
+        std::filesystem::remove_all(ncz_cache_dir);
+        for (const auto* filename : {"ncz-block.ncz", "ncz-solid.ncz"}) {
+            const bool block = std::string_view(filename) == "ncz-block.ncz";
+            auto ncz_source = std::make_shared<filesystem::DiskFile>(
+                (dir / filename).string());
+            const auto ncz_header = filesystem::NcaFile::readHeader(
+                *ncz_source, 0, ncz_source->getSize(), header_only, plaintext);
+            const auto cache = ncz_cache_dir / filename;
+            // The second solid pass must reuse the completed cache.
+            for (int pass = 0; pass < 2; ++pass) {
+                auto ncz = std::make_shared<filesystem::NczFile>(
+                    ncz_source, 0, ncz_source->getSize(), ncz_reference.size(),
+                    cache);
+                check(ncz->isBlockCompressed() == block,
+                      "NCZ compression mode misdetected");
+                filesystem::NcaFile ncz_nca(ncz, 0, ncz->getSize(), ncz_header,
+                                            plaintext, header_only, true);
+                std::unique_ptr<ztd::io::IStream> stream(
+                    ncz_nca.open(filesystem::FileOpenFlags::Read));
+                // Random reads first, so the solid cache grows on demand.
+                for (u64 i = 0; i < 300; ++i) {
+                    const auto offset = (i * 104729) % ncz_reference.size();
+                    const auto count = std::min<u64>(
+                        1 + (i * 4099) % 0x9000, ncz_reference.size() - offset);
+                    std::vector<u8> bytes(count);
+                    stream->seekTo(offset);
+                    stream->readToSpan(std::span(bytes));
+                    check(std::equal(bytes.begin(), bytes.end(),
+                                     ncz_reference.begin() +
+                                         static_cast<std::ptrdiff_t>(offset)),
+                          "Random NCZ read differs from reference");
+                }
+                std::vector<u8> ncz_full(ncz_nca.getSize());
+                stream->seekTo(0);
+                stream->readToSpan(std::span(ncz_full));
+                check(ncz_full == ncz_reference,
+                      "Decompressed NCZ differs from reference NCA");
+            }
+            check(std::filesystem::exists(cache) != block,
+                  "Solid NCZ cache missing (or block NCZ was cached)");
+        }
+        for (const auto& entry :
+             std::filesystem::directory_iterator(ncz_cache_dir))
+            check(entry.path().extension() != ".part",
+                  "Partial NCZ cache left behind");
+        std::filesystem::remove_all(ncz_cache_dir);
+        for (const auto* filename : {"base.nsz", "BASE.NSZ", "base.xcz"}) {
+            auto result =
+                loader::ILoader::createFromPath((dir / filename).string());
+            check(result.has_value(), "Valid NSZ/XCZ was rejected");
+            std::unique_ptr<loader::ILoader> game(*result);
+            check(game->getTitleId() == 0x0100000000001000 &&
+                      game->hasExeFs() && game->hasRomFs(),
+                  "Wrong NSZ/XCZ program or filesystems");
+        }
+        for (const auto* filename : {"bad-magic.nsz", "truncated.nsz"}) {
+            check(!loader::ILoader::createFromPath((dir / filename).string()),
+                  "Invalid NSZ was accepted");
+            check(!loader::ILoader::getLastError().empty(),
+                  "NSZ failure lacks explanation");
+        }
+        std::cout << "PASS: block/solid NCZ match reference NCA, solid cache "
+                     "reuse, NSZ/XCZ loading and malformed NSZ\n";
         check(!loader::ILoader::createFromPath(""), "Empty path accepted");
         check(!loader::ILoader::createFromPath((dir / "not-a-game").string()),
               "Extensionless file accepted");
@@ -456,6 +695,7 @@ int main(int argc, char** argv) {
             auto* test_process = test_kernel.getProcessManager().createProcess(
                 "Memory accounting test");
             test_process->setSystemResourceSize(0);
+            checkGpuMappings(test_system, test_process);
             TestWaitThread address_waiter;
             u32 address_value = 1;
             check(test_kernel.waitForAddress(

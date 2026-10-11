@@ -15,7 +15,8 @@ bool Driver::acquirePresentTextures(
     {
         std::scoped_lock lock(layer_mutex);
         for (const auto& layer : layer_pool) {
-            acquired |= layer->acquirePresentTexture(command_buffer);
+            if (layer->isVisible())
+                acquired |= layer->acquirePresentTexture(command_buffer);
         }
     }
 
@@ -29,6 +30,8 @@ void Driver::present(
     std::scoped_lock lock(layer_mutex);
     std::vector<Layer*> sorted_layers;
     for (const auto& layer : layer_pool) {
+        if (!layer->isVisible())
+            continue;
         // Find the correct position
         bool inserted = false;
         for (u32 i = 0; i < sorted_layers.size(); i++) {

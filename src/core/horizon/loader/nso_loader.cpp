@@ -1,6 +1,7 @@
 #include "core/horizon/loader/nso_loader.hpp"
 
 #include "core/debugger/debugger_manager.hpp"
+#include "core/horizon/filesystem/directory.hpp"
 #include "core/horizon/kernel/kernel.hpp"
 #include "core/horizon/kernel/process.hpp"
 #include "elf.h"
@@ -170,14 +171,14 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
     std::memcpy(arg_data_ptr->str, arg_data_str.c_str(), arg_data_str.size());
 
     // Debug
-#define DUMP 0
-#if DUMP
-    std::ofstream out(
-        fmt::format("/Users/samuliak/Downloads/extracted/0x{:08x}.bin", base),
-        std::ios::binary);
-    out.write(reinterpret_cast<const char*>(ptr), executable_size);
-    out.close();
-#endif
+    // DEBUG: HYDRA_DUMP_NSO=<dir> dumps each loaded module image
+    if (const char* dump_dir = std::getenv("HYDRA_DUMP_NSO")) {
+        std::ofstream out(fmt::format("{}/{}_0x{:08x}.bin", dump_dir, name,
+                                      base),
+                          std::ios::binary);
+        out.write(reinterpret_cast<const char*>(ptr),
+                  static_cast<std::streamsize>(executable_size));
+    }
 
     // Debug symbols
 
@@ -232,6 +233,34 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
         main_thread->setArg(0, 0x0);
         main_thread->setArg(1, main_thread_handle.getRaw());
     }
+}
+
+std::vector<std::pair<std::string, filesystem::IFile*>>
+getCodeModulesInLoadOrder(filesystem::Directory* exefs_dir) {
+    std::vector<std::string> order = {"rtld", "main"};
+    for (u32 i = 0; i < 10; i++)
+        order.push_back(fmt::format("subsdk{}", i));
+    order.push_back("sdk");
+
+    const auto& entries = exefs_dir->getEntries();
+    std::vector<std::pair<std::string, filesystem::IFile*>> modules;
+    const auto add = [&](const std::string& name, filesystem::IEntry* entry) {
+        ASSERT(entry->isFile(), Loader, "Code entry is not a file");
+        modules.emplace_back(name, static_cast<filesystem::IFile*>(entry));
+    };
+
+    for (const auto& name : order) {
+        if (const auto it = entries.find(name); it != entries.end())
+            add(name, it->second);
+    }
+    for (const auto& [name, entry] : entries) {
+        if (name == "main.npdm" ||
+            std::find(order.begin(), order.end(), name) != order.end())
+            continue;
+        add(name, entry);
+    }
+
+    return modules;
 }
 
 } // namespace hydra::horizon::loader

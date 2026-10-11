@@ -8,6 +8,7 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 Sampler::Sampler(MTL::Device* device, const SamplerDescriptor& descriptor)
     : SamplerBase(descriptor) {
     MTL::SamplerDescriptor* desc = MTL::SamplerDescriptor::alloc()->init();
+    desc->setSupportArgumentBuffers(true);
     desc->setMinFilter(toMtlSamplerMinMagFilter(descriptor.min_filter));
     desc->setMagFilter(toMtlSamplerMinMagFilter(descriptor.mag_filter));
     desc->setMipFilter(toMtlSamplerMipFilter(descriptor.mip_filter));

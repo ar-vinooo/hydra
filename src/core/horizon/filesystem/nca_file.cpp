@@ -300,7 +300,8 @@ NcaFile::Header NcaFile::readHeader(IFile& file, u64 offset, u64 size,
 }
 
 NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
-                 Header header, bool plaintext, const Keys& keys)
+                 Header header, bool plaintext, const Keys& keys,
+                 bool decrypted_body)
     : state{std::make_shared<State>()} {
     state->container = std::move(container);
     state->offset = offset;
@@ -309,7 +310,7 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
     if (valueAt<u64>(header, 0x208) != size)
         throw std::runtime_error(
             "XCI NCA content size does not match its partition entry.");
-    if (!plaintext) {
+    if (!plaintext && !decrypted_body) {
         const auto generation = std::max(header[0x206], header[0x220]);
         const auto revision = generation == 0 ? 0 : generation - 1;
         if (std::ranges::any_of(std::span(header).subspan(0x230, 16),
@@ -351,7 +352,7 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
                 throw std::runtime_error("Overlapping NCA sections.");
         }
         const auto fs = 0x400 + i * 0x200;
-        const auto encryption = plaintext ? u8{1} : header[fs + 4];
+        auto encryption = plaintext ? u8{1} : header[fs + 4];
         if (encryption < 1 || encryption > 3)
             throw std::runtime_error("XCI update/patch sections are not "
                                      "supported. Load the base game instead.");
@@ -360,6 +361,8 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
             valueAt<u64>(header, fs + 0x178) != 0)
             throw std::runtime_error(
                 "Sparse or compressed NCA sections are not supported.");
+        if (decrypted_body)
+            encryption = 1;
         State::Section section{start, end - start, encryption, {}};
         std::reverse_copy(
             header.begin() + static_cast<std::ptrdiff_t>(fs + 0x140),

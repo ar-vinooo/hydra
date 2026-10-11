@@ -49,6 +49,8 @@ class Process : public SynchronizationObject {
     hw::tegra_x1::cpu::IMemory* createTlsMemory(vaddr_t& base);
     void createStackMemory(u64 stack_size);
     void resizeHeap(u64 size);
+    result_t mapPhysicalMemory(vaddr_t addr, u64 size);
+    result_t unmapPhysicalMemory(vaddr_t addr, u64 size);
 
     // Thread
     Handle setMainThread(GuestThread* thread) {
@@ -59,7 +61,12 @@ class Process : public SynchronizationObject {
     void registerThread(IThread* thread) {
         std::scoped_lock lock(thread_mutex);
         threads.push_back(thread);
+        if (stopping)
+            thread->stop();
     }
+    // DEBUG: log PC/LR and the frame-pointer chain of every guest thread
+    void debugDumpThreads();
+
     void unregisterThread(IThread* thread) {
         std::scoped_lock lock(thread_mutex);
         std::erase(threads, thread);
@@ -107,6 +114,12 @@ class Process : public SynchronizationObject {
             }
         }
 
+        // Guest-provided handles may be garbage; the pool is not bounds checked
+        if (handle.getRaw() > HANDLE_POOL_CAPACITY) [[unlikely]] {
+            LOG_WARN(Kernel, "Invalid handle 0x{:x}", handle.getRaw());
+            return nullptr;
+        }
+
         // HACK
         return handle_pool.get(handle)
             .transform(
@@ -136,6 +149,11 @@ class Process : public SynchronizationObject {
                      "Cannot free current process handle");
         ASSERT_DEBUG(handle != CURRENT_THREAD_PSEUDO_HANDLE, Kernel,
                      "Cannot free current thread handle");
+
+        if (handle.getRaw() > HANDLE_POOL_CAPACITY) [[unlikely]] {
+            LOG_WARN(Kernel, "Invalid handle 0x{:x}", handle.getRaw());
+            return false;
+        }
 
         const auto object = handle_pool.get(handle);
         if (!object.has_value()) {
@@ -172,16 +190,34 @@ class Process : public SynchronizationObject {
     std::unique_ptr<hw::tegra_x1::cpu::IMemory> main_thread_stack_mem;
     std::unique_ptr<hw::tegra_x1::cpu::IMemory> heap_mem;
 
+    // Memory mapped with svcMapPhysicalMemory. The whole alias region is
+    // backed by one lazily committed host reservation, so memory that is
+    // contiguous for the guest is also contiguous for the host (IPC buffers
+    // rely on this). It is exposed to the CPU in slabs on first use.
+    static constexpr u64 ALIAS_SLAB_SIZE = 32ull * 1024 * 1024;
+    mutable std::mutex physical_mem_mutex;
+    uptr alias_host_base{0};
+    std::map<u64, std::unique_ptr<hw::tegra_x1::cpu::IMemory>> alias_slabs;
+    u64 physical_mem_size{0};
+
+    uptr getAliasHostPtr(vaddr_t va) const {
+        return alias_host_base + (va - ALIAS_REGION.getBegin());
+    }
+    void mapAliasRun(vaddr_t begin, vaddr_t end);
+    void releaseAliasMemory();
+
     vaddr_t tls_mem_base{TLS_REGION.getBegin()};
 
     // Thread
     GuestThread* main_thread{nullptr};
     std::mutex thread_mutex;
     std::vector<IThread*> threads;
+    bool stopping{false};
 
     // Handles
     // TODO: store as strong refs
-    StaticHandlePool<AutoObject*, 512>
+    static constexpr usize HANDLE_POOL_CAPACITY = 512;
+    StaticHandlePool<AutoObject*, HANDLE_POOL_CAPACITY>
         handle_pool; // TODO: get the size from capabilities
 
     std::atomic<ProcessState> state{ProcessState::Created};

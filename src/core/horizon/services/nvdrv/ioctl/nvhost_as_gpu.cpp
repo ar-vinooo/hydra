@@ -109,6 +109,9 @@ NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 big_page_size,
                                big_page_size, as_fd, flags, va_range_start,
                                va_range_end, va_range_split);
 
+    if (big_page_size != 0)
+        as_big_page_size = big_page_size;
+
     // TODO: why does nouveau pass 0x0 for all of these?
 
     // TODO: what is split for?
@@ -117,11 +120,37 @@ NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 big_page_size,
     return NvResult::Success;
 }
 
-NvResult NvHostAsGpu::remap(const RemapOp* entries) {
-    // TODO: what should the entry count be?
-    std::span<const RemapOp> entries_span(entries, 1);
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "entries: {}",
-                               fmt::join(entries_span, ", "));
+// Binds (or unbinds) nvmap memory to sparse GPU address space reserved with
+// allocSpace
+NvResult NvHostAsGpu::remap(IoctlContext* context, const RemapOp* entries) {
+    const usize count = context->in_stream->getSize() / sizeof(RemapOp);
+    auto& gmmu = context->process->getGMmu();
+    for (const auto& entry : std::span<const RemapOp>(entries, count)) {
+        LOG_DEBUG(Services, "Remap: {}", entry);
+
+        const gpu_vaddr_t gpu_addr =
+            static_cast<u64>(entry.virt_offset_in_pages) * as_big_page_size;
+        const u64 size = static_cast<u64>(entry.num_pages) * as_big_page_size;
+        if (size == 0)
+            continue;
+
+        if (entry.mem_handle == 0) {
+            gmmu.unbindToSparse(gpu_addr, size);
+            continue;
+        }
+
+        ZTD_ASSIGN_OR(
+            const auto map, context->system.getGpu().getMap(entry.mem_handle),
+            ZTD_PASS({
+                LOG_WARN(Services, "Invalid nvmap handle {}", entry.mem_handle);
+                return NvResult::BadParameter;
+            }));
+        const u64 offset =
+            static_cast<u64>(entry.mem_offset_in_pages) * as_big_page_size;
+        gmmu.mapBufferToAddressSpace(
+            ztd::Range<vaddr_t>::fromSize(map->addr + offset, size), gpu_addr);
+    }
+
     return NvResult::Success;
 }
 

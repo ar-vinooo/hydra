@@ -1,4 +1,9 @@
 add_library(hydra-core
+    video/submit_trace.cpp
+    video/submit_trace.hpp
+    video/submit.hpp
+    video/host1x.hpp
+    video/h264.hpp
     horizon/const.hpp
     horizon/handle_pool.hpp
     horizon/os.cpp
@@ -63,6 +68,8 @@ add_library(hydra-core
     horizon/filesystem/content_archive.hpp
     horizon/filesystem/nca_file.cpp
     horizon/filesystem/nca_file.hpp
+    horizon/filesystem/ncz_file.cpp
+    horizon/filesystem/ncz_file.hpp
     horizon/filesystem/romfs/const.hpp
     horizon/filesystem/romfs/parser.cpp
     horizon/filesystem/romfs/parser.hpp
@@ -555,6 +562,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/warp.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/compute.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/compute.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/warp.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/exit.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/exit.hpp
@@ -625,6 +634,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/sampler.hpp
     hw/tegra_x1/gpu/renderer/metal/render_pass.cpp
     hw/tegra_x1/gpu/renderer/metal/render_pass.hpp
+    hw/tegra_x1/gpu/renderer/metal/shader_library_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/shader.cpp
     hw/tegra_x1/gpu/renderer/metal/shader.hpp
     hw/tegra_x1/gpu/renderer/metal/pipeline.cpp
@@ -718,7 +729,7 @@ endif ()
 
 target_include_directories(hydra-core SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/externals/libyaz0/include)
 # TODO: only link Apple frameworks if Apple
-target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common)
+target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common libzstd_static)
 
 if (HYPERVISOR_ENABLED)
     target_link_libraries(hydra-core PRIVATE "-framework Hypervisor")
@@ -741,3 +752,32 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
 endif ()
 
 # TODO: link luft if AIR shader backend is enabled
+if (HYDRA_FFMPEG_VIDEO)
+    target_compile_definitions(hydra-core PRIVATE HYDRA_FFMPEG_VIDEO=1)
+    # An explicit prefix also works on systems without pkg-config, and keeps
+    # FFmpeg optional for existing macOS/iOS build configurations.
+    find_path(HYDRA_FFMPEG_INCLUDE libavcodec/avcodec.h
+        HINTS "${FFmpeg_ROOT}/include" /opt/homebrew/opt/ffmpeg/include)
+    foreach (component avcodec avutil swscale)
+        find_library(HYDRA_FFMPEG_${component}_LIBRARY NAMES ${component}
+            HINTS "${FFmpeg_ROOT}/lib" /opt/homebrew/opt/ffmpeg/lib)
+        if (NOT HYDRA_FFMPEG_${component}_LIBRARY)
+            message(FATAL_ERROR "FFmpeg ${component} library not found; set FFmpeg_ROOT")
+        endif ()
+    endforeach ()
+    if (NOT HYDRA_FFMPEG_INCLUDE)
+        message(FATAL_ERROR "FFmpeg headers not found; set FFmpeg_ROOT")
+    endif ()
+    add_library(hydra-video STATIC video/decoder.cpp video/decoder.hpp)
+    target_include_directories(hydra-video PUBLIC "${CMAKE_SOURCE_DIR}/src")
+    target_include_directories(hydra-video SYSTEM PRIVATE "${HYDRA_FFMPEG_INCLUDE}")
+    target_link_libraries(hydra-video PRIVATE hydra_compile_options
+        "${HYDRA_FFMPEG_avcodec_LIBRARY}" "${HYDRA_FFMPEG_avutil_LIBRARY}"
+        "${HYDRA_FFMPEG_swscale_LIBRARY}")
+    if (APPLE)
+        target_link_libraries(hydra-video PRIVATE "-framework VideoToolbox"
+            "-framework CoreMedia" "-framework CoreVideo"
+            "-framework CoreFoundation")
+    endif()
+    target_link_libraries(hydra-core PRIVATE hydra-video)
+endif ()

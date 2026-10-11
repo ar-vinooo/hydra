@@ -82,6 +82,12 @@ BlitPipelineCache::create(const BlitPipelineDescriptor& descriptor) {
     pipeline_descriptor->setFragmentFunction(fragment_blit);
     auto color_attachment = pipeline_descriptor->colorAttachments()->object(0);
     color_attachment->setPixelFormat(descriptor.pixel_format);
+    // The console display ignores alpha. Keep the drawable's cleared alpha of
+    // 1 so transparent game pixels do not show the window behind the view
+    // (CALayer.opaque is not honored for layers hosted by SwiftUI views).
+    color_attachment->setWriteMask(MTL::ColorWriteMaskRed |
+                                   MTL::ColorWriteMaskGreen |
+                                   MTL::ColorWriteMaskBlue);
     if (descriptor.transparent) {
         color_attachment->setBlendingEnabled(true);
         color_attachment->setRgbBlendOperation(MTL::BlendOperationAdd);

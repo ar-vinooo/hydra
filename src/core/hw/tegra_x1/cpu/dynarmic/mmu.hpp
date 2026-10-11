@@ -5,12 +5,15 @@
 
 namespace hydra::hw::tegra_x1::cpu::dynarmic {
 
-constexpr u64 PAGE_COUNT =
-    horizon::kernel::ADDRESS_SPACE.getEnd() / GUEST_PAGE_SIZE;
+// Must cover config.page_table_address_space_bits (39)
+constexpr u64 PAGE_COUNT = (1ull << 39) / GUEST_PAGE_SIZE;
+static_assert(horizon::kernel::ADDRESS_SPACE.getEnd() / GUEST_PAGE_SIZE <=
+              PAGE_COUNT);
 
 class Mmu : public IMmu {
   public:
-    using IMmu::IMmu;
+    explicit Mmu(System& system);
+    ~Mmu() override;
 
     void map(vaddr_t dst_va, ztd::Range<uptr> range,
              const horizon::kernel::MemoryState state) override;
@@ -25,7 +28,7 @@ class Mmu : public IMmu {
                             horizon::kernel::MemoryAttribute mask,
                             horizon::kernel::MemoryAttribute value) override;
 
-    uptr getPageTablePtr() const { return reinterpret_cast<uptr>(&pages); }
+    uptr getPageTablePtr() const { return reinterpret_cast<uptr>(pages); }
 
   protected:
     // Write tracking
@@ -49,9 +52,9 @@ class Mmu : public IMmu {
     }
 
   private:
-    uptr pages[PAGE_COUNT] = {0x0};
-    horizon::kernel::MemoryState states[PAGE_COUNT] = {
-        {.type = horizon::kernel::MemoryType::Free}};
+    // Lazily committed anonymous mappings; zero means unmapped / Free
+    uptr* pages;
+    horizon::kernel::MemoryState* states;
 };
 
 } // namespace hydra::hw::tegra_x1::cpu::dynarmic

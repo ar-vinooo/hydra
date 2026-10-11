@@ -208,6 +208,55 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
     case ir::Opcode::Discard:
         emitDiscard();
         break;
+
+    // Bit counting
+    case ir::Opcode::PopCount:
+        emitPopCount(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::FindMsb:
+        emitFindMsb(inst.getDst(), inst.getOperand(0),
+                    inst.getOperand(1).getRawValue<bool>());
+        break;
+
+    // Compute
+    case ir::Opcode::ReadSystemRegister:
+        emitReadSystemRegister(inst.getDst(),
+                               inst.getOperand(0).getRawValue<u32>());
+        break;
+    case ir::Opcode::LoadShared:
+        emitLoadShared(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::StoreShared:
+        emitStoreShared(inst.getOperand(0), inst.getOperand(1));
+        break;
+    case ir::Opcode::Barrier:
+        emitBarrier();
+        break;
+    case ir::Opcode::ImageStore:
+        emitImageStore(inst.getOperand(0).getRawValue<u32>(),
+                       inst.getOperand(1).getRawValue<TextureType>(),
+                       inst.getOperand(2),
+                       {inst.getOperand(3), inst.getOperand(4),
+                        inst.getOperand(5), inst.getOperand(6)});
+        break;
+    case ir::Opcode::ImageAtomic:
+        emitImageAtomic(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                        inst.getOperand(1).getRawValue<TextureType>(),
+                        inst.getOperand(2).getRawValue<u32>(),
+                        inst.getOperand(3), inst.getOperand(4));
+        break;
+
+    // Warp
+    case ir::Opcode::Vote:
+        emitVote(inst.getDst(), inst.getOperand(0),
+                 inst.getOperand(1).getRawValue<u32>());
+        break;
+    case ir::Opcode::Ballot:
+        emitBallot(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::Shuffle:
+        emitShuffle(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
+        break;
     }
 }
 

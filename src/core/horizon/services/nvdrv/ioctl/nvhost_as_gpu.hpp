@@ -66,8 +66,13 @@ class NvHostAsGpu : public FdBase {
                        u32 flags, [[maybe_unused]] u32 reserved,
                        u64 va_range_start, u64 va_range_end,
                        u64 va_range_split);
-    NvResult remap(const RemapOp* entries);
+    NvResult remap(IoctlContext* context, const RemapOp* entries);
 
+  private:
+    // Remap offsets are expressed in big pages
+    u64 as_big_page_size{0x10000};
+
+  public:
     NvResult getVaRegions3(gpu_vaddr_t buffer_addr,
                            InOutSingle<u32> inout_buffer_size,
                            [[maybe_unused]] u32 reserved) {

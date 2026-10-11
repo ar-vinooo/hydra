@@ -222,6 +222,7 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x45, 1,
                     loadMmeInstructionRam, u32, 0x47, 1,
                     loadMmeStartAddressRamPointer, u32, 0x48, 1,
                     loadMmeStartAddressRam, u32, 0x35e, 1, drawVertexArray, u32,
+                    0x586, 1, beginDraw, u32,
                     0x5f8, 1, drawVertexElements, u32, 0x674, 1, clearBuffer,
                     ClearBufferData, 0x6c3, 1, setReportSemaphore, u32, 0x8c4,
                     1, firmwareCall4, u32, 0x8e4, 16, loadConstBuffer, u32,
@@ -285,6 +286,30 @@ void ThreeD::loadMmeStartAddressRam(const u32 index, const u32 data) {
     macro_driver->loadStartAddressRam(data);
 }
 
+void ThreeD::beginDraw(const u32 index, const u32 arg) {
+    writeReg(0x586, arg);
+
+    // DEBUG: log begin values while rendering to a 3D target
+    if (regs.color_targets[0].tile_mode.is_3d) {
+        static u32 logs = 0;
+        if (logs++ < 100)
+            LOG_INFO(Engines, "DEBUG begin {:#010x} base_instance {}", arg,
+                     regs.base_instance);
+    }
+
+    // Instanced draws are submitted as one draw per instance
+    switch (extractBits(arg, 26, 2)) {
+    case 0: // First
+        instance_index = 0;
+        break;
+    case 1: // Subsequent
+        instance_index++;
+        break;
+    default: // Unchanged
+        break;
+    }
+}
+
 void ThreeD::drawVertexArray(const u32 index, u32 count) {
     auto index_type = IndexType::None;
     auto primitive_type = regs.begin.primitive_type;
@@ -296,7 +321,6 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
             return;
         if (FrameTracer::instance().isActive())
             traceDraw("draw", count, regs.vertex_array_start, 0);
-        debugLogoDraw(count);
 
         index_buffer = gpu.getRenderer().getIndexCache().decode(
             tls_crnt_command_buffer,
@@ -317,14 +341,62 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
         // TODO: instance count
         gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type,
                                       0, count, regs.vertex_array_start,
-                                      regs.base_instance, 1);
+                                      regs.base_instance + instance_index, 1);
+        profileDraw(count);
     } else {
         // Draw
         // TODO: instance count
         gpu.getRenderer().draw(tls_crnt_command_buffer, primitive_type,
                                regs.vertex_array_start, count,
-                               regs.base_instance, 1);
+                               regs.base_instance + instance_index, 1);
+        profileDraw(count);
     }
+}
+
+// DEBUG: GPU time per shader pair, enabled with HYDRA_PROFILE_DRAWS
+void ThreeD::profileDraw(u32 count) {
+    static const bool enabled = std::getenv("HYDRA_PROFILE_DRAWS") != nullptr;
+    if (!enabled)
+        return;
+    const auto ms =
+        gpu.getRenderer().debugSyncCommandBuffer(tls_crnt_command_buffer);
+    const auto program_addr = [&](ShaderStage stage) {
+        return static_cast<u64>(regs.shader_program_region) +
+               regs.shader_programs[static_cast<usize>(stage)].offset;
+    };
+    struct Entry {
+        f64 total_ms{0.0};
+        f64 max_ms{0.0};
+        u32 draws{0};
+        u32 max_count{0};
+    };
+    static std::map<std::pair<u64, u64>, Entry> entries;
+    static auto last = std::chrono::steady_clock::now();
+    auto& entry = entries[{program_addr(ShaderStage::VertexB),
+                           program_addr(ShaderStage::Fragment)}];
+    entry.total_ms += ms;
+    entry.max_ms = std::max(entry.max_ms, ms);
+    entry.draws++;
+    entry.max_count = std::max(entry.max_count, count);
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(5))
+        return;
+    last = now;
+    std::vector<std::pair<std::pair<u64, u64>, Entry>> sorted(entries.begin(),
+                                                              entries.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+    for (usize i = 0; i < std::min<usize>(sorted.size(), 12); i++) {
+        const auto& [key, e] = sorted[i];
+        LOG_INFO(Engines,
+                 "DEBUG draw profile vs {:#x} fs {:#x}: {:.1f} ms total, {:.2f} "
+                 "ms max, {} draws, max count {}",
+                 key.first, key.second, e.total_ms, e.max_ms, e.draws,
+                 e.max_count);
+    }
+    entries.clear();
 }
 
 void ThreeD::drawVertexElements(const u32 index, u32 count) {
@@ -369,7 +441,9 @@ void ThreeD::drawVertexElements(const u32 index, u32 count) {
     // TODO: instance count
     gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type,
                                   regs.vertex_elements_start, count,
-                                  regs.base_vertex, regs.base_instance, 1);
+                                  regs.base_vertex,
+                                  regs.base_instance + instance_index, 1);
+    profileDraw(count);
 }
 
 void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
@@ -764,8 +838,10 @@ bool ThreeD::isHighlightedDraw() const {
 renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
                                         u32 fragment_input_mask) {
     const auto& program = regs.shader_programs[static_cast<usize>(stage)];
-    if (!program.config.enable)
+    if (!program.config.enable) {
+        active_shaders[static_cast<u32>(toRendererShaderType(stage))] = nullptr;
         return nullptr;
+    }
 
     uptr gpu_addr =
         static_cast<u64>(regs.shader_program_region) + program.offset;
@@ -774,6 +850,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     renderer::GuestShaderDescriptor descriptor{
         .stage = stage,
         .code_ptr = ptr,
+        .gpu_addr = gpu_addr,
     };
 
     // DEBUG: dump the guest shader binary (header + code)
@@ -786,7 +863,9 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             std::ofstream out(fmt::format("{}/guest_{:#x}.bin", dump_dir,
                                           static_cast<u64>(gpu_addr)),
                               std::ios::binary);
-            out.write(reinterpret_cast<const char*>(ptr), 0x8000);
+            const auto bytes = tls_crnt_gmmu->readMappedBytes(gpu_addr, 0x10000);
+            out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
         }
     }
     if (stage == ShaderStage::VertexB) {
@@ -800,6 +879,52 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     // Vertex attribute states
     for (u32 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
         descriptor.state.vertex_attrib_states[i] = regs.vertex_attrib_states[i];
+    }
+
+    // DEBUG: log the attributes of a vertex shader (HYDRA_LOG_ATTRIBS_VS)
+    static const u64 log_attribs_vs = [] {
+        const char* env = std::getenv("HYDRA_LOG_ATTRIBS_VS");
+        return env != nullptr ? std::strtoull(env, nullptr, 0) : 0ull;
+    }();
+    if (stage == ShaderStage::VertexB && log_attribs_vs != 0 &&
+        (log_attribs_vs == 1 || gpu_addr == log_attribs_vs)) {
+        static std::set<std::string> logged;
+        std::string str;
+        for (u32 i = 0; i < 6; i++) {
+            const auto& a = regs.vertex_attrib_states[i];
+            str += fmt::format(" [{}: buf {} off {} size {:#x} type {} fixed "
+                               "{} bgra {} stride {}]",
+                               i, a.buffer_id, a.offset,
+                               static_cast<u32>(a.size),
+                               static_cast<u32>(a.type), a.is_fixed, a.bgra,
+                               static_cast<u32>(
+                                   regs.vertex_arrays[a.buffer_id].config.stride));
+        }
+        if (logged.insert(str).second)
+            LOG_INFO(Engines, "DEBUG attribs vs {:#x}:{}", gpu_addr, str);
+        // Raw data of attribute 4 for the first draws
+        static u32 data_logs = 0;
+        const auto& a4 = regs.vertex_attrib_states[4];
+        const auto& array = regs.vertex_arrays[a4.buffer_id];
+        if (!a4.is_fixed && a4.buffer_id == 1 &&
+            static_cast<u64>(array.addr) != 0 &&
+            data_logs++ < 40) {
+            const auto* data = reinterpret_cast<const u32*>(
+                tls_crnt_gmmu->unmapAddr(array.addr));
+            std::string words;
+            for (u32 v = 0; v < 6; v++) {
+                const auto* w =
+                    data + (v * array.config.stride + a4.offset) / 4;
+                words += fmt::format(" ({:08x} {:08x} {:08x} {:08x})", w[0],
+                                     w[1], w[2], w[3]);
+            }
+            LOG_INFO(Engines,
+                     "DEBUG attr4 vs {:#x} per_instance {} divisor {} start {} "
+                     "base_instance {}:{}",
+                     gpu_addr, regs.is_vertex_array_per_instance[a4.buffer_id],
+                     array.divisor, regs.vertex_array_start, regs.base_instance,
+                     words);
+        }
     }
 
     // Color target formats
@@ -817,24 +942,22 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     auto& active_shader =
         active_shaders[static_cast<u32>(toRendererShaderType(stage))];
     active_shader = gpu.getRenderer().getShaderCache().find(descriptor);
+    if (active_shader == nullptr)
+        return nullptr;
 
     // Buffer textures require a texture_buffer<T> declaration in Metal.
     // Use the cached shader's actual resource list to specialize only bindings
     // that it accesses, rather than inspecting unrelated uniform data.
     const auto pool_addr = static_cast<u64>(regs.tex_header_pool);
     const auto stage_index = static_cast<u32>(stage) - 1;
-    const auto handles =
-        bound_const_buffers[stage_index]
-                           [regs.bindless_texture_const_buffer_slot];
-    if (pool_addr != 0 && handles.getBegin() != 0) {
+    if (pool_addr != 0) {
         const auto* pool = reinterpret_cast<const TextureImageControl*>(
             tls_crnt_gmmu->unmapAddr(pool_addr));
-        const auto* handle_data =
-            reinterpret_cast<const u32*>(handles.getBegin());
         const auto& resource_mapping =
             active_shader->getDescriptor().resource_mapping;
         for (const auto& [index, renderer_index] : resource_mapping.textures) {
-            if (index >= handles.getSize() / sizeof(u32))
+            const auto handle = readTextureHandle(stage_index, index);
+            if (!handle)
                 continue;
             // Only 1D accesses can be buffer textures. Games can leave stale
             // buffer descriptors in slots the shader samples as another type.
@@ -842,7 +965,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             if (type_it == resource_mapping.texture_types.end() ||
                 type_it->second != renderer::TextureType::_1D)
                 continue;
-            const auto& tic = pool[getImageHandle(handle_data[index])];
+            const auto& tic = pool[getImageHandle(*handle)];
             if (tic.hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(
                     index,
@@ -857,6 +980,28 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
 
 renderer::PipelineBase* ThreeD::getPipeline() {
     renderer::PipelineDescriptor descriptor{};
+
+    // DEBUG: report enabled stages that are not supported
+    for (const auto stage : {ShaderStage::VertexA, ShaderStage::TessCtrl,
+                             ShaderStage::TessEval, ShaderStage::Geometry}) {
+        const auto& program = regs.shader_programs[static_cast<usize>(stage)];
+        if (!program.config.enable)
+            continue;
+        static std::set<std::pair<u32, u64>> reported;
+        const auto addr = static_cast<u64>(regs.shader_program_region) +
+                          program.offset;
+        if (reported.insert({static_cast<u32>(stage), addr}).second)
+            LOG_WARN(Engines,
+                     "DEBUG unsupported stage {} enabled (code {:#x}, vs "
+                     "{:#x}, rt0 layers {}, base layer {})",
+                     stage, addr,
+                     static_cast<u64>(regs.shader_program_region) +
+                         regs.shader_programs[static_cast<usize>(
+                                                  ShaderStage::VertexB)]
+                             .offset,
+                     static_cast<u32>(regs.color_targets[0].array_mode.layers),
+                     regs.color_targets[0].base_layer);
+    }
 
     // Shaders
     // TODO: add all shaders
@@ -981,10 +1126,14 @@ renderer::BufferView ThreeD::getVertexBuffer(u32 vertex_array_index) const {
 
 renderer::ITextureView*
 ThreeD::getTexture(const TextureImageControl& tic,
-                   std::optional<renderer::TextureType> shader_type) const {
+                   std::optional<renderer::TextureType> shader_type,
+                   renderer::TextureUsage usage) const {
+    // Storage images are written without a swizzle
+    const bool is_image = usage == renderer::TextureUsage::Write;
     if (tic.hdr_version == TicHdrVersion::_1DBuffer) {
         // The shader was not specialized for a buffer texture
-        if (shader_type && *shader_type != renderer::TextureType::_1D) {
+        if (shader_type && *shader_type != renderer::TextureType::_1D &&
+            *shader_type != renderer::TextureType::_1DBuffer) {
             ONCE(LOG_WARN(Engines,
                           "Buffer texture bound to a {} texture binding, "
                           "ignoring",
@@ -997,6 +1146,8 @@ ThreeD::getTexture(const TextureImageControl& tic,
             return nullptr;
         const auto format =
             renderer::toTextureFormat(tic.format_word, tic.is_srgb);
+        if (format == renderer::TextureFormat::Invalid)
+            return nullptr;
         const u64 width =
             (u64(tic.width_minus_one_16_31) << 16) + tic.width_minus_one + 1;
         const u64 bytes = width * renderer::getTextureFormatBpp(format);
@@ -1013,12 +1164,14 @@ ThreeD::getTexture(const TextureImageControl& tic,
         const renderer::TextureViewDescriptor view(
             renderer::TextureType::_1DBuffer, format, ztd::Range<u32>(0, 1),
             ztd::Range<u32>(0, 1),
-            renderer::SwizzleChannels(
-                format, tic.format_word.swizzle_x, tic.format_word.swizzle_y,
-                tic.format_word.swizzle_z, tic.format_word.swizzle_w));
+            is_image ? renderer::SwizzleChannels()
+                     : renderer::SwizzleChannels(format,
+                                                 tic.format_word.swizzle_x,
+                                                 tic.format_word.swizzle_y,
+                                                 tic.format_word.swizzle_z,
+                                                 tic.format_word.swizzle_w));
         return gpu.getRenderer().getTextureCache().find(
-            tls_crnt_command_buffer, descriptor, view,
-            renderer::TextureUsage::Read);
+            tls_crnt_command_buffer, descriptor, view, usage);
     }
 
     const uptr gpu_addr = makeAddr(tic.addr_lo, tic.addr_hi);
@@ -1028,6 +1181,8 @@ ThreeD::getTexture(const TextureImageControl& tic,
     }
 
     const auto format = renderer::toTextureFormat(tic.format_word, tic.is_srgb);
+    if (format == renderer::TextureFormat::Invalid)
+        return nullptr;
 
     bool is_linear = false;
     u32 linear_stride = 0;
@@ -1130,13 +1285,14 @@ ThreeD::getTexture(const TextureImageControl& tic,
     const renderer::TextureViewDescriptor view_descriptor(
         view_type, format, ztd::Range<u32>(0, level_count),
         ztd::Range<u32>(0, view_layer_count),
-        renderer::SwizzleChannels(
-            format, tic.format_word.swizzle_x, tic.format_word.swizzle_y,
-            tic.format_word.swizzle_z, tic.format_word.swizzle_w));
+        is_image ? renderer::SwizzleChannels()
+                 : renderer::SwizzleChannels(
+                       format, tic.format_word.swizzle_x,
+                       tic.format_word.swizzle_y, tic.format_word.swizzle_z,
+                       tic.format_word.swizzle_w));
 
     return gpu.getRenderer().getTextureCache().find(
-        tls_crnt_command_buffer, descriptor, view_descriptor,
-        renderer::TextureUsage::Read);
+        tls_crnt_command_buffer, descriptor, view_descriptor, usage);
 }
 
 renderer::SamplerBase*
@@ -1169,6 +1325,8 @@ void ThreeD::configureShaderStage(
                             1; // 1 is subtracted, because VertexA is skipped
 
     const auto shader = getShaderUnchecked(stage);
+    if (shader == nullptr)
+        return;
     const auto& resource_mapping = shader->getDescriptor().resource_mapping;
 
     // Uniform buffers
@@ -1195,17 +1353,44 @@ void ThreeD::configureShaderStage(
     // Textures
     if ((tex_header_pool != nullptr) && (tex_sampler_pool != nullptr)) {
         gpu.getRenderer().unbindTextures(shader_type);
-        auto tex_const_buffer = reinterpret_cast<const u32*>(
-            bound_const_buffers[stage_index]
-                               [regs.bindless_texture_const_buffer_slot]
-                                   .getBegin());
         for (const auto [const_buffer_index, renderer_index] :
              resource_mapping.textures) {
-            const auto texture_handle = tex_const_buffer[const_buffer_index];
+            const auto handle =
+                readTextureHandle(stage_index, const_buffer_index);
+            if (!handle)
+                continue;
+            const auto texture_handle = *handle;
 
             // Image
             const auto image_handle = getImageHandle(texture_handle);
+            const auto sampler_handle = getSamplerHandle(texture_handle);
+            if ((regs.tex_header_pool_max_index != 0 &&
+                 image_handle > regs.tex_header_pool_max_index) ||
+                (regs.tex_sampler_pool_max_index != 0 &&
+                 sampler_handle > regs.tex_sampler_pool_max_index)) {
+                ONCE(LOG_WARN(Engines,
+                              "Texture handle {:#010x} (binding {:#x}) is out "
+                              "of the pool bounds",
+                              texture_handle, const_buffer_index));
+                continue;
+            }
             const auto& tic = tex_header_pool[image_handle];
+            // DEBUG: report descriptors with formats we cannot decode
+            if (renderer::toTextureFormat(tic.format_word, tic.is_srgb) ==
+                renderer::TextureFormat::Invalid) {
+                static u32 bad_tic_count = 0;
+                if (bad_tic_count++ < 10) {
+                    const auto raw = reinterpret_cast<const u32*>(&tic);
+                    LOG_WARN(Engines,
+                             "DEBUG bad TIC: stage {}, binding {:#x}, handle "
+                             "{:#010x}, image {:#x} (max {:#x}), words {:08x} "
+                             "{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                             stage, const_buffer_index, texture_handle,
+                             image_handle, regs.tex_header_pool_max_index,
+                             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5],
+                             raw[6], raw[7]);
+                }
+            }
 
             // DEBUG: inspect descriptors that look like buffer textures
             if (tic.hdr_version == TicHdrVersion::_1DBuffer) {
@@ -1232,7 +1417,6 @@ void ThreeD::configureShaderStage(
                                     : std::nullopt);
 
             // Sampler
-            const auto sampler_handle = getSamplerHandle(texture_handle);
             const auto& tsc = tex_sampler_pool[sampler_handle];
             const auto sampler = getSampler(tsc);
 
@@ -1241,86 +1425,6 @@ void ThreeD::configureShaderStage(
                                               renderer_index);
         }
     }
-}
-
-// DEBUG: log uniforms and vertices of the title logo sprite draws
-void ThreeD::debugLogoDraw(u32 count) {
-    static u32 debug_count = 0;
-    if (debug_count >= 60)
-        return;
-
-    const auto pool_addr = static_cast<u64>(regs.tex_header_pool);
-    const auto fs = getShaderUnchecked(ShaderStage::Fragment);
-    if (pool_addr == 0x0 || fs == nullptr)
-        return;
-    const auto* pool = reinterpret_cast<const TextureImageControl*>(
-        tls_crnt_gmmu->unmapAddr(pool_addr));
-    const u32 fs_index = static_cast<u32>(ShaderStage::Fragment) - 1;
-    const auto handles = reinterpret_cast<const u32*>(
-        bound_const_buffers[fs_index][regs.bindless_texture_const_buffer_slot]
-            .getBegin());
-    if (handles == nullptr)
-        return;
-
-    // Is this a logo sprite?
-    bool is_logo = false;
-    const auto& fs_mapping = fs->getDescriptor().resource_mapping;
-    for (const auto [index, renderer_index] : fs_mapping.textures) {
-        const auto& tic = pool[getImageHandle(handles[index])];
-        const auto format =
-            renderer::toTextureFormat(tic.format_word, tic.is_srgb);
-        const u32 width = tic.width_minus_one + 1u;
-        const u32 height = tic.height_minus_one + 1u;
-        if (format == renderer::TextureFormat::BC3_RGBA && height == 1024 &&
-            (width == 1024 || width == 860))
-            is_logo = true;
-    }
-    if (!is_logo)
-        return;
-    debug_count++;
-
-    std::string str = fmt::format("DEBUG LOGO draw #{} count={} start={}\n",
-                                  debug_count, count, regs.vertex_array_start);
-
-    // Uniform buffers used by the shaders
-    for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
-        const auto shader = getShaderUnchecked(stage);
-        if (shader == nullptr)
-            continue;
-        const u32 stage_index = static_cast<u32>(stage) - 1;
-        const auto& mapping = shader->getDescriptor().resource_mapping;
-        for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
-            if (mapping.uniform_buffers[i] == invalid<u32>() ||
-                i == regs.bindless_texture_const_buffer_slot)
-                continue;
-            const auto range = bound_const_buffers[stage_index][i];
-            if (range.getBegin() == 0x0)
-                continue;
-            const auto data = reinterpret_cast<const f32*>(range.getBegin());
-            const usize n = std::min<usize>(range.getSize() / sizeof(f32), 32);
-            str += fmt::format("    {} c{} (size {:#x}): {}\n",
-                               stage == ShaderStage::VertexB ? "VS" : "FS", i,
-                               range.getSize(),
-                               fmt::join(data, data + n, " "));
-        }
-    }
-
-    // First vertices
-    for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++) {
-        const auto& vertex_array = regs.vertex_arrays[i];
-        if (!vertex_array.config.enable ||
-            static_cast<u64>(vertex_array.addr) == 0x0)
-            continue;
-        const auto data = reinterpret_cast<const f32*>(
-            tls_crnt_gmmu->unmapAddr(vertex_array.addr));
-        const u32 stride = vertex_array.config.stride;
-        const usize n = std::min<usize>(
-            static_cast<usize>(stride) * 4 / sizeof(f32), 32);
-        str += fmt::format("    VB{} stride={}: {}\n", i, stride,
-                           fmt::join(data, data + n, " "));
-    }
-
-    LOG_INFO(Engines, "{}", str);
 }
 
 void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
@@ -1350,12 +1454,16 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                        static_cast<u32>(regs.color_target_control.count));
     for (u32 i = 0; i < regs.color_target_control.count; i++) {
         const auto& rt = regs.color_targets[regs.color_target_control.getMap(i)];
-        str += fmt::format(" | [{}->{}] addr={:#x} fmt={} {}x{} mask={:#x}", i,
-                           regs.color_target_control.getMap(i),
+        str += fmt::format(" | [{}->{}] addr={:#x} fmt={} {}x{} mask={:#x} "
+                           "3d={} layers={} base_layer={} instance={}",
+                           i, regs.color_target_control.getMap(i),
                            static_cast<u64>(rt.addr),
                            renderer::toTextureFormat(rt.format),
                            rt.width_or_stride, rt.height,
-                           static_cast<u32>(regs.color_write_masks[i]));
+                           static_cast<u32>(regs.color_write_masks[i]),
+                           static_cast<bool>(rt.tile_mode.is_3d),
+                           static_cast<u32>(rt.array_mode.layers),
+                           rt.base_layer, instance_index);
     }
     str += "\n";
     str += fmt::format(
@@ -1392,11 +1500,18 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
         if (!vertex_array.config.enable ||
             static_cast<u64>(vertex_array.addr) == 0x0)
             continue;
+        // The address may not be mapped (yet); don't fault while tracing
+        uptr base;
+        const auto as = tls_crnt_gmmu->findAddrImplRef(vertex_array.addr, base);
+        if (as == nullptr || as->ptr == 0x0)
+            continue;
         const auto data = reinterpret_cast<const u8*>(
-            tls_crnt_gmmu->unmapAddr(vertex_array.addr));
+            as->ptr + (static_cast<uptr>(vertex_array.addr) - base));
         const u32 stride = vertex_array.config.stride;
+        const u32 avail = static_cast<u32>(std::min<u64>(
+            as->size - (static_cast<uptr>(vertex_array.addr) - base), 48));
         str += fmt::format("    VB{} stride={} bytes: {:02x}\n", i, stride,
-                           fmt::join(data, data + std::min(stride, 48u), " "));
+                           fmt::join(data, data + std::min(stride, avail), " "));
     }
     str += fmt::format("    cull: enabled={} mode={:#x} front={:#x} origin={:#x}\n",
                        regs.cull_face_enabled != 0,
@@ -1482,15 +1597,12 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
         if (shader == nullptr || pool == nullptr)
             continue;
         const u32 stage_index = static_cast<u32>(stage) - 1;
-        const auto handles = reinterpret_cast<const u32*>(
-            bound_const_buffers[stage_index]
-                               [regs.bindless_texture_const_buffer_slot]
-                                   .getBegin());
-        if (handles == nullptr)
-            continue;
         const auto& mapping = shader->getDescriptor().resource_mapping;
         for (const auto [index, renderer_index] : mapping.textures) {
-            const auto handle = handles[index];
+            const auto handle_opt = readTextureHandle(stage_index, index);
+            if (!handle_opt)
+                continue;
+            const auto handle = *handle_opt;
             const auto& tic = pool[getImageHandle(handle)];
             const auto type_it = mapping.texture_types.find(index);
             str += fmt::format(
@@ -1532,26 +1644,33 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                 static_cast<u32>(tic.format_word.swizzle_w),
                 tic.width_minus_one + 1, tic.height_minus_one + 1,
                 tic.depth_minus_one + 1, tic.mip_max_levels + 1,
-                makeAddr(tic.addr_lo, tic.addr_hi),
-                tls_crnt_gmmu->unmapAddr(makeAddr(tic.addr_lo, tic.addr_hi)));
+                makeAddr(tic.addr_lo, tic.addr_hi), uptr{0});
 
-            // Inspect the guest memory of the texture (approximate size)
-            {
-                const auto format =
-                    renderer::toTextureFormat(tic.format_word, tic.is_srgb);
-                const usize size = static_cast<usize>(
-                    renderer::getTextureFormatStride(format, tic.width_minus_one + 1u)) *
-                    renderer::getTextureFormatRows(format, tic.height_minus_one + 1u);
-                const auto data = reinterpret_cast<const u8*>(
-                    tls_crnt_gmmu->unmapAddr(
-                        makeAddr(tic.addr_lo, tic.addr_hi)));
+            // Inspect the guest memory of the texture (approximate size).
+            // Descriptors may be garbage, so stay within the mapping.
+            const auto format =
+                renderer::toTextureFormat(tic.format_word, tic.is_srgb);
+            uptr tex_base;
+            const auto tex_as = tls_crnt_gmmu->findAddrImplRef(
+                makeAddr(tic.addr_lo, tic.addr_hi), tex_base);
+            if (format != renderer::TextureFormat::Invalid &&
+                tex_as != nullptr && tex_as->ptr != 0x0) {
+                const uptr offset = makeAddr(tic.addr_lo, tic.addr_hi) - tex_base;
+                const usize size = std::min<usize>(
+                    static_cast<usize>(renderer::getTextureFormatStride(
+                        format, tic.width_minus_one + 1u)) *
+                        renderer::getTextureFormatRows(
+                            format, tic.height_minus_one + 1u),
+                    tex_as->size - offset);
+                const auto data =
+                    reinterpret_cast<const u8*>(tex_as->ptr + offset);
                 usize non_zero = 0;
                 for (usize i = 0; i < size; i++)
                     non_zero += (data[i] != 0);
                 str += fmt::format("        memory: size={:#x} non_zero={} "
                                    "first16={:02x}\n",
                                    size, non_zero,
-                                   fmt::join(data, data + 16, " "));
+                                   fmt::join(data, data + std::min<usize>(size, 16), " "));
             }
         }
     }
@@ -1581,16 +1700,15 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
     if (tracer.isDumpEnabled() && pool != nullptr) {
         const auto shader = getShaderUnchecked(ShaderStage::Fragment);
         const u32 stage_index = static_cast<u32>(ShaderStage::Fragment) - 1;
-        const auto handles = reinterpret_cast<const u32*>(
-            bound_const_buffers[stage_index]
-                               [regs.bindless_texture_const_buffer_slot]
-                                   .getBegin());
-        if (shader != nullptr && handles != nullptr) {
+        if (shader != nullptr) {
             std::scoped_lock texture_cache_lock(
                 gpu.getRenderer().getTextureCache().getMutex());
             const auto& mapping = shader->getDescriptor().resource_mapping;
             for (const auto [index, renderer_index] : mapping.textures) {
-                const auto& tic = pool[getImageHandle(handles[index])];
+                const auto handle = readTextureHandle(stage_index, index);
+                if (!handle)
+                    continue;
+                const auto& tic = pool[getImageHandle(*handle)];
                 if (makeAddr(tic.addr_lo, tic.addr_hi) == 0x0 ||
                     tic.hdr_version == TicHdrVersion::_1DBuffer)
                     continue;
@@ -1615,6 +1733,37 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
             }
         }
     }
+}
+
+std::optional<u32> ThreeD::readTextureHandle(u32 stage_index,
+                                             u32 binding_index) const {
+    u32 slot = regs.bindless_texture_const_buffer_slot;
+    u32 word = binding_index;
+    u32 sampler_word = renderer::TRACKED_TEXTURE_NO_SAMPLER;
+    if (renderer::isTrackedTextureIndex(binding_index)) {
+        slot = renderer::getTrackedTextureSlot(binding_index);
+        word = renderer::getTrackedTextureWord(binding_index);
+        sampler_word = renderer::getTrackedSamplerWord(binding_index);
+    }
+    if (slot >= CONST_BUFFER_BINDING_COUNT)
+        return std::nullopt;
+
+    const auto& range = bound_const_buffers[stage_index][slot];
+    const auto read_word = [&](u32 index) -> std::optional<u32> {
+        if (range.getBegin() == 0x0 ||
+            (static_cast<u64>(index) + 1) * sizeof(u32) > range.getSize())
+            return std::nullopt;
+        return reinterpret_cast<const u32*>(range.getBegin())[index];
+    };
+
+    auto handle = read_word(word);
+    if (handle && sampler_word != renderer::TRACKED_TEXTURE_NO_SAMPLER) {
+        const auto sampler = read_word(sampler_word);
+        if (!sampler)
+            return std::nullopt;
+        *handle |= *sampler;
+    }
+    return handle;
 }
 
 bool ThreeD::drawInternal() {

@@ -1,9 +1,12 @@
 """Generate tiny synthetic cartridges and independent AES test fixtures.
 
-Requires Python cryptography (tests only); contains no console keys or games.
+Requires Python cryptography and the zstd CLI (tests only); contains no
+console keys or games.
 """
 from pathlib import Path
+import random
 import struct
+import subprocess
 import sys
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -30,6 +33,30 @@ def partition(files, hashed):
         names += name.encode() + b"\0"
         content += bytes(data)
     return (b"HFS0" if hashed else b"PFS0") + struct.pack("<III", len(files), len(names), 0) + entries + names + content
+
+
+def zstd(data):
+    return subprocess.run(["zstd", "-q", "-c"], input=bytes(data),
+                          stdout=subprocess.PIPE, check=True).stdout
+
+
+def ncz(stored, plain, sections, block_exponent=None):
+    """NCZ as written by nsz: the stored (encrypted) first 0x4000 bytes, a
+    section table, then the decrypted rest of the NCA compressed with zstd."""
+    body = bytes(plain[0x4000:])
+    out = bytearray(stored[:0x4000]) + b"NCZSECTN" + struct.pack("<Q", len(sections))
+    for offset, size, crypto in sections:
+        out += struct.pack("<QQQQ", offset, size, crypto, 0) + bytes(32)
+    if block_exponent is None:
+        return out + zstd(body)
+    size = 1 << block_exponent
+    blocks = []
+    for i in range(0, len(body), size):
+        compressed = zstd(body[i:i + size])
+        blocks.append(compressed if len(compressed) < len(body[i:i + size]) else body[i:i + size])
+    out += b"NCZBLOCK" + bytes((2, 1, 0, block_exponent)) + struct.pack("<IQ", len(blocks), len(body))
+    out += b"".join(struct.pack("<I", len(block)) for block in blocks)
+    return out + b"".join(blocks)
 
 
 def cartridge(files):
@@ -174,6 +201,48 @@ def main(directory):
     npdm_start = program32.find(b"META", 0xc00)
     program32[npdm_start + 0xc] = 0
     (directory / "32-bit.nsp").write_bytes(partition([("base.nca", program32)], False))
+
+    # NCZ: an encrypted NCA whose CTR section is stored decrypted, in block
+    # (with a stored incompressible block and a short last block) and solid form.
+    ncz_plain = bytearray(0x3be00)
+    ncz_plain[:0xc00] = plain[:0xc00]
+    put(ncz_plain, 0x208, "Q", len(ncz_plain))
+    ncz_plain[0x240:0x280] = bytes(0x40)
+    noise = random.Random(1).randbytes(0x8000)
+    for i, (start, end, kind) in enumerate(((0x4000, 0x34000, 3), (0x34000, 0x3be00, 1))):
+        put(ncz_plain, 0x240 + i * 16, "II", start // 512, end // 512)
+        fs = 0x400 + i * 0x200
+        ncz_plain[fs + 4] = kind
+        put(ncz_plain, fs + 0x140, "II", 7, 11)
+        ncz_plain[start:end] = bytes((j // 7 + i * 37) % 256 for j in range(end - start))
+    ncz_plain[0x10000:0x18000] = noise
+    ncz_stored = bytearray(ncz_plain)
+    counter = bytes(ncz_plain[0x540:0x548][::-1]) + (0x4000 // 16).to_bytes(8, "big")
+    ncz_stored[0x4000:0x34000] = encrypt(section_keys[32:48], modes.CTR(counter), ncz_plain[0x4000:0x34000])
+    for i in range(6):
+        start = i * 512
+        ncz_stored[start:start + 512] = encrypt(header_key, modes.XTS(i.to_bytes(16, "big")), ncz_plain[start:start + 512])
+    ncz_sections = [(0x4000, 0x30000, 3), (0x34000, 0x7e00, 1)]
+    (directory / "ncz-expected.nca").write_bytes(ncz_plain)
+    (directory / "ncz-block.ncz").write_bytes(ncz(ncz_stored, ncz_plain, ncz_sections, 14))
+    (directory / "ncz-solid.ncz").write_bytes(ncz(ncz_stored, ncz_plain, ncz_sections))
+
+    # NSZ/XCZ: the base program relocated past the uncompressed NCZ head.
+    program_ncz = bytearray(0x4400)
+    program_ncz[:0xc00] = program[:0xc00]
+    put(program_ncz, 0x208, "Q", len(program_ncz))
+    put(program_ncz, 0x240, "II", 0x20, 0x21)
+    put(program_ncz, 0x250, "II", 0x21, 0x22)
+    program_ncz[0x4000:0x4400] = program[0xc00:0x1000]
+    program_sections = [(0x4000, 0x200, 1), (0x4200, 0x200, 1)]
+    base_ncz = ncz(program_ncz, program_ncz, program_sections, 14)
+    (directory / "base.nsz").write_bytes(partition([("base.ncz", base_ncz)], False))
+    (directory / "BASE.NSZ").write_bytes(partition([("base.ncz", base_ncz)], False))
+    (directory / "base.xcz").write_bytes(cartridge([("base.ncz", base_ncz)]))
+    bad_ncz = bytearray(base_ncz)
+    bad_ncz[0x4000:0x4008] = b"BADMAGIC"
+    (directory / "bad-magic.nsz").write_bytes(partition([("base.ncz", bad_ncz)], False))
+    (directory / "truncated.nsz").write_bytes(partition([("base.ncz", base_ncz[:0x4020])], False))
 
     # Independent title-key AES-ECB + AES-CTR fixture (synthetic keys only).
     title_kek = bytes(range(128, 144))

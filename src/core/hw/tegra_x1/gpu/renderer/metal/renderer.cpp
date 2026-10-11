@@ -1,5 +1,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 
+#include <objc/message.h>
+#include <objc/runtime.h>
+
 #include <stb_image_write.h>
 
 #include "common/config.hpp"
@@ -30,7 +33,8 @@ Renderer::Renderer()
     : device{MTL::CreateSystemDefaultDevice()},
       command_queue{device->newCommandQueue()},
       upload_buffer_pool(std::make_shared<UploadBufferPool>(device)),
-      binary_archive_cache(device), depth_stencil_state_cache(device),
+      binary_archive_cache(device), shader_library_cache(device),
+      depth_stencil_state_cache(device),
       blit_pipeline_cache(device), clear_color_pipeline_cache(device),
       clear_depth_pipeline_cache(device) {
     // Resources
@@ -80,6 +84,11 @@ Renderer::Renderer()
 }
 
 Renderer::~Renderer() {
+    for (auto& [function, pipeline] : compute_pipelines) {
+        if (pipeline != nullptr)
+            pipeline->release();
+    }
+
     linear_sampler->release();
     nearest_sampler->release();
 
@@ -95,6 +104,11 @@ Renderer::~Renderer() {
 void Renderer::setSurface(void* surface) {
     ca_layer = reinterpret_cast<CA::MetalLayer*>(surface);
     ca_layer->setDevice(device);
+    // The console display ignores alpha. Games often clear to transparent
+    // black, which would otherwise show whatever is behind the view.
+    // (metal-cpp has no wrapper for CALayer.opaque)
+    reinterpret_cast<void (*)(void*, SEL, BOOL)>(objc_msgSend)(
+        ca_layer, sel_registerName("setOpaque:"), YES);
     // TODO: set pixel format
 }
 
@@ -330,7 +344,7 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
         clear_color_pipeline_cache.find(pipeline_descriptor));
     command_buffer_impl->setCullMode(MTL::CullModeNone);
     // TODO: set viewport and scissor
-    encoder->setVertexBytes(&render_target_id, sizeof(render_target_id), 0);
+    encoder->setVertexBytes(&layer, sizeof(layer), 0);
     encoder->setFragmentBytes(&color, sizeof(color), 0);
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
                             static_cast<NS::UInteger>(0),
@@ -417,7 +431,7 @@ void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
 }
 
 ShaderBase* Renderer::createShader(const ShaderDescriptor& descriptor) {
-    return new Shader(device, descriptor);
+    return new Shader(device, descriptor, shader_library_cache);
 }
 
 PipelineBase* Renderer::createPipeline(const PipelineDescriptor& descriptor) {
@@ -830,6 +844,159 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
                                    instance_count, base_vertex, base_instance);
 }
 
+f64 Renderer::debugSyncCommandBuffer(ICommandBuffer* command_buffer) {
+    return static_cast<CommandBuffer*>(command_buffer)->debugCommitAndWait();
+}
+
+void Renderer::dispatchCompute(ICommandBuffer* command_buffer,
+                               const ComputeDispatch& dispatch) {
+    const auto command_buffer_impl =
+        static_cast<CommandBuffer*>(command_buffer);
+
+    const auto shader = static_cast<Shader*>(dispatch.shader);
+    if (shader == nullptr || shader->getFunction() == nullptr)
+        return;
+
+    // Pipeline
+    auto [it, inserted] =
+        compute_pipelines.try_emplace(shader->getFunction(), nullptr);
+    if (inserted) {
+        NS::Error* error = nullptr;
+        it->second =
+            device->newComputePipelineState(shader->getFunction(), &error);
+        if (it->second == nullptr)
+            LOG_ERROR(MetalRenderer, "Failed to create compute pipeline: {}",
+                      error ? error->localizedDescription()->utf8String()
+                            : "unknown error");
+    }
+    const auto pipeline = it->second;
+    if (pipeline == nullptr)
+        return;
+
+    const auto& block = dispatch.block_size;
+    const auto& grid = dispatch.grid_size;
+    if (block.x() * block.y() * block.z() == 0 ||
+        grid.x() * grid.y() * grid.z() == 0)
+        return;
+    if (block.x() * block.y() * block.z() >
+        pipeline->maxTotalThreadsPerThreadgroup()) {
+        ONCE(LOG_ERROR(MetalRenderer,
+                       "Compute block {}x{}x{} exceeds the maximum of {} "
+                       "threads",
+                       block.x(), block.y(), block.z(),
+                       pipeline->maxTotalThreadsPerThreadgroup()));
+        return;
+    }
+
+    if (PerfStats::isEnabled()) {
+        PerfStats::instance().compute_dispatches++;
+        PerfStats::instance().compute_threads +=
+            u64(grid.x()) * grid.y() * grid.z() * block.x() * block.y() *
+            block.z();
+    }
+
+    auto encoder = command_buffer_impl->getComputeCommandEncoder();
+    encoder->setComputePipelineState(pipeline);
+    const auto sampler_encoder = shader->getSamplerEncoder();
+    BufferBase* sampler_buffer = nullptr;
+    if (sampler_encoder != nullptr) {
+        sampler_buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
+        const auto native = static_cast<Buffer*>(sampler_buffer)->getBuffer();
+        sampler_encoder->setArgumentBuffer(native, 0);
+    }
+
+    // Resources
+    for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
+        const auto& buffer = dispatch.uniform_buffers[i];
+        if (buffer.getBase() == nullptr)
+            continue;
+        encoder->setBuffer(static_cast<Buffer*>(buffer.getBase())->getBuffer(),
+                           buffer.getOffset(), i);
+    }
+    for (const auto& binding : dispatch.textures) {
+        encoder->setTexture(
+            binding.texture != nullptr
+                ? static_cast<TextureView*>(binding.texture)->getTexture()
+                : nullptr,
+            binding.index);
+        if (sampler_encoder != nullptr)
+            sampler_encoder->setSamplerState(
+                binding.sampler != nullptr
+                    ? static_cast<Sampler*>(binding.sampler)->getSampler()
+                    : nullptr,
+                binding.index);
+        else if (binding.sampler != nullptr)
+            encoder->setSamplerState(
+                static_cast<Sampler*>(binding.sampler)->getSampler(),
+                binding.index);
+    }
+    for (const auto& binding : dispatch.images) {
+        encoder->setTexture(
+            binding.texture != nullptr
+                ? static_cast<TextureView*>(binding.texture)->getTexture()
+                : nullptr,
+            binding.index);
+    }
+    if (sampler_buffer != nullptr) {
+        encoder->setBuffer(
+            static_cast<Buffer*>(sampler_buffer)->getBuffer(), 0,
+            shader->getDescriptor().resource_mapping.sampler_buffer_index);
+        retireTextureUploadBuffer(command_buffer_impl, sampler_buffer);
+    }
+
+    encoder->dispatchThreadgroups(MTL::Size(grid.x(), grid.y(), grid.z()),
+                                  MTL::Size(block.x(), block.y(), block.z()));
+
+    // DEBUG: measure the GPU time of each dispatch in isolation
+    static const bool profile = std::getenv("HYDRA_PROFILE_COMPUTE") != nullptr;
+    if (profile) {
+        command_buffer_impl->endEncoding();
+        auto cb = command_queue->commandBuffer();
+        auto enc = cb->computeCommandEncoder();
+        enc->setComputePipelineState(pipeline);
+        for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
+            const auto& buffer = dispatch.uniform_buffers[i];
+            if (buffer.getBase() != nullptr)
+                enc->setBuffer(
+                    static_cast<Buffer*>(buffer.getBase())->getBuffer(),
+                    buffer.getOffset(), i);
+        }
+        for (const auto& binding : dispatch.textures) {
+            if (binding.texture != nullptr)
+                enc->setTexture(
+                    static_cast<TextureView*>(binding.texture)->getTexture(),
+                    binding.index);
+            if (binding.sampler != nullptr)
+                enc->setSamplerState(
+                    static_cast<Sampler*>(binding.sampler)->getSampler(),
+                    binding.index);
+        }
+        for (const auto& binding : dispatch.images) {
+            if (binding.texture != nullptr)
+                enc->setTexture(
+                    static_cast<TextureView*>(binding.texture)->getTexture(),
+                    binding.index);
+        }
+        enc->dispatchThreadgroups(MTL::Size(grid.x(), grid.y(), grid.z()),
+                                  MTL::Size(block.x(), block.y(), block.z()));
+        enc->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        static std::map<u64, double> max_ms;
+        auto& max = max_ms[dispatch.debug_program_addr];
+        if (ms > max * 1.5 + 0.01) {
+            max = ms;
+            LOG_INFO(MetalRenderer,
+                     "DEBUG compute {:#x} grid {}x{}x{} block {}x{}x{}: "
+                     "{:.3f} ms (status {})",
+                     dispatch.debug_program_addr, grid.x(), grid.y(),
+                     grid.z(), block.x(), block.y(), block.z(), ms,
+                     static_cast<int>(cb->status()));
+        }
+    }
+}
+
 void Renderer::getColorPixelFormats(
     MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const {
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
@@ -920,7 +1087,10 @@ void Renderer::setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
                                    ? texture.texture_view->getTexture()
                                    : nullptr,
                                shader_type, index);
-    if (texture.sampler != nullptr)
+    const auto shader = static_cast<Shader*>(
+        state.pipeline->getDescriptor().shaders[static_cast<u32>(shader_type)]);
+    if (texture.sampler != nullptr && index < SAMPLER_COUNT &&
+        (shader == nullptr || shader->getSamplerEncoder() == nullptr))
         command_buffer->setSampler(texture.sampler->getSampler(), shader_type,
                                    index);
 }
@@ -1052,16 +1222,35 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
     // Resources
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++)
         setVertexBuffer(command_buffer, i);
-    for (u32 shader_type = 0;
-         shader_type < static_cast<usize>(ShaderType::Count); shader_type++) {
+    for (u32 shader_type = 0; shader_type < GRAPHICS_SHADER_TYPE_COUNT;
+         shader_type++) {
         for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++)
             setUniformBuffer(command_buffer, ShaderType(shader_type), i);
     }
     // TODO: storage buffers
-    for (u32 shader_type = 0;
-         shader_type < static_cast<usize>(ShaderType::Count); shader_type++) {
+    for (u32 shader_type = 0; shader_type < GRAPHICS_SHADER_TYPE_COUNT;
+         shader_type++) {
         for (u32 i = 0; i < TEXTURE_COUNT; i++)
             setTexture(command_buffer, ShaderType(shader_type), i);
+        const auto shader = static_cast<Shader*>(
+            state.pipeline->getDescriptor().shaders[shader_type]);
+        if (shader == nullptr || shader->getSamplerEncoder() == nullptr)
+            continue;
+        const auto sampler_encoder = shader->getSamplerEncoder();
+        auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
+        const auto native = static_cast<Buffer*>(buffer)->getBuffer();
+        sampler_encoder->setArgumentBuffer(native, 0);
+        for (const auto& [binding, index] :
+             shader->getDescriptor().resource_mapping.textures) {
+            (void)binding;
+            const auto sampler = state.textures[shader_type][index].sampler;
+            sampler_encoder->setSamplerState(
+                sampler != nullptr ? sampler->getSampler() : nullptr, index);
+        }
+        command_buffer->setBuffer(
+            native, 0, ShaderType(shader_type),
+            shader->getDescriptor().resource_mapping.sampler_buffer_index);
+        retireTextureUploadBuffer(command_buffer, buffer);
     }
     if (PerfStats::isEnabled())
         PerfStats::instance().draw_state_ns += static_cast<u64>(

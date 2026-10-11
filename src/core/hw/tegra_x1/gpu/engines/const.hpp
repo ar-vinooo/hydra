@@ -117,6 +117,9 @@ enum class ShaderStage : u32 {
     Fragment,
 
     Count,
+
+    // Kepler compute, not part of the 3D pipeline
+    Compute = 0x10,
 };
 
 enum class CompareOp : u32 {
@@ -204,7 +207,7 @@ ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::engines::ShaderStage, VertexA,
                        "vertex A", VertexB, "vertex B", TessCtrl,
                        "tessellation control", TessEval,
                        "tessellation evaluation", Geometry, "geometry",
-                       Fragment, "fragment")
+                       Fragment, "fragment", Compute, "compute")
 
 ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::engines::CompareOp, Invalid,
                        "invalid", Never, "never", Less, "less", Equal, "equal",

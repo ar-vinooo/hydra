@@ -67,9 +67,21 @@ class Thread : public IThread {
 
   private:
     Cpu& cpu;
+    vaddr_t tls_mem_base;
 
+    // Hypervisor.framework allows only 64 vCPUs per VM, fewer than the threads
+    // some games create. Threads that block in the kernel give their vCPU back
+    // when vCPUs run low and create a new one when they run again; all guest
+    // state lives in `state` between runs, plus the few registers below.
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t* exit;
+    bool has_vcpu{false};
+    u64 saved_pc{0};
+    u64 saved_spsr{0};
+    u64 saved_tpidr{0};
+
+    void createVcpu();
+    void releaseVcpu(bool save_state = true);
     bool exception{false};
     std::optional<ThreadState> exit_register_state;
 
@@ -77,6 +89,8 @@ class Thread : public IThread {
 
     // Debug
     vaddr_t breakpoints[MAX_BREAKPOINTS] = {0x0};
+    // DEBUG: HYDRA_HOOK_PCS slot to re-enable after stepping over its hit
+    u32 hook_rearm_slot{MAX_BREAKPOINTS};
 
     // Messages
     std::mutex msg_mutex;

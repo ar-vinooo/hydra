@@ -50,6 +50,7 @@ class Server {
     std::vector<kernel::hipc::ServerPort*> ports;
     std::vector<kernel::hipc::ServerSession*> sessions;
 
+    void releaseSessionService(kernel::hipc::ServerSession* session);
     void mainLoop(const kernel::should_stop_fn_t& should_stop);
 };
 

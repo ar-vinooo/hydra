@@ -76,6 +76,23 @@ enum class Opcode {
     // Quad (fragment shaders)
     QuadShuffleXor,
     SwizzleAdd,
+
+    // Bit counting
+    PopCount,
+    FindMsb,
+
+    // Compute
+    ReadSystemRegister,
+    LoadShared,
+    StoreShared,
+    Barrier,
+    ImageStore,
+    ImageAtomic,
+
+    // Warp
+    Vote,
+    Ballot,
+    Shuffle,
 };
 
 constexpr usize MAX_INSTRUCTION_OPERANDS = 8;
@@ -125,7 +142,11 @@ ENABLE_ENUM_FORMATTING(
     VectorInsert, "vec_insert", VectorConstruct, "vec_construct", TextureSample,
     "tex_sample", TextureGather, "tex_gather", TextureQueryDimension,
     "tex_query_dim", Exit, "exit", Discard, "discard", QuadShuffleXor,
-    "quad_shuffle_xor", SwizzleAdd, "swizzle_add")
+    "quad_shuffle_xor", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
+    "find_msb", ReadSystemRegister, "read_sysreg", LoadShared, "load_shared",
+    StoreShared, "store_shared", Barrier, "barrier", ImageStore, "image_store",
+    ImageAtomic, "image_atomic", Vote, "vote", Ballot, "ballot", Shuffle,
+    "shuffle")
 
 template <>
 struct fmt::formatter<

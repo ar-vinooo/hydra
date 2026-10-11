@@ -53,6 +53,7 @@ option(HYDRA_LINT_TARGET "Add the hydra-lint target" ${HYDRA_LINT_TARGET_DEFAULT
 set(HYDRA_LINT_EXTRA_BUILD_DIRS "" CACHE STRING
     "Extra build directories to include in hydra-lint (e.g. a second frontend)")
 option(CUBEB_ENABLED "Enable the cubeb audio backend" ON)
+option(HYDRA_FFMPEG_VIDEO "Build the FFmpeg video decoder backend" OFF)
 option(SDL_ENABLED "Enable building SDL files" ON)
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     if (TARGET_ARCHS MATCHES "arm64")
@@ -140,6 +141,22 @@ if (NOT fmt_FOUND)
     )
     FetchContent_MakeAvailable(fmt)
 endif ()
+
+# zstd (NSZ/XCZ). Built from source and linked statically so it matches the
+# deployment target and the app does not depend on Homebrew.
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zstd
+    GIT_REPOSITORY https://github.com/facebook/zstd.git
+    GIT_TAG v1.5.7
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR build/cmake
+)
+FetchContent_MakeAvailable(zstd)
 
 # Externals
 
@@ -247,6 +264,20 @@ endif ()
 
 option(HYDRA_METAL_CACHE_TESTS "Build Metal binary archive integration tests" OFF)
 if (HYDRA_METAL_CACHE_TESTS)
+    add_executable(hydra-shutdown-tests MACOSX_BUNDLE tests/shutdown_tests.cpp res/images/default_avatar_image.png)
+    set_source_files_properties(res/images/default_avatar_image.png PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_include_directories(hydra-shutdown-tests PRIVATE src src/ztd/src)
+    target_link_libraries(hydra-shutdown-tests PRIVATE hydra-core hydra-common hydra_compile_options)
+    if (HYDRA_FFMPEG_VIDEO)
+        target_compile_definitions(hydra-shutdown-tests PRIVATE
+            HYDRA_FFMPEG_VIDEO=1
+            HYDRA_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/video")
+    endif ()
+    add_custom_command(TARGET hydra-shutdown-tests POST_BUILD
+        COMMAND codesign --force --sign - --entitlements "${CMAKE_SOURCE_DIR}/hydra.macos.entitlements" "$<TARGET_FILE:hydra-shutdown-tests>")
+    add_executable(hydra-shader-library-tests tests/shader_library_tests.cpp)
+    target_include_directories(hydra-shader-library-tests PRIVATE src src/ztd/src)
+    target_link_libraries(hydra-shader-library-tests PRIVATE hydra-core hydra-common hydra_compile_options)
     add_executable(hydra-metal-cache-tests tests/metal_cache_tests.cpp)
     target_include_directories(hydra-metal-cache-tests PRIVATE src src/ztd/src)
     target_link_libraries(hydra-metal-cache-tests PRIVATE hydra-core hydra-common hydra_compile_options)
@@ -270,6 +301,16 @@ if (HYDRA_METAL_CACHE_TESTS)
 endif ()
 
 option(HYDRA_AUDIO_TESTS "Build audio decoder and PCM queue regression tests" OFF)
+option(HYDRA_VIDEO_TESTS "Build FFmpeg video decoder regression tests" OFF)
+if (HYDRA_VIDEO_TESTS)
+    if (NOT HYDRA_FFMPEG_VIDEO)
+        message(FATAL_ERROR "HYDRA_VIDEO_TESTS requires HYDRA_FFMPEG_VIDEO")
+    endif ()
+    add_executable(hydra-video-tests tests/video_tests.cpp)
+    target_link_libraries(hydra-video-tests PRIVATE hydra-video hydra_compile_options)
+    target_compile_definitions(hydra-video-tests PRIVATE
+        HYDRA_VIDEO_FIXTURE_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures/video")
+endif ()
 if (HYDRA_AUDIO_TESTS)
     add_executable(hydra-audio-tests tests/audio_tests.cpp)
     target_include_directories(hydra-audio-tests PRIVATE src src/ztd/src)

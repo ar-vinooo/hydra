@@ -27,6 +27,13 @@ IAudioOut::IAudioOut(System& system, PcmFormat format, u32 sample_rate,
         });
 }
 
+IAudioOut::~IAudioOut() {
+    // Destroying the stream stops and drains host callbacks before the mutex,
+    // released buffer list, and event they access can be destroyed.
+    delete stream;
+    buffer_event->release();
+}
+
 result_t IAudioOut::getAudioOutState(AudioOutState* out_state) {
     *out_state =
         (stream->getState() == StreamState::Started ? AudioOutState::Started
@@ -82,6 +89,19 @@ result_t IAudioOut::appendAudioOutBufferImpl(
     // TODO: correct?
     const auto ptr = reinterpret_cast<u8*>(
         process->getMmu()->unmapAddr(buffer.sample_buffer_ptr));
+    // DEBUG: HYDRA_AUDIO_STATS reports the peak of the appended PCM16 data
+    static const bool audio_stats = std::getenv("HYDRA_AUDIO_STATS") != nullptr;
+    if (audio_stats) {
+        static u32 append_count = 0;
+        i32 peak = 0;
+        const auto* samples = reinterpret_cast<const i16*>(ptr);
+        for (u64 i = 0; i < buffer.sample_buffer_data_size / 2; i++)
+            peak = std::max(peak, std::abs(static_cast<i32>(samples[i])));
+        if (append_count++ % 25 == 0)
+            LOG_INFO(Services,
+                     "DEBUG audout append #{}: {} bytes, PCM16 peak {}",
+                     append_count, buffer.sample_buffer_data_size, peak);
+    }
     stream->enqueueBuffer(buffer_client_ptr,
                           std::span{ptr, buffer.sample_buffer_data_size});
 
@@ -92,14 +112,23 @@ result_t IAudioOut::getReleasedAudioOutBuffersImpl(
     u32* out_count, std::optional<ztd::io::MemoryStream> out_buffers_stream) {
     std::unique_lock lock(buffer_mutex);
 
-    *out_count = static_cast<u32>(released_buffers.size());
+    // Only as many buffers as fit in the guest's output array are returned;
+    // the rest stay queued for the next call. Writing past it corrupts guest
+    // memory.
+    const auto capacity =
+        static_cast<usize>(out_buffers_stream->getSize() / sizeof(u64));
+    const auto count = std::min(released_buffers.size(), capacity);
+    *out_count = static_cast<u32>(count);
 
-    if (released_buffers.empty()) {
-        out_buffers_stream->write<u64>(0);
+    if (count == 0) {
+        if (capacity != 0)
+            out_buffers_stream->write<u64>(0);
     } else {
-        for (const auto client_ptr : released_buffers)
-            out_buffers_stream->write(client_ptr);
-        released_buffers.clear();
+        for (usize i = 0; i < count; i++)
+            out_buffers_stream->write(released_buffers[i]);
+        released_buffers.erase(released_buffers.begin(),
+                               released_buffers.begin() +
+                                   static_cast<std::ptrdiff_t>(count));
     }
 
     return RESULT_SUCCESS;

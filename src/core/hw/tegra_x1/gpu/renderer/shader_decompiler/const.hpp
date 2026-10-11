@@ -111,6 +111,8 @@ enum class TextureType {
     _3DArray,
     Cube,
     CubeArray,
+    // Only for images
+    Buffer,
 };
 
 inline bool isTextureArray(TextureType type) {

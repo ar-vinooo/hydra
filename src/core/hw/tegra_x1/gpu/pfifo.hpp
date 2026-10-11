@@ -21,6 +21,7 @@ class Pfifo {
   public:
     explicit Pfifo(Gpu& gpu_);
     ~Pfifo();
+    void shutdown();
 
     void submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                        GpfifoFlags flags);

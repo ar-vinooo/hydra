@@ -4,13 +4,15 @@ import UniformTypeIdentifiers
 private let switchType = UTType(exportedAs: "com.samoz256.switch-document", conformingTo: .data)
 private let nspType = UTType(filenameExtension: "nsp", conformingTo: .data) ?? .data
 private let xciType = UTType(filenameExtension: "xci", conformingTo: .data) ?? .data
+private let nszType = UTType(filenameExtension: "nsz", conformingTo: .data) ?? .data
+private let xczType = UTType(filenameExtension: "xcz", conformingTo: .data) ?? .data
 #if os(macOS)
-    private let allowedContentTypes: [UTType] = [.folder, switchType, xciType, nspType]
+    private let allowedContentTypes: [UTType] = [.folder, switchType, xciType, nspType, xczType, nszType]
 
     private let installFirmwarePlacement = ToolbarItemPlacement.confirmationAction
     private let addGamePlacement = ToolbarItemPlacement.confirmationAction
 #else
-    private let allowedContentTypes: [UTType] = [switchType, xciType, nspType]  // No game folders on iOS
+    private let allowedContentTypes: [UTType] = [switchType, xciType, nspType, xczType, nszType]  // No game folders on iOS
 
     private let installFirmwarePlacement = ToolbarItemPlacement.topBarLeading
     private let addGamePlacement = ToolbarItemPlacement.topBarTrailing

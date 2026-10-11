@@ -399,6 +399,61 @@ class Builder {
                                Value::createRawValue(dimension)});
     }
 
+    // Bit counting
+    Value opPopCount(const Value& src) {
+        return addInstruction(Opcode::PopCount, ScalarType::U32, {src});
+    }
+    // Index of the most significant bit (sign bit excluded when signed), ~0
+    // when not found
+    Value opFindMsb(const Value& src, bool is_signed) {
+        return addInstruction(Opcode::FindMsb, ScalarType::U32,
+                              {src, Value::createRawValue(is_signed)});
+    }
+
+    // Compute
+    Value opReadSystemRegister(u32 sr) {
+        return addInstruction(Opcode::ReadSystemRegister, ScalarType::U32,
+                              {Value::createRawValue(sr)});
+    }
+    // Shared memory is addressed in bytes and accessed in words
+    Value opLoadShared(const Value& addr) {
+        return addInstruction(Opcode::LoadShared, ScalarType::U32, {addr});
+    }
+    void opStoreShared(const Value& addr, const Value& value) {
+        addInstructionWithDst(Opcode::StoreShared, std::nullopt,
+                              {addr, value});
+    }
+    void opBarrier() { addInstructionWithDst(Opcode::Barrier); }
+    // Formatted store of 4 raw register values
+    void opImageStore(u32 index, TextureType type, const Value& coords,
+                      const std::array<Value, 4>& values) {
+        addInstructionWithDst(Opcode::ImageStore, std::nullopt,
+                              {Value::createRawValue(index),
+                               Value::createRawValue(type), coords, values[0],
+                               values[1], values[2], values[3]});
+    }
+    // Returns the previous value
+    Value opImageAtomic(u32 index, TextureType type, u32 op,
+                        const Value& coords, const Value& value) {
+        return addInstruction(Opcode::ImageAtomic, ScalarType::U32,
+                              {Value::createRawValue(index),
+                               Value::createRawValue(type),
+                               Value::createRawValue(op), coords, value});
+    }
+
+    // Warp
+    // mode: 0 = all, 1 = any, 2 = equal
+    Value opVote(const Value& pred, u32 mode) {
+        return addInstruction(Opcode::Vote, ScalarType::Bool,
+                              {pred, Value::createRawValue(mode)});
+    }
+    Value opBallot(const Value& pred) {
+        return addInstruction(Opcode::Ballot, ScalarType::U32, {pred});
+    }
+    Value opShuffle(const Value& value, const Value& lane) {
+        return addInstruction(Opcode::Shuffle, ScalarType::U32, {value, lane});
+    }
+
     // Exit
     void opExit() { addInstructionWithDst(Opcode::Exit); }
     void opDiscard() { addInstructionWithDst(Opcode::Discard); }

@@ -603,8 +603,11 @@ void TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
                                     other_level, other_layer) ||
             !haveCompatibleLayout(descriptor, level, other_descriptor,
                                   other_level)) {
-            LOG_DEBUG(Gpu, "Cannot synchronize 2D textures ({}) and ({})",
-                      descriptor, other_descriptor);
+            // DEBUG: report textures that alias but cannot be synchronized
+            static u32 debug_count = 0;
+            if (debug_count++ < 20)
+                LOG_WARN(Gpu, "DEBUG cannot synchronize 2D textures ({}) and ({})",
+                         descriptor, other_descriptor);
             return;
         }
 

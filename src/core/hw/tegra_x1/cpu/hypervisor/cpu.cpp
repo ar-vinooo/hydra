@@ -107,4 +107,8 @@ IThread* Cpu::createThread(WallClock& wall_clock, IMmu* mmu,
 
 IMemory* Cpu::allocateMemory(u64 size) { return new Memory(size); }
 
+IMemory* Cpu::wrapMemory(uptr ptr, u64 size) {
+    return new ExternalMemory(ptr, size);
+}
+
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

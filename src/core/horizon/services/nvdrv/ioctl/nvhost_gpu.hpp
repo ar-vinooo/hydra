@@ -38,7 +38,7 @@ class NvHostGpu : public ChannelBase {
     NvResult setErrorNotifier(u64 offset, u64 size, u32 mem,
                               [[maybe_unused]] u32 reserved) override;
     NvResult getErrorNotification(u64* out_timestamp, u32* out_info32,
-                                  u16* out_info16, u64* out_status) override;
+                                  u16* out_info16, u16* out_status) override;
     NvResult
     allocGpfifoEx(u32 num_entries, u32 num_jobs, u32 flags,
                   hw::tegra_x1::gpu::Fence* out_fence,

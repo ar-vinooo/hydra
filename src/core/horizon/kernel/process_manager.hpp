@@ -12,6 +12,7 @@ class ProcessManager {
   public:
     explicit ProcessManager(System& system_) : system{system_} {}
     ~ProcessManager();
+    void destroyAllProcesses();
 
     Process* createProcess(const std::string_view name);
     void destroyProcess(Process* process);

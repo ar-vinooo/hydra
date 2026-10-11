@@ -61,12 +61,44 @@ class MslEmitter final : public LangEmitter {
     // Exit
     void emitDiscard() override;
 
+    // Bit counting
+    void emitPopCount(const ir::Value& dst, const ir::Value& src) override;
+    void emitFindMsb(const ir::Value& dst, const ir::Value& src,
+                     bool is_signed) override;
+
+    // Compute
+    void emitReadSystemRegister(const ir::Value& dst, u32 sr) override;
+    void emitLoadShared(const ir::Value& dst, const ir::Value& addr) override;
+    void emitStoreShared(const ir::Value& addr,
+                         const ir::Value& value) override;
+    void emitBarrier() override;
+    void emitImageStore(u32 index, TextureType type, const ir::Value& coords,
+                        const std::array<ir::Value, 4>& values) override;
+    void emitImageAtomic(const ir::Value& dst, u32 index, TextureType type,
+                         u32 op, const ir::Value& coords,
+                         const ir::Value& value) override;
+
+    // Warp
+    void emitVote(const ir::Value& dst, const ir::Value& pred,
+                  u32 mode) override;
+    void emitBallot(const ir::Value& dst, const ir::Value& pred) override;
+    void emitShuffle(const ir::Value& dst, const ir::Value& value,
+                     const ir::Value& lane) override;
+
     std::string getSvAccessQualifiedStr(const SvAccess& sv_access,
                                         bool output) override;
 
   private:
+    // Number of shared memory words (compute)
+    u32 shared_word_count{1};
+
     // Helpers
     static std::string getSvStr(const Sv& sv);
+    // Bounds check and coordinate arguments for an image access
+    std::string getImageBoundsStr(u32 index, TextureType type,
+                                  const std::string& coords);
+    static std::string getImageCoordsStr(TextureType type,
+                                         const std::string& coords);
     std::string getSvQualifierStr(const Sv& sv, bool output);
 };
 

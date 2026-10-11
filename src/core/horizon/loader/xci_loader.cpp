@@ -6,6 +6,7 @@
 
 #include "core/horizon/filesystem/disk_file.hpp"
 #include "core/horizon/filesystem/file_view.hpp"
+#include "core/horizon/filesystem/ncz_file.hpp"
 #include "core/horizon/loader/npdm.hpp"
 
 namespace hydra::horizon::loader {
@@ -294,18 +295,46 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
         }
     }
     struct Content {
+        // Location of the NCA inside `source`.
         Entry entry;
+        std::shared_ptr<IFile> source;
         NcaFile::Header header;
         bool plaintext;
+        bool compressed;
+
+        std::shared_ptr<NcaFile> open(const NcaFile::Keys& keys) const {
+            return std::make_shared<NcaFile>(source, entry.offset, entry.size,
+                                             header, plaintext, keys,
+                                             compressed);
+        }
     };
     std::vector<Content> content;
     for (const auto& entry : entries) {
-        if (!std::string_view(entry.name).ends_with(".nca"))
+        const std::string_view name(entry.name);
+        const bool compressed = name.ends_with(".ncz");
+        if (!name.ends_with(".nca") && !compressed)
             continue;
         bool plaintext;
+        // NCZ keeps the original NCA header uncompressed.
         auto nca_header = NcaFile::readHeader(*container, entry.offset,
                                               entry.size, keys, plaintext);
-        content.push_back({entry, nca_header, plaintext});
+        if (!compressed) {
+            content.push_back({entry, container, nca_header, plaintext, false});
+            continue;
+        }
+        const auto nca_size = valueAt<u64>(nca_header, 0x208);
+        const auto cache_path =
+            std::filesystem::path(CONFIG_INSTANCE.getAppDataPath()) /
+            "cache/ncz" /
+            fmt::format("{}-{:x}.nca", name.substr(0, name.size() - 4),
+                        entry.size);
+        auto ncz = std::make_shared<filesystem::NczFile>(
+            container, entry.offset, entry.size, nca_size, cache_path);
+        content.push_back({{entry.name, 0, nca_size},
+                           std::move(ncz),
+                           nca_header,
+                           plaintext,
+                           true});
     }
     // Updates may carry the same program ID. Select a base Program NCA, never
     // the largest archive or an update that requires a BKTR overlay.
@@ -331,9 +360,7 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
     if (program == nullptr)
         throw std::runtime_error("Package has no supported base Program NCA; "
                                  "update-only packages are not supported.");
-    auto program_file = std::make_shared<NcaFile>(
-        container, program->entry.offset, program->entry.size, program->header,
-        program->plaintext, keys);
+    auto program_file = program->open(keys);
     validateProgram(*program_file, program->header);
     auto loader =
         std::unique_ptr<XciLoader>(new XciLoader(std::move(program_file)));
@@ -343,23 +370,22 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
             valueAt<u64>(item.header, 0x210) != loader->getTitleId())
             continue;
         try {
-            NcaFile control(container, item.entry.offset, item.entry.size,
-                            item.header, item.plaintext, keys);
-            const auto files = controlEntries(control, item.header);
+            auto control = item.open(keys);
+            const auto files = controlEntries(*control, item.header);
             for (const auto& file : files) {
                 if (file.name == "control.nacp" &&
                     file.size ==
                         sizeof(services::ns::ApplicationControlProperty)) {
                     loader->control_file =
                         std::make_unique<filesystem::MemoryFile>(
-                            read(control, file.offset, file.size));
+                            read(*control, file.offset, file.size));
                     loader->nacp_file = loader->control_file.get();
                 } else if (std::string_view(file.name).starts_with("icon_") &&
                            std::string_view(file.name).ends_with(".dat") &&
                            !loader->game_icon) {
                     loader->game_icon =
                         std::make_unique<filesystem::MemoryFile>(
-                            read(control, file.offset, file.size));
+                            read(*control, file.offset, file.size));
                     loader->icon_file = loader->game_icon.get();
                 }
             }

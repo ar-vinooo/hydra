@@ -1,8 +1,11 @@
 #include "core/horizon/kernel/process.hpp"
 
 #include <random>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "core/debugger/debugger_manager.hpp"
+#include "core/horizon/kernel/guest_thread.hpp"
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
@@ -109,6 +112,10 @@ u64 Process::getUsedUserMemorySize() const {
         used += main_thread_stack_mem->getSize();
     if (heap_mem)
         used += heap_mem->getSize();
+    {
+        std::scoped_lock lock(physical_mem_mutex);
+        used += physical_mem_size;
+    }
     return used;
 }
 
@@ -127,6 +134,110 @@ void Process::resizeHeap(u64 size) {
               .perm = MemoryPermission::ReadWrite});
 }
 
+void Process::mapAliasRun(vaddr_t begin, vaddr_t end) {
+    if (begin == end)
+        return;
+
+    if (alias_host_base == 0x0) {
+        void* ptr = mmap(nullptr, ALIAS_REGION.getSize(), PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        ASSERT(ptr != MAP_FAILED, Kernel, "Failed to reserve alias memory");
+        alias_host_base = reinterpret_cast<uptr>(ptr);
+    }
+
+    // New mappings must read as zero, even if the pages were used before
+    std::memset(reinterpret_cast<void*>(getAliasHostPtr(begin)), 0,
+                end - begin);
+
+    // A guest mapping may not cross a slab, as each slab is a separate CPU
+    // memory object
+    for (vaddr_t va = begin; va < end;) {
+        const u64 slab_index = (va - ALIAS_REGION.getBegin()) / ALIAS_SLAB_SIZE;
+        const vaddr_t slab_begin =
+            ALIAS_REGION.getBegin() + slab_index * ALIAS_SLAB_SIZE;
+        auto& slab = alias_slabs[slab_index];
+        if (slab == nullptr)
+            slab.reset(system.getCpu().wrapMemory(getAliasHostPtr(slab_begin),
+                                                  ALIAS_SLAB_SIZE));
+
+        const vaddr_t run_end = std::min(end, slab_begin + ALIAS_SLAB_SIZE);
+        mmu->map(va,
+                 ztd::Range<uptr>(getAliasHostPtr(va), getAliasHostPtr(run_end)),
+                 {.type = MemoryType::Alias,
+                  .attr = MemoryAttribute::None,
+                  .perm = MemoryPermission::ReadWrite});
+        va = run_end;
+    }
+
+    physical_mem_size += end - begin;
+}
+
+void Process::releaseAliasMemory() {
+    std::scoped_lock lock(physical_mem_mutex);
+    alias_slabs.clear();
+    if (alias_host_base != 0x0) {
+        munmap(reinterpret_cast<void*>(alias_host_base), ALIAS_REGION.getSize());
+        alias_host_base = 0x0;
+    }
+    physical_mem_size = 0;
+}
+
+result_t Process::mapPhysicalMemory(vaddr_t addr, u64 size) {
+    std::scoped_lock lock(physical_mem_mutex);
+
+    // Only the unmapped parts of the range get new memory
+    const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
+    vaddr_t run_begin = range.getBegin();
+    for (vaddr_t va = range.getBegin(); va < range.getEnd();) {
+        const auto region = mmu->queryRegion(va);
+        const auto region_end = std::min<vaddr_t>(
+            std::max<vaddr_t>(region.va + region.size,
+                              va + hw::tegra_x1::cpu::GUEST_PAGE_SIZE),
+            range.getEnd());
+        if (region.state.type != MemoryType::Free) {
+            mapAliasRun(run_begin, va);
+            run_begin = region_end;
+        }
+        va = region_end;
+    }
+    mapAliasRun(run_begin, range.getEnd());
+
+    return RESULT_SUCCESS;
+}
+
+result_t Process::unmapPhysicalMemory(vaddr_t addr, u64 size) {
+    std::scoped_lock lock(physical_mem_mutex);
+
+    const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
+
+    // Every mapped page in the range must come from MapPhysicalMemory
+    u64 unmapped_size = 0;
+    for (vaddr_t va = range.getBegin(); va < range.getEnd();
+         va += hw::tegra_x1::cpu::GUEST_PAGE_SIZE) {
+        const auto type = mmu->queryRegion(va).state.type;
+        if (type == MemoryType::Alias)
+            unmapped_size += hw::tegra_x1::cpu::GUEST_PAGE_SIZE;
+        else if (type != MemoryType::Free)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    }
+    if (unmapped_size == 0)
+        return RESULT_SUCCESS;
+
+    mmu->unmap(range);
+    physical_mem_size -= unmapped_size;
+
+    // Give the pages back to the host; they are zeroed when mapped again
+    const uptr host_begin = align(getAliasHostPtr(range.getBegin()),
+                                  static_cast<uptr>(getpagesize()));
+    const uptr host_end = alignDown(getAliasHostPtr(range.getEnd()),
+                                    static_cast<uptr>(getpagesize()));
+    if (host_begin < host_end)
+        madvise(reinterpret_cast<void*>(host_begin), host_end - host_begin,
+                MADV_FREE_REUSABLE);
+
+    return RESULT_SUCCESS;
+}
+
 void Process::start() {
     // Main thread
     main_thread->start();
@@ -137,6 +248,7 @@ void Process::start() {
 
 void Process::stop() {
     std::scoped_lock lock(thread_mutex);
+    stopping = true;
     for (auto thread : threads)
         thread->stop();
 
@@ -144,8 +256,34 @@ void Process::stop() {
     signalStateChange(ProcessState::Exiting);
 }
 
+void Process::joinThreads() {
+    stop();
+    // A running thread can start another thread while the first snapshot joins.
+    do {
+        std::vector<IThread*> pending;
+        {
+            std::scoped_lock lock(thread_mutex);
+            pending = threads;
+            if (main_thread && std::find(pending.begin(), pending.end(),
+                                         main_thread) == pending.end())
+                pending.push_back(main_thread);
+            for (auto thread : pending)
+                thread->retain();
+        }
+        // Joining under thread_mutex would deadlock unregisterThread().
+        for (auto thread : pending)
+            thread->stopAndJoin();
+        for (auto thread : pending)
+            thread->release();
+    } while (isRunning());
+    // Also join threads that unregistered just before the snapshot; their final
+    // signal/debugger callbacks must finish before kernel locks are destroyed.
+    for (auto object : handle_pool)
+        if (object->isOfType<IThread>())
+            static_cast<IThread*>(object)->stopAndJoin();
+}
+
 void Process::supervisorPause() {
-@@
     std::scoped_lock lock(thread_mutex);
     for (auto thread : threads)
         thread->supervisorPause();
@@ -164,9 +302,11 @@ void Process::supervisorResume() {
 }
 
 void Process::cleanUp() {
+    joinThreads();
     executable_mems.clear();
     main_thread_stack_mem = nullptr;
     heap_mem = nullptr;
+    releaseAliasMemory();
 
     // Main thread
     if (main_thread != nullptr) {
@@ -185,6 +325,42 @@ void Process::cleanUp() {
 void Process::signalStateChange(ProcessState new_state) {
     state = new_state;
     signal();
+}
+
+void Process::debugDumpThreads() {
+    std::scoped_lock lock(thread_mutex);
+    LOG_INFO(Kernel, "THREADDUMP begin ({} threads)", threads.size());
+    for (auto* thread : threads) {
+        // No RTTI; guest threads are named "Guest thread ..."
+        if (!thread->getDebugName().starts_with("Guest thread"))
+            continue;
+        auto* cpu_thread = static_cast<GuestThread*>(thread)->getThread();
+        if (cpu_thread == nullptr)
+            continue;
+        const auto& cpu_state = cpu_thread->getState();
+        std::string frames;
+        vaddr_t fp = cpu_state.fp;
+        for (u32 i = 0; i < 12 && fp != 0; i++) {
+            u64 next_fp = 0, ret = 0;
+            if (!mmu->tryRead(fp, next_fp) || !mmu->tryRead(fp + 8, ret))
+                break;
+            frames += fmt::format(" {:#x}", ret);
+            fp = next_fp;
+        }
+        LOG_INFO(Kernel, "THREADDUMP {} pc={:#x} lr={:#x} x0={:#x} x1={:#x} "
+                         "frames:{}",
+                 thread->getDebugName(), cpu_state.pc, cpu_state.lr, cpu_state.r[0],
+                 cpu_state.r[1], frames);
+        // DEBUG: memory around the waited mutex (nn::os EventType state)
+        std::string words;
+        for (u64 off = 0; cpu_state.r[0] >= 0x10000000 && off < 0x30; off += 4) {
+            u32 word = 0;
+            mmu->tryRead(cpu_state.r[0] - 0x20 + off, word);
+            words += fmt::format(" {:08x}", word);
+        }
+        LOG_INFO(Kernel, "THREADDUMP   mem[x0-0x20]:{}", words);
+    }
+    LOG_INFO(Kernel, "THREADDUMP end");
 }
 
 } // namespace hydra::horizon::kernel

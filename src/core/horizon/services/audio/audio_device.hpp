@@ -8,7 +8,11 @@ namespace hydra::horizon::services::audio {
 
 class IAudioDevice : public IService {
   public:
-    IAudioDevice() : event{new kernel::Event(false, "IAudioDevice event")} {}
+    IAudioDevice()
+        : event{new kernel::Event(false, "IAudioDevice event")},
+          input_event{new kernel::Event(false, "IAudioDevice input event")},
+          output_event{new kernel::Event(false, "IAudioDevice output event")} {
+    }
 
   protected:
     result_t requestImpl([[maybe_unused]] RequestContext& context,
@@ -16,6 +20,8 @@ class IAudioDevice : public IService {
 
   private:
     kernel::Event* event;
+    kernel::Event* input_event;
+    kernel::Event* output_event;
 
     // Commands
     result_t listAudioDeviceName(i32* out_count,
@@ -44,6 +50,12 @@ class IAudioDevice : public IService {
         InBuffer<BufferAttr::AutoSelect> in_name_buffer, f32* out_volume);
     result_t
     getActiveAudioDeviceNameAuto(OutBuffer<BufferAttr::AutoSelect> out_buffer);
+    result_t
+    queryAudioDeviceInputEvent(kernel::Process* process,
+                               OutHandle<HandleAttr::Copy> out_handle);
+    result_t
+    queryAudioDeviceOutputEvent(kernel::Process* process,
+                                OutHandle<HandleAttr::Copy> out_handle);
 
     // Impl
     result_t

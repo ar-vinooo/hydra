@@ -106,16 +106,35 @@ void Mmu::map(vaddr_t dst_va, ztd::Range<uptr> range,
                         state, toApFlags(state.perm));
 }
 
-// HACK: this assumes that the whole src range is stored contiguously in
-// physical memory
+// The source may be backed by several physical allocations (e.g. memory from
+// MapPhysicalMemory), so map each physically contiguous run separately
 void Mmu::map(vaddr_t dst_va, ztd::Range<vaddr_t> range) {
     ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
     ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    const auto region = user_page_table.queryRegion(range.getBegin());
-    paddr_t pa = region.unmapAddr(range.getBegin());
-    // TODO: also inherit flags
-    user_page_table.map(dst_va, ztd::Range<uptr>::fromSize(pa, range.getSize()),
-                        region.state, toApFlags(region.state.perm));
+
+    vaddr_t run_va = range.getBegin();
+    while (run_va < range.getEnd()) {
+        const auto region = user_page_table.queryRegion(run_va);
+        const paddr_t run_pa = region.unmapAddr(run_va);
+
+        // Extend the run while the next page is physically contiguous and has
+        // the same state
+        vaddr_t end_va = run_va + GUEST_PAGE_SIZE;
+        while (end_va < range.getEnd()) {
+            const auto next = user_page_table.queryRegion(end_va);
+            if (next.unmapAddr(end_va) != run_pa + (end_va - run_va) ||
+                !(next.state == region.state))
+                break;
+            end_va += GUEST_PAGE_SIZE;
+        }
+
+        // TODO: also inherit flags
+        user_page_table.map(
+            dst_va + (run_va - range.getBegin()),
+            ztd::Range<uptr>::fromSize(run_pa, end_va - run_va), region.state,
+            toApFlags(region.state.perm));
+        run_va = end_va;
+    }
 }
 
 void Mmu::unmap(ztd::Range<vaddr_t> range) {

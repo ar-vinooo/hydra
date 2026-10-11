@@ -33,6 +33,28 @@ struct Info {
     }
 };
 
+// A Kepler compute grid launch
+struct ComputeDispatch {
+    ShaderBase* shader{nullptr};
+    // Indexed by the host binding
+    std::array<BufferView, CONST_BUFFER_BINDING_COUNT> uniform_buffers{};
+    struct TextureBinding {
+        u32 index;
+        ITextureView* texture;
+        SamplerBase* sampler;
+    };
+    std::vector<TextureBinding> textures;
+    struct ImageBinding {
+        u32 index;
+        ITextureView* texture;
+    };
+    std::vector<ImageBinding> images;
+    uint3 grid_size;
+    uint3 block_size;
+    // DEBUG: guest program address
+    u64 debug_program_addr{0};
+};
+
 enum class MemoryInvalidationScope {
     None = 0,
     BufferCache = ZTD_BIT(0),
@@ -68,6 +90,8 @@ class IRenderer {
             // TODO
         }
     }
+
+    virtual u64 getAllocatedResourceBytes() const { return 0; }
 
     // Surface
     virtual void setSurface(void* surface) = 0;
@@ -164,6 +188,18 @@ class IRenderer {
     // Resource unbinding
     virtual void unbindUniformBuffers(ShaderType shader_type) = 0;
     virtual void unbindTextures(ShaderType shader_type) = 0;
+
+    // DEBUG: submit the recorded work, wait for it and return its GPU time in
+    // milliseconds
+    virtual f64
+    debugSyncCommandBuffer([[maybe_unused]] ICommandBuffer* command_buffer) {
+        return 0.0;
+    }
+
+    // Compute
+    virtual void
+    dispatchCompute([[maybe_unused]] ICommandBuffer* command_buffer,
+                    [[maybe_unused]] const ComputeDispatch& dispatch) {}
 
     // Draw
     virtual void draw(ICommandBuffer* command_buffer,

@@ -7,7 +7,8 @@ namespace hydra::horizon::services::nvdrv::ioctl {
 
 class NvHostVic : public ChannelBase {
   private:
-    // Ioctls
+    std::string_view videoEngineName() const override { return "vic"; }
+    NvResult executeVideo(IoctlContext& context) override;
 };
 
 } // namespace hydra::horizon::services::nvdrv::ioctl

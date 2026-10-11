@@ -11,7 +11,8 @@ namespace hydra::hw::tegra_x1::gpu::engines {
 void InlineBase::launchDmaImpl(Gpu& gpu, RegsInline& regs, const u32 index,
                                const u32 data) {
     (void)this;
-    LOG_FUNC_WITH_ARGS_STUBBED(Engines, "index: {}, data: {:#x}", index, data);
+    ONCE(LOG_FUNC_WITH_ARGS_STUBBED(Engines, "index: {}, data: {:#x}", index,
+                                    data));
 }
 
 void InlineBase::loadInlineDataImpl(Gpu& gpu, RegsInline& regs, const u32 index,
@@ -26,13 +27,13 @@ void InlineBase::loadInlineDataImpl(Gpu& gpu, RegsInline& regs, const u32 index,
 
         // Buffer to buffer
         uptr dst_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_out);
-        memcpy(reinterpret_cast<void*>(dst_ptr), inline_data.data(),
-               inline_data.size() * sizeof(u32));
+        const usize size = inline_data.size() * sizeof(u32);
+        memcpy(reinterpret_cast<void*>(dst_ptr), inline_data.data(), size);
         inline_data.clear();
 
         // Invalidate
-        gpu.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
-            dst_ptr, inline_data.size() * sizeof(u32)));
+        gpu.getRenderer().invalidateMemory(
+            ztd::Range<uptr>::fromSize(dst_ptr, size));
     }
 }
 

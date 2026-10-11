@@ -1,5 +1,7 @@
 #include "core/horizon/kernel/kernel.hpp"
 
+#include <set>
+
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/kernel/code_memory.hpp"
 #include "core/horizon/kernel/hipc/client_session.hpp"
@@ -26,6 +28,10 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
     u32 tmp_u32;
     u64 tmp_u64;
     uptr tmp_uptr;
+    // DEBUG: HYDRA_TRACE_SVC traces memory SVCs and failed SVCs
+    static const bool trace_svc = std::getenv("HYDRA_TRACE_SVC") != nullptr;
+    const std::array<u64, 4> trace_args = {state.r[0], state.r[1], state.r[2],
+                                           state.r[3]};
     switch (id) {
     case 0x1:
         state.r[0] = setHeapSize(crnt_process, state.r[1], tmp_uptr);
@@ -76,9 +82,26 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
     case 0xa:
         exitThread(crnt_thread);
         break;
-    case 0xb:
+    case 0xb: {
+        // DEBUG: sample where guest threads poll with SleepThread
+        static std::atomic<u64> sleep_calls{0};
+        if (sleep_calls.fetch_add(1) % 500 == 0) {
+            std::string frames = fmt::format("{:#x}", state.lr);
+            vaddr_t fp = state.fp;
+            for (u32 i = 0; i < 6 && fp != 0; i++) {
+                u64 next_fp = 0, ret = 0;
+                if (!crnt_process->getMmu()->tryRead(fp, next_fp) ||
+                    !crnt_process->getMmu()->tryRead(fp + 8, ret))
+                    break;
+                frames += fmt::format(" {:#x}", ret);
+                fp = next_fp;
+            }
+            LOG_INFO(Kernel, "SleepThread({}) from {}",
+                     std::bit_cast<i64>(state.r[0]), frames);
+        }
         sleepThread(std::bit_cast<i64>(state.r[0]));
         break;
+    }
     case 0xc:
         state.r[0] = getThreadPriority(
             crnt_process->getHandle<IThread>(static_cast<u32>(state.r[1])),
@@ -91,8 +114,9 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             std::bit_cast<i32>(static_cast<u32>(state.r[1])));
         break;
     case 0xe:
+        // The thread handle is passed in w2; x0/x1 hold userland out pointers
         state.r[0] = getThreadCoreMask(
-            crnt_process->getHandle<IThread>(static_cast<u32>(state.r[0])),
+            crnt_process->getHandle<IThread>(static_cast<u32>(state.r[2])),
             tmp_i32, tmp_u64);
         state.r[1] = std::bit_cast<u32>(tmp_i32);
         state.r[2] = tmp_u64;
@@ -150,9 +174,30 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             sync_objs[i] =
                 crnt_process->getHandle<SynchronizationObject>(handles[i]);
 
+        // DEBUG: report guest waits that block for a long time
+        if (std::bit_cast<i64>(state.r[3]) < 0) {
+            std::string names;
+            for (auto i = 0; i < num_handles; i++)
+                names += fmt::format(
+                    "{}{}", i ? ", " : "",
+                    sync_objs[i] ? sync_objs[i]->getDebugName() : "null");
+            LOG_INFO(Kernel, "Infinite wait on [{}]", names);
+        }
+        const auto wait_start = std::chrono::steady_clock::now();
         state.r[0] = waitSynchronization(
             crnt_thread, std::span(sync_objs, static_cast<usize>(num_handles)),
             std::bit_cast<i64>(state.r[3]), tmp_u32);
+        if (std::chrono::steady_clock::now() - wait_start >
+            std::chrono::seconds(2)) {
+            std::string names;
+            for (auto i = 0; i < num_handles; i++)
+                names += fmt::format(
+                    "{}{}", i ? ", " : "",
+                    sync_objs[i] ? sync_objs[i]->getDebugName() : "null");
+            LOG_WARN(Kernel, "Long wait on [{}] (timeout: {}, result: {:#x})",
+                     names, std::bit_cast<i64>(trace_args[3]),
+                     static_cast<u32>(state.r[0]));
+        }
         state.r[1] = tmp_u32;
         break;
     }
@@ -172,17 +217,49 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             crnt_thread, crnt_process->getMmu()->unmapAddr(state.r[0]));
         break;
     case 0x1c:
-        state.r[0] = waitProcessWideKeyAtomic(
-            crnt_process, crnt_thread,
-            crnt_process->getMmu()->unmapAddr(state.r[0]),
-            crnt_process->getMmu()->unmapAddr(state.r[1]),
-            static_cast<u32>(state.r[2]), std::bit_cast<i64>(state.r[3]));
+        // DEBUG: log every distinct guest call site of infinite condvar waits
+        if (std::bit_cast<i64>(state.r[3]) < 0) {
+            static std::mutex sites_mutex;
+            static std::set<u64> sites;
+            std::string frames = fmt::format("{:#x}", state.lr);
+            u64 key = state.lr;
+            vaddr_t fp = state.fp;
+            for (u32 i = 0; i < 8 && fp != 0; i++) {
+                u64 next_fp = 0, ret = 0;
+                if (!crnt_process->getMmu()->tryRead(fp, next_fp) ||
+                    !crnt_process->getMmu()->tryRead(fp + 8, ret))
+                    break;
+                frames += fmt::format(" {:#x}", ret);
+                key = key * 31 + ret;
+                fp = next_fp;
+            }
+            std::scoped_lock lock(sites_mutex);
+            if (sites.insert(key).second)
+                LOG_INFO(Kernel, "CondVar wait (cv: {:#x}) from {}", state.r[1],
+                         frames);
+        }
+        {
+            const u64 guest_cv = state.r[1];
+            const i64 wait_timeout = std::bit_cast<i64>(state.r[3]);
+            state.r[0] = waitProcessWideKeyAtomic(
+                crnt_process, crnt_thread,
+                crnt_process->getMmu()->unmapAddr(state.r[0]),
+                crnt_process->getMmu()->unmapAddr(state.r[1]),
+                static_cast<u32>(state.r[2]), wait_timeout);
+            (void)guest_cv;
+        }
         break;
-    case 0x1d:
+    case 0x1d: {
+        // DEBUG: trace condition variable signals
+        const u64 guest_cv = state.r[0];
+        const auto signal_count = std::bit_cast<i32>(static_cast<u32>(state.r[1]));
+        u64 woken = 0;
         state.r[0] = signalProcessWideKey(
-            crnt_process, crnt_process->getMmu()->unmapAddr(state.r[0]),
-            std::bit_cast<i32>(static_cast<u32>(state.r[1])));
+            crnt_process, crnt_process->getMmu()->unmapAddr(guest_cv),
+            signal_count, &woken);
+        (void)woken;
         break;
+    }
     case 0x1e:
         getSystemTick(tmp_u64);
         state.r[0] = tmp_u64;
@@ -236,6 +313,10 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         break;
     case 0x2c:
         state.r[0] = mapPhysicalMemory(crnt_process, state.r[0], state.r[1]);
+        break;
+    case 0x2d:
+        state.r[0] =
+            unmapPhysicalMemory(crnt_process, state.r[0], state.r[1]);
         break;
     case 0x32:
         state.r[0] = setThreadActivity(
@@ -341,6 +422,19 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         LOG_NOT_IMPLEMENTED(Kernel, "SVC {:#x}", id);
         state.r[0] = MAKE_RESULT(Svc, Error::NotImplemented);
         break;
+    }
+
+    if (trace_svc) {
+        const bool memory_svc = id <= 0x6 || id == 0x29 || id == 0x2c ||
+                                id == 0x2d || id == 0x13 || id == 0x14 ||
+                                id == 0x15;
+        const bool failed = static_cast<u32>(state.r[0]) != RESULT_SUCCESS &&
+                            id != 0x18 && id != 0x34 && id != 0x1a;
+        if (memory_svc || failed)
+            LOG_INFO(Kernel,
+                     "SVC {:#x}({:#x}, {:#x}, {:#x}, {:#x}) -> {:#x} [r1={:#x}]",
+                     id, trace_args[0], trace_args[1], trace_args[2],
+                     trace_args[3], static_cast<u32>(state.r[0]), state.r[1]);
     }
 }
 
@@ -645,6 +739,7 @@ Kernel::waitSynchronization(IThread* crnt_thread,
     }
 
     crnt_thread->pause();
+    crnt_thread->beginSyncWait();
 
     // Add waiting thread
     for (auto sync_obj : sync_objs) {
@@ -667,6 +762,8 @@ Kernel::waitSynchronization(IThread* crnt_thread,
     } else {
         res = MAKE_RESULT(Svc, Error::TimedOut);
     }
+
+    crnt_thread->endSyncWait();
 
     // Remove the thread from the waiting list
     for (auto sync_obj : sync_objs) {
@@ -766,6 +863,9 @@ result_t Kernel::waitProcessWideKeyAtomic(Process* crnt_process,
         CriticalSectionLock cs_lock(*this);
         ASSERT_DEBUG(cond_var_waiters.addLast(crnt_thread).has_value(), Kernel,
                      "Failed to add cond var waiter");
+        // Horizon publishes this flag before releasing the user's mutex.
+        // SDK condition-variable signals skip the SVC when the flag is zero.
+        atomicStore(reinterpret_cast<u32*>(var_addr), 1u);
         unlockMutex(crnt_thread, mutex_addr);
     }
 
@@ -779,7 +879,29 @@ result_t Kernel::waitProcessWideKeyAtomic(Process* crnt_process,
                 res = MAKE_RESULT(Svc, Error::Cancelled);
         }
     } else {
-        res = MAKE_RESULT(Svc, Error::TimedOut);
+        // A signal may have raced with the timeout. If it already took this
+        // thread off the condition variable, the mutex is (or will be) handed
+        // to it, so this is a regular wakeup. Returning TimedOut would make
+        // userland lock a mutex it already owns and deadlock.
+        bool signalled;
+        {
+            CriticalSectionLock cs_lock(*this);
+            signalled = crnt_thread->cond_var_wait_addr == 0x0;
+            if (signalled && crnt_thread->mutex_wait_addr != 0x0) {
+                // Still queued on the owner; pause before releasing the lock
+                // so the owner's resume cannot be lost
+                crnt_thread->pause();
+            }
+        }
+
+        if (signalled) {
+            // Consume the resume from the mutex hand-off
+            crnt_thread->processMessages();
+            if (crnt_thread->getState() == ThreadState::Stopping)
+                res = MAKE_RESULT(Svc, Error::Cancelled);
+        } else {
+            res = MAKE_RESULT(Svc, Error::TimedOut);
+        }
     }
 
     // Remove this thread from the wait list
@@ -800,13 +922,14 @@ result_t Kernel::waitProcessWideKeyAtomic(Process* crnt_process,
 }
 
 result_t Kernel::signalProcessWideKey(Process* crnt_process, uptr addr,
-                                      i32 count) {
+                                      i32 count, u64* out_woken) {
     LOG_DEBUG(Kernel, "SignalProcessWideKey called (addr: 0x{:08x}, count: {})",
               addr, count);
 
     CriticalSectionLock cs_lock(*this);
 
-    if (count == -1)
+    // A non-positive count wakes every waiter
+    if (count <= 0)
         count = static_cast<i32>(cond_var_waiters.getSize());
 
     // TODO: sort by priority
@@ -819,11 +942,21 @@ result_t Kernel::signalProcessWideKey(Process* crnt_process, uptr addr,
             tryAcquireMutex(crnt_process, thread);
             thread_node = cond_var_waiters.remove(thread_node_);
             count--;
+            if (out_woken)
+                (*out_woken)++;
         } else {
             thread_node = thread_node_->getNext();
         }
     }
 
+    bool has_waiter = false;
+    for (auto node = cond_var_waiters.getHead(); node; node = (*node)->getNext())
+        if ((*node)->get()->cond_var_wait_addr == addr) {
+            has_waiter = true;
+            break;
+        }
+    if (!has_waiter)
+        atomicStore(reinterpret_cast<u32*>(addr), 0u);
     return RESULT_SUCCESS;
 }
 
@@ -1038,21 +1171,38 @@ result_t Kernel::mapPhysicalMemory(Process* crnt_process, vaddr_t addr,
               "MapPhysicalMemory called (addr: 0x{:08x}, size: 0x{:08x})", addr,
               size);
 
-    if (!isAligned(size, hw::tegra_x1::cpu::GUEST_PAGE_SIZE))
-        return MAKE_RESULT(Svc, 102); // Invalid address
+    if (const auto res = checkPhysicalMemoryRange(addr, size);
+        res != RESULT_SUCCESS)
+        return res;
 
-    if (!isAligned(size, hw::tegra_x1::cpu::GUEST_PAGE_SIZE))
-        return MAKE_RESULT(Svc, 101); // Invalid size
+    return crnt_process->mapPhysicalMemory(addr, size);
+}
+
+result_t Kernel::unmapPhysicalMemory(Process* crnt_process, vaddr_t addr,
+                                     u64 size) {
+    LOG_DEBUG(Kernel,
+              "UnmapPhysicalMemory called (addr: 0x{:08x}, size: 0x{:08x})",
+              addr, size);
+
+    if (const auto res = checkPhysicalMemoryRange(addr, size);
+        res != RESULT_SUCCESS)
+        return res;
+
+    return crnt_process->unmapPhysicalMemory(addr, size);
+}
+
+result_t Kernel::checkPhysicalMemoryRange(vaddr_t addr, u64 size) {
+    if (!isAligned(addr, hw::tegra_x1::cpu::GUEST_PAGE_SIZE))
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+
+    if (size == 0 || !isAligned(size, hw::tegra_x1::cpu::GUEST_PAGE_SIZE))
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+
+    if (addr + size <= addr)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
 
     if (!ALIAS_REGION.contains(ztd::Range<vaddr_t>::fromSize(addr, size)))
-        return MAKE_RESULT(Svc, 110); // Invalid memory region
-
-    auto mem = system.getCpu().allocateMemory(size);
-    // TODO: keep track of the memory
-    crnt_process->getMmu()->map(addr, mem,
-                                {.type = MemoryType::Alias,
-                                 .attr = MemoryAttribute::None,
-                                 .perm = MemoryPermission::ReadWrite});
+        return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
 
     return RESULT_SUCCESS;
 }

@@ -33,6 +33,10 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
     uptr unmapAddr(uptr gpu_addr) const;
 
+    // Copy a contiguous guest range across separate host mappings, stopping
+    // at the first unmapped address.
+    std::vector<u8> readMappedBytes(uptr gpu_addr, usize max_size);
+
     void mapImpl([[maybe_unused]] uptr base, [[maybe_unused]] AddressSpace as) {
     }
     void unmapImpl([[maybe_unused]] uptr base,
@@ -49,6 +53,17 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
     uptr mapBufferToAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
         return createAddressSpace(range, gpu_addr);
     }
+
+    // Sparse memory without backing reads as zero
+    void unbindToSparse(uptr gpu_addr, u64 size);
+
+  private:
+    // Mappings are kept disjoint: a buffer replaces whatever it overlaps,
+    // while a reservation only fills the parts that are still unmapped
+    void carveOut(uptr begin, uptr end);
+    void mapIntoGaps(uptr base, AddressSpace as);
+
+  public:
 
     // TODO
     /*

@@ -96,19 +96,13 @@ void NcaLoader::loadCode(System& system, kernel::Process* process,
     if (dir->getEntry("rtld", e) == filesystem::FsResult::DoesNotExist)
         entry_point = "main";
 
-    for (const auto& [filename, entry] : dir->getEntries()) {
-        ASSERT(entry->isFile(), Loader, "Code entry is not a file");
-        auto file = static_cast<filesystem::IFile*>(entry);
-        if (filename == "main.npdm") {
-            // Do nothing
-        } else {
-            LOG_DEBUG(Loader, "Loading {}", filename);
-            NsoLoader loader(file, filename, filename == entry_point);
-            loader.setMainThreadParams(main_thread_priority,
-                                       main_thread_core_number,
-                                       main_thread_stack_size);
-            loader.loadProcess(system, process);
-        }
+    for (const auto& [filename, file] : getCodeModulesInLoadOrder(dir)) {
+        LOG_DEBUG(Loader, "Loading {}", filename);
+        NsoLoader loader(file, filename, filename == entry_point);
+        loader.setMainThreadParams(main_thread_priority,
+                                   main_thread_core_number,
+                                   main_thread_stack_size);
+        loader.loadProcess(system, process);
     }
 
     process->setSystemResourceSize(system_resource_size);

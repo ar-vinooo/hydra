@@ -58,8 +58,15 @@ void PageTable::map(vaddr_t va, ztd::Range<uptr> range,
 }
 
 void PageTable::unmap(ztd::Range<vaddr_t> range) {
-    (void)this;
-    LOG_FUNC_WITH_ARGS_NOT_IMPLEMENTED(Hypervisor, "range: {:#x}", range);
+    LOG_DEBUG(Hypervisor, "range: {:#x}", range);
+
+    modifyRange(range, []([[maybe_unused]] ztd::Range<vaddr_t> range,
+                          u64& entry, horizon::kernel::MemoryState& state,
+                          PageFlags& flags) {
+        entry = 0x0;
+        state = {.type = horizon::kernel::MemoryType::Free};
+        flags = PageFlags::None;
+    });
 }
 
 // TODO: use IterateRange

@@ -51,4 +51,33 @@ class Memory : public IMemory {
     }
 };
 
+// Host memory owned by someone else, only registered with the VM
+class ExternalMemory : public IMemory {
+  public:
+    ExternalMemory(uptr ptr_, u64 size) : IMemory(size), ptr{ptr_} {
+        ASSERT_ALIGNMENT(ptr, APPLE_PAGE_SIZE, Hypervisor, "ptr");
+        ASSERT_ALIGNMENT(getSize(), APPLE_PAGE_SIZE, Hypervisor, "size");
+        physical_address = PhysicalMemory::instance().add(ptr, getSize());
+        HV_ASSERT_SUCCESS(
+            hv_vm_map(reinterpret_cast<void*>(ptr), physical_address,
+                      getSize(),
+                      HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC));
+    }
+    ~ExternalMemory() override {
+        HV_ASSERT_SUCCESS(hv_vm_unmap(physical_address, getSize()));
+        PhysicalMemory::instance().remove(physical_address);
+    }
+
+    uptr getPtr() const override { return ptr; }
+
+  protected:
+    void resizeImpl() override {
+        LOG_FATAL(Hypervisor, "External memory cannot be resized");
+    }
+
+  private:
+    uptr ptr;
+    paddr_t physical_address;
+};
+
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

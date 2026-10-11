@@ -85,12 +85,14 @@ void decompile(ztd::io::MemoryStream& code_stream, const ShaderType type,
                const GuestShaderState& state, ShaderBackend& out_backend,
                std::vector<u8>& out_code,
                ResourceMapping& out_resource_mapping) {
-    // Header
-    // TODO: don't read in case of compute shaders
-    const auto header = code_stream.read<ShaderHeader>();
-    // HACK: just for testing
-    ASSERT_DEBUG(header.version == 3, ShaderDecompiler,
-                 "Invalid shader version {}", header.version);
+    // Header (compute shaders don't have one)
+    ShaderHeader header{};
+    if (type != ShaderType::Compute) {
+        header = code_stream.read<ShaderHeader>();
+        // HACK: just for testing
+        ASSERT_DEBUG(header.version == 3, ShaderDecompiler,
+                     "Invalid shader version {}", header.version);
+    }
 
     // Context
     DecompilerContext context;

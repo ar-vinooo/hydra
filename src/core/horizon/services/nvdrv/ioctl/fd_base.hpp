@@ -11,6 +11,7 @@ namespace hydra::horizon::services::nvdrv::ioctl {
 class FdBase {
   public:
     virtual ~FdBase() noexcept = default;
+    virtual std::string_view videoEngineName() const { return {}; }
 
     virtual NvResult ioctl(IoctlContext& context, u32 type, u32 nr) = 0;
     virtual NvResult ioctl2([[maybe_unused]] IoctlContext& context, u32 type,

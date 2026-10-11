@@ -81,7 +81,7 @@ NvResult NvHostGpu::setErrorNotifier(u64 offset, u64 size, u32 mem,
 }
 
 NvResult NvHostGpu::getErrorNotification(u64* out_timestamp, u32* out_info32,
-                                         u16* out_info16, u64* out_status) {
+                                         u16* out_info16, u16* out_status) {
     LOG_FUNC_STUBBED(Services);
 
     *out_timestamp = 0;           // TODO

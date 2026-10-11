@@ -60,6 +60,16 @@ void emitS2R(DecoderContext& context, InstS2R inst) {
     constexpr u32 SR_LANE_ID = 0x00;
     constexpr u32 SR_Y_DIRECTION = 0x12;
 
+    // Thread and block IDs, lane masks
+    const auto sr = static_cast<u32>(inst.sr);
+    if (context.decomp_context.type == ShaderType::Compute &&
+        (sr == SR_LANE_ID || (sr >= 0x20 && sr <= 0x23) ||
+         (sr >= 0x25 && sr <= 0x27) || (sr >= 0x38 && sr <= 0x3c))) {
+        emitMove(context, inst.pred, inst.pred_inv, inst.dst,
+                 context.builder.opReadSystemRegister(sr));
+        return;
+    }
+
     u32 value = 0;
     switch (static_cast<u32>(inst.sr)) {
     case SR_Y_DIRECTION:

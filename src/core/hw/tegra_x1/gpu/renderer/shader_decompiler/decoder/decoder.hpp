@@ -30,6 +30,7 @@ class Decoder {
     std::queue<label_t> to_visit_queue;
     std::map<label_t, Block> blocks;
     Block* crnt_block{nullptr};
+    u32 last_unknown_pc{0xfffffff0};
 
     void parseNextInstruction();
 
