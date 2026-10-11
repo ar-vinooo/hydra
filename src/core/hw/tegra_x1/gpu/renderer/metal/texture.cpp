@@ -80,6 +80,8 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
 }
 
 Texture::~Texture() {
+    if (byte_copy_pipeline)
+        byte_copy_pipeline->release();
     texture->release();
     if (buffer_backing)
         buffer_backing->release();
@@ -88,6 +90,57 @@ Texture::~Texture() {
 ITextureView*
 Texture::createView(const TextureViewDescriptor& view_descriptor) {
     return new TextureView(this, view_descriptor);
+}
+
+void Texture::copyBufferBytes(ICommandBuffer* command_buffer,
+                              const ITexture* src, u64 src_offset,
+                              u64 dst_offset, u64 size) {
+    const auto* source = static_cast<const Texture*>(src);
+    ASSERT(buffer_backing && source->buffer_backing, MetalRenderer,
+           "Raw buffer copies require buffer textures");
+    ASSERT(src_offset + size <= source->descriptor.size &&
+               dst_offset + size <= descriptor.size,
+           MetalRenderer, "Buffer texture copy exceeds guest range");
+    if (size == 0)
+        return;
+    auto* commands = static_cast<CommandBuffer*>(command_buffer);
+    // macOS blits require four-byte aligned offsets and lengths. A byte
+    // kernel preserves neighboring texels for partial R8/R16 aliases.
+    if ((src_offset | dst_offset | size) % 4 == 0) {
+        commands->getBlitCommandEncoder()->copyFromBuffer(
+            source->buffer_backing, src_offset, buffer_backing, dst_offset,
+            size);
+        return;
+    }
+    if (!byte_copy_pipeline) {
+        const char* code = R"(
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void copy_bytes(device const uchar* src [[buffer(0)]],
+                                   device uchar* dst [[buffer(1)]],
+                                   constant ulong3& range [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) {
+                if (i < range.z) dst[range.y + i] = src[range.x + i];
+            }
+        )";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            texture->device()->newLibrary(toNsString(code), nullptr, &error);
+        ASSERT(library, MetalRenderer, "Failed to compile buffer byte copy");
+        NS_STACK_SCOPED auto function =
+            library->newFunction(toNsString("copy_bytes"));
+        byte_copy_pipeline =
+            texture->device()->newComputePipelineState(function, &error);
+        ASSERT(byte_copy_pipeline, MetalRenderer,
+               "Failed to create buffer byte copy pipeline");
+    }
+    const u64 offsets[4] = {src_offset, dst_offset, size, 0};
+    auto* encoder = commands->getComputeCommandEncoder();
+    encoder->setComputePipelineState(byte_copy_pipeline);
+    encoder->setBuffer(source->buffer_backing, 0, 0);
+    encoder->setBuffer(buffer_backing, 0, 1);
+    encoder->setBytes(offsets, sizeof(offsets), 2);
+    encoder->dispatchThreads(MTL::Size(size, 1, 1), MTL::Size(64, 1, 1));
 }
 
 void Texture::copyFrom(ICommandBuffer* command_buffer, const BufferBase* src,

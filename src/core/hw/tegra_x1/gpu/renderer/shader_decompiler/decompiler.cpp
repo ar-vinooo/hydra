@@ -81,10 +81,11 @@ struct ShaderHeader {
 };
 #pragma pack(pop)
 
-void decompile(ztd::io::MemoryStream& code_stream, const ShaderType type,
-               const GuestShaderState& state, ShaderBackend& out_backend,
-               std::vector<u8>& out_code,
-               ResourceMapping& out_resource_mapping) {
+void decompile(
+    ztd::io::MemoryStream& code_stream, const ShaderType type,
+    const GuestShaderState& state, ShaderBackend& out_backend,
+    std::vector<u8>& out_code, ResourceMapping& out_resource_mapping,
+    const std::function<std::optional<u32>(u32, u32)>& read_const_word) {
     // Header (compute shaders don't have one)
     ShaderHeader header{};
     if (type != ShaderType::Compute) {
@@ -97,6 +98,17 @@ void decompile(ztd::io::MemoryStream& code_stream, const ShaderType type,
     // Context
     DecompilerContext context;
     context.type = type;
+    // The header often reports 0 even for shaders that use local memory, so
+    // keep a sensible minimum. Compute shaders have no header at all.
+    context.local_memory_size =
+        (type == ShaderType::Compute
+             ? 0x400u
+             : std::max<u32>(header.sh_local_mem_lo_sz +
+                                 header.sh_local_mem_hi_sz +
+                                 header.sh_local_mem_crs_sz,
+                             0x100u));
+    context.read_const_word = read_const_word;
+    context.branch_constants = &out_resource_mapping.branch_constants;
     if (type == ShaderType::Fragment) {
         for (u32 i = 0; i < PIXEL_IMAP_COUNT; i++) {
             const auto imap = header.ps.imap_generic_vector[i];

@@ -11,6 +11,7 @@ enum class ValueKind {
     Local,
     Register,
     Predicate,
+    ConditionFlag,
     AttrMemory,
     ConstMemory,
     Label,
@@ -20,6 +21,14 @@ class Value {
   public:
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+    // Z, S, C and O flags, separate from the eight architectural predicates.
+    static Value createConditionFlag(u32 flag) {
+        return Value{.kind = ValueKind::ConditionFlag, .type = ScalarType::Bool, .raw_value = flag};
+    }
+    u32 getConditionFlag() const {
+        assertKind<ValueKind::ConditionFlag>();
+        return static_cast<u32>(raw_value);
+    }
     static Value createUndefined() {
         return Value{.kind = ValueKind::Undefined};
     }
@@ -102,6 +111,7 @@ class Value {
         switch (kind) {
         case ValueKind::Undefined:
             return true;
+        case ValueKind::ConditionFlag:
         case ValueKind::RawValue:
             return raw_value == other.raw_value;
         case ValueKind::Constant:
@@ -219,6 +229,9 @@ struct fmt::formatter<
         case hydra::hw::tegra_x1::gpu::renderer::shader_decomp::ir::ValueKind::
             Register:
             str = fmt::format("{}", value.getRegister());
+            break;
+        case hydra::hw::tegra_x1::gpu::renderer::shader_decomp::ir::ValueKind::ConditionFlag:
+            str = fmt::format("cc{}", value.getConditionFlag());
             break;
         case hydra::hw::tegra_x1::gpu::renderer::shader_decomp::ir::ValueKind::
             Predicate:

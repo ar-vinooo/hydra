@@ -85,6 +85,9 @@ enum class Opcode {
     ReadSystemRegister,
     LoadShared,
     StoreShared,
+    AtomicShared,
+    LoadLocal,
+    StoreLocal,
     Barrier,
     ImageStore,
     ImageAtomic,
@@ -144,7 +147,7 @@ ENABLE_ENUM_FORMATTING(
     "tex_query_dim", Exit, "exit", Discard, "discard", QuadShuffleXor,
     "quad_shuffle_xor", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
     "find_msb", ReadSystemRegister, "read_sysreg", LoadShared, "load_shared",
-    StoreShared, "store_shared", Barrier, "barrier", ImageStore, "image_store",
+    StoreShared, "store_shared", AtomicShared, "atomic_shared", LoadLocal, "load_local", StoreLocal, "store_local", Barrier, "barrier", ImageStore, "image_store",
     ImageAtomic, "image_atomic", Vote, "vote", Ballot, "ballot", Shuffle,
     "shuffle")
 

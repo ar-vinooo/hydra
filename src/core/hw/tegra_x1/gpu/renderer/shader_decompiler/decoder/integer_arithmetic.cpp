@@ -4,24 +4,32 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: extended, write_cc, sat
+// TODO: saturating mode
 void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
-              AvgMode avg_mode, reg_t dst, reg_t src_a, ir::Value src_b) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
-
-    auto src_a_v = negIf(context.builder,
-                         ir::Value::createRegister(src_a, ir::ScalarType::I32),
-                         avg_mode == AvgMode::NegA);
-    auto src_b_v = negIf(context.builder, src_b, avg_mode == AvgMode::NegB);
-
-    auto res = context.builder.opAdd(src_a_v, src_b_v);
-    if (avg_mode == AvgMode::PlusOne)
-        res = context.builder.opAdd(res, ir::Value::createConstantI(1));
-    context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::I32),
-                           res);
-
-    if (conditional)
-        context.builder.opEndIf();
+              AvgMode avg_mode, reg_t dst, reg_t src_a, ir::Value src_b,
+              bool write_cc, bool extended) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, pred, pred_inv);
+    auto a = b.opCopy(ir::Value::createRegister(src_a));
+    auto other = b.opBitCast(src_b, ir::ScalarType::U32);
+    if (avg_mode == AvgMode::NegA) a = b.opNeg(a);
+    if (avg_mode == AvgMode::NegB) other = b.opNeg(other);
+    const auto sum = b.opAdd(a, other);
+    auto result = sum;
+    if (extended) result = b.opAdd(sum, b.opSelect(ir::Value::createConditionFlag(2), ir::Value::createConstantU(1), ir::Value::createConstantU(0)));
+    if (avg_mode == AvgMode::PlusOne) result = b.opAdd(result, ir::Value::createConstantU(1));
+    if (write_cc) {
+        const auto zero = ir::Value::createConstantU(0);
+        const auto sign = [&](ir::Value v) { return b.opCompareNotEqual(b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero); };
+        const auto overflow = sign(b.opBitwiseAnd(b.opBitwiseNot(b.opBitwiseXor(a, other)), b.opBitwiseXor(a, result)));
+        const auto carry = b.opBitwiseOr(b.opCompareLess(sum, a), b.opCompareLess(result, sum));
+        b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(result, zero));
+        b.opCopy(ir::Value::createConditionFlag(1), sign(result));
+        b.opCopy(ir::Value::createConditionFlag(2), carry);
+        b.opCopy(ir::Value::createConditionFlag(3), overflow);
+    }
+    b.opCopy(ir::Value::createRegister(dst), result);
+    if (conditional) b.opEndIf();
 }
 
 // TODO: write_cc
@@ -266,7 +274,7 @@ void emitIadd3I(DecoderContext& context, InstIadd3I inst) {
 void emitIaddR(DecoderContext& context, InstIaddR inst) {
     emitIadd(context, inst.base.pred, inst.base.pred_inv, inst.base.avg_mode,
              inst.base.dst, inst.base.src_a,
-             ir::Value::createRegister(inst.src_b, ir::ScalarType::I32));
+             ir::Value::createRegister(inst.src_b, ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
 }
 
 void emitIaddC(DecoderContext& context, InstIaddC inst) {
@@ -275,7 +283,7 @@ void emitIaddC(DecoderContext& context, InstIaddC inst) {
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::ScalarType::I32));
+            ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
 }
 
 void emitIaddI(DecoderContext& context, InstIaddI inst) {
@@ -283,13 +291,13 @@ void emitIaddI(DecoderContext& context, InstIaddI inst) {
              inst.base.dst, inst.base.src_a,
              ir::Value::createConstant(
                  getIntImm20(inst.imm20_0, inst.imm20_19, true),
-                 ir::ScalarType::I32));
+                 ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
 }
 
 void emitIadd32I(DecoderContext& context, InstIadd32I inst) {
     emitIadd(context, inst.pred, inst.pred_inv, inst.avg_mode, inst.dst,
              inst.src_a,
-             ir::Value::createConstant(inst.imm, ir::ScalarType::I32));
+             ir::Value::createConstant(inst.imm, ir::ScalarType::I32), inst.write_cc, inst.x);
 }
 
 void emitIscaddR(DecoderContext& context, InstIscaddR inst) {

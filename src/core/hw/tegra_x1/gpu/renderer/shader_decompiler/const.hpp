@@ -157,7 +157,11 @@ struct PixelImap {
 constexpr u32 PIXEL_IMAP_COUNT = 32;
 
 struct DecompilerContext {
+    std::function<std::optional<u32>(u32, u32)> read_const_word;
+    std::map<std::pair<u32, u32>, u32>* branch_constants{nullptr};
     ShaderType type;
+    // Per-thread local memory size in bytes
+    u32 local_memory_size{0};
     union {
         struct {
             PixelImap pixel_imaps[PIXEL_IMAP_COUNT];

@@ -33,6 +33,7 @@ class Decoder {
     u32 last_unknown_pc{0xfffffff0};
 
     void parseNextInstruction();
+    bool emitIndirectBranch(instruction_t inst, u32 pc);
 
     // Helpers
     void jump(u32 target) const {

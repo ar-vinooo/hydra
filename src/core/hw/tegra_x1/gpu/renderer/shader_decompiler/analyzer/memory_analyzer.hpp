@@ -26,6 +26,7 @@ class MemoryAnalyzer {
     std::unordered_set<u32> const_buffers;
     std::map<u32, TextureInfo> textures;
     std::map<u32, ImageInfo> images;
+    bool uses_local_memory{false};
 
     // Helpers
     void handleAMemLoad(const AMem amem);
@@ -42,6 +43,7 @@ class MemoryAnalyzer {
     CONST_REF_GETTER(const_buffers, getConstBuffers);
     CONST_REF_GETTER(textures, getTextures);
     CONST_REF_GETTER(images, getImages);
+    CONST_REF_GETTER(uses_local_memory, getUsesLocalMemory);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::analyzer

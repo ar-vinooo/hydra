@@ -410,6 +410,8 @@ constexpr u32 getTrackedSamplerWord(u32 index) {
 }
 
 struct ResourceMapping {
+    // Constant-buffer jump table words used to enumerate indirect branches.
+    std::map<std::pair<u32, u32>, u32> branch_constants;
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
     // TODO: storage buffers
     std::map<u32, u32> textures;

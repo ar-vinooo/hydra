@@ -28,6 +28,26 @@ bool isStore(instruction_t inst) {
            (inst & 0xfff0000000000000) == 0xeb20000000000000;
 }
 
+// Predicate-only instructions encode predicate destinations in bits 0..7.
+// They must not shadow a texture handle held in a general-purpose register.
+bool isPredicateOnly(instruction_t inst) {
+    const auto op = inst & 0xfff0000000000000ull;
+    if (op == 0x5b60000000000000ull || op == 0x4b60000000000000ull ||
+        (inst & 0xfef0000000000000ull) == 0x3660000000000000ull ||
+        op == 0x5bb0000000000000ull || op == 0x4bb0000000000000ull ||
+        (inst & 0xfef0000000000000ull) == 0x36b0000000000000ull ||
+        op == 0x5b80000000000000ull || op == 0x4b80000000000000ull ||
+        (inst & 0xfef0000000000000ull) == 0x3680000000000000ull)
+        return true;
+    const auto op8 = inst & 0xfff8000000000000ull;
+    return op8 == 0x5d20000000000000ull ||
+           (inst & 0xfe00000000000000ull) == 0x7e00000000000000ull ||
+           op8 == 0x50a0000000000000ull || op8 == 0x5090000000000000ull ||
+           op8 == 0x50b0000000000000ull || op8 == 0x4cf0000000000000ull ||
+           op8 == 0x5cf0000000000000ull ||
+           (inst & 0xfef8000000000000ull) == 0x38f0000000000000ull;
+}
+
 bool isLdc(instruction_t inst) {
     return (inst & 0xfff8000000000000) == 0xef90000000000000;
 }
@@ -56,12 +76,16 @@ findDefinition(ztd::io::IStream& stream, reg_t reg, u64 pc) {
         const auto dst = static_cast<reg_t>(inst & 0xff);
         if (isLdc(inst)) {
             const auto ldc = std::bit_cast<InstLdc>(inst);
-            if (dst == reg ||
-                (ldc.size.get() == LsSize2::B64 && dst + 1 == reg))
+            const u32 count = ldc.size.get() == LsSize2::B128  ? 4u
+                              : ldc.size.get() == LsSize2::B64 ? 2u
+                                                               : 1u;
+            if (static_cast<u32>(reg) >= static_cast<u32>(dst) &&
+                static_cast<u32>(reg) - static_cast<u32>(dst) < count)
                 return std::make_pair(def_pc, inst);
             continue;
         }
-        if (dst == reg && !isControlFlow(inst) && !isStore(inst))
+        if (dst == reg && !isControlFlow(inst) && !isStore(inst) &&
+            !isPredicateOnly(inst))
             return std::make_pair(def_pc, inst);
     }
 
@@ -87,7 +111,8 @@ std::optional<TrackedHandle> traceHandle(ztd::io::IStream& stream, reg_t reg,
             return std::nullopt;
         }
         const auto dst = static_cast<reg_t>(inst & 0xff);
-        const u32 offset = ldc.cbuf_offset.get() + (dst != reg ? 4u : 0u);
+        const u32 offset = ldc.cbuf_offset.get() +
+                           (static_cast<u32>(reg) - static_cast<u32>(dst)) * 4u;
         return TrackedHandle{{ldc.cbuf_slot.get(), offset / 4}, std::nullopt};
     }
 

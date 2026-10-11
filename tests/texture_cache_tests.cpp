@@ -4,9 +4,11 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 
+#include <cmath>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -144,6 +146,268 @@ int main() {
                              rgba[259] == 0x7a;
         pixels->release();
         check(correct, "GPU alias copy and CPU invalidation preserve pixels");
+
+        // A compute-written buffer subrange must update a wider sampled alias.
+        // CPU memory remains zero, so re-uploading it would erase the GPU data.
+        std::vector<u32> buffer_guest(128, 0);
+        const auto buffer_ptr = reinterpret_cast<uptr>(buffer_guest.data());
+        metal::Renderer buffer_renderer;
+        auto& buffer_cache = buffer_renderer.getTextureCache();
+        commands.reset(buffer_renderer.createCommandBuffer());
+        auto buffer_full = TextureDescriptor(buffer_ptr, TextureType::_1DBuffer,
+                                             TextureFormat::R32Uint, true, 256,
+                                             64, 1, 1, 1, 1, 0, 0, 0);
+        auto buffer_sub = TextureDescriptor(
+            buffer_ptr + 64, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            true, 128, 32, 1, 1, 1, 1, 0, 0, 0);
+        auto* full_view =
+            buffer_cache.find(commands.get(), buffer_full, TextureUsage::Read);
+        buffer_cache.invalidateMemory(buffer_full.getRange());
+        auto* sub_view =
+            buffer_cache.find(commands.get(), buffer_sub, TextureUsage::Write);
+        const char* buffer_source = R"(
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void fill(texture_buffer<uint, access::write> t [[texture(0)]], uint i [[thread_position_in_grid]]) { t.write(uint4(0xdead0000u+i), i); }
+            kernel void fill_half(texture_buffer<uint, access::write> t [[texture(0)]], uint i [[thread_position_in_grid]]) { t.write(uint4(0x1200u+i), i); }
+            kernel void readback(texture_buffer<uint, access::read> t [[texture(0)]], device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i]=t.read(i).x; }
+        )";
+        NS::Error* buffer_error = nullptr;
+        NS_STACK_SCOPED auto buffer_library =
+            buffer_renderer.getDevice()->newLibrary(
+                metal::toNsString(buffer_source), nullptr, &buffer_error);
+        check(buffer_library != nullptr, "Buffer alias shaders compile");
+        NS_STACK_SCOPED auto fill_function =
+            buffer_library->newFunction(metal::toNsString("fill"));
+        NS_STACK_SCOPED auto read_function =
+            buffer_library->newFunction(metal::toNsString("readback"));
+        NS_STACK_SCOPED auto fill_pipeline =
+            buffer_renderer.getDevice()->newComputePipelineState(fill_function,
+                                                                 &buffer_error);
+        NS_STACK_SCOPED auto read_pipeline =
+            buffer_renderer.getDevice()->newComputePipelineState(read_function,
+                                                                 &buffer_error);
+        NS_STACK_SCOPED auto half_function =
+            buffer_library->newFunction(metal::toNsString("fill_half"));
+        NS_STACK_SCOPED auto half_pipeline =
+            buffer_renderer.getDevice()->newComputePipelineState(half_function,
+                                                                 &buffer_error);
+        check(half_pipeline, "R16 fill pipeline compiles");
+        check(fill_pipeline && read_pipeline, "Buffer alias pipelines compile");
+        auto* buffer_encoder =
+            static_cast<metal::CommandBuffer*>(commands.get())
+                ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(fill_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(sub_view->getBase())->getTexture(), 0);
+        buffer_encoder->dispatchThreads(MTL::Size(32, 1, 1),
+                                        MTL::Size(32, 1, 1));
+        buffer_cache.find(commands.get(), buffer_full, TextureUsage::Read);
+        // Also create an alias after the GPU write. It has no earlier cached
+        // contents and must recover the written data rather than stale CPU
+        // zeros.
+        auto late_descriptor = TextureDescriptor(
+            buffer_ptr + 80, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            true, 64, 16, 1, 1, 1, 1, 0, 0, 0);
+        auto* late_view = buffer_cache.find(commands.get(), late_descriptor,
+                                            TextureUsage::Read);
+        NS_STACK_SCOPED auto late_pixels =
+            buffer_renderer.getDevice()->newBuffer(
+                64, MTL::ResourceStorageModeShared);
+        buffer_encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                             ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(read_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(late_view->getBase())->getTexture(),
+            0);
+        buffer_encoder->setBuffer(late_pixels, 0, 0);
+        buffer_encoder->dispatchThreads(MTL::Size(16, 1, 1),
+                                        MTL::Size(16, 1, 1));
+        NS_STACK_SCOPED auto buffer_pixels =
+            buffer_renderer.getDevice()->newBuffer(
+                256, MTL::ResourceStorageModeShared);
+        buffer_encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                             ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(read_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(full_view->getBase())->getTexture(),
+            0);
+        buffer_encoder->setBuffer(buffer_pixels, 0, 0);
+        buffer_encoder->dispatchThreads(MTL::Size(64, 1, 1),
+                                        MTL::Size(32, 1, 1));
+        // Reinterpret the written bytes as R16, starting at a half-word
+        // boundary. Copying texel indices or requiring equal formats loses
+        // data.
+        auto half_descriptor = TextureDescriptor(
+            buffer_ptr + 82, TextureType::_1DBuffer, TextureFormat::R16Uint,
+            true, 62, 31, 1, 1, 1, 1, 0, 0, 0);
+        auto* half_view = buffer_cache.find(commands.get(), half_descriptor,
+                                            TextureUsage::Read);
+        NS_STACK_SCOPED auto half_pixels =
+            buffer_renderer.getDevice()->newBuffer(
+                31 * sizeof(u32), MTL::ResourceStorageModeShared);
+        buffer_encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                             ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(read_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(half_view->getBase())->getTexture(),
+            0);
+        buffer_encoder->setBuffer(half_pixels, 0, 0);
+        buffer_encoder->dispatchThreads(MTL::Size(31, 1, 1),
+                                        MTL::Size(31, 1, 1));
+        commands.reset();
+        const auto* buffer_result =
+            static_cast<const u32*>(buffer_pixels->contents());
+        for (u32 i = 0; i < 64; ++i)
+            check(buffer_result[i] ==
+                      (i >= 16 && i < 48 ? 0xdead0000u + i - 16 : 0u),
+                  "GPU buffer alias preserves both written subrange and "
+                  "untouched texels");
+        const auto* late_result =
+            static_cast<const u32*>(late_pixels->contents());
+        for (u32 i = 0; i < 16; ++i)
+            check(late_result[i] == 0xdead0004u + i,
+                  "New buffer alias preserves earlier GPU writes");
+        const auto* half_result =
+            static_cast<const u32*>(half_pixels->contents());
+        for (u32 i = 0; i < 31; ++i) {
+            const u32 byte_offset = 18 + i * 2;
+            const u32 word = 0xdead0000u + byte_offset / 4;
+            check(half_result[i] ==
+                      ((word >> ((byte_offset % 4) * 8)) & 0xffffu),
+                  "R16 alias preserves GPU R32 bytes at half-word offset");
+        }
+        std::cout
+            << "PASS: GPU-written buffer subrange synchronizes to sampled alias"
+            << std::endl;
+
+        // Write through R16, then create a fresh R32 alias. Both the older
+        // R32 source and the newer R16 source overlap: latest bytes must win.
+        commands.reset(buffer_renderer.createCommandBuffer());
+        buffer_cache.find(commands.get(), half_descriptor, TextureUsage::Write);
+        buffer_encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                             ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(half_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(half_view->getBase())->getTexture(),
+            0);
+        buffer_encoder->dispatchThreads(MTL::Size(31, 1, 1),
+                                        MTL::Size(31, 1, 1));
+        auto mixed_descriptor = TextureDescriptor(
+            buffer_ptr + 80, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            true, 80, 20, 1, 1, 1, 1, 0, 0, 0);
+        auto* mixed_view = buffer_cache.find(commands.get(), mixed_descriptor,
+                                             TextureUsage::Read);
+        NS_STACK_SCOPED auto mixed_pixels =
+            buffer_renderer.getDevice()->newBuffer(
+                80, MTL::ResourceStorageModeShared);
+        buffer_encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                             ->getComputeCommandEncoder();
+        buffer_encoder->setComputePipelineState(read_pipeline);
+        buffer_encoder->setTexture(
+            static_cast<metal::Texture*>(mixed_view->getBase())->getTexture(),
+            0);
+        buffer_encoder->setBuffer(mixed_pixels, 0, 0);
+        buffer_encoder->dispatchThreads(MTL::Size(20, 1, 1),
+                                        MTL::Size(20, 1, 1));
+        commands.reset();
+        std::array<u32, 32> expected_words{};
+        for (u32 i = 0; i < 32; ++i)
+            expected_words[i] = 0xdead0000u + i;
+        auto* expected_bytes = reinterpret_cast<u8*>(expected_words.data());
+        for (u32 i = 0; i < 31; ++i) {
+            const u16 half = static_cast<u16>(0x1200 + i);
+            std::memcpy(expected_bytes + 18 + i * 2, &half, 2);
+        }
+        const auto* mixed_result =
+            static_cast<const u32*>(mixed_pixels->contents());
+        for (u32 i = 0; i < 20; ++i)
+            check(mixed_result[i] == expected_words[i + 4],
+                  "R32 alias preserves newer R16 writes and older neighboring "
+                  "bytes");
+        std::cout << "PASS: Cross-format buffer aliases preserve bytes and GPU "
+                     "write order"
+                  << std::endl;
+
+        // Crash 4 samples a GPU-written Z24S8 target using a G24R8 TIC.
+        // Guest memory deliberately contains zero depth: sampling it instead
+        // of the rendered surface would fail this regression.
+        using namespace hw::tegra_x1::gpu;
+        ImageFormatWord depth_tic{};
+        depth_tic.image_format = ImageFormat::G24R8;
+        depth_tic.component_r = ImageComponent::Uint;
+        depth_tic.component_g = depth_tic.component_b = depth_tic.component_a =
+            ImageComponent::Unorm;
+        auto sampled_format = toTextureFormat(depth_tic, false);
+        check(sampled_format == toTextureFormat(DepthSurfaceFormat::Z24S8Unorm),
+              "G24R8 sampling aliases Z24S8 render target format");
+        auto depth_desc =
+            TextureDescriptor(ptr + 16384, TextureType::_2D, sampled_format,
+                              false, 0, 16, 16, 1, 1, 1, 0, 0, 0);
+        commands.reset(range_renderer.createCommandBuffer());
+        auto* depth_target =
+            range_cache.find(commands.get(), depth_desc, TextureUsage::Write);
+        auto* depth_native =
+            static_cast<metal::Texture*>(depth_target->getBase())->getTexture();
+        auto* depth_pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        depth_pass->depthAttachment()->setTexture(depth_native);
+        depth_pass->depthAttachment()->setLoadAction(MTL::LoadActionClear);
+        depth_pass->depthAttachment()->setStoreAction(MTL::StoreActionStore);
+        depth_pass->depthAttachment()->setClearDepth(0.625);
+        static_cast<metal::CommandBuffer*>(commands.get())
+            ->getRenderCommandEncoder(depth_pass);
+        SwizzleChannels depth_swizzle(sampled_format, ImageSwizzle::G,
+                                      ImageSwizzle::G, ImageSwizzle::G,
+                                      ImageSwizzle::OneFloat);
+        auto* sampled_depth = range_cache.find(
+            commands.get(), depth_desc,
+            TextureViewDescriptor(TextureType::_2D, sampled_format,
+                                  ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1),
+                                  depth_swizzle),
+            TextureUsage::Read);
+        check(sampled_depth->getBase() == depth_target->getBase(),
+              "Depth sampling reuses GPU-written storage");
+        auto* sample_native =
+            static_cast<metal::TextureView*>(sampled_depth)->getTexture();
+        check(sample_native != nullptr, "Depth sampling view is valid");
+        NS::Error* error = nullptr;
+        auto* device = range_renderer.getDevice();
+        auto* library =
+            device->newLibrary(NS::String::string(R"(
+            #include <metal_stdlib>
+            using namespace metal;
+            kernel void sample_depth(texture2d<float, access::read> depth [[texture(0)]],
+                                     device float4* result [[buffer(0)]]) {
+                result[0] = depth.read(uint2(0));
+            }
+        )",
+                                                  NS::UTF8StringEncoding),
+                               nullptr, &error);
+        check(library != nullptr, "Depth sampling shader compiles");
+        auto* function = library->newFunction(
+            NS::String::string("sample_depth", NS::UTF8StringEncoding));
+        auto* pipeline = device->newComputePipelineState(function, &error);
+        check(pipeline != nullptr, "Depth sampling pipeline compiles");
+        auto* depth_result =
+            device->newBuffer(16, MTL::ResourceStorageModeShared);
+        auto* compute = static_cast<metal::CommandBuffer*>(commands.get())
+                            ->getComputeCommandEncoder();
+        compute->setComputePipelineState(pipeline);
+        compute->setTexture(sample_native, 0);
+        compute->setBuffer(depth_result, 0, 0);
+        compute->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+        commands.reset();
+        const auto* result =
+            static_cast<const float*>(depth_result->contents());
+        check(std::abs(result[0] - 0.625f) < 0.0001f &&
+                  std::abs(result[1] - 0.625f) < 0.0001f &&
+                  std::abs(result[2] - 0.625f) < 0.0001f && result[3] == 1.0f,
+              "G24R8 samples rendered depth through G and preserves constants");
+        depth_result->release();
+        pipeline->release();
+        function->release();
+        library->release();
+        std::cout << "PASS: G24R8 alias samples GPU-written Z24S8 depth\n";
 
         metal::Renderer upload_renderer;
         // Two uploads encoded before submission must never share CPU-writable

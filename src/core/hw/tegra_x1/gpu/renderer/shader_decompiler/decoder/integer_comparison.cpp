@@ -82,6 +82,53 @@ void emitIntSetPredicate(DecoderContext& context, pred_t pred, bool pred_inv,
 
 } // namespace
 
+// ICMP selects raw register bits by comparing its third operand with zero.
+// Signedness applies to the comparison, not to the values being selected.
+static void emitIntCompare(DecoderContext& context, InstIcmpBase inst,
+                           ir::Value alternative, ir::Value operand) {
+    const auto conditional =
+        handlePredCond(context.builder, inst.pred, inst.pred_inv);
+    const auto cmp =
+        getIntCmp(context, inst.op, operand,
+                  ir::Value::createConstant(0u, getDataType(inst.is_signed)));
+    const auto result = context.builder.opSelect(
+        cmp, ir::Value::createRegister(inst.src_a), alternative);
+    context.builder.opCopy(ir::Value::createRegister(inst.dst), result);
+    if (conditional)
+        context.builder.opEndIf();
+}
+
+void emitIcmpR(DecoderContext& context, InstIcmpR inst) {
+    emitIntCompare(context, inst.base, ir::Value::createRegister(inst.src_b),
+                   ir::Value::createRegister(inst.base.src_c,
+                                             getDataType(inst.base.is_signed)));
+}
+
+void emitIcmpC(DecoderContext& context, InstIcmpC inst) {
+    emitIntCompare(
+        context, inst.base,
+        ir::Value::createConstMemory(
+            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4))),
+        ir::Value::createRegister(inst.base.src_c,
+                                  getDataType(inst.base.is_signed)));
+}
+
+void emitIcmpRC(DecoderContext& context, InstIcmpC inst) {
+    emitIntCompare(
+        context, inst.base, ir::Value::createRegister(inst.base.src_c),
+        ir::Value::createConstMemory(
+            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
+            getDataType(inst.base.is_signed)));
+}
+
+void emitIcmpI(DecoderContext& context, InstIcmpI inst) {
+    emitIntCompare(context, inst.base,
+                   ir::Value::createConstant(
+                       getIntImm20(inst.imm20_0, inst.imm20_19, true)),
+                   ir::Value::createRegister(inst.base.src_c,
+                                             getDataType(inst.base.is_signed)));
+}
+
 void emitIsetR(DecoderContext& context, InstIsetR inst) {
     emitIntSet(
         context, inst.base.pred, inst.base.pred_inv, inst.base.op,

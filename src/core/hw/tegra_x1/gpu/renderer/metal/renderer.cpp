@@ -500,6 +500,7 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
     case MTL::PixelFormatRG16Float:
     case MTL::PixelFormatDepth32Float:
     case MTL::PixelFormatRGB10A2Unorm:
+    case MTL::PixelFormatRG11B10Float:
         bpp = 4;
         break;
     case MTL::PixelFormatRGBA16Float:
@@ -645,6 +646,31 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
                     rgba[i * 4 + 2] = static_cast<u8>(((v >> 20) & 0x3ff) >> 2);
                 }
                 break;
+            case MTL::PixelFormatRG11B10Float: {
+                // Unsigned floats (5 bit exponent), tone mapped as x / (1 + x)
+                const auto decode = [](u32 bits, u32 mantissa_bits) -> f32 {
+                    const u32 exponent = bits >> mantissa_bits;
+                    const u32 mantissa = bits & ((1u << mantissa_bits) - 1);
+                    const f32 scale = static_cast<f32>(1u << mantissa_bits);
+                    if (exponent == 0)
+                        return (static_cast<f32>(mantissa) / scale) *
+                               std::ldexp(1.0f, -14);
+                    if (exponent == 31)
+                        return mantissa != 0 ? 0.0f : 65504.0f;
+                    return (1.0f + static_cast<f32>(mantissa) / scale) *
+                           std::ldexp(1.0f, static_cast<int>(exponent) - 15);
+                };
+                for (usize i = 0; i < pixel_count; i++) {
+                    const u32 v = reinterpret_cast<const u32*>(data)[i];
+                    const f32 channels[3] = {decode(v & 0x7ff, 6),
+                                             decode((v >> 11) & 0x7ff, 6),
+                                             decode((v >> 22) & 0x3ff, 5)};
+                    for (u32 c = 0; c < 3; c++)
+                        rgba[i * 4 + c] = static_cast<u8>(
+                            channels[c] / (1.0f + channels[c]) * 255.0f);
+                }
+                break;
+            }
             case MTL::PixelFormatRGBA16Float:
                 for (usize i = 0; i < pixel_count * 4; i++) {
                     const f32 v = static_cast<f32>(

@@ -85,6 +85,10 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                         instruction.getOperand(1).getRawValue<TextureType>(),
                         true);
                     break;
+                case ir::Opcode::LoadLocal:
+                case ir::Opcode::StoreLocal:
+                    uses_local_memory = true;
+                    break;
                 // TODO: TextureQueryDimension?
                 default:
                     break;

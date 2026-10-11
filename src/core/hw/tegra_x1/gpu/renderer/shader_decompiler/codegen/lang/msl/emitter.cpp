@@ -222,6 +222,11 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
             toRendererTextureType(info.type);
     }
 
+    // Only shaders that use local memory pay for the per-thread array
+    local_word_count =
+        memory_analyzer.getUsesLocalMemory()
+            ? std::clamp((context.local_memory_size + 3) / 4, 1u, 0x1000u)
+            : 1u;
     if (context.type == ShaderType::Compute)
         shared_word_count =
             std::clamp((state.shared_memory_size + 3) / 4, 1u, 0x2000u);
@@ -230,6 +235,20 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
 void MslEmitter::emitHeader() {
     write("#include <metal_stdlib>");
     write("using namespace metal;");
+    if (context.type == ShaderType::Compute) {
+        write("{}", R"(
+            inline uint hydra_shared_wrap(threadgroup atomic_uint* word, uint limit, bool increment) {
+                uint old = atomic_load_explicit(word, memory_order_relaxed);
+                for (;;) {
+                    uint next = increment ? (old >= limit ? 0u : old + 1u)
+                                          : (old == 0u || old > limit ? limit : old - 1u);
+                    if (atomic_compare_exchange_weak_explicit(word, &old, next,
+                            memory_order_relaxed, memory_order_relaxed)) return old;
+                }
+            }
+        )");
+    }
+
     if (out_resource_mapping.sampler_buffer_index != invalid<u32>()) {
         write("struct HydraSamplers {{");
         write("    array<sampler, {}> values [[id(0)]];",
@@ -427,6 +446,12 @@ void MslEmitter::emitDeclarations() {
 }
 
 void MslEmitter::emitStateBindings() {
+    // Local memory reads as zero until written, only initialized when used
+    if (memory_analyzer.getUsesLocalMemory())
+        writeStatement("Reg lmem[{}] = {{}}", local_word_count);
+    else
+        writeStatement("Reg lmem[1]");
+
     // Compute
     if (context.type == ShaderType::Compute) {
         writeStatement("uint3 tid");
@@ -827,6 +852,38 @@ void MslEmitter::emitStoreShared(const ir::Value& addr,
     writeStatement("state.smem[min(uint({}) >> 2u, {}u)]._u32 = uint({})",
                    getBitwiseOperandStr(addr), shared_word_count - 1,
                    getBitwiseOperandStr(value));
+}
+
+void MslEmitter::emitLoadLocal(const ir::Value& dst, const ir::Value& addr) {
+    storeValue(dst, "state.lmem[min(uint({}) >> 2u, {}u)]._u32",
+               getBitwiseOperandStr(addr), local_word_count - 1);
+}
+
+void MslEmitter::emitStoreLocal(const ir::Value& addr,
+                                const ir::Value& value) {
+    writeStatement("state.lmem[min(uint({}) >> 2u, {}u)]._u32 = uint({})",
+                   getBitwiseOperandStr(addr), local_word_count - 1,
+                   getBitwiseOperandStr(value));
+}
+
+void MslEmitter::emitAtomicShared(const ir::Value& dst, const ir::Value& addr,
+                                  const ir::Value& value, u32 op, bool is_signed) {
+    const bool signed_minmax = is_signed && (op == 1 || op == 2);
+    const auto pointer = fmt::format(
+        "reinterpret_cast<threadgroup atomic_{}*>(&state.smem[min(uint({}) >> 2u, {}u)]._u32)",
+        signed_minmax ? "int" : "uint", getBitwiseOperandStr(addr), shared_word_count - 1);
+    if (op == 3 || op == 4) {
+        storeValue(dst, "hydra_shared_wrap({}, uint({}), {})", pointer,
+                   getBitwiseOperandStr(value), op == 3 ? "true" : "false");
+        return;
+    }
+    constexpr std::array<std::string_view, 9> functions{
+        "atomic_fetch_add_explicit", "atomic_fetch_min_explicit", "atomic_fetch_max_explicit",
+        "", "", "atomic_fetch_and_explicit", "atomic_fetch_or_explicit",
+        "atomic_fetch_xor_explicit", "atomic_exchange_explicit"};
+    ASSERT(op < functions.size(), ShaderDecompiler, "Invalid shared atomic operation");
+    storeValue(dst, "as_type<uint>({}({}, as_type<{}>(uint({})), memory_order_relaxed))",
+               functions[op], pointer, signed_minmax ? "int" : "uint", getBitwiseOperandStr(value));
 }
 
 void MslEmitter::emitBarrier() {

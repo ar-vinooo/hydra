@@ -30,6 +30,114 @@ void Decoder::decode() {
     }
 }
 
+// Compiler-generated switches use a clamped index, optionally a SHL, then
+// either branch directly or load the offset from a constant-buffer table.
+// Enumerate only the proven bounded targets; arbitrary indirect addresses are
+// never treated as shader code.
+bool Decoder::emitIndirectBranch(instruction_t inst, u32 pc) {
+    if ((inst & 0x60u) != 0)
+        return false; // cbuf mode / LMT
+    const auto saved = context.code_stream->getSeek();
+    const reg_t branch_reg = static_cast<u8>(extractBits(inst, 8, 8));
+    reg_t index_reg = branch_reg;
+    std::optional<InstLdc> table;
+    u32 shift = 0;
+    std::optional<u32> bound;
+    for (u32 distance = 1; distance <= 32 && distance <= pc; ++distance) {
+        const u32 at = pc - distance;
+        if (at % 4 == 0)
+            continue;
+        context.code_stream->seekTo(at * sizeof(instruction_t));
+        const auto x = context.code_stream->read<instruction_t>();
+        if (static_cast<u8>(x & 255) != static_cast<u8>(index_reg))
+            continue;
+        const auto op = x & 0xfff0000000000000ull;
+        if (op == 0x5b60000000000000ull || op == 0x4b60000000000000ull ||
+            op == 0x5bb0000000000000ull || op == 0x4bb0000000000000ull)
+            continue;
+        if (extractBits(x, 16, 4) != 7)
+            break;
+        if (!table && (x & 0xfff8000000000000ull) == 0xef90000000000000ull) {
+            const auto load = std::bit_cast<InstLdc>(x);
+            if (load.size.get() != LsSize2::B32 ||
+                static_cast<u32>(load.address_mode.get()) != 0 ||
+                load.src.get() == RZ)
+                break;
+            table = load;
+            index_reg = load.src.get();
+            continue;
+        }
+        if ((x & 0xfef8000000000000ull) == 0x3848000000000000ull) {
+            if (shift != 0 || extractBits(x, 39, 1) != 0 ||
+                extractBits(x, 56, 1) != 0)
+                break;
+            shift = static_cast<u32>(extractBits(x, 20, 19));
+            if (shift > 8)
+                break;
+            index_reg = static_cast<u8>(extractBits(x, 8, 8));
+            continue;
+        }
+        if ((x & 0xfef8000000000000ull) == 0x3820000000000000ull &&
+            extractBits(x, 39, 4) == 7 && extractBits(x, 56, 1) == 0 &&
+            extractBits(x, 48, 1) == 0) {
+            const auto n = static_cast<u32>(extractBits(x, 20, 19));
+            if (n <= 255)
+                bound = n;
+        }
+        break;
+    }
+    context.code_stream->seekTo(saved);
+    if (!bound || (table && !context.decomp_context.read_const_word))
+        return false;
+    std::map<u32, label_t> targets;
+    std::map<std::pair<u32, u32>, u32> constants;
+    const i64 relative =
+        signExtend<i32, 24>(static_cast<i32>(extractBits(inst, 20, 24)));
+    for (u32 index = 0; index <= *bound; ++index) {
+        u32 offset = index << shift;
+        if (table) {
+            const u32 byte_offset = table->cbuf_offset.get() + offset;
+            if (byte_offset % 4 != 0)
+                return false;
+            const auto value = context.decomp_context.read_const_word(
+                table->cbuf_slot.get(), byte_offset / 4);
+            if (!value)
+                return false;
+            offset = *value;
+            constants[{table->cbuf_slot.get(), byte_offset / 4}] = offset;
+        }
+        const i64 address = static_cast<i64>(pc + 1) * 8 + relative +
+                            std::bit_cast<i32>(offset);
+        if (address < 0 || address % 8 != 0 ||
+            static_cast<u64>(address) >= context.code_stream->getSize())
+            return false;
+        targets.emplace(offset, static_cast<u32>(address / 8));
+    }
+    if (context.decomp_context.branch_constants)
+        context.decomp_context.branch_constants->insert(constants.begin(),
+                                                        constants.end());
+    auto& b = context.builder;
+    const auto pred = pred_t(extractBits(inst, 16, 3));
+    const auto conditional = handlePredCond(b, pred, extractBits(inst, 19, 1));
+    // Capture the input before a target block can change its register.
+    const auto offset_value = b.opCopy(ir::Value::createRegister(branch_reg));
+    for (const auto& [offset, target] : targets) {
+        inheritSyncPoints(target);
+        b.opBeginIf(
+            b.opCompareEqual(offset_value, ir::Value::createConstantU(offset)));
+        b.opBranch(target);
+        b.opEndIf();
+    }
+    b.opExit(); // malformed runtime table offset
+    if (conditional) {
+        b.opEndIf();
+        inheritSyncPoints(pc + 1);
+        b.opBranch(pc + 1);
+    }
+    endBlock();
+    return true;
+}
+
 void Decoder::parseNextInstruction() {
     const u32 pc = getPc();
     // Control flow that leaves the shader (unsupported instructions, garbage
@@ -130,13 +238,9 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("cctl");
     }
     INST(0xef58000000000000, 0xfff8000000000000) { emitSts(context, inst); }
-    INST(0xef50000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("st");
-    }
+    INST(0xef50000000000000, 0xfff8000000000000) { emitStl(context, inst); }
     INST(0xef48000000000000, 0xfff8000000000000) { emitLds(context, inst); }
-    INST(0xef40000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("ld");
-    }
+    INST(0xef40000000000000, 0xfff8000000000000) { emitLdl(context, inst); }
     INST(0xef10000000000000, 0xfff8000000000000) { EMIT(Shfl); }
     INST(0xeef0000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("atom");
@@ -152,13 +256,13 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("stp");
     }
     INST(0xee00000000000000, 0xff80000000000000) {
-        COMMENT_NOT_IMPLEMENTED("atoms");
+        emitAtoms(context, inst);
     }
     INST(0xed00000000000000, 0xff00000000000000) {
         COMMENT_NOT_IMPLEMENTED("atom");
     }
     INST(0xec00000000000000, 0xff00000000000000) {
-        COMMENT_NOT_IMPLEMENTED("atoms");
+        emitAtoms(context, inst);
     }
     INST(0xebf8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("red");
@@ -328,7 +432,11 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("brx");
     }
     INST(0xe250000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("brx");
+        if (!emitIndirectBranch(inst, pc)) {
+            LOG_NOT_IMPLEMENTED(
+                ShaderDecompiler,
+                "BRX unbounded/unsupported target pattern at {:#x}", pc);
+        }
     }
     INST(0xe240000000000020, 0xfff0000000000020) {
         COMMENT_NOT_IMPLEMENTED("bra");
@@ -439,10 +547,10 @@ void Decoder::parseNextInstruction() {
     INST(0x5d08000000000000, 0xfff8000000000000) { EMIT(Hmul2R); }
     INST(0x5d00000000000000, 0xfff8000000000000) { EMIT(Hfma2R); }
     INST(0x5cf8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("shf");
+        emitShf(context, inst, true, false);
     }
     INST(0x5cf0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("r2p");
+        emitR2p(context, inst, 0);
     }
     INST(0x5ce8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("p2r");
@@ -483,11 +591,9 @@ void Decoder::parseNextInstruction() {
     INST(0x5c08000000000000, 0xfff8000000000000) { emitPopcR(context, inst); }
     INST(0x5c00000000000000, 0xfff8000000000000) { EMIT(BfeR); }
     INST(0x5bf8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("shf");
+        emitShf(context, inst, false, false);
     }
-    INST(0x5bf0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("bfi");
-    }
+    INST(0x5bf0000000000000, 0xfff8000000000000) { EMIT(BfiR); }
     INST(0x5be0000000000000, 0xfff8000000000000) { emitLop3R(context, inst); }
     INST(0x5bd8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("lea");
@@ -499,9 +605,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("prmt");
     }
     INST(0x5bb0000000000000, 0xfff0000000000000) { EMIT(FsetpR); }
-    INST(0x5ba0000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("fcmp");
-    }
+    INST(0x5ba0000000000000, 0xfff0000000000000) { EMIT(FcmpR); }
     INST(0x5b80000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("dsetp");
     }
@@ -510,9 +614,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x5b60000000000000, 0xfff0000000000000) { EMIT(IsetpR); }
     INST(0x5b50000000000000, 0xfff0000000000000) { EMIT(IsetR); }
-    INST(0x5b40000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("icmp");
-    }
+    INST(0x5b40000000000000, 0xfff0000000000000) { EMIT(IcmpR); }
     INST(0x5b00000000000000, 0xffc0000000000000) { EMIT(XmadR); }
     INST(0x5a80000000000000, 0xff80000000000000) {
         COMMENT_NOT_IMPLEMENTED("imadsp");
@@ -538,7 +640,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("idp");
     }
     INST(0x53f0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("bfi");
+        emitBfiRC(context, std::bit_cast<InstBfiC>(inst));
     }
     INST(0x53d8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("idp");
@@ -547,13 +649,13 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("prmt");
     }
     INST(0x53a0000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("fcmp");
+        emitFcmpRC(context, std::bit_cast<InstFcmpC>(inst));
     }
     INST(0x5370000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("dfma");
     }
     INST(0x5340000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("icmp");
+        emitIcmpRC(context, std::bit_cast<InstIcmpC>(inst));
     }
     INST(0x5280000000000000, 0xff80000000000000) {
         COMMENT_NOT_IMPLEMENTED("imadsp");
@@ -597,7 +699,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x50b0000000000000, 0xfff8000000000000) { COMMENT("nop"); }
     INST(0x50a0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("csetp");
+        emitCsetp(context, inst);
     }
     INST(0x5098000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("cset");
@@ -610,7 +712,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x4e00000000000000, 0xfe00000000000000) { EMIT(XmadC); }
     INST(0x4cf0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("r2p");
+        emitR2p(context, inst, 1);
     }
     INST(0x4ce8000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("p2r");
@@ -650,9 +752,7 @@ void Decoder::parseNextInstruction() {
     INST(0x4c10000000000000, 0xfff8000000000000) { EMIT(IaddC); }
     INST(0x4c08000000000000, 0xfff8000000000000) { emitPopcC(context, inst); }
     INST(0x4c00000000000000, 0xfff8000000000000) { EMIT(BfeC); }
-    INST(0x4bf0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("bfi");
-    }
+    INST(0x4bf0000000000000, 0xfff8000000000000) { EMIT(BfiC); }
     INST(0x4bd0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("lea");
     }
@@ -660,9 +760,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("prmt");
     }
     INST(0x4bb0000000000000, 0xfff0000000000000) { EMIT(FsetpC); }
-    INST(0x4ba0000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("fcmp");
-    }
+    INST(0x4ba0000000000000, 0xfff0000000000000) { EMIT(FcmpC); }
     INST(0x4b80000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("dsetp");
     }
@@ -671,9 +769,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x4b60000000000000, 0xfff0000000000000) { EMIT(IsetpC); }
     INST(0x4b50000000000000, 0xfff0000000000000) { EMIT(IsetC); }
-    INST(0x4b40000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("icmp");
-    }
+    INST(0x4b40000000000000, 0xfff0000000000000) { EMIT(IcmpC); }
     INST(0x4a80000000000000, 0xff80000000000000) {
         COMMENT_NOT_IMPLEMENTED("imadsp");
     }
@@ -693,10 +789,10 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("vmnmx");
     }
     INST(0x38f8000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("shf");
+        emitShf(context, inst, true, true);
     }
     INST(0x38f0000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("r2p");
+        emitR2p(context, inst, 2);
     }
     INST(0x38e8000000000000, 0xfef8000000000000) {
         COMMENT_NOT_IMPLEMENTED("p2r");
@@ -737,11 +833,9 @@ void Decoder::parseNextInstruction() {
     INST(0x3808000000000000, 0xfef8000000000000) { emitPopcI(context, inst); }
     INST(0x3800000000000000, 0xfef8000000000000) { EMIT(BfeI); }
     INST(0x36f8000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("shf");
+        emitShf(context, inst, false, true);
     }
-    INST(0x36f0000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("bfi");
-    }
+    INST(0x36f0000000000000, 0xfef8000000000000) { EMIT(BfiI); }
     INST(0x36d0000000000000, 0xfef8000000000000) {
         COMMENT_NOT_IMPLEMENTED("lea");
     }
@@ -749,9 +843,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("prmt");
     }
     INST(0x36b0000000000000, 0xfef0000000000000) { EMIT(FsetpI); }
-    INST(0x36a0000000000000, 0xfef0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("fcmp");
-    }
+    INST(0x36a0000000000000, 0xfef0000000000000) { EMIT(FcmpI); }
     INST(0x3680000000000000, 0xfef0000000000000) {
         COMMENT_NOT_IMPLEMENTED("dsetp");
     }
@@ -760,9 +852,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0x3660000000000000, 0xfef0000000000000) { EMIT(IsetpI); }
     INST(0x3650000000000000, 0xfef0000000000000) { EMIT(IsetI); }
-    INST(0x3640000000000000, 0xfef0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("icmp");
-    }
+    INST(0x3640000000000000, 0xfef0000000000000) { EMIT(IcmpI); }
     INST(0x3600000000000000, 0xfec0000000000000) { EMIT(XmadI); }
     INST(0x3480000000000000, 0xfe80000000000000) {
         COMMENT_NOT_IMPLEMENTED("imadsp");

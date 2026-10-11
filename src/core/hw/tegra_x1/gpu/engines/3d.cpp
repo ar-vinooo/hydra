@@ -941,6 +941,20 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
 
     auto& active_shader =
         active_shaders[static_cast<u32>(toRendererShaderType(stage))];
+    descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
+        if (slot >= CONST_BUFFER_BINDING_COUNT)
+            return std::nullopt;
+        const auto& range =
+            bound_const_buffers[static_cast<u32>(stage) - 1][slot];
+        if (range.getBegin() == 0 || word >= range.getSize() / sizeof(u32))
+            return std::nullopt;
+        u32 value;
+        std::memcpy(&value,
+                    reinterpret_cast<const void*>(range.getBegin() +
+                                                  word * sizeof(u32)),
+                    sizeof(value));
+        return value;
+    };
     active_shader = gpu.getRenderer().getShaderCache().find(descriptor);
     if (active_shader == nullptr)
         return nullptr;
@@ -1677,19 +1691,46 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
 
     tracer.write(str);
 
-    // DEBUG: dump the first color target before the draw (HYDRA_TRACE_DUMP_RT)
-    static const bool dump_rt = std::getenv("HYDRA_TRACE_DUMP_RT") != nullptr;
-    if (dump_rt && regs.color_target_control.count > 0) {
-        const auto rt_index = regs.color_target_control.getMap(0);
-        const auto& rt = regs.color_targets[rt_index];
-        if (static_cast<u64>(rt.addr) != 0x0 && rt.height >= 400) {
+    // DEBUG: dump the color targets before every Nth draw
+    // (HYDRA_TRACE_DUMP_RT=<N>, 1 for every draw)
+    static const u32 dump_rt_every = [] {
+        const char* env = std::getenv("HYDRA_TRACE_DUMP_RT");
+        return env != nullptr ? static_cast<u32>(std::max(1, std::atoi(env))) : 0u;
+    }();
+    // HYDRA_TRACE_DUMP_GBUFFER=<N>: dump all targets of every Nth draw that
+    // writes 4 or more color targets (the deferred base pass)
+    static const u32 dump_gbuffer_every = [] {
+        const char* env = std::getenv("HYDRA_TRACE_DUMP_GBUFFER");
+        return env != nullptr ? static_cast<u32>(std::max(1, std::atoi(env))) : 0u;
+    }();
+    static std::atomic<u32> gbuffer_draws{0};
+    const bool dump_gbuffer =
+        dump_gbuffer_every != 0 && regs.color_target_control.count >= 4 &&
+        gbuffer_draws.fetch_add(1) % dump_gbuffer_every == 0;
+    // HYDRA_TRACE_DUMP_POST=<N>: dump the target of every Nth draw that writes
+    // exactly one full-size color target (post processing and the final pass)
+    static const u32 dump_post_every = [] {
+        const char* env = std::getenv("HYDRA_TRACE_DUMP_POST");
+        return env != nullptr ? static_cast<u32>(std::max(1, std::atoi(env))) : 0u;
+    }();
+    static std::atomic<u32> post_draws{0};
+    const bool dump_post =
+        dump_post_every != 0 && regs.color_target_control.count == 1 &&
+        post_draws.fetch_add(1) % dump_post_every == 0;
+    if (dump_gbuffer || dump_post ||
+        (dump_rt_every != 0 && draw_index_for_dump % dump_rt_every == 0)) {
+        for (u32 i = 0; i < regs.color_target_control.count; i++) {
+            const auto rt_index = regs.color_target_control.getMap(i);
+            const auto& rt = regs.color_targets[rt_index];
+            if (static_cast<u64>(rt.addr) == 0x0 || rt.height < 400)
+                continue;
             std::scoped_lock texture_cache_lock(
                 gpu.getRenderer().getTextureCache().getMutex());
             if (const auto view = getColorTargetTexture(rt_index)) {
                 const auto path =
-                    tracer.getDir() / fmt::format("f{}_d{:03}_rt0.png",
+                    tracer.getDir() / fmt::format("f{}_d{:04}_rt{}.png",
                                                   tracer.getFrameIndex(),
-                                                  draw_index_for_dump);
+                                                  draw_index_for_dump, i);
                 gpu.getRenderer().debugDumpTexture(tls_crnt_command_buffer,
                                                    view, path.string());
             }

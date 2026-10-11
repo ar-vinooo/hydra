@@ -94,7 +94,12 @@ class Builder {
     Value opIsNan(const Value& src) {
         ASSERT_DEBUG(src.getType().isFloatingPoint(), ShaderDecompiler,
                      "Cannot check for NaN with type {}", src.getType());
-        return addInstruction(Opcode::IsNan, src.getType(), {src});
+        const auto type =
+            src.getType().isScalar()
+                ? Type(ScalarType::Bool)
+                : Type(VectorType(ScalarType::Bool,
+                                  src.getType().getVectorType().getSize()));
+        return addInstruction(Opcode::IsNan, type, {src});
     }
     Value opRound(const Value& src) {
         ASSERT_DEBUG(src.getType().isFloatingPoint(), ShaderDecompiler,
@@ -421,6 +426,18 @@ class Builder {
     }
     void opStoreShared(const Value& addr, const Value& value) {
         addInstructionWithDst(Opcode::StoreShared, std::nullopt,
+                              {addr, value});
+    }
+    Value opAtomicShared(const Value& addr, const Value& value, u32 op, bool is_signed) {
+        return addInstruction(Opcode::AtomicShared, ScalarType::U32,
+                              {addr, value, Value::createRawValue(op), Value::createRawValue(is_signed)});
+    }
+    // Per-thread local memory, addressed in bytes and accessed in words
+    Value opLoadLocal(const Value& addr) {
+        return addInstruction(Opcode::LoadLocal, ScalarType::U32, {addr});
+    }
+    void opStoreLocal(const Value& addr, const Value& value) {
+        addInstructionWithDst(Opcode::StoreLocal, std::nullopt,
                               {addr, value});
     }
     void opBarrier() { addInstructionWithDst(Opcode::Barrier); }

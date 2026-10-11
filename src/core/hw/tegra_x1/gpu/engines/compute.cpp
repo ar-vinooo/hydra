@@ -5,6 +5,7 @@
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
+#include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
@@ -134,6 +135,17 @@ void Compute::launch(const u32 index, const u32 arg) {
         .gpu_addr = program_addr,
     };
     descriptor.state.shared_memory_size = qmd.sharedAlloc();
+    descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
+        const auto range = getConstBuffer(qmd, slot);
+        if (range.getBegin() == 0 || word >= range.getSize() / sizeof(u32))
+            return std::nullopt;
+        u32 value;
+        std::memcpy(&value,
+                    reinterpret_cast<const void*>(range.getBegin() +
+                                                  word * sizeof(u32)),
+                    sizeof(value));
+        return value;
+    };
     auto shader = renderer.getShaderCache().find(descriptor);
     if (shader == nullptr)
         return;
@@ -270,6 +282,30 @@ void Compute::launch(const u32 index, const u32 arg) {
               qmd.blockDimX(), qmd.blockDimY(), qmd.blockDimZ(),
               qmd.sharedAlloc(), dispatch.textures.size(),
               dispatch.images.size());
+
+    // DEBUG: record the launch in the frame trace
+    if (FrameTracer::instance().isActive()) {
+        std::string str = fmt::format(
+            "#C compute program={:#x} grid={}x{}x{} block={}x{}x{} shared={:#x}\n",
+            program_addr, qmd.gridDimX(), qmd.gridDimY(), qmd.gridDimZ(),
+            qmd.blockDimX(), qmd.blockDimY(), qmd.blockDimZ(),
+            qmd.sharedAlloc());
+        for (const auto& [binding_index, renderer_index] :
+             resource_mapping.images) {
+            const auto tic = get_tic(binding_index);
+            if (!tic)
+                continue;
+            str += fmt::format(
+                "    image {:#x}: addr={:#x} fmt={} {}x{}x{} hdr={}\n",
+                binding_index, makeAddr(tic->addr_lo, tic->addr_hi),
+                renderer::toTextureFormat(tic->format_word, tic->is_srgb),
+                tic->width_minus_one + 1, tic->height_minus_one + 1,
+                tic->depth_minus_one + 1, static_cast<u32>(tic->hdr_version));
+        }
+        str += fmt::format("    textures={} images={}\n",
+                           dispatch.textures.size(), dispatch.images.size());
+        FrameTracer::instance().write(str);
+    }
 
     renderer.dispatchCompute(tls_crnt_command_buffer, dispatch);
 }

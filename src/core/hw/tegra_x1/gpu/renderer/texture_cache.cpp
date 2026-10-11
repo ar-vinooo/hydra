@@ -318,6 +318,14 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                               usage);
     }
 
+    // Buffer subranges are not mip/layer views. Keep exact-sized storages;
+    // overlapping GPU contents are synchronized by byte range in update().
+    if (descriptor.type == TextureType::_1DBuffer) {
+        auto& storage = group.cache.insert(storage_hash);
+        return getTexture(command_buffer, storage, mem, descriptor,
+                          view_descriptor, usage);
+    }
+
     // ---------------- View ----------------
     for (auto& [key, storage] : group.cache) {
         const auto& other_descriptor = storage.base->getDescriptor();
@@ -492,11 +500,19 @@ void TextureCache::update(ICommandBuffer* command_buffer,
                           TextureStorage& storage, TextureMem& mem,
                           TextureUsage usage) {
     bool sync = false;
+    bool uploaded_cpu = false;
     if (storage.update_timestamp < mem.info.modified_timestamp ||
         storage.update_timestamp < storage.cpu_modified_timestamp) {
         // If modified by the guest
+        decodeTexture(command_buffer, storage);
+        uploaded_cpu = true;
+        // CPU uploads establish a baseline, but newer GPU writes into aliases
+        // must still be applied before this texture is sampled.
+        storage.update_timestamp = std::max(mem.info.modified_timestamp,
+                                            storage.cpu_modified_timestamp);
         sync = true;
-    } else if (storage.update_timestamp < mem.info.written_timestamp) {
+    }
+    if (storage.update_timestamp < mem.info.written_timestamp) {
         // Other textures in this memory changed, let's copy them
         const auto base = storage.base;
         const auto& descriptor = base->getDescriptor();
@@ -510,41 +526,58 @@ void TextureCache::update(ICommandBuffer* command_buffer,
             mem.hasGpuWriteSince(range, storage.update_timestamp)) {
             if (PerfStats::isEnabled())
                 PerfStats::instance().texture_sync_scans++;
+            std::vector<TextureStorage*> sources;
             for (auto& [group_key, group] : mem.cache) {
-                for (auto& [storage_key, other_storage] : group.cache) {
-                    // Only newer GPU rendered contents need to be copied. This
-                    // is checked first, since it rejects almost all storages
-                    if (other_storage.gpu_written_timestamp <=
-                        storage.update_timestamp)
-                        continue;
+                for (auto& [storage_key, candidate] : group.cache) {
+                    if (&candidate != &storage &&
+                        candidate.gpu_written_timestamp >
+                            storage.update_timestamp &&
+                        range.intersects(
+                            candidate.base->getDescriptor().getRange()))
+                        sources.push_back(&candidate);
+                }
+            }
+            // Apply overlapping writes in time order so an older alias cannot
+            // overwrite the newer contents of another alias.
+            std::sort(sources.begin(), sources.end(),
+                      [](const auto* a, const auto* b) {
+                          return a->gpu_written_timestamp <
+                                 b->gpu_written_timestamp;
+                      });
+            for (auto* source : sources) {
+                auto& other_storage = *source;
+                const auto& other_descriptor =
+                    other_storage.base->getDescriptor();
+                const auto other_range = other_descriptor.getRange();
 
-                    // Skip this storage
-                    if (&other_storage == &storage)
-                        continue;
-
-                    const auto& other_descriptor =
-                        other_storage.base->getDescriptor();
-                    const auto other_range = other_descriptor.getRange();
-
-                    if (range.intersects(other_range)) {
-                        const auto type_class =
-                            getTextureTypeClass(descriptor.type);
-                        const auto other_type_class =
-                            getTextureTypeClass(other_descriptor.type);
-                        if (type_class == TextureTypeClass::_2D &&
-                            other_type_class == TextureTypeClass::_2D) {
-                            synchronize2DWith2D(command_buffer, storage,
-                                                other_storage);
-                        } else if (type_class == TextureTypeClass::_3D &&
-                                   other_type_class == TextureTypeClass::_3D) {
-                            synchronize3DWith3D(command_buffer, storage,
-                                                other_storage);
-                        } else {
-                            LOG_WARN(
-                                Gpu,
-                                "Cannot synchronize textures ({}) and ({})",
-                                descriptor, other_descriptor);
-                        }
+                if (range.intersects(other_range)) {
+                    const auto type_class =
+                        getTextureTypeClass(descriptor.type);
+                    const auto other_type_class =
+                        getTextureTypeClass(other_descriptor.type);
+                    if (type_class == TextureTypeClass::_2D &&
+                        other_type_class == TextureTypeClass::_2D) {
+                        synchronize2DWith2D(command_buffer, storage,
+                                            other_storage);
+                    } else if (type_class == TextureTypeClass::_1DBuffer &&
+                               other_type_class ==
+                                   TextureTypeClass::_1DBuffer) {
+                        const auto begin =
+                            std::max(range.getBegin(), other_range.getBegin());
+                        const auto end =
+                            std::min(range.getEnd(), other_range.getEnd());
+                        storage.base->copyBufferBytes(
+                            command_buffer, other_storage.base,
+                            begin - other_range.getBegin(),
+                            begin - range.getBegin(), end - begin);
+                    } else if (type_class == TextureTypeClass::_3D &&
+                               other_type_class == TextureTypeClass::_3D) {
+                        synchronize3DWith3D(command_buffer, storage,
+                                            other_storage);
+                    } else {
+                        LOG_WARN(Gpu,
+                                 "Cannot synchronize textures ({}) and ({})",
+                                 descriptor, other_descriptor);
                     }
                 }
             }
@@ -563,7 +596,8 @@ void TextureCache::update(ICommandBuffer* command_buffer,
         }
     }
 
-    if (sync)
+    if (sync && !uploaded_cpu && usage == TextureUsage::Present &&
+        mem.info.written_timestamp == TextureCacheTimePoint{})
         decodeTexture(command_buffer, storage);
 
     if (usage == TextureUsage::Read)

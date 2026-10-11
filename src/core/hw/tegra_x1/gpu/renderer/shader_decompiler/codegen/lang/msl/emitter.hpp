@@ -71,6 +71,11 @@ class MslEmitter final : public LangEmitter {
     void emitLoadShared(const ir::Value& dst, const ir::Value& addr) override;
     void emitStoreShared(const ir::Value& addr,
                          const ir::Value& value) override;
+    void emitLoadLocal(const ir::Value& dst, const ir::Value& addr) override;
+    void emitStoreLocal(const ir::Value& addr,
+                        const ir::Value& value) override;
+    void emitAtomicShared(const ir::Value& dst, const ir::Value& addr,
+                          const ir::Value& value, u32 op, bool is_signed) override;
     void emitBarrier() override;
     void emitImageStore(u32 index, TextureType type, const ir::Value& coords,
                         const std::array<ir::Value, 4>& values) override;
@@ -91,6 +96,7 @@ class MslEmitter final : public LangEmitter {
   private:
     // Number of shared memory words (compute)
     u32 shared_word_count{1};
+    u32 local_word_count{1};
 
     // Helpers
     static std::string getSvStr(const Sv& sv);

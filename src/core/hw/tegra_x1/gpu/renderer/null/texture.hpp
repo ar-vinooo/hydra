@@ -14,6 +14,8 @@ class Texture final : public ITexture {
     createView(const TextureViewDescriptor& view_descriptor) override;
 
     // Copying
+    void copyBufferBytes(ICommandBuffer* command_buffer, const ITexture* src,
+                         u64 src_offset, u64 dst_offset, u64 size) override;
     void copyFrom(ICommandBuffer* command_buffer, const BufferBase* src,
                   const ztd::Range<u32> dst_levels,
                   const ztd::Range<u32> dst_layers) override;

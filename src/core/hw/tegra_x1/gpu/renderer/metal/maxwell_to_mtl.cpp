@@ -817,7 +817,6 @@ toMtlSamplerAddressMode(const SamplerAddressMode address_mode) {
     case SamplerAddressMode::ClampToEdge:
         return MTL::SamplerAddressModeClampToEdge;
     case SamplerAddressMode::ClampToBorder:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "ClampToBorder");
         return MTL::SamplerAddressModeClampToBorderColor;
     case SamplerAddressMode::Clamp:
         LOG_NOT_IMPLEMENTED(MetalRenderer, "Clamp");

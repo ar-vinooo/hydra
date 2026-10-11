@@ -300,6 +300,8 @@ class LangEmitter : public Emitter {
             return getLocalStr(value.getLocal());
         case ir::ValueKind::Register:
             return getRegisterStr(value.getRegister(), value.getType());
+        case ir::ValueKind::ConditionFlag:
+            return fmt::format("state.cc[{}]", value.getConditionFlag());
         case ir::ValueKind::Predicate:
             return getPredicateStr(value.getPredicate());
         case ir::ValueKind::AttrMemory:
@@ -323,6 +325,9 @@ class LangEmitter : public Emitter {
             writeStatement(
                 "{} = {}",
                 getRegisterStr<false>(dst.getRegister(), dst.getType()), FMT);
+            break;
+        case ir::ValueKind::ConditionFlag:
+            writeStatement("state.cc[{}] = {}", dst.getConditionFlag(), FMT);
             break;
         case ir::ValueKind::Predicate:
             writeStatement("{} = {}",

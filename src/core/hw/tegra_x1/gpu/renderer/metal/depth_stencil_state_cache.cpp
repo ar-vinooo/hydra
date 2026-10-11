@@ -46,9 +46,14 @@ MTL::DepthStencilState*
 DepthStencilStateCache::create(const DepthStencilStateDescriptor& descriptor) {
     auto desc = MTL::DepthStencilDescriptor::alloc()->init();
 
+    // DEBUG: HYDRA_DEBUG_DEPTH_ALWAYS=1 makes every enabled depth test pass
+    static const bool debug_depth_always =
+        std::getenv("HYDRA_DEBUG_DEPTH_ALWAYS") != nullptr;
     if (descriptor.depth_test_enabled)
         desc->setDepthCompareFunction(
-            toMtlCompareFunc(descriptor.depth_compare_op));
+            debug_depth_always
+                ? MTL::CompareFunctionAlways
+                : toMtlCompareFunc(descriptor.depth_compare_op));
 
     // HACK: Minecraft: Story Mode overrides the depth buffer
     if (descriptor.depth_write_enabled && descriptor.depth_test_enabled &&

@@ -211,39 +211,50 @@ inline ir::Value getSwizzledHalf(ir::Builder& builder, HalfSwizzle swizzle,
 
 inline ir::Value getFloatCmp(DecoderContext& context, FloatCmpOp op,
                              ir::Value a, ir::Value b) {
-    // TODO: handle U versions differently?
-    switch (op) {
-    case FloatCmpOp::F:
+    if (op == FloatCmpOp::F)
         return ir::Value::createConstantB(false);
-    case FloatCmpOp::T:
+    if (op == FloatCmpOp::T)
         return ir::Value::createConstantB(true);
+    const auto nan = context.builder.opBitwiseOr(context.builder.opIsNan(a),
+                                                 context.builder.opIsNan(b));
+    if (op == FloatCmpOp::Num)
+        return context.builder.opNot(nan);
+    if (op == FloatCmpOp::Nan)
+        return nan;
+
+    auto comparison = ir::Value::createConstantB(false);
+    switch (op) {
     case FloatCmpOp::Lt:
     case FloatCmpOp::Ltu:
-        return context.builder.opCompareLess(a, b);
+        comparison = context.builder.opCompareLess(a, b);
+        break;
     case FloatCmpOp::Le:
     case FloatCmpOp::Leu:
-        return context.builder.opCompareLessOrEqual(a, b);
+        comparison = context.builder.opCompareLessOrEqual(a, b);
+        break;
     case FloatCmpOp::Gt:
     case FloatCmpOp::Gtu:
-        return context.builder.opCompareGreater(a, b);
+        comparison = context.builder.opCompareGreater(a, b);
+        break;
     case FloatCmpOp::Ge:
     case FloatCmpOp::Geu:
-        return context.builder.opCompareGreaterOrEqual(a, b);
+        comparison = context.builder.opCompareGreaterOrEqual(a, b);
+        break;
     case FloatCmpOp::Eq:
     case FloatCmpOp::Equ:
-        return context.builder.opCompareEqual(a, b);
+        comparison = context.builder.opCompareEqual(a, b);
+        break;
     case FloatCmpOp::Ne:
     case FloatCmpOp::Neu:
-        return context.builder.opCompareNotEqual(a, b);
-    case FloatCmpOp::Num:
-    case FloatCmpOp::Nan: {
-        const auto res = context.builder.opBitwiseOr(a, b);
-        if (op == FloatCmpOp::Num)
-            return context.builder.opNot(res);
-        else
-            return res;
+        comparison = context.builder.opCompareNotEqual(a, b);
+        break;
+    default:
+        unreachable();
     }
-    }
+    // Ordered comparisons are false for NaN; unordered comparisons are true.
+    if (op >= FloatCmpOp::Ltu)
+        return context.builder.opBitwiseOr(comparison, nan);
+    return context.builder.opBitwiseAnd(comparison, context.builder.opNot(nan));
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

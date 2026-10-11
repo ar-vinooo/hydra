@@ -20,7 +20,7 @@ ShaderLibraryCache::ShaderLibraryCache(MTL::Device* device_,
                                        std::filesystem::path path)
     : device(device_->retain()),
       directory(path.empty() ? BinaryArchiveCache::defaultPath(device_) /
-                                   "msl-invariant-v1"
+                                   "msl-invariant-ieee-v2"
                              : std::move(path)) {
     const char* disabled = std::getenv("HYDRA_DISABLE_SHADER_CACHE");
     enabled = !(disabled && std::string_view(disabled) == "1");
@@ -50,7 +50,8 @@ MTL::Library* ShaderLibraryCache::compile(std::string_view source,
                                           NS::Error** error) {
     NS_STACK_SCOPED auto options = MTL::CompileOptions::alloc()->init();
     options->setPreserveInvariance(true);
-    // Keep the existing default fastMath setting and shader semantics.
+    // Guest float comparisons require NaN, infinity, and subnormal semantics.
+    options->setFastMathEnabled(false);
     return device->newLibrary(toNsString(std::string(source)), options, error);
 }
 void ShaderLibraryCache::insert(const std::string& key, MTL::Library* library) {

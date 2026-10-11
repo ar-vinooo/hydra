@@ -171,6 +171,12 @@ class Emitter {
                                 const ir::Value& addr) = 0;
     virtual void emitStoreShared(const ir::Value& addr,
                                  const ir::Value& value) = 0;
+    virtual void emitLoadLocal(const ir::Value& dst,
+                               const ir::Value& addr) = 0;
+    virtual void emitStoreLocal(const ir::Value& addr,
+                                const ir::Value& value) = 0;
+    virtual void emitAtomicShared(const ir::Value& dst, const ir::Value& addr,
+                                  const ir::Value& value, u32 op, bool is_signed) = 0;
     virtual void emitBarrier() = 0;
     virtual void emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,

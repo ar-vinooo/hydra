@@ -64,6 +64,66 @@ void emitFloatSetPredicate(DecoderContext& context, pred_t pred, bool pred_inv,
 
 } // namespace
 
+static void emitFloatCompare(DecoderContext& context, InstFcmpBase inst,
+                             ir::Value alternative, ir::Value operand) {
+    const auto conditional =
+        handlePredCond(context.builder, inst.pred, inst.pred_inv);
+    // Metal flushes subnormal arithmetic on some GPUs even without fast math.
+    // FCMP compares only with zero, so preserve a tiny operand's sign by
+    // replacing it with +/-1 when FTZ is off, or signed zero when FTZ is on.
+    const auto bits = context.builder.opBitCast(operand, ir::ScalarType::U32);
+    const auto magnitude = context.builder.opBitwiseAnd(
+        bits, ir::Value::createConstant(0x7fffffffu));
+    const auto tiny = context.builder.opBitwiseAnd(
+        context.builder.opCompareLess(magnitude,
+                                      ir::Value::createConstant(0x00800000u)),
+        context.builder.opCompareNotEqual(magnitude,
+                                          ir::Value::createConstant(0u)));
+    const auto sign = context.builder.opBitwiseAnd(
+        bits, ir::Value::createConstant(0x80000000u));
+    const auto normalized = context.builder.opBitwiseOr(
+        sign, ir::Value::createConstant(inst.ftz ? 0u : 0x3f800000u));
+    operand = context.builder.opBitCast(
+        context.builder.opSelect(tiny, normalized, bits), ir::ScalarType::F32);
+    const auto cmp = getFloatCmp(context, inst.op, operand,
+                                 ir::Value::createConstantF(0.0f));
+    const auto result = context.builder.opSelect(
+        cmp, ir::Value::createRegister(inst.src_a), alternative);
+    context.builder.opCopy(ir::Value::createRegister(inst.dst), result);
+    if (conditional)
+        context.builder.opEndIf();
+}
+
+void emitFcmpR(DecoderContext& context, InstFcmpR inst) {
+    emitFloatCompare(
+        context, inst.base, ir::Value::createRegister(inst.src_b),
+        ir::Value::createRegister(inst.base.src_c, ir::ScalarType::F32));
+}
+
+void emitFcmpC(DecoderContext& context, InstFcmpC inst) {
+    emitFloatCompare(
+        context, inst.base,
+        ir::Value::createConstMemory(
+            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4))),
+        ir::Value::createRegister(inst.base.src_c, ir::ScalarType::F32));
+}
+
+void emitFcmpRC(DecoderContext& context, InstFcmpC inst) {
+    emitFloatCompare(
+        context, inst.base, ir::Value::createRegister(inst.base.src_c),
+        ir::Value::createConstMemory(
+            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
+            ir::ScalarType::F32));
+}
+
+void emitFcmpI(DecoderContext& context, InstFcmpI inst) {
+    emitFloatCompare(
+        context, inst.base,
+        ir::Value::createConstant(
+            std::bit_cast<u32>(getFloatImm20(inst.imm20_0, inst.imm20_19))),
+        ir::Value::createRegister(inst.base.src_c, ir::ScalarType::F32));
+}
+
 void emitFsetR(DecoderContext& context, InstFsetR inst) {
     emitFloatSet(context, inst.base.pred, inst.base.pred_inv, inst.base.op,
                  inst.base.b_op, inst.base.dst, inst.base.src_a,

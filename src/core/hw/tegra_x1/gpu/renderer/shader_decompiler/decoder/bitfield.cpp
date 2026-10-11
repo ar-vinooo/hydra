@@ -47,4 +47,63 @@ void emitBfeI(DecoderContext& context, InstBfeI inst) {
         ir::Value::createConstantU(inst.imm20_0 | (inst.imm20_19 << 19)));
 }
 
+namespace {
+void emitInsert(DecoderContext& context, InstBfiBase inst, ir::Value control,
+                ir::Value base) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
+    const auto bits = ir::Value::createConstantU(32);
+    const auto offset =
+        b.opBitwiseAnd(control, ir::Value::createConstantU(255));
+    const auto raw_count = b.opBitfieldExtract(
+        control, ir::Value::createConstantU(8), ir::Value::createConstantU(8));
+    const auto valid = b.opCompareLess(offset, bits);
+    const auto safe_offset =
+        b.opBitwiseAnd(offset, ir::Value::createConstantU(31));
+    const auto remaining = b.opAdd(bits, b.opNeg(safe_offset));
+    const auto count =
+        b.opSelect(b.opCompareLess(raw_count, remaining), raw_count, remaining);
+    // Mask shift counts before evaluating: Metal/C++ shifts by 32 are
+    // undefined.
+    const auto n = b.opBitwiseAnd(count, ir::Value::createConstantU(31));
+    const auto low_mask = b.opSelect(
+        b.opCompareEqual(count, bits), ir::Value::createConstantU(0xffffffffu),
+        b.opAdd(b.opShiftLeft(ir::Value::createConstantU(1), n),
+                ir::Value::createConstantU(0xffffffffu)));
+    const auto mask = b.opShiftLeft(low_mask, safe_offset);
+    const auto inserted = b.opBitwiseAnd(
+        b.opShiftLeft(ir::Value::createRegister(inst.insert), safe_offset),
+        mask);
+    const auto result =
+        b.opBitwiseOr(b.opBitwiseAnd(base, b.opBitwiseNot(mask)), inserted);
+    b.opCopy(ir::Value::createRegister(inst.dst),
+             b.opSelect(valid, result, base));
+    if (inst.write_cc)
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "BFI condition code output");
+    if (conditional)
+        b.opEndIf();
+}
+} // namespace
+void emitBfiR(DecoderContext& c, InstBfiR i) {
+    emitInsert(c, i.base, ir::Value::createRegister(i.src_b),
+               ir::Value::createRegister(i.base.src_c));
+}
+void emitBfiC(DecoderContext& c, InstBfiC i) {
+    emitInsert(
+        c, i.base,
+        ir::Value::createConstMemory(CMem(i.cbuf_slot, RZ, i.cbuf_offset * 4)),
+        ir::Value::createRegister(i.base.src_c));
+}
+void emitBfiRC(DecoderContext& c, InstBfiC i) {
+    emitInsert(
+        c, i.base, ir::Value::createRegister(i.base.src_c),
+        ir::Value::createConstMemory(CMem(i.cbuf_slot, RZ, i.cbuf_offset * 4)));
+}
+void emitBfiI(DecoderContext& c, InstBfiI i) {
+    emitInsert(
+        c, i.base,
+        ir::Value::createConstantU(getIntImm20(i.imm20_0, i.imm20_19, true)),
+        ir::Value::createRegister(i.base.src_c));
+}
+
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

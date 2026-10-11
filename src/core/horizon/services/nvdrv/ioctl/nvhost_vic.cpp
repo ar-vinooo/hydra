@@ -6,6 +6,8 @@
 #include "core/system.hpp"
 
 #include <atomic>
+#include <cstdlib>
+#include <fstream>
 
 namespace hydra::horizon::services::nvdrv::ioctl {
 
@@ -73,6 +75,36 @@ NvResult NvHostVic::executeVideo(IoctlContext& context) {
         return NvResult::NotInitialized;
     if (u32(frame->width) < source_width || u32(frame->height) < source_height)
         return NvResult::InvalidSize;
+    // DEBUG: HYDRA_DUMP_VIDEO=<dir> writes every 60th decoded frame as PPM,
+    // once as-is and once with U/V swapped
+    if (const char* dump_dir = std::getenv("HYDRA_DUMP_VIDEO")) {
+        static std::atomic<u32> counter{0};
+        const auto n = counter.fetch_add(1);
+        if (n % 60 == 0) {
+            for (u32 swap = 0; swap < 2; ++swap) {
+                std::ofstream out(std::string(dump_dir) + "/f" + std::to_string(n) +
+                                      (swap ? "_swapuv.ppm" : "_asis.ppm"),
+                                  std::ios::binary);
+                const u32 w = u32(frame->width), h = u32(frame->height);
+                out << "P6\n" << w << " " << h << "\n255\n";
+                for (u32 y = 0; y < h; y += 1)
+                    for (u32 x = 0; x < w; x += 1) {
+                        const auto* yp = frame->pixels.data() + frame->offsets[0] +
+                                         usize(y) * u32(frame->strides[0]) + x;
+                        const auto* uv = frame->pixels.data() + frame->offsets[1] +
+                                         usize(y / 2) * u32(frame->strides[1]) + (x & ~1u);
+                        const float Y = (float(*yp) - 16.f) * 1.164f;
+                        const float U = float(uv[swap ? 1 : 0]) - 128.f;
+                        const float V = float(uv[swap ? 0 : 1]) - 128.f;
+                        const auto clamp8 = [](float v) { return u8(std::clamp(v, 0.f, 255.f)); };
+                        const u8 px[3] = {clamp8(Y + 1.793f * V),
+                                           clamp8(Y - 0.213f * U - 0.533f * V),
+                                           clamp8(Y + 2.112f * U)};
+                        out.write(reinterpret_cast<const char*>(px), 3);
+                    }
+            }
+        }
+    }
     const auto block_kind = (word(0x20) >> 11) & 15;
     const auto gob_height = (word(0x20) >> 15) & 15;
     if (block_kind > 1 || gob_height > 5) return unsupported("surface layout");
@@ -138,6 +170,54 @@ NvResult NvHostVic::executeVideo(IoctlContext& context) {
                     output[column + 1] = input[column];
                 }
             } else std::memcpy(output, input, width);
+        }
+        // DEBUG: HYDRA_DUMP_VIDEO also dumps the RGBA picture VIC produces
+        if (rgb) {
+            if (const char* dump_dir = std::getenv("HYDRA_DUMP_VIDEO")) {
+                static std::atomic<u32> rgba_counter{0};
+                const auto n = rgba_counter.fetch_add(1);
+                if (n % 10 == 0) {
+                    std::ofstream out(std::string(dump_dir) + "/vic_rgba_" + std::to_string(n) +
+                                          ".ppm",
+                                      std::ios::binary);
+                    // Reference: the decoded frame converted with plain BT.709
+                    {
+                        std::ofstream ref(std::string(dump_dir) + "/vic_ref_" + std::to_string(n) + ".ppm",
+                                          std::ios::binary);
+                        ref << "P6\n" << width << " " << height << "\n255\n";
+                        for (u32 row = 0; row < height; ++row)
+                            for (u32 column = 0; column < width; ++column) {
+                                const auto* yp = frame->pixels.data() + frame->offsets[0] +
+                                                 usize(row) * u32(frame->strides[0]) + column;
+                                const auto* uv = frame->pixels.data() + frame->offsets[1] +
+                                                 usize(row / 2) * u32(frame->strides[1]) + (column & ~1u);
+                                const float Y = (float(*yp) - 16.f) * 1.164f;
+                                const float U = float(uv[0]) - 128.f;
+                                const float V = float(uv[1]) - 128.f;
+                                const auto clamp8 = [](float v) { return static_cast<char>(u8(std::clamp(v, 0.f, 255.f))); };
+                                const char px[3] = {clamp8(Y + 1.793f * V), clamp8(Y - 0.213f * U - 0.533f * V), clamp8(Y + 2.112f * U)};
+                                ref.write(px, 3);
+                            }
+                    }
+                    std::ofstream cfg(std::string(dump_dir) + "/vic_cfg_" + std::to_string(n) + ".txt");
+                    cfg << "output_format " << output_format << " input_format " << input_format
+                        << " matrix_enabled " << matrix_enabled << " shift " << matrix_shift
+                        << " clamp " << clamp_low << ".." << clamp_high << " alpha " << alpha
+                        << " block_kind " << block_kind << " gob_height " << gob_height << "\n";
+                    for (usize c = 0; c < 4; ++c)
+                        cfg << "col" << c << ": " << matrix[0][c] << " " << matrix[1][c] << " " << matrix[2][c] << "\n";
+                    out << "P6\n" << width << " " << height << "\n255\n";
+                    for (u32 row = 0; row < height; ++row)
+                        for (u32 column = 0; column < width; ++column) {
+                            const auto* pixel = linear.data() + usize(row) * storage_stride +
+                                                column * 4;
+                            const char c[3] = {static_cast<char>(pixel[output_format == 32 ? 2 : 0]),
+                                               static_cast<char>(pixel[1]),
+                                               static_cast<char>(pixel[output_format == 32 ? 0 : 2])};
+                            out.write(c, 3);
+                        }
+                }
+            }
         }
         planes[plane].resize(linear.size());
         if (block_kind) {

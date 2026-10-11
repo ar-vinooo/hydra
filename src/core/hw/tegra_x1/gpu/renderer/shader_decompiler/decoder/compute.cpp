@@ -47,11 +47,21 @@ ir::Value addOffset(ir::Builder& builder, const ir::Value& addr, u32 offset) {
 
 // Shared memory
 
-void emitSharedAccess(DecoderContext& context, instruction_t inst,
-                      bool store) {
+void emitSharedAccess(DecoderContext& context, instruction_t inst, bool store,
+                      bool local = false) {
     auto& builder = context.builder;
     const auto conditional =
         handlePredCond(builder, getPred(inst), getPredInv(inst));
+
+    const auto loadMem = [&](const ir::Value& a) {
+        return local ? builder.opLoadLocal(a) : builder.opLoadShared(a);
+    };
+    const auto storeMem = [&](const ir::Value& a, const ir::Value& v) {
+        if (local)
+            builder.opStoreLocal(a, v);
+        else
+            builder.opStoreShared(a, v);
+    };
 
     const auto data = getReg(inst, 0);
     const auto addr_reg = getReg(inst, 8);
@@ -67,7 +77,7 @@ void emitSharedAccess(DecoderContext& context, instruction_t inst,
         // 8 and 16 bit accesses
         const u32 bits = (size < 2 ? 8 : 16);
         const bool is_signed = (size & 1) != 0;
-        const auto word = builder.opLoadShared(addr);
+        const auto word = loadMem(addr);
         const auto shift = builder.opMultiply(
             builder.opBitwiseAnd(addr, ir::Value::createConstantU(3)),
             ir::Value::createConstantU(8));
@@ -79,7 +89,7 @@ void emitSharedAccess(DecoderContext& context, instruction_t inst,
                 builder.opShiftLeft(getRegOffset(data, 0), shift), mask);
             const auto kept =
                 builder.opBitwiseAnd(word, builder.opBitwiseNot(mask));
-            builder.opStoreShared(addr, builder.opBitwiseOr(kept, value));
+            storeMem(addr, builder.opBitwiseOr(kept, value));
         } else {
             auto res = ir::Value::createUndefined();
             if (is_signed)
@@ -97,13 +107,13 @@ void emitSharedAccess(DecoderContext& context, instruction_t inst,
         const u32 count = (size == 4 ? 1 : size == 5 ? 2 : 4);
         if (store) {
             for (u32 i = 0; i < count; i++)
-                builder.opStoreShared(addOffset(builder, addr, i * 4),
+                storeMem(addOffset(builder, addr, i * 4),
                                       getRegOffset(data, i));
         } else {
             std::vector<ir::Value> values;
             for (u32 i = 0; i < count; i++)
                 values.push_back(
-                    builder.opLoadShared(addOffset(builder, addr, i * 4)));
+                    loadMem(addOffset(builder, addr, i * 4)));
             for (u32 i = 0; i < count; i++)
                 builder.opCopy(ir::Value::createRegister(
                                    static_cast<reg_t>(data + i)),
@@ -268,12 +278,92 @@ void emitFlo(DecoderContext& context, instruction_t inst, ir::Value src) {
 
 } // namespace
 
+void emitCsetp(DecoderContext& context, instruction_t inst) {
+    const auto test = extractBits(inst, 8, 5);
+    if (test != 13 && test != 0 && test != 15) {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "CSETP flow test {}", test);
+        return;
+    }
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
+    const auto condition = test == 13
+        ? b.opBitwiseOr(ir::Value::createConditionFlag(1), b.opNot(ir::Value::createConditionFlag(0)))
+        : ir::Value::createConstantB(test == 15);
+    const auto other = notIf(b, ir::Value::createPredicate(static_cast<pred_t>(extractBits(inst, 39, 3))), extractBits(inst, 42, 1));
+    const u32 bop = static_cast<u32>(extractBits(inst, 45, 2));
+    const auto combine = [&](ir::Value x) {
+        if (bop == 0) return b.opBitwiseAnd(x, other);
+        if (bop == 1) return b.opBitwiseOr(x, other);
+        return b.opBitwiseXor(x, other);
+    };
+    const auto result_a = b.opCopy(combine(condition));
+    const auto result_b = b.opCopy(combine(b.opNot(condition)));
+    const auto pa = static_cast<pred_t>(extractBits(inst, 3, 3));
+    const auto pb = static_cast<pred_t>(extractBits(inst, 0, 3));
+    if (pa != PT) b.opCopy(ir::Value::createPredicate(pa), result_a);
+    if (pb != PT) b.opCopy(ir::Value::createPredicate(pb), result_b);
+    if (conditional) b.opEndIf();
+}
+
+void emitR2p(DecoderContext& context, instruction_t inst, u32 variant) {
+    const bool cc_mode = extractBits(inst, 40, 1);
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
+    const auto mask = variant == 0 ? getSrcBReg(inst) : variant == 1 ? getSrcBCbuf(inst) : getSrcBImm(inst);
+    const auto source = ir::Value::createRegister(getReg(inst, 8));
+    const u32 byte = static_cast<u32>(extractBits(inst, 41, 2)) * 8;
+    // Snapshot source/mask before writing predicates, including the predicate
+    // that guards this instruction itself.
+    const auto bits = b.opCopy(source);
+    const auto enabled = b.opCopy(mask);
+    for (u32 i = 0; i < (cc_mode ? 4u : 7u); ++i) {
+        const auto selected = b.opCompareNotEqual(
+            b.opBitwiseAnd(enabled, ir::Value::createConstantU(1u << i)), ir::Value::createConstantU(0));
+        const auto bit = b.opCompareNotEqual(
+            b.opBitwiseAnd(bits, ir::Value::createConstantU(1u << (byte + i))), ir::Value::createConstantU(0));
+        const auto pred = cc_mode ? ir::Value::createConditionFlag(i) : ir::Value::createPredicate(static_cast<pred_t>(i));
+        b.opCopy(pred, b.opSelect(selected, bit, pred));
+    }
+    if (conditional) b.opEndIf();
+}
+
+void emitAtoms(DecoderContext& context, instruction_t inst) {
+    const u32 size = static_cast<u32>(extractBits(inst, 28, 2));
+    const u32 op = static_cast<u32>(extractBits(inst, 52, 4));
+    if (size > 1 || op > 8) {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "ATOMS size {} operation {}", size, op);
+        return;
+    }
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
+    const auto addr_reg = getReg(inst, 8);
+    const u32 offset = static_cast<u32>(extractBits(inst, 30, 22)) << 2;
+    auto addr = ir::Value::createConstantU(offset);
+    if (addr_reg != RZ) {
+        const auto signed_offset = signExtend<i32, 24>(static_cast<i32>(offset));
+        addr = b.opAdd(ir::Value::createRegister(addr_reg),
+                       ir::Value::createConstantU(std::bit_cast<u32>(signed_offset)));
+    }
+    const auto result = b.opAtomicShared(addr, ir::Value::createRegister(getReg(inst, 20)), op, size == 1);
+    const auto dst = getReg(inst, 0);
+    if (dst != RZ) b.opCopy(ir::Value::createRegister(dst), result);
+    if (conditional) b.opEndIf();
+}
+
 void emitLds(DecoderContext& context, instruction_t inst) {
     emitSharedAccess(context, inst, false);
 }
 
 void emitSts(DecoderContext& context, instruction_t inst) {
     emitSharedAccess(context, inst, true);
+}
+
+void emitLdl(DecoderContext& context, instruction_t inst) {
+    emitSharedAccess(context, inst, false, true);
+}
+
+void emitStl(DecoderContext& context, instruction_t inst) {
+    emitSharedAccess(context, inst, true, true);
 }
 
 void emitBar(DecoderContext& context, instruction_t inst) {

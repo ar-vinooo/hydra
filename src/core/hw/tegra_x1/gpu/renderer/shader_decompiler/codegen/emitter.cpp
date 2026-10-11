@@ -229,6 +229,17 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
     case ir::Opcode::StoreShared:
         emitStoreShared(inst.getOperand(0), inst.getOperand(1));
         break;
+    case ir::Opcode::LoadLocal:
+        emitLoadLocal(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::StoreLocal:
+        emitStoreLocal(inst.getOperand(0), inst.getOperand(1));
+        break;
+    case ir::Opcode::AtomicShared:
+        emitAtomicShared(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
+                         inst.getOperand(2).getRawValue<u32>(),
+                         inst.getOperand(3).getRawValue<bool>());
+        break;
     case ir::Opcode::Barrier:
         emitBarrier();
         break;

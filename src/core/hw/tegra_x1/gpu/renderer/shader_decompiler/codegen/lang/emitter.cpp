@@ -33,6 +33,7 @@ void LangEmitter::start() {
     enterScope("struct State");
     write("float4 dbg;"); // DEBUG: captured register values
     write("Reg r[256];");
+    write("bool cc[4];");
     write("bool p[8];"); // TODO: is the size correct?
     // TODO: move this to the backend
     for (auto index : memory_analyzer.getConstBuffers())
@@ -66,6 +67,15 @@ void LangEmitter::emitMainFunctionPrologue() {
     writeStatement("State state");
     writeStatement("state.dbg = float4(0.0)");
 
+    // DEBUG: HYDRA_ZERO_REGS=1 initializes every register and attribute
+    static const bool zero_regs = std::getenv("HYDRA_ZERO_REGS") != nullptr;
+    if (zero_regs) {
+        writeStatement("for (uint zi = 0; zi < 256; zi++) state.r[zi]._u32 = 0u");
+        writeStatement("for (uint zi = 0; zi < 0x200; zi++) {{ state.a_in[zi]._u32 = 0u; state.a_out[zi]._u32 = 0u; }}");
+        writeStatement("for (uint zi = 0; zi < 4; zi++) state.cc[zi] = false");
+        writeStatement("for (uint zi = 0; zi < 8; zi++) state.p[zi] = false");
+    }
+
     // Inputs
     // TODO: these are provided in the shader header, no need for analysis
 
@@ -87,6 +97,23 @@ void LangEmitter::emitMainFunctionPrologue() {
 
     switch (context.type) {
     case ShaderType::Vertex:
+        // Guest shaders may only write XY (for fullscreen/offscreen passes).
+        // Supply the default homogeneous position before executing the shader;
+        // otherwise its unwritten Z/W components contain thread-stack garbage.
+        for (u8 c = 0; c < 4; ++c)
+            writeStatement(
+                "{} = {}",
+                getAttrMemoryStr({RZ, SV_POSITION_BASE + c * 4u, false}),
+                c == 3 ? "0x3f800000u" : "0u");
+        for (const auto output : memory_analyzer.getStageOutputs()) {
+            for (u8 c = 0; c < 4; ++c)
+                writeStatement(
+                    "{} = {}",
+                    getAttrMemoryStr(
+                        {RZ, SV_USER_IN_OUT_BASE + output * 16u + c * 4u,
+                         false}),
+                    c == 3 ? "0x3f800000u" : "0u");
+        }
         for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
             const auto vertex_attrib_state = state.vertex_attrib_states[i];
 

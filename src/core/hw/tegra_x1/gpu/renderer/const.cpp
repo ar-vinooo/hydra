@@ -291,6 +291,10 @@ TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
     IMAGE_FORMAT_CASE_SRGB(ASTC_2D_12X12, Unorm, Unorm, Unorm, Unorm,
                            ASTC_RGBA_12x12_sRGB)
     IMAGE_FORMAT_CASE(DXN1, Unorm, Unorm, Unorm, Unorm, BC4_RUnorm)
+    // G24R8 is the uncompressed sampling alias of a Z24S8 surface.
+    // Keep its storage format identical to the render target so sampling
+    // sees GPU-written depth instead of uploading stale guest memory.
+    IMAGE_FORMAT_CASE(G24R8, Uint, Unorm, Unorm, Unorm, Z24Unorm_S8Uint)
     IMAGE_FORMAT_CASE(Z24S8, Uint, Unorm, Unorm, Unorm, Z24Unorm_S8Uint)
     IMAGE_FORMAT_CASE(Z16, Unorm, Unorm, Unorm, Unorm, Z16Unorm)
     IMAGE_FORMAT_CASE(ZF32, Float, Float, Float, Float, Z32Float)
@@ -666,9 +670,17 @@ SwizzleChannels::SwizzleChannels(const TextureFormat format,
     case TextureFormat::Z16Unorm:
     case TextureFormat::Z24Unorm_X8Uint:
     case TextureFormat::Z32Float:
-    case TextureFormat::Z24Unorm_S8Uint:
     case TextureFormat::Z32Float_X24S8Uint:
         SWIZZLE(x, y, z, w);
+    case TextureFormat::Z24Unorm_S8Uint: {
+        // Z24S8/G24R8 expose depth through G in the TIC. Metal exposes
+        // the depth plane through R. Preserve constant swizzles.
+        const auto depth_channel = [](ImageSwizzle channel) {
+            return channel == ImageSwizzle::G ? ImageSwizzle::R : channel;
+        };
+        SWIZZLE(depth_channel(x), depth_channel(y), depth_channel(z),
+                depth_channel(w));
+    }
     case TextureFormat::BGR5A1Unorm:
     case TextureFormat::BGRA8Unorm:
     case TextureFormat::BGRA8Unorm_sRGB:
@@ -823,7 +835,16 @@ void TextureDescriptor::calculateSize() {
             } else {
                 // TODO: make sure the layer sizes match?
             }
-            size = layer_count * layer_size;
+            // The last layer only occupies its actual data, not the whole
+            // layer stride. Otherwise a small mip level of a layered texture
+            // (e.g. 1x1 of a cubemap with a large stride) would extend past
+            // the end of the texture that owns it and never be merged into it
+            // The last layer only occupies its actual data, not the whole
+            // layer stride. Otherwise a small mip level of a layered texture
+            // (e.g. 1x1 of a cubemap with a large stride) would extend past
+            // the end of the texture that owns it and never be merged into it
+            size = (layer_count - 1) * layer_size +
+                   std::min(layer_size_, layer_size);
         }
     }
 }

@@ -9,6 +9,7 @@ class ShaderBase;
 class IRenderer;
 
 struct GuestShaderState {
+    std::map<std::pair<u32, u32>, u32> branch_constants;
     std::map<u32, TextureFormat> buffer_texture_formats;
     // User inputs read by the fragment shader, which the vertex shader must
     // write (bit per location)
@@ -30,6 +31,7 @@ struct GuestShaderDescriptor {
     uptr code_ptr;
     uptr gpu_addr;
     GuestShaderState state;
+    std::function<std::optional<u32>(u32, u32)> read_const_word;
 };
 
 class ShaderCache
@@ -39,6 +41,7 @@ class ShaderCache
 
     void destroy() {}
 
+    ShaderBase* find(const GuestShaderDescriptor& descriptor);
     ShaderBase* create(const GuestShaderDescriptor& descriptor);
     void update([[maybe_unused]] ShaderBase* shader) {}
     static u32 hash(const GuestShaderDescriptor& descriptor);
@@ -47,6 +50,7 @@ class ShaderCache
 
   private:
     IRenderer& renderer;
+    std::map<u32, std::map<std::pair<u32, u32>, u32>> branch_dependencies;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer
