@@ -4,14 +4,22 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: brev, write_cc
+// TODO: write_cc
 void emitBitfieldExtract(DecoderContext& context, pred_t pred, bool pred_inv,
-                         bool is_signed, reg_t dst, reg_t src_a,
+                         bool is_signed, bool brev, reg_t dst, reg_t src_a,
                          ir::Value src_b) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
-    const auto src_a_v = ir::Value::createRegister(
+    auto src_a_v = ir::Value::createRegister(
         src_a, (is_signed ? ir::ScalarType::I32 : ir::ScalarType::U32));
+    // .BREV reverses the source bits before the extraction
+    if (brev) {
+        src_a_v = context.builder.opIntrinsic(
+            ir::Intrinsic::BitReverse, ir::ScalarType::U32,
+            {ir::Value::createRegister(src_a, ir::ScalarType::U32)});
+        if (is_signed)
+            src_a_v = context.builder.opBitCast(src_a_v, ir::ScalarType::I32);
+    }
     const auto position =
         context.builder.opBitwiseAnd(src_b, ir::Value::createConstantU(0xff));
     const auto size = context.builder.opBitfieldExtract(
@@ -28,13 +36,13 @@ void emitBitfieldExtract(DecoderContext& context, pred_t pred, bool pred_inv,
 
 void emitBfeR(DecoderContext& context, InstBfeR inst) {
     emitBitfieldExtract(context, inst.base.pred, inst.base.pred_inv,
-                        inst.base.is_signed, inst.base.dst, inst.base.src_a,
+                        inst.base.is_signed, inst.base.brev, inst.base.dst, inst.base.src_a,
                         ir::Value::createRegister(inst.src_b));
 }
 
 void emitBfeC(DecoderContext& context, InstBfeC inst) {
     emitBitfieldExtract(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed,
+        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev,
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4))));
@@ -42,7 +50,7 @@ void emitBfeC(DecoderContext& context, InstBfeC inst) {
 
 void emitBfeI(DecoderContext& context, InstBfeI inst) {
     emitBitfieldExtract(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed,
+        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev,
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstantU(inst.imm20_0 | (inst.imm20_19 << 19)));
 }

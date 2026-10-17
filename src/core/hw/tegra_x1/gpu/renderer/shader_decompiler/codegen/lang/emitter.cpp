@@ -35,6 +35,10 @@ void LangEmitter::start() {
     write("Reg r[256];");
     write("bool cc[4];");
     write("bool p[8];"); // TODO: is the size correct?
+    if (memory_analyzer.getUsesCallStack()) {
+        write("uint call_stack[8];");
+        write("uint call_depth = 0;");
+    }
     // TODO: move this to the backend
     for (auto index : memory_analyzer.getConstBuffers())
         write("constant Reg* c{};", index);
@@ -244,6 +248,12 @@ void LangEmitter::emitFunction(const ir::Function& func) {
         writeStatement("next = func_{}(state)", label);
         writeStatement("break");
     }
+    indent--;
+    write("default:");
+    indent++;
+    // A return to nowhere (or from a garbage stack) ends the shader
+    writeStatement("next = Block_{}::None", func.getName());
+    writeStatement("break");
     exitScopeEmpty();
     exitScopeEmpty();
     writeNewline();
@@ -276,19 +286,27 @@ void LangEmitter::emitFunction(const ir::Function& func) {
 
 #undef ADD_OUTPUT
         break;
-    case ShaderType::Fragment:
+    case ShaderType::Fragment: {
+        u8 source_register = 0;
         for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
+            const auto mask = (context.fragment_output_mask >> (i * 4)) & 0xf;
+            if (mask == 0)
+                continue;
+            const auto base_register = source_register;
+            source_register += 4;
             const auto color_target_data_type =
                 state.color_target_data_types[i];
             if (color_target_data_type == ColorDataType::Invalid)
                 continue;
 
             for (u8 c = 0; c < 4; c++) {
+                if ((mask & (1u << c)) == 0)
+                    continue;
                 writeStatement(
                     "{} = as_type<{}>({})",
                     getSvAccessQualifiedStr(
                         SvAccess(Sv(SvSemantic::UserInOut, i), c), true),
-                    toType(color_target_data_type), getRegisterStr(i * 4 + c));
+                    toType(color_target_data_type), getRegisterStr(base_register + c));
             }
 
             // DEBUG: show pixels whose shader hit the block guard
@@ -300,6 +318,7 @@ void LangEmitter::emitFunction(const ir::Function& func) {
                     "1, 1)",
                     guard_limit, i, toType(color_target_data_type));
         }
+    }
         break;
     default:
         break;
@@ -380,14 +399,6 @@ void LangEmitter::emitBlock(const ir::Function& func, const ir::Block& block) {
     writeStatement("using Block = Block_{}", func.getName());
     writeNewline();
 
-    // Temporary
-    enterScope("union");
-    write("int4 i;");
-    write("uint4 u;");
-    write("float4 f;");
-    exitScope("temp");
-    writeNewline();
-
     // DEBUG: capture registers at the start of a block, set with
     // HYDRA_DEBUG_CAPTURE="<block label>:<reg>,<reg>,<reg>"
     if (context.type == ShaderType::Fragment && state.debug_highlight) {
@@ -432,18 +443,40 @@ void LangEmitter::emitAbs(const ir::Value& dst, const ir::Value& src) {
     storeValue(dst, "abs({})", getValueStr(src));
 }
 
+namespace {
+
+// Signed overflow is undefined in C++ (and so MSL), the guest wraps around:
+// 32-bit signed arithmetic runs on the unsigned bits
+bool isWrappingSigned(const ir::Value& dst) {
+    return dst.getType() == ir::Type(ir::ScalarType::I32);
+}
+
+} // namespace
+
 void LangEmitter::emitNeg(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "(-{})", getValueStr(src));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(0u - as_type<uint>({}))",
+                   getValueStr(src));
+    else
+        storeValue(dst, "(-{})", getValueStr(src));
 }
 
 void LangEmitter::emitAdd(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "({} + {})", getValueStr(srcA), getValueStr(srcB));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(as_type<uint>({}) + as_type<uint>({}))",
+                   getValueStr(srcA), getValueStr(srcB));
+    else
+        storeValue(dst, "({} + {})", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitMultiply(const ir::Value& dst, const ir::Value& srcA,
                                const ir::Value& srcB) {
-    storeValue(dst, "({} * {})", getValueStr(srcA), getValueStr(srcB));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(as_type<uint>({}) * as_type<uint>({}))",
+                   getValueStr(srcA), getValueStr(srcB));
+    else
+        storeValue(dst, "({} * {})", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitFma(const ir::Value& dst, const ir::Value& srcA,
@@ -454,12 +487,12 @@ void LangEmitter::emitFma(const ir::Value& dst, const ir::Value& srcA,
 
 void LangEmitter::emitMin(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "min({}, {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "{}({}, {})", dst.getType().isFloatingPoint() ? "fmin" : "min", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitMax(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "max({}, {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "{}({}, {})", dst.getType().isFloatingPoint() ? "fmax" : "max", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitClamp(const ir::Value& dst, const ir::Value& srcA,
@@ -491,7 +524,9 @@ void LangEmitter::emitNot(const ir::Value& dst, const ir::Value& src) {
 }
 
 void LangEmitter::emitBitwiseNot(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "(~{})", getValueStr(src));
+    // ~ on a bool promotes it to an always nonzero int
+    const bool is_bool = src.getType() == ir::Type(ir::ScalarType::Bool);
+    storeValue(dst, "({}{})", is_bool ? "!" : "~", getValueStr(src));
 }
 
 // Bitwise instructions operate on raw register bits. A register last written
@@ -582,6 +617,23 @@ void LangEmitter::emitEndIf() { exitScopeEmpty(); }
 void LangEmitter::emitBranch(label_t target) {
     // LOG_FATAL(ShaderDecompiler, "Should not happen");
     writeStatement("return Block::{}", target);
+}
+
+void LangEmitter::emitPushReturn(label_t target) {
+    // Calls nest less than 8 deep; a deeper one overwrites the last entry
+    writeStatement("state.call_stack[min(state.call_depth, 7u)] = "
+                   "static_cast<uint>(Block::{})",
+                   target);
+    writeStatement("state.call_depth++");
+}
+
+void LangEmitter::emitReturnBranch() {
+    enterScope("if (state.call_depth == 0u)");
+    writeStatement("return Block::None");
+    exitScopeEmpty();
+    writeStatement("state.call_depth--");
+    writeStatement("return static_cast<Block>(state.call_stack[min("
+                   "state.call_depth, 7u)])");
 }
 
 void LangEmitter::emitBranchConditional(const ir::Value& cond,

@@ -1,9 +1,14 @@
 #include "core/hw/tegra_x1/cpu/hypervisor/mmu.hpp"
 
+#include <cstdlib>
+
 #include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/const.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/memory.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/stage2_tracker.hpp"
+#include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/system.hpp"
 
 /*
 #define USER_RANGE_MEM_BASE 0x01000000
@@ -77,6 +82,17 @@ void releasePageTableRegion(paddr_t addr) {
 
 Mmu::Mmu(System& system)
     : IMmu(system), user_page_table(findFreePageTableRegion()) {
+    Stage2Tracker::instance().setCallbacks({
+        .flush_gpu_writes =
+            [&system](ztd::Range<uptr> range) {
+                system.getGpu().getRenderer().flushMemoryForCpu(range);
+            },
+        .invalidate_gpu_caches =
+            [&system](ztd::Range<uptr> range) {
+                system.getGpu().getRenderer().invalidateMemory(range);
+            },
+    });
+
     // Loader return address
     // TODO: this should be done in a backend agnostic way (perhaps in the
     // kernel?)
@@ -170,22 +186,77 @@ void Mmu::setMemoryAttribute(ztd::Range<vaddr_t> range,
     user_page_table.setMemoryAttribute(range, mask, value);
 }
 
+// Stage 2 (hypervisor) tracking is opt-in with HYDRA_STAGE2_TRACKING: it
+// also makes GPU writes visible to the CPU, but UE4 games still render wrong
+// lighting with it. Guest page table (stage 1) tracking is the default.
+static bool useStage1Tracking() {
+    static const bool value = std::getenv("HYDRA_STAGE2_TRACKING") == nullptr;
+    return value;
+}
+
+bool Mmu::protectsGpuWrites() const { return !useStage1Tracking(); }
+
 void Mmu::setWriteTrackingEnabled(ztd::Range<vaddr_t> range, bool enable) {
     ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
     ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    user_page_table.setWriteTrackingEnabled(range, enable);
+    if (useStage1Tracking()) {
+        user_page_table.setWriteTrackingEnabled(range, enable);
+        return;
+    }
+    // Guest pages can be backed by separate host allocations, track each
+    // contiguous host run at once
+    uptr run_begin = 0x0;
+    uptr run_end = 0x0;
+    const auto flush_run = [&] {
+        if (run_end != run_begin)
+            Stage2Tracker::instance().setWriteTracked(
+                ztd::Range<uptr>(run_begin, run_end), enable);
+        run_begin = run_end = 0x0;
+    };
+    for (vaddr_t va = range.getBegin(); va < range.getEnd();
+         va += GUEST_PAGE_SIZE) {
+        const uptr host = unmapAddr(va);
+        if (host == 0x0 || host != run_end)
+            flush_run();
+        if (host == 0x0)
+            continue;
+        if (run_begin == 0x0)
+            run_begin = host;
+        run_end = host + GUEST_PAGE_SIZE;
+    }
+    flush_run();
 }
 
+// Stage 1 tracking is not used: stage 2 faults are handled by the VM thread
 bool Mmu::trySuspendWriteTracking(ztd::Range<vaddr_t> range) {
-    ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
-    ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    return user_page_table.trySuspendWriteTracking(range);
+    if (useStage1Tracking())
+        return user_page_table.trySuspendWriteTracking(range);
+    return false;
 }
 
 void Mmu::resumeWriteTracking(ztd::Range<vaddr_t> range) {
-    ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
-    ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    user_page_table.resumeWriteTracking(range);
+    if (useStage1Tracking())
+        user_page_table.resumeWriteTracking(range);
+}
+
+bool Mmu::trackWrite(ztd::Range<vaddr_t> range) {
+    if (useStage1Tracking())
+        return IMmu::trackWrite(range);
+    return false;
+}
+
+void Mmu::flushTrackedPages() {
+    if (useStage1Tracking()) {
+        IMmu::flushTrackedPages();
+        return;
+    }
+    Stage2Tracker::instance().rearmWriteTracking();
+}
+
+void Mmu::protectGpuWritten(ztd::Range<uptr> range) {
+    if (useStage1Tracking())
+        return;
+    Stage2Tracker::instance().protectGpuWritten(range);
 }
 
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

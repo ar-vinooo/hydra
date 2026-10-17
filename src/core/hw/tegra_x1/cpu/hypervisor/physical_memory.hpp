@@ -46,6 +46,17 @@ class PhysicalMemory {
         return 0;
     }
 
+    // Returns 0 if the host address isn't guest memory
+    paddr_t tryFromHost(uptr host) {
+        std::lock_guard lock(mutex);
+        for (const auto& [address, allocation] : allocations) {
+            if (host >= allocation.host &&
+                host - allocation.host < allocation.size)
+                return address + (host - allocation.host);
+        }
+        return 0;
+    }
+
     uptr toHost(paddr_t address) {
         std::lock_guard lock(mutex);
         auto it = allocations.upper_bound(address);

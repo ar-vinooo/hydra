@@ -2,7 +2,10 @@
 
 #include <fstream>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
 #include <iostream>
+#include <thread>
 #include <stdexcept>
 
 #include "core/c_api.h"
@@ -99,26 +102,97 @@ void checkMmuLookup() {
     TestMmu::size_queries = 0;
     uptr base = 0;
     for (u32 i = 0; i < 4096; ++i) {
-        auto* range =
-            mmu.findAddrImplRef(0x10000 + uptr(i) * 0x2000 + 0xfff, base);
+        const auto range =
+            mmu.findAddr(0x10000 + uptr(i) * 0x2000 + 0xfff, base);
         check(range && range->id == i, "Wrong GPU range lookup");
         check(base == 0x10000 + uptr(i) * 0x2000, "Wrong GPU range base");
     }
     check(TestMmu::size_queries == 4096,
           "GPU lookup still scans every mapping");
-    check(!mmu.findAddrImplRef(0xffff, base),
-          "Address before mapping accepted");
-    check(!mmu.findAddrImplRef(0x11000, base), "Mapping boundary/gap accepted");
+    // Repeated lookups of a recent mapping skip the map
+    for (u32 i = 0; i < 16; ++i)
+        check(mmu.findAddr(0x10000 + uptr(4095) * 0x2000 + i, base)->id ==
+                  4095,
+              "Cached GPU range lookup");
+    check(TestMmu::size_queries == 4096, "Recent mappings are cached");
+    check(!mmu.findAddr(0xffff, base), "Address before mapping accepted");
+    check(!mmu.findAddr(0x11000, base), "Mapping boundary/gap accepted");
     mmu.map(0x10800, {0x1000, 9000});
-    check(mmu.findAddrImplRef(0x10900, base)->id == 0,
+    check(mmu.findAddr(0x10900, base)->id == 0,
           "Overlapping mapping precedence changed");
-    check(mmu.findAddrImplRef(0x11000, base)->id == 9000,
+    check(mmu.findAddr(0x11000, base)->id == 9000,
           "Overlap extension unavailable");
     mmu.unmap(0x10800);
-    check(!mmu.findAddrImplRef(0x11000, base),
+    check(!mmu.findAddr(0x11000, base),
           "Unmapped GPU range remains visible");
+    // A remap replaces the cached mapping
+    mmu.unmap(0x10000);
+    mmu.map(0x10000, {0x1000, 7777});
+    check(mmu.findAddr(0x10010, base)->id == 7777,
+          "Cached lookup survives a remap");
     std::cout << "PASS: 4096 GPU lookups use one range check each; boundaries "
                  "and overlap precedence\n";
+
+    // Lookup cost: the GPU thread resolves addresses constantly, mostly inside
+    // a few mappings. The locked, cached lookup must stay close to a bare map.
+    {
+        constexpr u32 LOOKUPS = 4'000'000;
+        std::map<uptr, TestMmuRange> bare;
+        for (u32 i = 0; i < 4096; ++i)
+            bare[0x10000 + uptr(i) * 0x2000] = {0x1000, i};
+        const auto time = [&](auto&& lookup) {
+            const auto begin = std::chrono::steady_clock::now();
+            u64 sum = 0;
+            for (u32 i = 0; i < LOOKUPS; ++i)
+                sum += lookup(0x10000 + uptr((i >> 4) % 6) * 0x2000 + (i & 0xff));
+            const auto end = std::chrono::steady_clock::now();
+            check(sum != 0, "Lookups ran");
+            return std::chrono::duration<double, std::nano>(end - begin).count() /
+                   LOOKUPS;
+        };
+        uptr lookup_base = 0;
+        const double bare_ns = time([&](uptr addr) {
+            auto it = bare.upper_bound(addr);
+            --it;
+            return it->second.id + u64(1);
+        });
+        const double cached_ns = time([&](uptr addr) {
+            return mmu.findAddr(addr, lookup_base)->id + u64(1);
+        });
+        std::cout << "GPU lookup: " << cached_ns << " ns (bare map " << bare_ns
+                  << " ns)\n";
+        check(cached_ns < bare_ns * 2.0 + 20.0,
+              "The cached lookup is not slower than a bare map lookup");
+    }
+
+    // Mappings change on service threads while the GPU thread looks them up
+    TestMmu shared;
+    for (u32 i = 0; i < 64; ++i)
+        shared.map(0x100000 + uptr(i) * 0x10000, {0x10000, i});
+    std::atomic<bool> stop{false};
+    std::thread mapper([&] {
+        for (u32 round = 0; round < 20000; ++round) {
+            const uptr addr = 0x2000000 + uptr(round % 512) * 0x1000;
+            shared.map(addr, {0x1000, round});
+            shared.unmap(addr);
+        }
+        stop = true;
+    });
+    u64 lookups = 0;
+    while (!stop) {
+        for (u32 i = 0; i < 64; ++i) {
+            uptr lookup_base;
+            const auto range =
+                shared.findAddr(0x100000 + uptr(i) * 0x10000 + 0x123,
+                                lookup_base);
+            check(range && range->id == i,
+                  "Lookup during concurrent remapping");
+            lookups++;
+        }
+    }
+    mapper.join();
+    check(lookups != 0, "Lookups ran during remapping");
+    std::cout << "PASS: GPU range lookups during concurrent remapping\n";
 }
 
 void checkThreadWaits() {
@@ -139,10 +213,20 @@ void checkThreadWaits() {
         check(waiting.processMessages(1'000'000'000), "Resume wait timed out");
         check(waiting.wasSignalled(), "Wait returned without a guest signal");
     }
+    // CancelSynchronization ends a wait in progress...
     waiting.pause();
+    waiting.beginSyncWait();
     waiting.cancelSync();
     check(waiting.processMessages(), "Cancel wait timed out");
     check(!waiting.wasSignalled(), "Cancellation was treated as a signal");
+    waiting.endSyncWait();
+    // ...and, sent before the thread waits, the next wait (no lost wakeup)
+    waiting.cancelSync();
+    waiting.pause();
+    waiting.beginSyncWait();
+    check(waiting.processMessages(), "Early cancel did not end the next wait");
+    check(!waiting.wasSignalled(), "Early cancellation was a signal");
+    waiting.endSyncWait();
     waiting.stop();
     waiting.processMessages();
     std::cout
@@ -308,8 +392,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         check(argc >= 2, "Usage: hydra-xci-tests FIXTURE_DIRECTORY [REAL_XCI]");
-        checkThreadWaits();
         checkMmuLookup();
+        checkThreadWaits();
         const std::filesystem::path dir(argv[1]);
         const auto keys = filesystem::NcaFile::loadKeys(dir / "prod.keys");
         auto source = std::make_shared<filesystem::DiskFile>(

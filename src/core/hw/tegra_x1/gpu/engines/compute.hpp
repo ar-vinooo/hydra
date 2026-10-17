@@ -73,6 +73,7 @@ class Compute : public EngineWithRegsBase<RegsCompute>, public InlineBase {
     explicit Compute(Gpu& gpu_) : gpu{gpu_} {}
 
     void method(u32 method, u32 arg) override;
+    void methodHot(u32 method, u32 arg);
 
   private:
     Gpu& gpu;

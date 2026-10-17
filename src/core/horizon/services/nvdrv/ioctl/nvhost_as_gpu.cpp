@@ -41,8 +41,47 @@ NvResult NvHostAsGpu::freeSpace(vaddr_t offset, u32 pages, u32 page_size) {
     return NvResult::Success;
 }
 
-NvResult NvHostAsGpu::unmapBuffer(gpu_vaddr_t addr) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "address: {:#x}", addr);
+namespace {
+
+// Cached GPU resources of guest memory that is (re)mapped or unmapped may be
+// stale: the guest can reuse the memory for other data, and CPU writes made
+// while it was not GPU mapped are not tracked. Re-read it from guest memory.
+void invalidateGuestRange(System* system, kernel::Process* process,
+                          vaddr_t begin, u64 size) {
+    if (size == 0)
+        return;
+    auto* mmu = process->getMmu();
+    auto& renderer = system->getGpu().getRenderer();
+    const vaddr_t end = begin + size;
+    vaddr_t run_begin = begin;
+    uptr run_ptr = mmu->unmapAddr(begin);
+    vaddr_t cursor = begin;
+    while (cursor < end) {
+        const vaddr_t next =
+            std::min(align(cursor + 1, hw::tegra_x1::cpu::GUEST_PAGE_SIZE), end);
+        const uptr ptr = next < end ? mmu->unmapAddr(next) : 0;
+        if (next == end || ptr != run_ptr + (next - run_begin)) {
+            if (run_ptr != 0)
+                renderer.invalidateMemory(
+                    ztd::Range<uptr>::fromSize(run_ptr, next - run_begin));
+            run_begin = next;
+            run_ptr = ptr;
+        }
+        cursor = next;
+    }
+}
+
+} // namespace
+
+NvResult NvHostAsGpu::unmapBuffer(System* system, kernel::Process* process,
+                                  gpu_vaddr_t addr) {
+    // TODO: remove the GPU mapping (sparse reservations read as zero)
+    const auto it = buffer_mappings.find(addr);
+    if (it != buffer_mappings.end()) {
+        invalidateGuestRange(system, process, it->second.first,
+                             it->second.second);
+        buffer_mappings.erase(it);
+    }
     return NvResult::Success;
 }
 
@@ -57,9 +96,11 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
     (void)kind;
 
     if (any(flags & MapBufferFlags::Modify)) {
-        LOG_NOT_IMPLEMENTED(
-            Services, "Address space modifying (Gpu addr: {:#x}, size: {:#x})",
-            *inout_addr.data, mapping_size);
+        // Changes the PTE kind (compression) of an existing mapping, which the
+        // host does not model: the mapping stays as it is
+        LOG_DEBUG(Services,
+                  "Address space modifying (Gpu addr: {:#x}, size: {:#x})",
+                  *inout_addr.data, mapping_size);
         return NvResult::Success;
     }
 
@@ -79,6 +120,8 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
 
     inout_addr = process->getGMmu().mapBufferToAddressSpace(
         ztd::Range<vaddr_t>::fromSize(map->addr + buffer_offset, size), addr);
+    buffer_mappings[*inout_addr.data] = {map->addr + buffer_offset, size};
+    invalidateGuestRange(system, process, map->addr + buffer_offset, size);
     return NvResult::Success;
 }
 
@@ -98,19 +141,26 @@ NvResult NvHostAsGpu::getVaRegions(gpu_vaddr_t buffer_addr,
     return NvResult::Success;
 }
 
-NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 big_page_size,
-                                i32 as_fd, u32 flags,
+// Arguments in the order of the guest structure: flags, as_fd, big_page_size
+NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
+                                u32 big_page_size,
                                 [[maybe_unused]] u32 reserved,
                                 u64 va_range_start, u64 va_range_end,
                                 u64 va_range_split) {
     LOG_FUNC_WITH_ARGS_STUBBED(Services,
-                               "big page size: {}, as fd: {}, flags: {}, "
+                               "big page size: {:#x}, as fd: {}, flags: {:#x}, "
                                "start: {:#x}, end: {:#x}, split: {:#x}",
                                big_page_size, as_fd, flags, va_range_start,
                                va_range_end, va_range_split);
 
-    if (big_page_size != 0)
+    if (big_page_size != 0) {
+        if (!std::has_single_bit(big_page_size)) {
+            LOG_ERROR(Services, "Big page size {:#x} is not a power of two",
+                      big_page_size);
+            return NvResult::BadValue;
+        }
         as_big_page_size = big_page_size;
+    }
 
     // TODO: why does nouveau pass 0x0 for all of these?
 

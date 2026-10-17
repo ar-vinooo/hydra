@@ -72,21 +72,39 @@ bool IMmu::trackWrite(ztd::Range<vaddr_t> range) {
     if (!trySuspendWriteTracking(aligned_range))
         return false;
 
-    // Notify the GPU
+    // Notify the GPU. Queued: invalidating here would wait for the cache
+    // locks that the GPU thread holds for whole draws.
     // TODO: what about non-contiguous regions?
     const auto ptr = unmapAddr(aligned_range.getBegin());
-    system.getGpu().getRenderer().invalidateMemory(
-        ztd::Range<uptr>::fromSize(ptr, aligned_range.getSize()));
-
     {
         std::scoped_lock lock(write_tracking_mutex);
         tracked_pages.push_back(aligned_range);
+        pending_invalidations.push_back(
+            ztd::Range<uptr>::fromSize(ptr, aligned_range.getSize()));
+        has_pending_invalidations.store(true, std::memory_order_release);
     }
 
     return true;
 }
 
+void IMmu::applyPendingInvalidations() {
+    if (!has_pending_invalidations.load(std::memory_order_acquire))
+        return;
+    std::vector<ztd::Range<uptr>> ranges;
+    {
+        std::scoped_lock lock(write_tracking_mutex);
+        ranges.swap(pending_invalidations);
+        has_pending_invalidations.store(false, std::memory_order_relaxed);
+    }
+    auto& renderer = system.getGpu().getRenderer();
+    for (const auto& range : ranges)
+        renderer.invalidateMemory(range);
+}
+
 void IMmu::flushTrackedPages() {
+    // Pending invalidations are applied by PFIFO before each entry: this is
+    // called with the cache mutexes held, so invalidating here would deadlock.
+    // Ranges stay queued, so a write after the resume is not lost
     std::scoped_lock lock(write_tracking_mutex);
     for (const auto& range : tracked_pages)
         resumeWriteTracking(range);

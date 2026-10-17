@@ -1,6 +1,7 @@
 #include "core/system.hpp"
 
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 
 #include <execinfo.h>
@@ -550,8 +551,10 @@ void System::progressFrame(u32 width, u32 height,
     // Acquire present textures
     bool acquired =
         os.getDisplayDriver().acquirePresentTextures(command_buffer);
-    if (acquired)
+    if (acquired) {
         hw::tegra_x1::gpu::FrameTracer::instance().onPresent();
+        hw::tegra_x1::gpu::VisualDiagnostics::instance().onPresent();
+    }
 
     // DEBUG: performance statistics
     if (acquired && hw::tegra_x1::gpu::PerfStats::isEnabled()) {

@@ -45,6 +45,9 @@ ninja -C build
 
 You will find a macOS app at `build/bin/Hydra.app`. If you want to use the SwiftUI frontend instead of `SDL3`, you can use the `-DFRONTEND=SwiftUI` option.
 
+For live texture-cache code updates, shader overrides and frame captures, see
+[Live graphics debugging](tests/README-hot-debug.md).
+
 ### Configuring
 
 You can find a config file at `~/Library/Application Support/Hydra/config.toml` after launching the emulator at least once.

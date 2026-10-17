@@ -164,7 +164,9 @@ NvResult NvHostVic::executeVideo(IoctlContext& context) {
                     pixel[2] = color[output_format == 32 ? 0 : 2];
                     pixel[3] = output_format == 35 ? 255 : u8(std::clamp(i64(alpha), clamp_low, clamp_high) >> 2);
                 }
-            } else if (plane && output_format == 68) {
+            } else if (plane && output_format == 67) {
+                // 67 is Y8___V8U8_N420 (NV21); 68 is Y8___U8V8_N420 (NV12),
+                // which matches the decoder's chroma order.
                 for (u32 column = 0; column < width; column += 2) {
                     output[column] = input[column + 1];
                     output[column + 1] = input[column];
@@ -244,7 +246,7 @@ NvResult NvHostVic::executeVideo(IoctlContext& context) {
         }
     }
     LOG_INFO(Services, "VIC wrote {}x{} {} picture from 0x{:x} to 0x{:x}/0x{:x}",
-        width, height, rgb ? (output_format == 32 ? "BGRA" : "RGBA") : (output_format == 68 ? "NV21" : "NV12"), u64(video_registers[0x100]) << 8,
+        width, height, rgb ? (output_format == 32 ? "BGRA" : "RGBA") : (output_format == 67 ? "NV21" : "NV12"), u64(video_registers[0x100]) << 8,
         u64(video_registers[0x1c8]) << 8, u64(video_registers[0x1c9]) << 8);
     return NvResult::Success;
 }

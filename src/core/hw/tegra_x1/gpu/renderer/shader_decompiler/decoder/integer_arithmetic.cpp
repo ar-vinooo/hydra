@@ -39,16 +39,16 @@ void emitIscadd(DecoderContext& context, pred_t pred, bool pred_inv,
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = negIf(context.builder,
-                         ir::Value::createRegister(src_a, ir::ScalarType::I32),
+                         ir::Value::createRegister(src_a, ir::ScalarType::U32),
                          avg_mode == AvgMode::NegA);
     src_a_v =
         context.builder.opShiftLeft(src_a_v, ir::Value::createConstantU(shift));
-    auto src_b_v = negIf(context.builder, src_b, avg_mode == AvgMode::NegB);
+    auto src_b_v = negIf(context.builder, context.builder.opBitCast(src_b, ir::ScalarType::U32), avg_mode == AvgMode::NegB);
 
     auto res = context.builder.opAdd(src_a_v, src_b_v);
     if (avg_mode == AvgMode::PlusOne)
-        res = context.builder.opAdd(res, ir::Value::createConstantI(1));
-    context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::I32),
+        res = context.builder.opAdd(res, ir::Value::createConstantU(1));
+    context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32),
                            res);
 
     if (conditional)
@@ -66,12 +66,11 @@ ir::Value extend16To32(DecoderContext& context, ir::Value value, bool high) {
             ir::Value::createConstantU(16));
 }
 
-// TODO: x, write_cc
 // TODO: verify
 void emitXmad(DecoderContext& context, pred_t pred, bool pred_inv, XmadCop mode,
               bool product_shift_left, bool merge, reg_t dst, reg_t src_a,
               bool a_signed, bool high_a, ir::Value src_b, bool high_b,
-              ir::Value src_c) {
+              ir::Value src_c, bool extended, bool write_cc) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = ir::Value::createRegister(
@@ -119,8 +118,33 @@ void emitXmad(DecoderContext& context, pred_t pred, bool pred_inv, XmadCop mode,
     }
     }
 
-    // TODO: extend
-    res = context.builder.opAdd(res, src_c_v);
+    // The flags come from the addition, like IADD
+    auto& b = context.builder;
+    const auto product = b.opBitCast(res, ir::ScalarType::U32);
+    const auto addend = b.opBitCast(src_c_v, ir::ScalarType::U32);
+    const auto sum = b.opAdd(product, addend);
+    res = sum;
+    if (extended)
+        res = b.opAdd(sum, b.opSelect(ir::Value::createConditionFlag(2),
+                                      ir::Value::createConstantU(1),
+                                      ir::Value::createConstantU(0)));
+    if (write_cc) {
+        const auto zero = ir::Value::createConstantU(0);
+        const auto sign = [&](ir::Value v) {
+            return b.opCompareNotEqual(
+                b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)),
+                zero);
+        };
+        const auto overflow =
+            sign(b.opBitwiseAnd(b.opBitwiseNot(b.opBitwiseXor(product, addend)),
+                                b.opBitwiseXor(product, res)));
+        const auto carry = b.opBitwiseOr(b.opCompareLess(sum, product),
+                                         b.opCompareLess(res, sum));
+        b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(res, zero));
+        b.opCopy(ir::Value::createConditionFlag(1), sign(res));
+        b.opCopy(ir::Value::createConditionFlag(2), carry);
+        b.opCopy(ir::Value::createConditionFlag(3), overflow);
+    }
 
     if (merge) {
         res = context.builder.opBitwiseAnd(res,
@@ -193,9 +217,9 @@ void emitIadd3(DecoderContext& context, InstIadd3Base base,
     auto c = extractIadd3Half(
         context, ir::Value::createRegister(base.src_c, ir::ScalarType::U32),
         half_c);
-    a = ensureIntegerSignedness<true>(context.builder, a);
-    b = ensureIntegerSignedness<true>(context.builder, b);
-    c = ensureIntegerSignedness<true>(context.builder, c);
+    a = ensureIntegerSignedness<false>(context.builder, a);
+    b = ensureIntegerSignedness<false>(context.builder, b);
+    c = ensureIntegerSignedness<false>(context.builder, c);
     a = negIf(context.builder, a, base.neg_a);
     b = negIf(context.builder, b, base.neg_b);
     c = negIf(context.builder, c, base.neg_c);
@@ -213,10 +237,10 @@ void emitIadd3(DecoderContext& context, InstIadd3Base base,
     default:
         break;
     }
-    res = context.builder.opAdd(ensureIntegerSignedness<true>(context.builder, res),
+    res = context.builder.opAdd(ensureIntegerSignedness<false>(context.builder, res),
                                 c);
     context.builder.opCopy(
-        ir::Value::createRegister(base.dst, ir::ScalarType::I32), res);
+        ir::Value::createRegister(base.dst, ir::ScalarType::U32), res);
 
     if (conditional)
         context.builder.opEndIf();
@@ -323,6 +347,109 @@ void emitIscaddI(DecoderContext& context, InstIscaddI inst) {
                    ir::ScalarType::I32));
 }
 
+// LEA: dst = (neg ? -a : a) << shift + b
+void emitLeaLo(DecoderContext& context, InstLeaLoBase inst,
+               ir::Value src_b) {
+    if (inst.x || inst.write_cc || static_cast<pred_t>(inst.dst_pred) != PT)
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "LEA X/CC/predicate output");
+
+    const auto conditional =
+        handlePredCond(context.builder, inst.pred, inst.pred_inv);
+
+    auto src_a = negIf(context.builder,
+                       ir::Value::createRegister(inst.src_a, ir::ScalarType::U32),
+                       inst.neg_a);
+    src_a = context.builder.opShiftLeft(src_a,
+                                        ir::Value::createConstantU(inst.shift));
+    context.builder.opCopy(
+        ir::Value::createRegister(inst.dst, ir::ScalarType::U32),
+        context.builder.opAdd(src_a, context.builder.opBitCast(src_b, ir::ScalarType::U32)));
+
+    if (conditional)
+        context.builder.opEndIf();
+}
+
+void emitLeaLoR(DecoderContext& context, InstLeaLoR inst) {
+    emitLeaLo(context, inst.base,
+              ir::Value::createRegister(inst.src_b, ir::ScalarType::I32));
+}
+
+void emitLeaLoC(DecoderContext& context, InstLeaLoC inst) {
+    emitLeaLo(context, inst.base,
+              ir::Value::createConstMemory(
+                  CMem(inst.cbuf_slot, RZ,
+                       static_cast<u64>(inst.cbuf_offset * 4)),
+                  ir::ScalarType::I32));
+}
+
+void emitLeaLoI(DecoderContext& context, InstLeaLoI inst) {
+    emitLeaLo(context, inst.base,
+              ir::Value::createConstant(
+                  getIntImm20(inst.imm20_0, inst.imm20_19, true),
+                  ir::ScalarType::I32));
+}
+
+namespace {
+
+// LEA.HI: dst = low word of ((neg ? -a : a) >> (32 - shift)) + b, where a is
+// the 64-bit value a_hi:a_lo
+void emitLeaHi(DecoderContext& context, pred_t pred, bool pred_inv, reg_t dst,
+               reg_t src_a_lo, reg_t src_a_hi, u32 shift, bool neg_a, bool x,
+               bool write_cc, pred_t dst_pred, ir::Value src_b) {
+    if (x || write_cc || dst_pred != PT)
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "LEA.HI X/CC/predicate output");
+
+    auto& builder = context.builder;
+    const auto conditional = handlePredCond(builder, pred, pred_inv);
+
+    auto lo = ir::Value::createRegister(src_a_lo, ir::ScalarType::U32);
+    auto hi = ir::Value::createRegister(src_a_hi, ir::ScalarType::U32);
+    if (neg_a) {
+        // 64-bit two's complement negation
+        const auto lo_zero =
+            builder.opCompareEqual(lo, ir::Value::createConstantU(0));
+        lo = builder.opNeg(lo);
+        lo = builder.opBitCast(lo, ir::ScalarType::U32);
+        hi = builder.opBitwiseNot(hi);
+        hi = builder.opAdd(hi, builder.opSelect(lo_zero,
+                                                ir::Value::createConstantU(1),
+                                                ir::Value::createConstantU(0)));
+    }
+
+    const auto word =
+        (shift == 0
+             ? hi
+             : builder.opBitwiseOr(
+                   builder.opShiftRight(lo,
+                                        ir::Value::createConstantU(32 - shift)),
+                   builder.opShiftLeft(hi, ir::Value::createConstantU(shift))));
+    builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32),
+                   builder.opAdd(word, builder.opBitCast(src_b,
+                                                         ir::ScalarType::U32)));
+
+    if (conditional)
+        builder.opEndIf();
+}
+
+} // namespace
+
+void emitLeaHiR(DecoderContext& context, InstLeaHiR inst) {
+    emitLeaHi(context, inst.pred, inst.pred_inv, inst.dst, inst.src_a_lo,
+              inst.src_a_hi, inst.shift, inst.neg_a, inst.x, inst.write_cc,
+              inst.dst_pred,
+              ir::Value::createRegister(inst.src_b, ir::ScalarType::U32));
+}
+
+void emitLeaHiC(DecoderContext& context, InstLeaHiC inst) {
+    emitLeaHi(context, inst.pred, inst.pred_inv, inst.dst, inst.src_a_lo,
+              inst.src_a_hi, inst.shift, inst.neg_a, inst.x, inst.write_cc,
+              inst.dst_pred,
+              ir::Value::createConstMemory(
+                  CMem(inst.cbuf_slot, RZ,
+                       static_cast<u64>(inst.cbuf_offset * 4)),
+                  ir::ScalarType::U32));
+}
+
 void emitIscadd32I(DecoderContext& context, InstIscadd32I inst) {
     emitIscadd(context, inst.pred, inst.pred_inv, AvgMode::NoNeg, inst.dst,
                inst.src_a, inst.shift,
@@ -337,7 +464,8 @@ void emitXmadR(DecoderContext& context, InstXmadR inst) {
                                                        ? ir::ScalarType::I32
                                                        : ir::ScalarType::U32),
              inst.hilo_b,
-             ir::Value::createRegister(inst.src_c, ir::ScalarType::U32));
+             ir::Value::createRegister(inst.src_c, ir::ScalarType::U32),
+             inst.base.x, inst.base.write_cc);
 }
 
 void emitXmadRC(DecoderContext& context, InstXmadRC inst) {
@@ -350,18 +478,21 @@ void emitXmadRC(DecoderContext& context, InstXmadRC inst) {
         inst.hilo_b,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::ScalarType::U32));
+            ir::ScalarType::U32),
+        inst.x, inst.base.write_cc);
 }
 
 void emitXmadC(DecoderContext& context, InstXmadC inst) {
     emitXmad(
-        context, inst.base.pred, inst.base.pred_inv, inst.cop, false, false,
+        context, inst.base.pred, inst.base.pred_inv, inst.cop, inst.psl,
+        inst.mrg,
         inst.base.dst, inst.base.src_a, inst.base.a_signed, inst.base.hilo_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
             inst.base.b_signed ? ir::ScalarType::I32 : ir::ScalarType::U32),
         inst.hilo_b,
-        ir::Value::createRegister(inst.src_c, ir::ScalarType::U32));
+        ir::Value::createRegister(inst.src_c, ir::ScalarType::U32), inst.x,
+        inst.base.write_cc);
 }
 
 void emitXmadI(DecoderContext& context, InstXmadI inst) {
@@ -371,7 +502,8 @@ void emitXmadI(DecoderContext& context, InstXmadI inst) {
              ir::Value::createConstant(inst.imm16, inst.base.b_signed
                                                        ? ir::ScalarType::I32
                                                        : ir::ScalarType::U32),
-             false, ir::Value::createRegister(inst.src_c, ir::ScalarType::U32));
+             false, ir::Value::createRegister(inst.src_c, ir::ScalarType::U32),
+             inst.base.x, inst.base.write_cc);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

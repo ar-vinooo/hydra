@@ -2,8 +2,6 @@
 
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
-// TODO: support depth
-
 namespace hydra::hw::tegra_x1::gpu {
 
 constexpr u32 GOB_WIDTH_LOG2 = 6;
@@ -37,5 +35,10 @@ void convertLinearToBlockLinear(u32 src_stride, u32 src_slice_stride,
                                 u32 block_height_gobs_log2,
                                 u32 block_depth_gobs_log2, const u8* in_data,
                                 u8* out_data);
+
+// Byte offset of (x bytes, y, z) in a block linear surface of the given width
+// in bytes and height in rows
+u64 getBlockLinearOffset(u32 x, u32 y, u32 z, u32 width, u32 height,
+                         u32 block_height_log2, u32 block_depth_log2);
 
 } // namespace hydra::hw::tegra_x1::gpu

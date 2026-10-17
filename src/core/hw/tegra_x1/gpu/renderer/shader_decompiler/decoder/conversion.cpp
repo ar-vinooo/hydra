@@ -4,298 +4,336 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-ir::ScalarType toType(FloatFormat format) {
+// The conversions are backend helpers taking a control word, the bits are
+// documented with the helpers
+
+// Words of a source operand: 64-bit operands use the next register or
+// constant buffer word
+struct Source {
+    ir::Value lo;
+    ir::Value hi;
+};
+
+Source getRegisterSource(reg_t reg) {
+    return {ir::Value::createRegister(reg, ir::ScalarType::U32),
+            ir::Value::createRegister(reg == RZ ? RZ : reg_t(reg + 1),
+                                      ir::ScalarType::U32)};
+}
+
+Source getConstSource(u32 slot, u32 offset) {
+    return {ir::Value::createConstMemory(
+                CMem(slot, RZ, static_cast<u64>(offset) * 4)),
+            ir::Value::createConstMemory(
+                CMem(slot, RZ, static_cast<u64>(offset) * 4 + 4))};
+}
+
+// Float immediates are the top bits of the value. An F16 immediate is the
+// low half of the field, in both halves.
+Source getFloatImmSource(u32 imm20_0, u32 imm20_19, FloatFormat format) {
+    const u32 field = imm20_0 | (imm20_19 << 19);
     switch (format) {
-    case FloatFormat::F16:
-        return ir::ScalarType::F16;
-    case FloatFormat::F32:
-        return ir::ScalarType::F32;
+    case FloatFormat::F16: {
+        const u32 half = imm20_0 & 0xffff;
+        return {ir::Value::createConstantU(half | (half << 16)),
+                ir::Value::createConstantU(0)};
+    }
     case FloatFormat::F64:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F64");
-        return ir::ScalarType::F32;
+        return {ir::Value::createConstantU(0),
+                ir::Value::createConstantU(field << 12)};
     default:
-        unreachable();
+        return {ir::Value::createConstantU(field << 12),
+                ir::Value::createConstantU(0)};
     }
 }
 
-// TODO: sh, ftz, write_cc
-void emitFloatToFloat(DecoderContext& context, pred_t pred, bool pred_inv,
-                      RoundMode2 round_mode, bool saturate, reg_t dst,
-                      FloatFormat dst_format, ir::Value src, bool abs,
-                      bool neg) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+// Integer immediates are sign extended, to 64 bits as well
+Source getIntImmSource(u32 imm20_0, u32 imm20_19) {
+    const u32 value = getIntImm20(imm20_0, imm20_19, true);
+    return {ir::Value::createConstantU(value),
+            ir::Value::createConstantU((value & 0x80000000u) != 0 ? 0xffffffffu
+                                                                  : 0u)};
+}
 
-    auto src_v = absNegIf(context.builder, src, abs, neg);
-    switch (round_mode) {
-    case RoundMode2::Pass:
-        break;
+ir::Value callIntrinsic(ir::Builder& builder, ir::Intrinsic intrinsic,
+                        const std::vector<ir::Value>& args) {
+    return builder.opIntrinsic(intrinsic, ir::ScalarType::U32, args);
+}
+
+void writeWord(ir::Builder& builder, reg_t dst, const ir::Value& value) {
+    builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32), value);
+}
+
+void writePair(ir::Builder& builder, reg_t dst, const ir::Value& lo,
+               const ir::Value& hi) {
+    writeWord(builder, dst, lo);
+    if (dst != RZ)
+        writeWord(builder, dst + 1, hi);
+}
+
+// Format code of the F16/F32 helpers (1 F16, 2 F32)
+u32 getFloatCode(FloatFormat format) {
+    return format == FloatFormat::F16 ? 1u : 2u;
+}
+
+// TODO: ftz on F64, write_cc, rounding direction of size changes
+void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
+                      const Source& src) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
+    if (inst.write_cc)
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2F CC"));
+
+    const auto src_fmt = inst.src_fmt.get();
+    const auto dst_fmt = inst.dst_fmt.get();
+    u32 rounding = 0;
+    switch (inst.getRoundMode()) {
     case RoundMode2::Round:
-        src_v = context.builder.opRound(src_v);
+        rounding = 1;
         break;
     case RoundMode2::Floor:
-        src_v = context.builder.opFloor(src_v);
+        rounding = 2;
         break;
     case RoundMode2::Ceil:
-        src_v = context.builder.opCeil(src_v);
+        rounding = 3;
         break;
     case RoundMode2::Trunc:
-        src_v = context.builder.opTrunc(src_v);
+        rounding = 4;
+        break;
+    default:
         break;
     }
+    // Integer rounding applies to conversions between equal sizes
+    if (src_fmt != dst_fmt)
+        rounding = 0;
 
-    const auto dst_type = toType(dst_format);
-    auto res = context.builder.opCast(src_v, dst_type);
-    res = saturateIf(context.builder, res, saturate);
-    context.builder.opCopy(ir::Value::createRegister(dst, dst_type), res);
+    if (src_fmt == FloatFormat::F64 && dst_fmt == FloatFormat::F64) {
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2F.F64.F64"));
+        writePair(b, inst.dst, src.lo, src.hi);
+    } else if (src_fmt == FloatFormat::F64) {
+        const u32 control = (inst.abs ? 1u : 0u) | (inst.neg ? 2u : 0u) |
+                            (inst.sat ? 4u : 0u) | (getFloatCode(dst_fmt) << 3);
+        writeWord(b, inst.dst,
+                  callIntrinsic(b, ir::Intrinsic::F64ToF32,
+                                {src.lo, src.hi,
+                                 ir::Value::createConstantU(control)}));
+    } else if (dst_fmt == FloatFormat::F64) {
+        const u32 control = getFloatCode(src_fmt) | (inst.sh ? 4u : 0u) |
+                            (inst.abs ? 8u : 0u) | (inst.neg ? 0x10u : 0u);
+        const auto convert = [&](bool high) {
+            return callIntrinsic(
+                b, ir::Intrinsic::F32ToF64,
+                {src.lo,
+                 ir::Value::createConstantU(control | (high ? 0x20u : 0u))});
+        };
+        const auto lo = convert(false);
+        const auto hi = convert(true);
+        writePair(b, inst.dst, lo, hi);
+    } else {
+        const u32 control = getFloatCode(src_fmt) |
+                            (getFloatCode(dst_fmt) << 2) |
+                            (inst.sh ? 0x10u : 0u) | (rounding << 5) |
+                            (inst.abs ? 0x100u : 0u) |
+                            (inst.neg ? 0x200u : 0u) |
+                            (inst.sat ? 0x400u : 0u) | (inst.ftz ? 0x800u : 0u);
+        writeWord(b, inst.dst,
+                  callIntrinsic(b, ir::Intrinsic::FloatToFloat,
+                                {src.lo, ir::Value::createConstantU(control)}));
+    }
 
     if (conditional)
-        context.builder.opEndIf();
-}
-
-ir::ScalarType toType(IntegerFormat format) {
-    switch (format) {
-    case IntegerFormat::U16:
-        return ir::ScalarType::U16;
-    case IntegerFormat::U32:
-        return ir::ScalarType::U32;
-    case IntegerFormat::U64:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "U64");
-        return ir::ScalarType::U32;
-    case IntegerFormat::S16:
-        return ir::ScalarType::I16;
-    case IntegerFormat::S32:
-        return ir::ScalarType::I32;
-    case IntegerFormat::S64:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "I64");
-        return ir::ScalarType::I32;
-    default:
-        unreachable();
-    }
-}
-
-// TODO: sh, ftz, write_cc
-void emitFloatToInt(DecoderContext& context, pred_t pred, bool pred_inv,
-                    RoundMode3 round_mode, reg_t dst, IntegerFormat dst_format,
-                    ir::Value src, bool abs, bool neg) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
-
-    auto src_v = absNegIf(context.builder, src, abs, neg);
-    switch (round_mode) {
-    case RoundMode3::Round:
-        src_v = context.builder.opRound(src_v);
-        break;
-    case RoundMode3::Floor:
-        src_v = context.builder.opFloor(src_v);
-        break;
-    case RoundMode3::Ceil:
-        src_v = context.builder.opCeil(src_v);
-        break;
-    case RoundMode3::Trunc:
-        src_v = context.builder.opTrunc(src_v);
-        break;
-    }
-
-    const auto dst_type = toType(dst_format);
-    const auto res = context.builder.opCast(src_v, dst_type);
-    context.builder.opCopy(ir::Value::createRegister(dst, dst_type), res);
-
-    if (conditional)
-        context.builder.opEndIf();
-}
-
-ir::ScalarType toType(IntegerFormat2 format) {
-    switch (format) {
-    case IntegerFormat2::U8:
-        return ir::ScalarType::U8;
-    case IntegerFormat2::U16:
-        return ir::ScalarType::U16;
-    case IntegerFormat2::U32:
-        return ir::ScalarType::U32;
-    case IntegerFormat2::S8:
-        return ir::ScalarType::I8;
-    case IntegerFormat2::S16:
-        return ir::ScalarType::I16;
-    case IntegerFormat2::S32:
-        return ir::ScalarType::I32;
-    default:
-        unreachable();
-    }
-}
-
-// Selects the byte (or halfword) the conversion reads from the source
-ir::Value selectSourceBytes(ir::Builder& builder, const ir::Value& src,
-                            ByteSelect byte_sel, char debug_kind = 'f') {
-    if (byte_sel == ByteSelect::B0)
-        return src;
-    // DEBUG: HYDRA_NO_BYTESEL disables byte selection
-    if (const char* env = std::getenv("HYDRA_NO_BYTESEL");
-        env != nullptr && std::strchr(env, debug_kind) != nullptr) {
-        LOG_INFO(ShaderDecompiler, "DEBUG skipped byte select {} ({}, {})",
-                 debug_kind, static_cast<u32>(byte_sel), src.getType());
-        return src;
-    }
-    LOG_INFO(ShaderDecompiler, "DEBUG byte select {} ({}, {})", debug_kind,
-             static_cast<u32>(byte_sel), src.getType());
-
-    // Reinterpret the whole register, shift the selected part down and
-    // truncate it to the source type
-    auto raw = src;
-    raw.type = ir::ScalarType::U32;
-    const auto shifted = builder.opShiftRight(
-        raw, ir::Value::createConstantU(static_cast<u32>(byte_sel) * 8));
-    return builder.opCast(shifted, src.getType());
+        b.opEndIf();
 }
 
 // TODO: write_cc
-void emitIntToInt(DecoderContext& context, pred_t pred, bool pred_inv,
-                  ByteSelect byte_sel, bool saturate, reg_t dst,
-                  IntegerFormat2 dst_format, ir::Value src, bool abs,
-                  bool neg) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+void emitFloatToInt(DecoderContext& context, InstF2iBase inst,
+                    const Source& src) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
+    if (inst.write_cc)
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2I CC"));
 
-    auto src_v = absNegIf(context.builder,
-                          selectSourceBytes(context.builder, src, byte_sel, 'i'),
-                          abs, neg);
+    auto value = src.lo;
+    bool is_f16 = inst.src_fmt == FloatFormat::F16;
+    if (inst.src_fmt == FloatFormat::F64) {
+        // TODO: exact conversion of doubles beyond the float mantissa
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2I from F64"));
+        value = callIntrinsic(b, ir::Intrinsic::F64ToF32,
+                              {src.lo, src.hi, ir::Value::createConstantU(
+                                                   getFloatCode(
+                                                       FloatFormat::F32)
+                                                   << 3)});
+        is_f16 = false;
+    }
 
-    const auto dst_type = toType(dst_format);
-    auto res = context.builder.opCast(src_v, dst_type);
-    // TODO: saturate
-    // res = IntegerSaturateIf(context.builder, dst_type, res, saturate);
-    if (saturate)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Saturation");
-    context.builder.opCopy(ir::Value::createRegister(dst, dst_type), res);
+    auto width = inst.dst_width.get();
+    if (width == IntegerWidth::Invalid) {
+        ONCE(LOG_WARN(ShaderDecompiler, "Invalid F2I destination format"));
+        width = IntegerWidth::_32;
+    }
+    const u32 control =
+        static_cast<u32>(inst.round_mode.get()) |
+        (inst.dst_signed ? 4u : 0u) |
+        (width == IntegerWidth::_16 ? 8u : 0u) | (is_f16 ? 0x10u : 0u) |
+        (inst.sh ? 0x20u : 0u) | (inst.abs ? 0x40u : 0u) |
+        (inst.neg ? 0x80u : 0u) | (inst.ftz ? 0x100u : 0u);
+    if (width == IntegerWidth::_64) {
+        const auto lo = callIntrinsic(b, ir::Intrinsic::FloatToInt64,
+                                      {value, ir::Value::createConstantU(control)});
+        const auto hi = callIntrinsic(
+            b, ir::Intrinsic::FloatToInt64,
+            {value, ir::Value::createConstantU(control | 0x200u)});
+        writePair(b, inst.dst, lo, hi);
+    } else {
+        writeWord(b, inst.dst,
+                  callIntrinsic(b, ir::Intrinsic::FloatToInt,
+                                {value, ir::Value::createConstantU(control)}));
+    }
 
     if (conditional)
-        context.builder.opEndIf();
+        b.opEndIf();
 }
 
-// TODO: round_mode, write_cc
-void emitIntToFloat(DecoderContext& context, pred_t pred, bool pred_inv,
-                    ByteSelect byte_sel, reg_t dst, FloatFormat dst_format,
-                    ir::Value src, bool abs, bool neg) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+void emitIntToInt(DecoderContext& context, InstI2iBase inst,
+                  const Source& src) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
 
-    auto src_v = absNegIf(context.builder,
-                          selectSourceBytes(context.builder, src, byte_sel),
-                          abs, neg);
+    const auto to_width = [](SmallIntegerWidth width) {
+        if (width == SmallIntegerWidth::_64) {
+            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "64-bit I2I"));
+            return 2u;
+        }
+        return static_cast<u32>(width);
+    };
+    const u32 control = to_width(inst.src_width) |
+                        (inst.src_signed ? 4u : 0u) |
+                        (to_width(inst.dst_width) << 3) |
+                        (inst.dst_signed ? 0x20u : 0u) |
+                        (inst.byte_sel.get() << 6) | (inst.sat ? 0x200u : 0u) |
+                        (inst.abs ? 0x400u : 0u) | (inst.neg ? 0x800u : 0u);
+    const auto res = callIntrinsic(b, ir::Intrinsic::IntToInt,
+                                   {src.lo, ir::Value::createConstantU(control)});
+    writeWord(b, inst.dst, res);
 
-    const auto dst_type = toType(dst_format);
-    const auto res = context.builder.opCast(src_v, dst_type);
-    context.builder.opCopy(ir::Value::createRegister(dst, dst_type), res);
+    if (inst.write_cc) {
+        // Zero and sign of the result, carry and overflow are cleared
+        const auto zero = ir::Value::createConstantU(0);
+        b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(res, zero));
+        b.opCopy(ir::Value::createConditionFlag(1),
+                 b.opCompareNotEqual(
+                     b.opBitwiseAnd(res, ir::Value::createConstantU(0x80000000u)),
+                     zero));
+        b.opCopy(ir::Value::createConditionFlag(2),
+                 ir::Value::createConstantB(false));
+        b.opCopy(ir::Value::createConditionFlag(3),
+                 ir::Value::createConstantB(false));
+    }
 
     if (conditional)
-        context.builder.opEndIf();
+        b.opEndIf();
+}
+
+// TODO: rounding direction, write_cc
+void emitIntToFloat(DecoderContext& context, InstI2fBase inst,
+                    const Source& src) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
+    if (inst.write_cc)
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "I2F CC"));
+
+    const auto dst_fmt = inst.dst_fmt.get();
+    const bool is_64 = inst.src_width == SmallIntegerWidth::_64;
+    const u32 control = static_cast<u32>(inst.src_width.get()) |
+                        (inst.src_signed ? 4u : 0u) |
+                        (getFloatCode(dst_fmt == FloatFormat::F64
+                                          ? FloatFormat::F32
+                                          : dst_fmt)
+                         << 3) |
+                        (is_64 ? 0u : inst.byte_sel.get() << 5) |
+                        (inst.abs ? 0x80u : 0u) | (inst.neg ? 0x100u : 0u);
+    const auto res =
+        is_64 ? callIntrinsic(b, ir::Intrinsic::Int64ToFloat,
+                              {src.lo, src.hi, ir::Value::createConstantU(control)})
+              : callIntrinsic(b, ir::Intrinsic::IntToFloat,
+                              {src.lo, ir::Value::createConstantU(control)});
+    if (dst_fmt == FloatFormat::F64) {
+        // TODO: exact conversion of integers beyond the float mantissa
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "I2F to F64"));
+        const auto convert = [&](bool high) {
+            return callIntrinsic(
+                b, ir::Intrinsic::F32ToF64,
+                {res, ir::Value::createConstantU(
+                          getFloatCode(FloatFormat::F32) | (high ? 0x20u : 0u))});
+        };
+        const auto lo = convert(false);
+        const auto hi = convert(true);
+        writePair(b, inst.dst, lo, hi);
+    } else {
+        writeWord(b, inst.dst, res);
+    }
+
+    if (conditional)
+        b.opEndIf();
 }
 
 } // namespace
 
 void emitF2fR(DecoderContext& context, InstF2fR inst) {
-    emitFloatToFloat(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.getRoundMode(),
-        inst.base.sat, inst.base.dst, inst.base.dst_fmt,
-        ir::Value::createRegister(inst.src, toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToFloat(context, inst.base, getRegisterSource(inst.src));
 }
 
 void emitF2fC(DecoderContext& context, InstF2fC inst) {
-    emitFloatToFloat(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.getRoundMode(),
-        inst.base.sat, inst.base.dst, inst.base.dst_fmt,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToFloat(context, inst.base,
+                     getConstSource(inst.cbuf_slot, inst.cbuf_offset));
 }
 
 void emitF2fI(DecoderContext& context, InstF2fI inst) {
-    emitFloatToFloat(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.getRoundMode(),
-        inst.base.sat, inst.base.dst, inst.base.dst_fmt,
-        ir::Value::createConstant((inst.imm20_0 | (inst.imm20_19 << 19)) << 12,
-                                  toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToFloat(context, inst.base,
+                     getFloatImmSource(inst.imm20_0, inst.imm20_19,
+                                       inst.base.src_fmt));
 }
 
 void emitF2iR(DecoderContext& context, InstF2iR inst) {
-    emitFloatToInt(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.round_mode,
-        inst.base.dst, inst.base.getDstFmt(),
-        ir::Value::createRegister(inst.src, toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToInt(context, inst.base, getRegisterSource(inst.src));
 }
 
 void emitF2iC(DecoderContext& context, InstF2iC inst) {
-    emitFloatToInt(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.round_mode,
-        inst.base.dst, inst.base.getDstFmt(),
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToInt(context, inst.base,
+                   getConstSource(inst.cbuf_slot, inst.cbuf_offset));
 }
 
 void emitF2iI(DecoderContext& context, InstF2iI inst) {
-    emitFloatToInt(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.round_mode,
-        inst.base.dst, inst.base.getDstFmt(),
-        ir::Value::createConstant((inst.imm20_0 | (inst.imm20_19 << 19)) << 12,
-                                  toType(inst.base.src_fmt)),
-        inst.base.abs, inst.base.neg);
+    emitFloatToInt(context, inst.base,
+                   getFloatImmSource(inst.imm20_0, inst.imm20_19,
+                                     inst.base.src_fmt));
 }
 
 void emitI2iR(DecoderContext& context, InstI2iR inst) {
-    emitIntToInt(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.byte_sel,
-        inst.base.sat, inst.base.dst, inst.base.getDstFmt(),
-        ir::Value::createRegister(inst.src, toType(inst.base.getSrcFmt())),
-        inst.base.abs, inst.base.neg);
+    emitIntToInt(context, inst.base, getRegisterSource(inst.src));
 }
 
 void emitI2iC(DecoderContext& context, InstI2iC inst) {
-    emitIntToInt(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.byte_sel,
-        inst.base.sat, inst.base.dst, inst.base.getDstFmt(),
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            toType(inst.base.getSrcFmt())),
-        inst.base.abs, inst.base.neg);
+    emitIntToInt(context, inst.base,
+                 getConstSource(inst.cbuf_slot, inst.cbuf_offset));
 }
 
 void emitI2iI(DecoderContext& context, InstI2iI inst) {
-    emitIntToInt(context, inst.base.pred, inst.base.pred_inv,
-                 inst.base.byte_sel, inst.base.sat, inst.base.dst,
-                 inst.base.getDstFmt(),
-                 ir::Value::createConstant(
-                     getIntImm20(inst.imm20_0, inst.imm20_19, true),
-                     toType(inst.base.getSrcFmt())),
-                 inst.base.abs, inst.base.neg);
+    emitIntToInt(context, inst.base,
+                 getIntImmSource(inst.imm20_0, inst.imm20_19));
 }
 
 void emitI2fR(DecoderContext& context, InstI2fR inst) {
-    emitIntToFloat(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.byte_sel,
-        inst.base.dst, inst.base.dst_fmt,
-        ir::Value::createRegister(inst.src, toType(inst.base.getSrcFmt())),
-        inst.base.abs, inst.base.neg);
+    emitIntToFloat(context, inst.base, getRegisterSource(inst.src));
 }
 
 void emitI2fC(DecoderContext& context, InstI2fC inst) {
-    emitIntToFloat(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.byte_sel,
-        inst.base.dst, inst.base.dst_fmt,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            toType(inst.base.getSrcFmt())),
-        inst.base.abs, inst.base.neg);
+    emitIntToFloat(context, inst.base,
+                   getConstSource(inst.cbuf_slot, inst.cbuf_offset));
 }
 
 void emitI2fI(DecoderContext& context, InstI2fI inst) {
-    emitIntToFloat(context, inst.base.pred, inst.base.pred_inv,
-                   inst.base.byte_sel, inst.base.dst, inst.base.dst_fmt,
-                   ir::Value::createConstant(
-                       getIntImm20(inst.imm20_0, inst.imm20_19, true),
-                       toType(inst.base.getSrcFmt())),
-                   inst.base.abs, inst.base.neg);
+    emitIntToFloat(context, inst.base,
+                   getIntImmSource(inst.imm20_0, inst.imm20_19));
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

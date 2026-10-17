@@ -125,9 +125,7 @@ void emitHadd2C(DecoderContext& context, InstHadd2C inst) {
         context, inst.base.pred, inst.base.pred_inv, inst.sat,
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         inst.base.abs_a, inst.neg_a,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::VectorType(ir::ScalarType::F16, 2)),
+        getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
         inst.abs_b, inst.neg_b);
 }
 
@@ -161,9 +159,7 @@ void emitHmul2C(DecoderContext& context, InstHmul2C inst) {
         context, inst.base.pred, inst.base.pred_inv, inst.sat,
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         inst.base.abs_a, inst.neg_a,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::VectorType(ir::ScalarType::F16, 2)),
+        getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
         inst.abs_b, false);
 }
 
@@ -200,9 +196,7 @@ void emitHfma2RC(DecoderContext& context, InstHfma2RC inst) {
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         false, getSwizzledHalf(context.builder, inst.swizzle_b, inst.src_b),
         inst.neg_b,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::VectorType(ir::ScalarType::F16, 2)),
+        getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
         inst.neg_c);
 }
 
@@ -211,9 +205,7 @@ void emitHfma2C(DecoderContext& context, InstHfma2C inst) {
         context, inst.base.pred, inst.base.pred_inv, inst.sat,
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         false,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::VectorType(ir::ScalarType::F16, 2)),
+        getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
         inst.neg_b,
         getSwizzledHalf(context.builder, inst.swizzle_c, inst.src_c),
         inst.neg_c);

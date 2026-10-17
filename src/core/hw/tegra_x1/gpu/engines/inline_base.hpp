@@ -46,7 +46,14 @@ class InlineBase {
                             const u32 data);
 
   private:
-    std::vector<u32> inline_data;
+    // Transfer started by LAUNCH_DMA: LINE_LENGTH_IN * LINE_COUNT bytes
+    std::vector<u8> inline_data;
+    usize copy_size{0};
+    bool is_pitch{true};
+    bool active{false};
+
+    void startTransfer(const RegsInline& regs, bool pitch);
+    void writeTransfer(Gpu& gpu, const RegsInline& regs);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

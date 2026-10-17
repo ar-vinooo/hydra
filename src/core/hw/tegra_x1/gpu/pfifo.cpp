@@ -1,4 +1,9 @@
 #include "core/hw/tegra_x1/gpu/pfifo.hpp"
+#include "core/hw/tegra_x1/cpu/mmu.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
+#ifdef ZTD_PLATFORM_APPLE
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#endif
 
 #include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
@@ -60,9 +65,26 @@ struct CommandHeader {
     SecondaryOpcode secondary_opcode : 3;
 };
 
+// Host mapping of the push buffer being executed. Only the GPU thread
+// executes push buffers, and an entry lies in one mapping: resolving every
+// word through the GMMU map was a large part of the command processing.
+struct PushBufferWindow {
+    uptr gpu_begin{0};
+    uptr gpu_end{0};
+    uptr host{0};
+} push_buffer_window;
+
 template <typename T>
 T read(uptr& gpu_addr) {
-    T word = tls_crnt_gmmu->load<T>(gpu_addr);
+    T word;
+    const auto& window = push_buffer_window;
+    if (gpu_addr >= window.gpu_begin && gpu_addr + sizeof(T) <= window.gpu_end)
+        std::memcpy(&word,
+                    reinterpret_cast<const void*>(window.host +
+                                                  (gpu_addr - window.gpu_begin)),
+                    sizeof(T));
+    else
+        word = tls_crnt_gmmu->load<T>(gpu_addr);
     gpu_addr += sizeof(T);
 
     return word;
@@ -86,15 +108,18 @@ void Pfifo::shutdown() {
 }
 
 void Pfifo::submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
-                          GpfifoFlags flags) {
+                          GpfifoFlags flags,
+                          std::function<void()> on_complete) {
     LOG_DEBUG(Gpu, "Flags: {}", flags);
 
     {
         std::scoped_lock lock(mutex);
         entry_lists.emplace(
             gmmu, std::vector<GpfifoEntry>(entries.begin(), entries.end()),
-            flags);
+            flags, submitted_count + 1, std::move(on_complete));
         submitted_count++;
+        VisualDiagnostics::instance().submissionQueued(
+            submitted_count, reinterpret_cast<uint64_t>(&gmmu), entries.size());
     }
 
     cond_var.notify_all();
@@ -136,11 +161,30 @@ void Pfifo::threadFunc() {
             {
                 ScopedPerfTimer timer(PerfStats::instance().pfifo_busy_ns);
                 PerfStats::instance().pfifo_lists++;
+                VisualDiagnostics::instance().beginSubmission(entry_list.correlation_id);
                 tls_crnt_gmmu = &entry_list.gmmu;
+                gpu.getRenderer().applyCaptureRequests();
                 tls_crnt_command_buffer =
                     gpu.getRenderer().createCommandBuffer();
                 for (const auto& entry : entry_list.entries)
                     submitEntry(entry);
+#ifdef ZTD_PLATFORM_APPLE
+                if (VisualDiagnostics::instance().enabled() &&
+                    CONFIG_INSTANCE.getGpuRenderer() == GpuRenderer::Metal) {
+                    const auto id = entry_list.correlation_id;
+                    const auto epoch = VisualDiagnostics::instance().frameId();
+                    static_cast<renderer::metal::CommandBuffer*>(tls_crnt_command_buffer)
+                        ->getCommandBuffer()->addCompletedHandler([id, epoch](MTL::CommandBuffer* completed) {
+                            const auto* error = completed->error();
+                            VisualDiagnostics::instance().completed(id, epoch,
+                                completed->status() == MTL::CommandBufferStatusCompleted ? "completed" : "failed",
+                                error ? error->localizedDescription()->utf8String() : "",
+                                completed->GPUEndTime() - completed->GPUStartTime());
+                        });
+                }
+#endif
+                if (entry_list.on_complete)
+                    tls_crnt_command_buffer->onCompleted(entry_list.on_complete);
                 delete tls_crnt_command_buffer;
                 tls_crnt_command_buffer = nullptr;
                 tls_crnt_gmmu = nullptr;
@@ -157,6 +201,8 @@ void Pfifo::threadFunc() {
 }
 
 void Pfifo::submitEntry(const GpfifoEntry entry) {
+    // CPU writes queued by write tracking must reach the caches first
+    tls_crnt_gmmu->getMmu()->applyPendingInvalidations();
     LOG_DEBUG(
         Gpu,
         "Gpfifo entry (addr lo: {:#x}, addr hi: {:#x}, size: {:#x}, allow "
@@ -169,14 +215,21 @@ void Pfifo::submitEntry(const GpfifoEntry entry) {
     gpu_addr &= ~0x3llu; // Clear the 2 lsb
     uptr end = gpu_addr + entry.size * sizeof(u32);
 
+    uptr base;
+    if (const auto as = tls_crnt_gmmu->findAddr(gpu_addr, base);
+        as && as->ptr != 0)
+        push_buffer_window = {base, base + as->size, as->ptr};
     while (gpu_addr < end) {
         if (!submitCommand(gpu_addr))
             break;
     }
+    push_buffer_window = {};
 }
 
 bool Pfifo::submitCommand(uptr& gpu_addr) {
+    const auto command_address = gpu_addr;
     const auto raw_header = read<u32>(gpu_addr);
+    VisualDiagnostics::instance().command(command_address, raw_header);
     const auto header = std::bit_cast<CommandHeader>(raw_header);
     LOG_DEBUG(
         Gpu, "Method: {:#x}, subchannel: {}, arg: {:#x}, secondary opcode: {}",

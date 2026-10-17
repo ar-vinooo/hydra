@@ -82,6 +82,7 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA16Sint, RGBA16Sint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Float, RGBA32Float),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Uint, RGBA32Uint),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Sint, RGBA32Sint),
     DS_PIXEL_FORMAT_ENTRY(S8Uint, Stencil8, false, true),
     DS_PIXEL_FORMAT_ENTRY(Z16Unorm, Depth16Unorm, true, false),
     DS_PIXEL_FORMAT_ENTRY(Z24Unorm_X8Uint, Depth32Float_Stencil8, true,
@@ -89,15 +90,20 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     DS_PIXEL_FORMAT_ENTRY(Z32Float, Depth32Float, true, false),
     DS_PIXEL_FORMAT_ENTRY(Z24Unorm_S8Uint, Depth32Float_Stencil8, true,
                           true), // HACK
+    DS_PIXEL_FORMAT_ENTRY(S8Uint_Z24Unorm, Depth32Float_Stencil8, true,
+                          true), // HACK
     DS_PIXEL_FORMAT_ENTRY(Z32Float_X24S8Uint, Depth32Float_Stencil8, true,
                           true),                                     // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Unorm_sRGB, RGBA8Unorm_sRGB), // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA8Unorm_sRGB, RGBA8Unorm_sRGB),
     COLOR_PIXEL_FORMAT_ENTRY(RGBA4Unorm, ABGR4Unorm, ZTD_PASS({3, 2, 1, 0})),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB5Unorm, BGR5A1Unorm), // HACK
-    COLOR_PIXEL_FORMAT_ENTRY(R5G6B5Unorm, B5G6R5Unorm,
-                             ZTD_PASS({2, 1, 0, 3})), // TODO: correct?
+    COLOR_PIXEL_FORMAT_ENTRY(RGB5A1Unorm, BGR5A1Unorm, ZTD_PASS({2, 1, 0, 3})),
+    COLOR_PIXEL_FORMAT_ENTRY(R1G5B5A5Unorm, A1BGR5Unorm,
+                             ZTD_PASS({3, 2, 1, 0})),
+    COLOR_PIXEL_FORMAT_ENTRY(R5G6B5Unorm, B5G6R5Unorm, ZTD_PASS({2, 1, 0, 3})),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB10A2Unorm, RGB10A2Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGR10A2Unorm, BGR10A2Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB10A2Uint, RGB10A2Uint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG11B10Float, RG11B10Float),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(E5BGR9Float, RGB9E5Float), // HACK
@@ -115,8 +121,8 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC5_RGSnorm, BC5_RGSnorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC7_RGBAUnorm, BC7_RGBAUnorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC7_RGBAUnorm_sRGB, BC7_RGBAUnorm_sRGB),
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_SF16_Float, Invalid), // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_UF16_Float, Invalid), // TODO
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_SF16_Float, BC6H_RGBFloat),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_UF16_Float, BC6H_RGBUfloat),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Unorm, RGBA8Unorm),        // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Snorm, RGBA8Snorm),        // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Uint, RGBA8Uint),          // HACK
@@ -165,17 +171,16 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRA8Unorm, BGRA8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRX8Unorm_sRGB, BGRA8Unorm_sRGB), // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRA8Unorm_sRGB, BGRA8Unorm_sRGB),
-    // TODO: implement ETC formats
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Unorm, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Snorm, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Unorm, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Snorm, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB, Invalid),          // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA, Invalid),         // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB_sRGB, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB_sRGB, Invalid), // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA_sRGB, Invalid),    // TODO
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Unorm, EAC_R11Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Snorm, EAC_R11Snorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Unorm, EAC_RG11Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Snorm, EAC_RG11Snorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB, ETC2_RGB8),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB, ETC2_RGB8A1),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA, EAC_RGBA8),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB_sRGB, ETC2_RGB8_sRGB),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB_sRGB, ETC2_RGB8A1_sRGB),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA_sRGB, EAC_RGBA8_sRGB),
 };
 
 /*
@@ -356,15 +361,15 @@ swizzle COLOR_PIXEL_FORMAT_ENTRY_RGBA(A16B16G16R16_sRGB, Invalid),
 */
 
 const PixelFormatInfo& toMtlPixelFormatInfo(TextureFormat format) {
+    static const PixelFormatInfo invalid_info{MTL::PixelFormatInvalid, false,
+                                              false, {0, 1, 2, 3}};
     auto it = pixel_format_lut.find(format);
-    ASSERT_DEBUG(it != pixel_format_lut.end(), MetalRenderer,
-                 "Unknown format {}", format);
+    if (it == pixel_format_lut.end()) {
+        ONCE(LOG_ERROR(MetalRenderer, "Unknown format {}", format));
+        return invalid_info;
+    }
 
-    const auto& info = it->second;
-    ASSERT_DEBUG(info.pixel_format != MTL::PixelFormatInvalid, MetalRenderer,
-                 "Unimplemented format {}", format);
-
-    return info;
+    return it->second;
 }
 
 MTL::CullMode toMtlCullMode(const engines::CullFaceMode mode) {
@@ -687,6 +692,9 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 }
 
 MTL::CompareFunction toMtlCompareFunc(engines::CompareOp depth_compare_op) {
+    const auto raw = static_cast<u32>(depth_compare_op);
+    if (raw >= 0x200 && raw <= 0x207)
+        depth_compare_op = static_cast<engines::CompareOp>(raw - 0x200 + 1);
     switch (depth_compare_op) {
     case engines::CompareOp::Never:
         return MTL::CompareFunctionNever;
@@ -726,6 +734,8 @@ MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle) {
     case ImageSwizzle::OneInt:
     case ImageSwizzle::OneFloat:
         return MTL::TextureSwizzleOne;
+    default:
+        return MTL::TextureSwizzleZero;
     }
 }
 
@@ -792,18 +802,23 @@ MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter) {
     case SamplerFilter::Nearest:
         return MTL::SamplerMinMagFilterNearest;
     case SamplerFilter::Linear:
+    // Anisotropic minification and the VCAA magnification filters
+    case SamplerFilter::Anisotropic:
+    case SamplerFilter::Vcaa8Tap:
         return MTL::SamplerMinMagFilterLinear;
+    default:
+        return MTL::SamplerMinMagFilterNearest;
     }
 }
 
 MTL::SamplerMipFilter toMtlSamplerMipFilter(const SamplerMipFilter filter) {
     switch (filter) {
-    case SamplerMipFilter::NotMipmapped:
-        return MTL::SamplerMipFilterNotMipmapped;
     case SamplerMipFilter::Nearest:
         return MTL::SamplerMipFilterNearest;
     case SamplerMipFilter::Linear:
         return MTL::SamplerMipFilterLinear;
+    default:
+        return MTL::SamplerMipFilterNotMipmapped;
     }
 }
 
@@ -819,16 +834,16 @@ toMtlSamplerAddressMode(const SamplerAddressMode address_mode) {
     case SamplerAddressMode::ClampToBorder:
         return MTL::SamplerAddressModeClampToBorderColor;
     case SamplerAddressMode::Clamp:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "Clamp");
+        // The sampler picks edge or border by its filter (see Sampler)
         return MTL::SamplerAddressModeClampToEdge;
     case SamplerAddressMode::MirrorClampToEdge:
         return MTL::SamplerAddressModeMirrorClampToEdge;
     case SamplerAddressMode::MirrorClampToBorder:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "MirrorClampToBorder");
-        return MTL::SamplerAddressModeClampToBorderColor;
-    case SamplerAddressMode::MirrorClamp:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "MirrorClamp");
         return MTL::SamplerAddressModeMirrorClampToEdge;
+    case SamplerAddressMode::MirrorClamp:
+        return MTL::SamplerAddressModeMirrorClampToEdge;
+    default:
+        return MTL::SamplerAddressModeRepeat;
     }
 }
 

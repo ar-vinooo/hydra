@@ -5,11 +5,11 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-PipelineBase* PipelineCache::create(const PipelineDescriptor& descriptor) {
+PipelineBase* PipelineCache::createHot0(const PipelineDescriptor& descriptor) {
     return renderer.createPipeline(descriptor);
 }
 
-u32 PipelineCache::hash(const PipelineDescriptor& descriptor) {
+u32 PipelineCache::hashHot1(const PipelineDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
 
     // Shaders
@@ -55,8 +55,56 @@ u32 PipelineCache::hash(const PipelineDescriptor& descriptor) {
     }
 
     hash.add(static_cast<u32>(descriptor.depth_stencil_format));
+    hash.add(static_cast<u32>(descriptor.topology_class));
 
     return hash.toHashCode();
+}
+
+// The fields of the hash
+bool PipelineCache::equals(const PipelineDescriptor& a,
+                           const PipelineDescriptor& b) {
+    if (a.shaders[0] != b.shaders[0] || a.shaders[1] != b.shaders[1])
+        return false;
+
+    for (usize i = 0; i < std::size(a.vertex_state.vertex_attrib_states);
+         i++) {
+        const auto& attrib_a = a.vertex_state.vertex_attrib_states[i];
+        const auto& attrib_b = b.vertex_state.vertex_attrib_states[i];
+        if (attrib_a.buffer_id != attrib_b.buffer_id ||
+            attrib_a.offset != attrib_b.offset ||
+            attrib_a.bgra != attrib_b.bgra)
+            return false;
+    }
+
+    for (usize i = 0; i < std::size(a.vertex_state.vertex_arrays); i++) {
+        const auto& array_a = a.vertex_state.vertex_arrays[i];
+        const auto& array_b = b.vertex_state.vertex_arrays[i];
+        if (array_a.enable != array_b.enable ||
+            array_a.stride != array_b.stride ||
+            array_a.is_per_instance != array_b.is_per_instance ||
+            array_a.divisor != array_b.divisor)
+            return false;
+    }
+
+    for (usize i = 0; i < std::size(a.color_target_states); i++) {
+        const auto& target_a = a.color_target_states[i];
+        const auto& target_b = b.color_target_states[i];
+        if (target_a.format != target_b.format ||
+            target_a.write_mask != target_b.write_mask ||
+            target_a.blend_enabled != target_b.blend_enabled)
+            return false;
+        if (target_a.blend_enabled &&
+            (target_a.rgb_op != target_b.rgb_op ||
+             target_a.src_rgb_factor != target_b.src_rgb_factor ||
+             target_a.dst_rgb_factor != target_b.dst_rgb_factor ||
+             target_a.alpha_op != target_b.alpha_op ||
+             target_a.src_alpha_factor != target_b.src_alpha_factor ||
+             target_a.dst_alpha_factor != target_b.dst_alpha_factor))
+            return false;
+    }
+
+    return a.depth_stencil_format == b.depth_stencil_format &&
+           a.topology_class == b.topology_class;
 }
 
 void PipelineCache::destroyElement(PipelineBase* pipeline) { delete pipeline; }

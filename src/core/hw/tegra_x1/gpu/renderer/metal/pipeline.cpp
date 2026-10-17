@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
@@ -31,6 +32,23 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         return;
     }
     pipeline_descriptor->setVertexFunction(vertex_shader->getFunction());
+    // Layered rendering and viewport selection require the primitive class
+    if (vertex_shader->getDescriptor().writes_layer) {
+        switch (descriptor.topology_class) {
+        case PrimitiveTopologyClass::Point:
+            pipeline_descriptor->setInputPrimitiveTopology(
+                MTL::PrimitiveTopologyClassPoint);
+            break;
+        case PrimitiveTopologyClass::Line:
+            pipeline_descriptor->setInputPrimitiveTopology(
+                MTL::PrimitiveTopologyClassLine);
+            break;
+        default:
+            pipeline_descriptor->setInputPrimitiveTopology(
+                MTL::PrimitiveTopologyClassTriangle);
+            break;
+        }
+    }
     // Depth-only passes can intentionally disable the fragment stage.
     if (fragment_shader != nullptr)
         pipeline_descriptor->setFragmentFunction(fragment_shader->getFunction());
@@ -46,7 +64,8 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
             continue;
 
         // HACK: how are attributes disabled?
-        if (vertex_attrib_state.is_fixed)
+        if (vertex_attrib_state.is_fixed ||
+            vertex_attrib_state.buffer_id >= VERTEX_ARRAY_COUNT)
             continue;
 
         ASSERT_DEBUG(i != 31, MetalRenderer,
@@ -85,8 +104,10 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         MTL::VertexStepFunction step_function;
         u32 step_rate;
         const auto min_stride = min_vertex_array_strides[i];
-        if (stride == 0) {
-            stride = min_stride;
+        // Instances are drawn one at a time and the engine binds the element
+        // of the current instance, so instanced streams are constant
+        if (stride == 0 || vertex_array.is_per_instance) {
+            stride = std::max(stride, min_stride);
             step_function = MTL::VertexStepFunctionConstant;
             step_rate = 0;
         } else {
@@ -95,10 +116,8 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
                          "Vertex array stride ({}) is less than minimum "
                          "required stride ({})",
                          stride, min_stride);
-            step_function = vertex_array.is_per_instance
-                                ? MTL::VertexStepFunctionPerInstance
-                                : MTL::VertexStepFunctionPerVertex;
-            step_rate = 1; // TODO: divisor
+            step_function = MTL::VertexStepFunctionPerVertex;
+            step_rate = 1;
         }
 
         auto vertex_array_descriptor =
@@ -138,6 +157,15 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
             write_mask |= MTL::ColorWriteMaskBlue;
         if (any(color_target_state.write_mask & engines::ColorWriteMask::Alpha))
             write_mask |= MTL::ColorWriteMaskAlpha;
+        if (fragment_shader != nullptr) {
+            const auto mask = (fragment_shader->getDescriptor().resource_mapping.fragment_output_mask >> (i * 4)) & 0xf;
+            MTL::ColorWriteMask export_mask = MTL::ColorWriteMaskNone;
+            if (mask & 1) export_mask |= MTL::ColorWriteMaskRed;
+            if (mask & 2) export_mask |= MTL::ColorWriteMaskGreen;
+            if (mask & 4) export_mask |= MTL::ColorWriteMaskBlue;
+            if (mask & 8) export_mask |= MTL::ColorWriteMaskAlpha;
+            write_mask &= export_mask;
+        }
         color_attachment_descriptor->setWriteMask(write_mask);
 
         if (color_target_state.blend_enabled) {
@@ -169,6 +197,11 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         fmt::format("{}:{}", vertex_shader->getCacheKey(),
                     fragment_shader != nullptr ? fragment_shader->getCacheKey()
                                                : "no-fragment"));
+    if (auto& visual = VisualDiagnostics::instance(); visual.selected())
+        visual.event("metal_pipeline_result", {{"available", pipeline ? "1" : "0"},
+            {"vertex_key", vertex_shader->getCacheKey()},
+            {"fragment_key", fragment_shader ? fragment_shader->getCacheKey() : "no-fragment"},
+            {"message", error ? error->localizedDescription()->utf8String() : ""}});
     pipeline_descriptor->release();
     if (error != nullptr) {
         LOG_ERROR(MetalRenderer, "Failed to create pipeline: {}",

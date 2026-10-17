@@ -113,6 +113,34 @@ class CommandBuffer final : public ICommandBuffer {
 
   public:
     GETTER(command_buffer, getCommandBuffer);
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    void retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> pool,
+                                MTL::Buffer* buffer);
+    MTL::RenderCommandEncoder* getRenderCommandEncoderHot1(
+        MTL::RenderPassDescriptor* render_pass_descriptor);
+    MTL::RenderCommandEncoder* createRenderCommandEncoderHot2(
+        MTL::RenderPassDescriptor* render_pass_descriptor);
+    MTL::BlitCommandEncoder* getBlitCommandEncoderHot3();
+    MTL::ComputeCommandEncoder* getComputeCommandEncoderHot4();
+    f64 debugCommitAndWaitHot5();
+    void endEncodingHot6();
+    void setRenderPipelineStateHot7(MTL::RenderPipelineState* pipeline);
+    void setDepthStencilStateHot8(MTL::DepthStencilState* depth_stencil_state);
+    void setCullModeHot9(MTL::CullMode cull_mode);
+    void setFrontFaceWindingHot10(MTL::Winding front_face_winding);
+    void setDepthBiasHot11(float constant, float slope, float clamp);
+    void setBlendColorHot12(float r, float g, float b, float a);
+    void setStencilReferencesHot13(u32 front, u32 back);
+    void setViewportsHot14(std::span<const MTL::Viewport> values);
+    void setScissorsHot15(std::span<const MTL::ScissorRect> values);
+    void setBufferHot16(MTL::Buffer* buffer, u64 offset, ShaderType shader_type,
+                        u32 index);
+    void setTextureHot17(MTL::Texture* texture, ShaderType shader_type,
+                         u32 index);
+    void setSamplerHot18(MTL::SamplerState* sampler, ShaderType shader_type,
+                         u32 index);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

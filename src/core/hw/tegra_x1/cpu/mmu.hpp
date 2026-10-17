@@ -53,8 +53,20 @@ class IMmu {
     void disableWriteTracking(ztd::Range<vaddr_t> range) {
         setWriteTrackingEnabled(range, false);
     }
-    bool trackWrite(ztd::Range<vaddr_t> range);
-    void flushTrackedPages();
+    virtual bool trackWrite(ztd::Range<vaddr_t> range);
+    virtual void flushTrackedPages();
+    // Applies GPU cache invalidations queued by trackWrite. Called by the
+    // GPU thread before it uses the caches, so CPU threads never wait on
+    // the cache locks a draw holds.
+    void applyPendingInvalidations();
+
+    // GPU-written memory: the GPU's contents are not in guest memory, so CPU
+    // accesses must fault and have them written back first. Takes host
+    // pointers, as used by the GPU caches.
+    virtual void protectGpuWritten([[maybe_unused]] ztd::Range<uptr> range) {}
+    // Whether CPU accesses to GPU written memory fault and write the GPU
+    // contents back first (protectGpuWritten)
+    virtual bool protectsGpuWrites() const { return false; }
 
     // Read
     template <typename T>
@@ -106,11 +118,16 @@ class IMmu {
     virtual bool trySuspendWriteTracking(ztd::Range<vaddr_t> range) = 0;
     virtual void resumeWriteTracking(ztd::Range<vaddr_t> range) = 0;
 
+  protected:
+    System& getSystem() const { return system; }
+
   private:
     System& system;
 
     std::mutex write_tracking_mutex;
     std::vector<ztd::Range<vaddr_t>> tracked_pages;
+    std::vector<ztd::Range<uptr>> pending_invalidations;
+    std::atomic<bool> has_pending_invalidations{false};
 };
 
 } // namespace hydra::hw::tegra_x1::cpu

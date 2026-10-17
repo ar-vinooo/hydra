@@ -1,8 +1,10 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/helper.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/intrinsics.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen::lang::
     msl {
@@ -75,8 +77,16 @@ std::string textureTypeToStr(TextureType type, bool is_depth) {
 std::string textureDeclaration(const GuestShaderState& state, u32 index,
                                const analyzer::TextureInfo& info) {
     const auto it = state.buffer_texture_formats.find(index);
-    if (it == state.buffer_texture_formats.end())
+    if (it == state.buffer_texture_formats.end()) {
+        const auto int_it = state.integer_texture_formats.find(index);
+        if (int_it != state.integer_texture_formats.end()) {
+            if (const auto component =
+                    renderer::getIntegerTextureComponentType(int_it->second))
+                return textureTypeToStr(info.type, false) + "<" + component +
+                       ">";
+        }
         return textureTypeToStr(info.type, info.is_depth) + "<float>";
+    }
     switch (it->second) {
     case renderer::TextureFormat::R8Uint:
     case renderer::TextureFormat::R16Uint:
@@ -141,7 +151,200 @@ std::string imageDeclaration(const GuestShaderState& state, u32 index,
                              const analyzer::ImageInfo& info) {
     return fmt::format("{}<{}, access::{}>", textureTypeToStr(info.type, false),
                        imageComponentType(state, index, info.is_atomic),
-                       info.is_atomic ? "read_write" : "write");
+                       info.is_atomic || info.is_read ? "read_write" : "write");
+}
+
+// Layout of the texel of an image format, to convert between the raw words
+// the guest reads and writes (SULD.D, SUST.D) and the channels Metal uses
+struct RawImageLayout {
+    enum class Kind { Unorm, Snorm, Uint, Sint, Float };
+    u32 channels;
+    u32 bits;
+    Kind kind;
+    bool packed_1010102{false};
+
+    u32 bytes() const { return packed_1010102 ? 4 : channels * bits / 8; }
+};
+
+std::optional<RawImageLayout> getRawImageLayout(renderer::TextureFormat format) {
+    using F = renderer::TextureFormat;
+    using K = RawImageLayout::Kind;
+    switch (format) {
+    case F::R8Unorm: return RawImageLayout{1, 8, K::Unorm};
+    case F::R8Snorm: return RawImageLayout{1, 8, K::Snorm};
+    case F::R8Uint: return RawImageLayout{1, 8, K::Uint};
+    case F::R8Sint: return RawImageLayout{1, 8, K::Sint};
+    case F::RG8Unorm: return RawImageLayout{2, 8, K::Unorm};
+    case F::RG8Snorm: return RawImageLayout{2, 8, K::Snorm};
+    case F::RG8Uint: return RawImageLayout{2, 8, K::Uint};
+    case F::RG8Sint: return RawImageLayout{2, 8, K::Sint};
+    case F::RGBA8Unorm: return RawImageLayout{4, 8, K::Unorm};
+    case F::RGBA8Snorm: return RawImageLayout{4, 8, K::Snorm};
+    case F::RGBA8Uint: return RawImageLayout{4, 8, K::Uint};
+    case F::RGBA8Sint: return RawImageLayout{4, 8, K::Sint};
+    case F::R16Float: return RawImageLayout{1, 16, K::Float};
+    case F::R16Unorm: return RawImageLayout{1, 16, K::Unorm};
+    case F::R16Snorm: return RawImageLayout{1, 16, K::Snorm};
+    case F::R16Uint: return RawImageLayout{1, 16, K::Uint};
+    case F::R16Sint: return RawImageLayout{1, 16, K::Sint};
+    case F::RG16Float: return RawImageLayout{2, 16, K::Float};
+    case F::RG16Unorm: return RawImageLayout{2, 16, K::Unorm};
+    case F::RG16Snorm: return RawImageLayout{2, 16, K::Snorm};
+    case F::RG16Uint: return RawImageLayout{2, 16, K::Uint};
+    case F::RG16Sint: return RawImageLayout{2, 16, K::Sint};
+    case F::RGBA16Float: return RawImageLayout{4, 16, K::Float};
+    case F::RGBA16Unorm: return RawImageLayout{4, 16, K::Unorm};
+    case F::RGBA16Snorm: return RawImageLayout{4, 16, K::Snorm};
+    case F::RGBA16Uint: return RawImageLayout{4, 16, K::Uint};
+    case F::RGBA16Sint: return RawImageLayout{4, 16, K::Sint};
+    case F::R32Float: return RawImageLayout{1, 32, K::Float};
+    case F::R32Uint: return RawImageLayout{1, 32, K::Uint};
+    case F::R32Sint: return RawImageLayout{1, 32, K::Sint};
+    case F::RG32Float: return RawImageLayout{2, 32, K::Float};
+    case F::RG32Uint: return RawImageLayout{2, 32, K::Uint};
+    case F::RG32Sint: return RawImageLayout{2, 32, K::Sint};
+    case F::RGBA32Float: return RawImageLayout{4, 32, K::Float};
+    case F::RGBA32Uint: return RawImageLayout{4, 32, K::Uint};
+    case F::RGBA32Sint: return RawImageLayout{4, 32, K::Sint};
+    case F::RGB10A2Unorm: return RawImageLayout{4, 10, K::Unorm, true};
+    case F::RGB10A2Uint: return RawImageLayout{4, 10, K::Uint, true};
+    default: return std::nullopt;
+    }
+}
+
+// Bytes of a raw access (U8, S8, U16, S16, B32, B64, B128)
+u32 rawAccessBytes(u32 raw_size) {
+    constexpr u32 bytes[] = {1, 1, 2, 2, 4, 8, 16};
+    return raw_size < 7 ? bytes[raw_size] : 0;
+}
+
+// The raw layout of an image if a raw access of the size matches its texel
+std::optional<RawImageLayout> getRawLayout(const GuestShaderState& state,
+                                           u32 index, u32 raw_size) {
+    if (raw_size == ir::IMAGE_FORMATTED)
+        return std::nullopt;
+    const auto it = state.image_formats.find(index);
+    if (it != state.image_formats.end()) {
+        const auto layout = getRawImageLayout(it->second);
+        if (layout && layout->bytes() == rawAccessBytes(raw_size))
+            return layout;
+    }
+    ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                             "Raw surface access of size {} to image {}",
+                             raw_size, index));
+    return std::nullopt;
+}
+
+// Value of channel `channel` (in the type of its kind) from raw words
+std::string decodeRawChannel(const RawImageLayout& layout,
+                             const std::array<std::string, 4>& words,
+                             u32 channel) {
+    using K = RawImageLayout::Kind;
+    if (layout.packed_1010102) {
+        const std::string raw =
+            channel == 3 ? fmt::format("(({}) >> 30)", words[0])
+                         : fmt::format("((({}) >> {}) & 0x3ffu)", words[0],
+                                       channel * 10);
+        if (layout.kind == K::Uint)
+            return raw;
+        return fmt::format("(float({}) / {}.0)", raw, channel == 3 ? 3 : 1023);
+    }
+    const u32 per_word = 32 / layout.bits;
+    const u32 shift = (channel % per_word) * layout.bits;
+    const std::string word = words[channel / per_word];
+    const std::string raw =
+        layout.bits == 32
+            ? fmt::format("({})", word)
+            : fmt::format("((({}) >> {}) & {:#x}u)", word, shift,
+                          (1u << layout.bits) - 1);
+    switch (layout.kind) {
+    case K::Uint:
+        return raw;
+    case K::Sint:
+        return layout.bits == 32
+                   ? fmt::format("as_type<int>({})", raw)
+                   : fmt::format("int(as_type<{}>({}({})))",
+                                 layout.bits == 8 ? "char" : "short",
+                                 layout.bits == 8 ? "uchar" : "ushort", raw);
+    case K::Float:
+        return layout.bits == 32
+                   ? fmt::format("as_type<float>({})", raw)
+                   : fmt::format("float(as_type<half>(ushort({})))", raw);
+    case K::Unorm:
+        return fmt::format("(float({}) / {}.0)", raw,
+                           (1u << layout.bits) - 1);
+    case K::Snorm:
+        return fmt::format("max(float(as_type<{}>({}({}))) / {}.0, -1.0)",
+                           layout.bits == 8 ? "char" : "short",
+                           layout.bits == 8 ? "uchar" : "ushort", raw,
+                           (1u << (layout.bits - 1)) - 1);
+    }
+    return "0";
+}
+
+// Bits of a channel value (of the type of the layout's kind), masked to the
+// channel width
+std::string encodeRawChannel(const RawImageLayout& layout,
+                             const std::string& value) {
+    using K = RawImageLayout::Kind;
+    const u32 bits = layout.bits;
+    const u32 mask = bits == 32 ? 0xffffffffu : (1u << bits) - 1;
+    switch (layout.kind) {
+    case K::Uint:
+        return fmt::format("(uint({}) & {:#x}u)", value, mask);
+    case K::Sint:
+        return fmt::format("(as_type<uint>(int({})) & {:#x}u)", value, mask);
+    case K::Float:
+        return bits == 32 ? fmt::format("as_type<uint>(float({}))", value)
+                          : fmt::format("uint(as_type<ushort>(half({})))",
+                                        value);
+    case K::Unorm:
+        return fmt::format("uint(rint(clamp(float({}), 0.0, 1.0) * {}.0))",
+                           value, mask);
+    case K::Snorm:
+        return fmt::format(
+            "(as_type<uint>(int(rint(clamp(float({}), -1.0, 1.0) * {}.0))) & "
+            "{:#x}u)",
+            value, mask >> 1, mask);
+    }
+    return "0u";
+}
+
+// Word `word` of the texel from the channel values
+std::string encodeRawWord(const RawImageLayout& layout,
+                          const std::array<std::string, 4>& channels,
+                          u32 word) {
+    if (layout.packed_1010102) {
+        if (word != 0)
+            return "0u";
+        using K = RawImageLayout::Kind;
+        const auto channel = [&](u32 c, u32 width, u32 shift) {
+            const u32 max = (1u << width) - 1;
+            const std::string bits =
+                layout.kind == K::Uint
+                    ? fmt::format("(uint({}) & {:#x}u)", channels[c], max)
+                    : fmt::format(
+                          "uint(rint(clamp(float({}), 0.0, 1.0) * {}.0))",
+                          channels[c], max);
+            return fmt::format("({} << {})", bits, shift);
+        };
+        return fmt::format("({} | {} | {} | {})", channel(0, 10, 0),
+                           channel(1, 10, 10), channel(2, 10, 20),
+                           channel(3, 2, 30));
+    }
+    const u32 per_word = 32 / layout.bits;
+    std::string result;
+    for (u32 i = 0; i < per_word; i++) {
+        const u32 channel = word * per_word + i;
+        if (channel >= layout.channels)
+            break;
+        if (!result.empty())
+            result += " | ";
+        result += fmt::format("({} << {})",
+                              encodeRawChannel(layout, channels[channel]),
+                              i * layout.bits);
+    }
+    return result.empty() ? "0u" : fmt::format("({})", result);
 }
 
 std::string_view componentToStr(u8 component) {
@@ -215,6 +418,14 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
                ShaderDecompiler, "No buffer slot available for shader samplers");
     }
 
+    if (context.type == ShaderType::Vertex) {
+        const auto& outputs = memory_analyzer.getOutputSVs();
+        out_resource_mapping.writes_layer =
+            state.layer_output_addr != 0 ||
+            outputs.contains(SvSemantic::Layer) ||
+            outputs.contains(SvSemantic::ViewportIndex);
+    }
+
     // Images share the texture slots
     for (const auto& [index, info] : memory_analyzer.getImages()) {
         out_resource_mapping.images[index] = texture_index++;
@@ -233,10 +444,20 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
 }
 
 void MslEmitter::emitHeader() {
+    out_resource_mapping.fragment_output_mask = context.fragment_output_mask;
     write("#include <metal_stdlib>");
     write("using namespace metal;");
     if (context.type == ShaderType::Compute) {
         write("{}", R"(
+            // Retries spurious failures, returns the previous value
+            inline uint hydra_shared_cas(threadgroup atomic_uint* word, uint compare, uint value) {
+                uint expected = compare;
+                while (!atomic_compare_exchange_weak_explicit(word, &expected, value,
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    if (expected != compare) return expected;
+                }
+                return compare;
+            }
             inline uint hydra_shared_wrap(threadgroup atomic_uint* word, uint limit, bool increment) {
                 uint old = atomic_load_explicit(word, memory_order_relaxed);
                 for (;;) {
@@ -255,6 +476,10 @@ void MslEmitter::emitHeader() {
               memory_analyzer.getTextures().size());
         write("}};");
     }
+
+    // Intrinsic helpers
+    for (const auto intrinsic : memory_analyzer.getIntrinsics())
+        write("{}", getIntrinsicSource(intrinsic));
 
     // Bit counting helpers
     writeNewline();
@@ -293,8 +518,8 @@ void MslEmitter::emitHeader() {
         write("    const uint y_bit = py > quad_shuffle_xor(py, y_mask) ? 1u : 0u;");
         write("    const uint lane = x_bit | (y_bit << 1);");
         write("    const uint mode = (swizzle >> (lane * 2u)) & 3u;");
-        write("    const float lut_a[4] = {{1.0, -1.0, 1.0, 0.0}};");
-        write("    const float lut_b[4] = {{1.0, 1.0, -1.0, 1.0}};");
+        write("    const float lut_a[4] = {{1.0, 1.0, -1.0, 0.0}};");
+        write("    const float lut_b[4] = {{1.0, -1.0, 1.0, 1.0}};");
         write("    return a * lut_a[mode] + b * lut_b[mode];");
         write("}}");
     }
@@ -391,13 +616,26 @@ void MslEmitter::emitDeclarations() {
 
     // SVs
     // HACK: always write position in vertex shaders
-    if (context.type == ShaderType::Vertex)
+    if (context.type == ShaderType::Vertex) {
+        const auto& outputs = memory_analyzer.getOutputSVs();
         write("float4 position [[position, invariant]];");
+        if (state.layer_output_addr != 0 || outputs.contains(SvSemantic::Layer))
+            write("uint layer [[render_target_array_index]];");
+        if (outputs.contains(SvSemantic::ViewportIndex))
+            write("uint viewport_index [[viewport_array_index]];");
+        // Metal reads the point size of every point, written or not
+        if (state.point_list)
+            write("float point_size [[point_size]];");
+        if (const u32 count = getClipDistanceCount(); count != 0)
+            write("float clip_distance [[clip_distance]] [{}];", count);
+    }
     for (const auto sv_semantic : memory_analyzer.getOutputSVs()) {
-        // NOLINTNEXTLINE(readability-trivial-switch)
         switch (sv_semantic) {
         case SvSemantic::Position:
-            // Write("float4 position [[position]];");
+        case SvSemantic::Layer:
+        case SvSemantic::ViewportIndex:
+        case SvSemantic::PointSize:
+        case SvSemantic::ClipDistance:
             break;
         default:
             LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Output SV semantic {}",
@@ -435,6 +673,8 @@ void MslEmitter::emitDeclarations() {
             write("vec<{}, 4> {} [[{}]];", toType(color_target_data_type),
                   getSvStr(sv), getSvQualifierStr(sv, true));
         }
+        if (context.fragment_depth_register != invalid<u32>())
+            write("float depth [[depth(any)]];");
         break;
     default:
         break;
@@ -458,6 +698,9 @@ void MslEmitter::emitStateBindings() {
         writeStatement("uint3 ctaid");
         writeStatement("uint lane");
         writeStatement("threadgroup Reg* smem");
+    } else if (memory_analyzer.usesLaneId()) {
+        // Vertex functions have no SIMD-group lane, they read lane 0
+        writeStatement("uint lane");
     }
 
     // Storage buffers
@@ -530,8 +773,22 @@ void MslEmitter::emitMainPrototype() {
         ADD_ARG("uint iid [[instance_id]]");
         ADD_ARG("uint vid [[vertex_id]]");
         break;
-    case ShaderType::Fragment:
+    case ShaderType::Fragment: {
+        const auto& inputs = memory_analyzer.getInputSVs();
+        if (memory_analyzer.usesLaneId())
+            ADD_ARG("uint __lane [[thread_index_in_simdgroup]]");
+        if (inputs.contains(SvSemantic::FrontFacing))
+            ADD_ARG("bool __front_facing [[front_facing]]");
+        if (inputs.contains(SvSemantic::PointCoord))
+            ADD_ARG("float2 __point_coord [[point_coord]]");
+        if (inputs.contains(SvSemantic::PrimitiveID))
+            ADD_ARG("uint __primitive_id [[primitive_id]]");
+        if (inputs.contains(SvSemantic::Layer))
+            ADD_ARG("uint __layer [[render_target_array_index]]");
+        if (inputs.contains(SvSemantic::ViewportIndex))
+            ADD_ARG("uint __viewport_index [[viewport_array_index]]");
         break;
+    }
     default:
         break;
     }
@@ -586,7 +843,67 @@ void MslEmitter::emitMainPrototype() {
     write("StageOut __out = {{}};");
     writeNewline();
 
+    if (context.type == ShaderType::Fragment &&
+        state.visual_output == static_cast<uint32_t>(VisualDiagnostics::Output::Solid) &&
+        context.fragment_depth_register == invalid<u32>()) {
+        for (u8 i = 0; i < COLOR_TARGET_COUNT; ++i) {
+            const auto type = state.color_target_data_types[i];
+            if (type != ColorDataType::Invalid)
+                writeStatement("__out.{} = vec<{}, 4>(1, 0, 1, 1)",
+                               getSvStr(Sv(SvSemantic::UserInOut, i)), toType(type));
+        }
+        writeStatement("return __out");
+        VisualDiagnostics::instance().event("solid_coverage_override", {
+            {"guest_execution", "bypassed_including_discard_and_side_effects"},
+            {"fixed_function", "depth_stencil_cull_and_write_masks_preserved"}});
+    } else if (context.type == ShaderType::Fragment &&
+               state.visual_output == static_cast<uint32_t>(VisualDiagnostics::Output::Solid)) {
+        VisualDiagnostics::instance().event("solid_coverage_unavailable", {
+            {"reason", "guest_depth_export_requires_guest_execution; output_only_override"}});
+    }
     emitMainFunctionPrologue();
+    if (memory_analyzer.usesLaneId())
+        writeStatement("state.lane = {}", context.type == ShaderType::Fragment
+                                              ? "__lane"
+                                              : "0u");
+    if (context.type == ShaderType::Fragment)
+        emitFragmentSystemValueInputs();
+}
+
+void MslEmitter::emitFragmentSystemValueInputs() {
+    const auto& inputs = memory_analyzer.getInputSVs();
+    const auto attr = [&](u32 addr, ir::ScalarType type) {
+        return getAttrMemoryStr({RZ, addr, true}, type);
+    };
+    // Front facing reads as all ones, like a predicate converted to an
+    // integer mask
+    if (inputs.contains(SvSemantic::FrontFacing))
+        writeStatement("{} = __front_facing ? 0xffffffffu : 0u",
+                       attr(SV_FRONT_FACING_BASE, ir::ScalarType::U32));
+    if (inputs.contains(SvSemantic::PointCoord)) {
+        // Metal point coordinates start at the top
+        writeStatement("{} = __point_coord.x",
+                       attr(SV_POINT_COORD_BASE, ir::ScalarType::F32));
+        writeStatement("{} = {}",
+                       attr(SV_POINT_COORD_BASE + 4, ir::ScalarType::F32),
+                       state.point_coord_origin_bottom ? "1.0 - __point_coord.y"
+                                                       : "__point_coord.y");
+    }
+    if (inputs.contains(SvSemantic::PrimitiveID))
+        writeStatement("{} = __primitive_id",
+                       attr(SV_PRIMITIVE_ID_BASE, ir::ScalarType::U32));
+    if (inputs.contains(SvSemantic::Layer))
+        writeStatement("{} = __layer", attr(SV_LAYER_BASE, ir::ScalarType::U32));
+    if (inputs.contains(SvSemantic::ViewportIndex))
+        writeStatement("{} = __viewport_index",
+                       attr(SV_VIEWPORT_INDEX_BASE, ir::ScalarType::U32));
+}
+
+u32 MslEmitter::getClipDistanceCount() const {
+    if (context.type != ShaderType::Vertex || state.clip_distance_mask == 0)
+        return 0;
+    return 32 - static_cast<u32>(std::countl_zero(
+                    state.clip_distance_mask & ((1u << CLIP_DISTANCE_COUNT) - 1)));
 }
 
 void MslEmitter::emitExitReturn() {
@@ -600,10 +917,100 @@ void MslEmitter::emitExitReturn() {
         // TODO: handle this with viewports?
         // WriteStatement("__out.position.y = -__out.position.y");
 
+        // Window coordinates (viewport transform disabled) to clip space.
+        // The depth is already a window depth.
+        const bool window_space = state.window_space_width != 0 &&
+                                  state.window_space_height != 0;
+        if (window_space) {
+            writeStatement("__out.position.x = (__out.position.x * {} - 1.0) "
+                           "* __out.position.w",
+                           2.0 / state.window_space_width);
+            // Window rows count from the top, or from the bottom when the
+            // origin is lower left
+            const double y_scale = 2.0 / state.window_space_height;
+            if (state.y_negate)
+                writeStatement("__out.position.y = (__out.position.y * {} - "
+                               "1.0) * __out.position.w",
+                               y_scale);
+            else
+                writeStatement("__out.position.y = (1.0 - __out.position.y * "
+                               "{}) * __out.position.w",
+                               y_scale);
+        }
+
         // Convert depth from < -1, 1 > to < 0, 1 >
-        if (!state.depth_zero_to_one)
+        if (!state.depth_zero_to_one && !window_space)
             writeStatement("__out.position.z = (__out.position.z + "
                            "__out.position.w) / 2.0");
+
+        const auto& outputs = memory_analyzer.getOutputSVs();
+        const auto out_attr = [&](u32 addr, ir::ScalarType type) {
+            return getAttrMemoryStr({RZ, addr, false}, type);
+        };
+        // Layer selected by an unsupported geometry shader
+        if (state.layer_output_addr != 0)
+            writeStatement("__out.layer = {}",
+                           getAttrMemoryStr(
+                               {RZ, state.layer_output_addr, false}));
+        else if (outputs.contains(SvSemantic::Layer))
+            writeStatement("__out.layer = {}",
+                           out_attr(SV_LAYER_BASE, ir::ScalarType::U32));
+        if (outputs.contains(SvSemantic::ViewportIndex))
+            writeStatement("__out.viewport_index = {}",
+                           out_attr(SV_VIEWPORT_INDEX_BASE, ir::ScalarType::U32));
+        if (state.point_list) {
+            if (state.program_point_size &&
+                outputs.contains(SvSemantic::PointSize))
+                writeStatement("__out.point_size = {}",
+                               out_attr(SV_POINT_SIZE_BASE, ir::ScalarType::F32));
+            else
+                writeStatement("__out.point_size = {}",
+                               getConstantStr(state.point_size));
+        }
+        // Distances the guest enabled but the shader does not write do not
+        // clip
+        const u32 written = memory_analyzer.getClipDistanceOutputs();
+        for (u32 i = 0; i < getClipDistanceCount(); i++) {
+            if ((state.clip_distance_mask & written & (1u << i)) != 0)
+                writeStatement("__out.clip_distance[{}] = {}", i,
+                               out_attr(SV_CLIP_DISTANCE_BASE + i * 4,
+                                        ir::ScalarType::F32));
+            else
+                writeStatement("__out.clip_distance[{}] = 0.0", i);
+        }
+    }
+
+    // Alpha test against the alpha written to render target 0
+    if (context.type == ShaderType::Fragment &&
+        state.alpha_test_func != engines::CompareOp::Invalid &&
+        state.alpha_test_func != engines::CompareOp::Always &&
+        (context.fragment_output_mask & 0x8u) != 0 &&
+        state.color_target_data_types[0] == ColorDataType::Float) {
+        const auto alpha = getSvAccessQualifiedStr(
+            SvAccess(Sv(SvSemantic::UserInOut, 0), 3), true);
+        const auto ref = getConstantStr(state.alpha_test_ref);
+        const char* op = "";
+        switch (state.alpha_test_func) {
+        case engines::CompareOp::Less: op = "<"; break;
+        case engines::CompareOp::Equal: op = "=="; break;
+        case engines::CompareOp::LessEqual: op = "<="; break;
+        case engines::CompareOp::Greater: op = ">"; break;
+        case engines::CompareOp::NotEqual: op = "!="; break;
+        case engines::CompareOp::GreaterEqual: op = ">="; break;
+        default: break;
+        }
+        if (state.alpha_test_func == engines::CompareOp::Never)
+            writeStatement("discard_fragment()");
+        else
+            writeStatement("if (!(float({}) {} {})) discard_fragment()", alpha,
+                           op, ref);
+    }
+
+    if (context.type == ShaderType::Fragment &&
+        context.fragment_depth_register != invalid<u32>()) {
+        writeStatement("__out.depth = {}",
+                       getRegisterStr(static_cast<u8>(context.fragment_depth_register),
+                                      ir::ScalarType::F32));
     }
 
     // DEBUG: highlight
@@ -621,6 +1028,33 @@ void MslEmitter::emitExitReturn() {
             }();
             writeStatement("__out.{} = vec<{}, 4>({})", getSvStr(sv),
                            toType(data_type), color);
+        }
+    }
+
+    if (context.type == ShaderType::Fragment && state.visual_output != 0) {
+        std::string color = "float4(1.0, 0.0, 1.0, 1.0)";
+        const auto mode = static_cast<VisualDiagnostics::Output>(state.visual_output);
+        const auto& inputs = memory_analyzer.getStageInputs();
+        const bool available = std::find(inputs.begin(), inputs.end(), state.visual_input) != inputs.end();
+        if (mode == VisualDiagnostics::Output::Solid || available) {
+            if (mode != VisualDiagnostics::Output::Solid) {
+                const auto input = "__in." + getSvStr(Sv(SvSemantic::UserInOut, static_cast<u8>(state.visual_input)));
+                if (mode == VisualDiagnostics::Output::Uv)
+                    color = fmt::format("float4(fract({}.xy), 0.0, 1.0)", input);
+                else if (mode == VisualDiagnostics::Output::Normal)
+                    color = fmt::format("float4({}.xyz * 0.5 + 0.5, 1.0)", input);
+                else if (mode == VisualDiagnostics::Output::Checker)
+                    color = fmt::format("float4(float3(fmod(abs(floor({0}.x * 16.0) + floor({0}.y * 16.0)), 2.0)), 1.0)", input);
+            }
+            for (u8 i = 0; i < COLOR_TARGET_COUNT; ++i) {
+                const auto type = state.color_target_data_types[i];
+                if (type != ColorDataType::Invalid)
+                    writeStatement("__out.{} = vec<{}, 4>({})", getSvStr(Sv(SvSemantic::UserInOut, i)), toType(type), color);
+            }
+        } else {
+            VisualDiagnostics::instance().event("override_unavailable", {
+                {"reason", "chosen fragment input is not consumed by this shader"},
+                {"input", std::to_string(state.visual_input)}});
         }
     }
 
@@ -674,26 +1108,105 @@ void MslEmitter::emitBitfieldExtract(const ir::Value& dst,
                                      const ir::Value& src_a,
                                      const ir::Value& src_b,
                                      const ir::Value& src_c) {
-    storeValue(dst, "extract_bits({}, {}, {})", getValueStr(src_a),
-               getValueStr(src_b), getValueStr(src_c));
+    storeValue(dst, "((uint({1}) >= 32u || uint({2}) == 0u) ? 0 : extract_bits({0}, min(uint({1}), 31u), min(uint({2}), 32u - min(uint({1}), 31u))))",
+               getValueStr(src_a), getValueStr(src_b), getValueStr(src_c));
 }
 
 // Texture
-void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
-                                   TextureType type, TextureSampleFlags flags,
-                                   const ir::Value& array_index,
-                                   const ir::Value& coords,
-                                   const ir::Value& cmp_value,
-                                   const ir::Value& lod) {
+void MslEmitter::emitTextureSample(
+    const ir::Value& dst, u32 const_buffer_index, TextureType type,
+    TextureSampleFlags flags, const ir::Value& array_index,
+    const ir::Value& coords, const ir::Value& cmp_value, const ir::Value& lod,
+    const ir::Value& ddx, const ir::Value& ddy, const ir::Value& offset,
+    const ir::Value& offsets, u8 component) {
+    const auto bias_it = state.texture_lod_bias.find(const_buffer_index);
+    const float sampler_bias = bias_it == state.texture_lod_bias.end() ? 0.0f : bias_it->second;
     // Flags
     const auto is_array = isTextureArray(type);
     const auto is_buffer =
         state.buffer_texture_formats.contains(const_buffer_index);
+    const auto int_it = state.integer_texture_formats.find(const_buffer_index);
+    const bool is_integer =
+        !is_buffer && int_it != state.integer_texture_formats.end() &&
+        renderer::getIntegerTextureComponentType(int_it->second) != nullptr;
+    // Integer textures are bound with nearest samplers (ThreeD::getSampler)
     const auto int_coords =
         is_buffer || any(flags & TextureSampleFlags::IntCoords);
     const auto depth_compare = any(flags & TextureSampleFlags::DepthCompare);
-    const auto has_lod = any(flags & TextureSampleFlags::Lod);
+    const auto has_lod =
+        any(flags & (TextureSampleFlags::Lod | TextureSampleFlags::LodZero));
 
+    if (any(flags & TextureSampleFlags::Gather)) {
+        const bool cube =
+            type == TextureType::Cube || type == TextureType::CubeArray;
+        ASSERT(!(cube && any(flags & (TextureSampleFlags::Offset |
+                                      TextureSampleFlags::Offsets))),
+               ShaderDecompiler, "Cube gathers cannot have texel offsets");
+        const auto gather = [&](const std::string& location,
+                                const std::string& texel_offset) {
+            auto arguments =
+                fmt::format("state.samplr{}, {}", const_buffer_index, location);
+            if (is_array)
+                arguments += fmt::format(", {}", getValueStr(array_index));
+            if (depth_compare)
+                arguments += fmt::format(", {}", getValueStr(cmp_value));
+            if (!cube)
+                arguments += ", " + texel_offset;
+            if (!depth_compare)
+                arguments +=
+                    fmt::format(", component::{}", componentToStr(component));
+            auto result = fmt::format(
+                "state.tex{}.{}({})", const_buffer_index,
+                depth_compare ? "gather_compare" : "gather", arguments);
+            if (is_integer)
+                result = fmt::format("as_type<float4>({})", result);
+            return result;
+        };
+        if (any(flags & TextureSampleFlags::Offsets)) {
+            // PTP packs eight signed six-bit values in two registers, one
+            // x/y pair per gathered texel. Select that texel from each gather.
+            std::array<std::string, 4> samples;
+            for (u32 lane = 0; lane < 4; ++lane) {
+                const auto word = fmt::format("({}).{}", getValueStr(offsets),
+                                              lane < 2 ? "x" : "y");
+                const u32 base = (lane % 2) * 16;
+                const auto pair = fmt::format(
+                    "int2(int({} << {}u) >> 26, int({} << {}u) >> 26)", word,
+                    26 - base, word, 18 - base);
+                samples[lane] = fmt::format(
+                    "({}).{}", gather(getValueStr(coords), pair), "xyzw"[lane]);
+            }
+            storeValue(dst, "float4({}, {}, {}, {})", samples[0], samples[1],
+                       samples[2], samples[3]);
+        } else {
+            storeValue(dst, "{}",
+                       gather(getValueStr(coords),
+                              any(flags & TextureSampleFlags::Offset)
+                                  ? fmt::format("int2({})", getValueStr(offset))
+                                  : "int2(0)"));
+        }
+        return;
+    }
+
+    std::string sample_coords = getValueStr(coords);
+    // Metal 1D textures have a single level and no sampling options: texel
+    // offsets move the normalized coordinate instead
+    const bool is_1d = !is_buffer && (type == TextureType::_1D ||
+                                      type == TextureType::_1DArray);
+    if (any(flags & TextureSampleFlags::Offset)) {
+        const auto count = coords.getType().getVectorType().getSize();
+        const auto vector_type =
+            count == 1 ? std::string("uint") : fmt::format("uint{}", count);
+        if (int_coords) {
+            sample_coords =
+                fmt::format("(as_type<{}>({}) + {}({}))", vector_type,
+                            sample_coords, vector_type, getValueStr(offset));
+        } else if (is_1d) {
+            sample_coords = fmt::format(
+                "({}.x + float({}) / float(state.tex{}.get_width()))",
+                sample_coords, getValueStr(offset), const_buffer_index);
+        }
+    }
     std::string func_name;
     std::string args;
     if (int_coords) {
@@ -714,7 +1227,7 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
         }
 
         // Buffer textures are always addressed with a single coordinate
-        const auto coords_str = getValueStr(coords);
+        const auto coords_str = sample_coords;
         if (coord_count == 1)
             args = fmt::format("as_type<uint>({})", coords_str);
         else if (is_buffer)
@@ -730,7 +1243,7 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
         if (depth_compare)
             func_name += "_compare";
         args = fmt::format("state.samplr{}, {}", const_buffer_index,
-                           getValueStr(coords));
+                           sample_coords);
     }
 
     // Args
@@ -738,26 +1251,60 @@ void MslEmitter::emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
         args += fmt::format(", uint({})", getValueStr(array_index));
     if (depth_compare)
         args += fmt::format(", {}", getValueStr(cmp_value));
-    if (has_lod && !is_buffer) {
-        if (int_coords)
+    if (is_1d && !int_coords) {
+        // No LOD, bias or gradient options
+    } else if (any(flags & TextureSampleFlags::Derivatives) && !int_coords) {
+        const char* gradient =
+            type == TextureType::Cube || type == TextureType::CubeArray
+                ? "gradientcube"
+            : coords.getType().getVectorType().getSize() == 1 ? "gradient1d"
+            : coords.getType().getVectorType().getSize() == 2 ? "gradient2d"
+                                                              : "gradient3d";
+        if (sampler_bias == 0.0f)
+            args += fmt::format(", {}({}, {})", gradient, getValueStr(ddx), getValueStr(ddy));
+        else
+            args += fmt::format(", {}(({}) * exp2({}), ({}) * exp2({}))", gradient,
+                                getValueStr(ddx), getValueStr(ir::Value::createConstantF(sampler_bias)),
+                                getValueStr(ddy), getValueStr(ir::Value::createConstantF(sampler_bias)));
+        if (has_lod)
+            args += fmt::format(", min_lod_clamp({})", getValueStr(lod));
+    } else if (has_lod && !is_buffer) {
+        if (any(flags & TextureSampleFlags::LodZero))
+            args += int_coords ? ", 0u" : ", level(0.0)";
+        else if (int_coords)
             args += fmt::format(", as_type<uint>({})", getValueStr(lod));
         else
             args += fmt::format(", level({})", getValueStr(lod));
+    } else if (!int_coords && any(flags & TextureSampleFlags::Bias) &&
+               context.type == ShaderType::Fragment) {
+        args += fmt::format(", bias(({}) + {})", getValueStr(lod), getValueStr(ir::Value::createConstantF(sampler_bias)));
+    } else if (!int_coords && context.type == ShaderType::Fragment && sampler_bias != 0.0f) {
+        args += fmt::format(", bias({})", getValueStr(ir::Value::createConstantF(sampler_bias)));
     } else if (!int_coords && context.type == ShaderType::Compute) {
         // There are no derivatives in compute kernels
         args += ", level(0.0)";
     }
 
+    if (!int_coords && !is_1d && any(flags & TextureSampleFlags::Offset)) {
+        const auto dimensions = coords.getType().getVectorType().getSize();
+        args += dimensions == 1 ? fmt::format(", int({})", getValueStr(offset))
+                                : fmt::format(", int{}({})", dimensions,
+                                              getValueStr(offset));
+    }
+
     std::string res =
         fmt::format("state.tex{}.{}({})", const_buffer_index, func_name, args);
-    // HACK: construct float4 if sample_compare
+    // Depth comparisons return the result in RGB and 1 in alpha
     if (depth_compare)
-        res = fmt::format("float4({}, 0.0, 0.0, 0.0)", res);
+        res = fmt::format("float4(float3({}), 1.0)", res);
     if (is_buffer) {
         const auto decl = textureDeclaration(
             state, const_buffer_index, analyzer::TextureInfo{type, false});
         if (decl != "texture_buffer<float>")
             res = fmt::format("as_type<float4>({})", res);
+    } else if (is_integer) {
+        // Integer textures return raw bits
+        res = fmt::format("as_type<float4>({})", res);
     }
     storeValue(dst, "{}", res);
 }
@@ -778,11 +1325,64 @@ void MslEmitter::emitTextureGather(const ir::Value& dst, u32 const_buffer_index,
                componentToStr(component));
 }
 
+void MslEmitter::emitTextureQueryLod(const ir::Value& dst,
+                                     u32 const_buffer_index, TextureType type,
+                                     const ir::Value& coords, bool unclamped) {
+    // Metal 1D textures and buffers have a single level
+    const bool is_1d = state.buffer_texture_formats.contains(const_buffer_index) ||
+                       type == TextureType::_1D || type == TextureType::_1DArray;
+    // The query needs derivatives, which only fragment shaders have
+    if (is_1d || context.type != ShaderType::Fragment) {
+        storeValue(dst, "0.0");
+        return;
+    }
+    storeValue(dst, "state.tex{}.calculate_{}_lod(state.samplr{}, {})",
+               const_buffer_index, unclamped ? "unclamped" : "clamped",
+               const_buffer_index, getValueStr(coords));
+}
+
 void MslEmitter::emitTextureQueryDimension(const ir::Value& dst,
                                            u32 const_buffer_index,
-                                           u32 dimension) {
-    storeValue(dst, "state.tex{}.get_{}()", const_buffer_index,
-               dimensionToStr(dimension));
+                                           u32 dimension,
+                                           const ir::Value& lod) {
+    // Only query dimensions the texture type has: depth is the array size
+    // for arrays and 1 otherwise, and 1D textures have a height of 1
+    auto type = TextureType::_2D;
+    if (const auto it = memory_analyzer.getTextures().find(const_buffer_index);
+        it != memory_analyzer.getTextures().end())
+        type = it->second.type;
+    const bool is_buffer = state.buffer_texture_formats.contains(const_buffer_index);
+    const bool is_1d = is_buffer || type == TextureType::_1D ||
+                       type == TextureType::_1DArray;
+    const bool is_3d =
+        type == TextureType::_3D || type == TextureType::_3DArray;
+    // Metal 1D textures and buffers have a single level
+    if (dimension == 3) {
+        if (is_1d)
+            storeValue(dst, "1u");
+        else
+            storeValue(dst, "state.tex{}.get_num_mip_levels()",
+                       const_buffer_index);
+        return;
+    }
+    if (dimension == 1 && is_1d) {
+        storeValue(dst, "1u");
+        return;
+    }
+    if (dimension == 2 && !is_3d) {
+        if (isTextureArray(type))
+            storeValue(dst, "state.tex{}.get_array_size()", const_buffer_index);
+        else
+            storeValue(dst, "1u");
+        return;
+    }
+    // Buffers and 1D textures have no mip levels
+    if (is_buffer || type == TextureType::_1D || type == TextureType::_1DArray)
+        storeValue(dst, "state.tex{}.get_{}()", const_buffer_index,
+                   dimensionToStr(dimension));
+    else
+        storeValue(dst, "state.tex{}.get_{}(uint({}))", const_buffer_index,
+                   dimensionToStr(dimension), getBitwiseOperandStr(lod));
 }
 
 // Exit
@@ -805,6 +1405,36 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
     switch (sr) {
     case 0x00: // Lane ID
         value = "state.lane";
+        break;
+    case 0x12: // Y direction (+1.0 or -1.0)
+        value = state.y_negate ? "0xbf800000u" : "0x3f800000u";
+        break;
+    case 0x13: // Thread kill: helper invocations of a fragment quad
+        value = context.type == ShaderType::Fragment
+                    ? "(simd_is_helper_thread() ? 0xffffffffu : 0u)"
+                    : "0u";
+        break;
+    case 0x1d: // Invocation info
+    case 0x1e: // W scale factor XY
+    case 0x1f: // W scale factor Z
+        // Values the hardware reports for stages without these inputs
+        value = "0x00ff0000u";
+        break;
+    case 0x01: // Clock
+    case 0x02: // Virtual configuration
+    case 0x03: // Virtual ID
+    case 0x0f: // Ordering ticket
+    case 0x10: // Primitive type
+    case 0x11: // Invocation ID
+    case 0x14: // Shader type
+    case 0x1c: // Affinity
+    case 0x50: // Clock low
+    case 0x51: // Clock high
+    case 0x52: // Global timer low
+    case 0x53: // Global timer high
+        // Metal shaders cannot read these; hardware reports zero for
+        // invocation inputs a stage does not have
+        value = "0u";
         break;
     case 0x20: // Packed thread ID
         value = "(state.tid.x | (state.tid.y << 16) | (state.tid.z << 26))";
@@ -886,6 +1516,17 @@ void MslEmitter::emitAtomicShared(const ir::Value& dst, const ir::Value& addr,
                functions[op], pointer, signed_minmax ? "int" : "uint", getBitwiseOperandStr(value));
 }
 
+void MslEmitter::emitAtomicSharedCas(const ir::Value& dst,
+                                     const ir::Value& addr,
+                                     const ir::Value& compare,
+                                     const ir::Value& value) {
+    storeValue(dst,
+               "hydra_shared_cas(reinterpret_cast<threadgroup atomic_uint*>("
+               "&state.smem[min(uint({}) >> 2u, {}u)]._u32), uint({}), uint({}))",
+               getBitwiseOperandStr(addr), shared_word_count - 1,
+               getBitwiseOperandStr(compare), getBitwiseOperandStr(value));
+}
+
 void MslEmitter::emitBarrier() {
     writeStatement("threadgroup_barrier(mem_flags::mem_threadgroup | "
                    "mem_flags::mem_device | mem_flags::mem_texture)");
@@ -938,16 +1579,32 @@ std::string MslEmitter::getImageCoordsStr(TextureType type,
 
 void MslEmitter::emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,
-                                const std::array<ir::Value, 4>& values) {
+                                const std::array<ir::Value, 4>& values,
+                                u32 raw_size) {
     const auto& info = memory_analyzer.getImages().at(index);
     const auto component_type =
         imageComponentType(state, index, info.is_atomic);
     std::string value = fmt::format("vec<{}, 4>(", component_type);
-    for (u32 i = 0; i < 4; i++) {
-        if (i != 0)
-            value += ", ";
-        value += fmt::format("as_type<{}>(uint({}))", component_type,
-                             getBitwiseOperandStr(values[i]));
+    if (const auto layout = getRawLayout(state, index, raw_size)) {
+        // The register words are the texel
+        std::array<std::string, 4> words;
+        for (u32 i = 0; i < 4; i++)
+            words[i] = getBitwiseOperandStr(values[i]);
+        for (u32 i = 0; i < 4; i++) {
+            if (i != 0)
+                value += ", ";
+            value += i < layout->channels
+                         ? fmt::format("{}({})", component_type,
+                                       decodeRawChannel(*layout, words, i))
+                         : fmt::format("{}(0)", component_type);
+        }
+    } else {
+        for (u32 i = 0; i < 4; i++) {
+            if (i != 0)
+                value += ", ";
+            value += fmt::format("as_type<{}>(uint({}))", component_type,
+                                 getBitwiseOperandStr(values[i]));
+        }
     }
     value += ")";
 
@@ -957,10 +1614,73 @@ void MslEmitter::emitImageStore(u32 index, TextureType type,
                    getImageCoordsStr(type, coords_str));
 }
 
+void MslEmitter::emitImageLoad(const ir::Value& dst, u32 index,
+                               TextureType type, const ir::Value& coords,
+                               u32 raw_size) {
+    const auto& info = memory_analyzer.getImages().at(index);
+    const auto component_type =
+        imageComponentType(state, index, info.is_atomic);
+    const auto coords_str = getValueStr(coords);
+    const auto texel = getValueStr(dst) + "_texel";
+    // Out of bounds reads return 0
+    writeStatement("vec<{0}, 4> {1} = ({2}) ? state.img{3}.read({4}) : "
+                   "vec<{0}, 4>(0)",
+                   component_type, texel,
+                   getImageBoundsStr(index, type, coords_str), index,
+                   getImageCoordsStr(type, coords_str));
+
+    std::array<std::string, 4> bits;
+    const char* components[] = {"x", "y", "z", "w"};
+    if (const auto layout = getRawLayout(state, index, raw_size)) {
+        std::array<std::string, 4> channels;
+        for (u32 i = 0; i < 4; i++)
+            channels[i] = fmt::format("{}.{}", texel, components[i]);
+        for (u32 word = 0; word < 4; word++)
+            bits[word] = encodeRawWord(*layout, channels, word);
+    } else {
+        for (u32 i = 0; i < 4; i++)
+            bits[i] = fmt::format("as_type<uint>({}.{})", texel, components[i]);
+    }
+    storeValue(dst, "vec<u32, 4>({}, {}, {}, {})", bits[0], bits[1], bits[2],
+               bits[3]);
+}
+
 void MslEmitter::emitImageAtomic(const ir::Value& dst, u32 index,
                                  TextureType type, u32 op,
                                  const ir::Value& coords,
                                  const ir::Value& value) {
+    // INC and DEC wrap around the operand, which texture atomics lack: a
+    // compare and exchange loop
+    if (op == 3 || op == 4) {
+        const auto component_type = imageComponentType(state, index, true);
+        const auto coords_str = getValueStr(coords);
+        const auto expected = getValueStr(dst) + "_expected";
+        writeStatement("vec<{0}, 4> {1} = vec<{0}, 4>(0)", component_type,
+                       expected);
+        enterScope("if ({})", getImageBoundsStr(index, type, coords_str));
+        writeStatement("{} = state.img{}.read({})", expected, index,
+                       getImageCoordsStr(type, coords_str));
+        enterScope("while (true)");
+        const auto operand = fmt::format("as_type<{}>(uint({}))", component_type,
+                                         getBitwiseOperandStr(value));
+        writeStatement("const {0} current = {1}.x; const {0} desired = {2}",
+                       component_type, expected,
+                       op == 3 ? fmt::format("(current >= {0}) ? {1}(0) : "
+                                             "{1}(current + 1)",
+                                             operand, component_type)
+                               : fmt::format("(current == 0 || current > {0}) "
+                                             "? {0} : {1}(current - 1)",
+                                             operand, component_type));
+        writeStatement("if (state.img{}.atomic_compare_exchange_weak({}, &{}, "
+                       "vec<{}, 4>(desired))) break",
+                       index, getImageCoordsStr(type, coords_str), expected,
+                       component_type);
+        exitScopeEmpty();
+        exitScopeEmpty();
+        storeValue(dst, "as_type<uint>({}.x)", expected);
+        return;
+    }
+
     std::string_view func;
     std::string operand = getBitwiseOperandStr(value);
     switch (op) {
@@ -1040,6 +1760,18 @@ void MslEmitter::emitShuffle(const ir::Value& dst, const ir::Value& value,
                getBitwiseOperandStr(value), getValueStr(lane));
 }
 
+// Intrinsic
+void MslEmitter::emitIntrinsic(const ir::Value& dst, ir::Intrinsic intrinsic,
+                               std::span<const ir::Value> args) {
+    std::string arguments;
+    for (const auto& arg : args) {
+        if (!arguments.empty())
+            arguments += ", ";
+        arguments += getBitwiseOperandStr(arg);
+    }
+    storeValue(dst, "{}({})", getIntrinsicFunctionName(intrinsic), arguments);
+}
+
 std::string MslEmitter::getSvAccessQualifiedStr(const SvAccess& sv_access,
                                                 bool output) {
     bool needs_in_out = (sv_access.sv.semantic == SvSemantic::Position ||
@@ -1085,8 +1817,12 @@ std::string MslEmitter::getSvQualifierStr(const Sv& sv, bool output) {
             else
                 return fmt::format("attribute({})", sv.index);
         case ShaderType::Fragment:
-            if (output)
+            if (output) {
+                // The second blend input of render target 0
+                if (state.dual_source_blending && sv.index == 1)
+                    return "color(0), index(1)";
                 return fmt::format("color({})", sv.index);
+            }
             else
                 return fmt::format("user(locn{})", sv.index);
         default:

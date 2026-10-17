@@ -27,6 +27,22 @@ union InstTxq {
 
 void emitTxq(DecoderContext& context, InstTxq inst);
 
+// Mip level query; bindless: the handle is in the meta register
+union InstTmml {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> meta;
+    BitField64<u32, 28, 3> dim;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<u32, 36, 13> cbuf_index;
+};
+
+void emitTmml(DecoderContext& context, InstTmml inst);
+using InstTmmlB = InstTmml;
+void emitTmmlB(DecoderContext& context, InstTmmlB inst);
+
 // Bindless: the handle is in register src, the LOD follows it
 union InstTxqB {
     BitField64<reg_t, 0, 8> dst;
@@ -81,6 +97,8 @@ union InstTexsTlds {
     BitField64<bool, 49, 1> nodep;
     BitField64<u8, 50, 3> write_mask;
     BitField64<TextureSampleTarget, 53, 4> target;
+    // Results are packed F16 pairs when clear
+    BitField64<bool, 59, 1> f32;
 };
 
 using InstTexs = InstTexsTlds;
@@ -147,6 +165,22 @@ union InstTexB {
 };
 
 void emitTexB(DecoderContext& context, InstTexB inst);
+
+union InstTxd {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src_a;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> src_b;
+    BitField64<TextureDimension, 28, 3> dim;
+    BitField64<u8, 31, 4> write_mask;
+    BitField64<bool, 35, 1> aoffi;
+    BitField64<u32, 36, 13> cbuf_index;
+    BitField64<bool, 50, 1> lc;
+};
+using InstTxdB = InstTxd;
+void emitTxd(DecoderContext& context, InstTxd inst);
+void emitTxdB(DecoderContext& context, InstTxdB inst);
 
 // Texel fetch; the bindless variant has the handle as the first register of
 // src_b and no cbuf_index
@@ -222,6 +256,8 @@ union InstTld4s {
     BitField64<bool, 49, 1> nodep;
     BitField64<bool, 50, 1> dc;
     BitField64<bool, 51, 1> aoffi;
+    // Results are packed F16 pairs when set
+    BitField64<bool, 55, 1> f16;
 };
 
 void emitTld4s(DecoderContext& context, InstTld4s inst);

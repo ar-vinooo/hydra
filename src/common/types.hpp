@@ -1,5 +1,6 @@
 #pragma once
 
+#include <list>
 #include <map>
 #include <string>
 
@@ -332,7 +333,11 @@ class strong_number_typedef {
         using strong_number_typedef::strong_number_typedef;                    \
     }
 
-template <typename Subclass, typename T, typename DescriptorT>
+// Objects created from descriptors, found by the hash of the descriptor. With
+// compare_descriptors, Subclass::equals tells descriptors with the same hash
+// apart, otherwise the hash alone identifies an object.
+template <typename Subclass, typename T, typename DescriptorT,
+          bool compare_descriptors = false>
 class CacheBase {
     friend Subclass;
 
@@ -340,8 +345,14 @@ class CacheBase {
 
   public:
     ~CacheBase() noexcept {
-        for (auto& [key, value] : cache) {
-            THIS->destroyElement(value);
+        if constexpr (compare_descriptors) {
+            for (auto& [key, bucket] : cache) {
+                for (auto& entry : bucket)
+                    THIS->destroyElement(entry.value);
+            }
+        } else {
+            for (auto& [key, value] : cache)
+                THIS->destroyElement(value);
         }
 
         THIS->destroy();
@@ -351,20 +362,39 @@ class CacheBase {
 
     T& find(const DescriptorT& descriptor) {
         u32 hash = THIS->hash(descriptor);
-        auto it = cache.find(hash);
-        if (it == cache.end()) {
-            it = cache.insert({hash, THIS->create(descriptor)}).first;
+        if constexpr (compare_descriptors) {
+            auto& bucket = cache[hash];
+            for (auto& entry : bucket) {
+                if (Subclass::equals(entry.descriptor, descriptor)) {
+                    THIS->update(entry.value);
+                    return entry.value;
+                }
+            }
+            // List elements keep their address when the bucket grows
+            return bucket.emplace_back(Entry{descriptor, THIS->create(descriptor)})
+                .value;
+        } else {
+            auto it = cache.find(hash);
+            if (it == cache.end()) {
+                it = cache.insert({hash, THIS->create(descriptor)}).first;
+
+                return it->second;
+            }
+
+            THIS->update(it->second);
 
             return it->second;
         }
-
-        THIS->update(it->second);
-
-        return it->second;
     }
 
   private:
-    std::map<u32, T> cache;
+    struct Entry {
+        DescriptorT descriptor;
+        T value;
+    };
+    std::conditional_t<compare_descriptors, std::map<u32, std::list<Entry>>,
+                       std::map<u32, T>>
+        cache;
 };
 
 } // namespace hydra

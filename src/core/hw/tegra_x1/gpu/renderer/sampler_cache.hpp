@@ -12,7 +12,7 @@ class SamplerBase;
 class IRenderer;
 
 class SamplerCache
-    : public CacheBase<SamplerCache, SamplerBase*, SamplerDescriptor> {
+    : public CacheBase<SamplerCache, SamplerBase*, SamplerDescriptor, true> {
   public:
     explicit SamplerCache(IRenderer& renderer_) : renderer{renderer_} {}
 
@@ -21,11 +21,17 @@ class SamplerCache
     SamplerBase* create(const SamplerDescriptor& descriptor);
     void update([[maybe_unused]] SamplerBase* sampler) {}
     static u32 hash(const SamplerDescriptor& descriptor);
+    static bool equals(const SamplerDescriptor& a, const SamplerDescriptor& b);
 
     static void destroyElement(SamplerBase* sampler);
 
   private:
     IRenderer& renderer;
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    SamplerBase* createHot0(const SamplerDescriptor& descriptor);
+    static u32 hashHot1(const SamplerDescriptor& descriptor);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

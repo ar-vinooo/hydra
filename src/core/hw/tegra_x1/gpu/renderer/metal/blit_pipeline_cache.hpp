@@ -14,6 +14,10 @@ struct BlitParams {
 struct BlitPipelineDescriptor {
     MTL::PixelFormat pixel_format;
     bool transparent;
+    bool copy_alpha = false;
+    // 0 float, 1 uint, 2 int
+    u8 src_type = 0;
+    u8 dst_type = 0;
 };
 
 class BlitPipelineCache
@@ -34,6 +38,12 @@ class BlitPipelineCache
     MTL::Device* device;
 
     MTL::RenderPipelineDescriptor* pipeline_descriptor;
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    MTL::RenderPipelineState*
+    createHot0(const BlitPipelineDescriptor& descriptor);
+    u32 hashHot1(const BlitPipelineDescriptor& descriptor);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

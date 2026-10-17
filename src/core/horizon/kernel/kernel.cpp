@@ -83,9 +83,11 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         exitThread(crnt_thread);
         break;
     case 0xb: {
-        // DEBUG: sample where guest threads poll with SleepThread
+        // Optional polling diagnostics; avoid atomics and stack walks in normal play.
+        static const bool trace_sleep =
+            std::getenv("HYDRA_TRACE_SLEEP") != nullptr;
         static std::atomic<u64> sleep_calls{0};
-        if (sleep_calls.fetch_add(1) % 500 == 0) {
+        if (trace_sleep && sleep_calls.fetch_add(1) % 500 == 0) {
             std::string frames = fmt::format("{:#x}", state.lr);
             vaddr_t fp = state.fp;
             for (u32 i = 0; i < 6 && fp != 0; i++) {

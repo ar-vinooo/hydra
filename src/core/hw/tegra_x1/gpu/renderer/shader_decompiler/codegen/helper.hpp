@@ -15,8 +15,7 @@ inline ir::ScalarType toType(engines::VertexAttribType vertex_attrib_type) {
     case engines::VertexAttribType::Uint:
         return ir::ScalarType::U32;
     case engines::VertexAttribType::Sscaled:
-        return ir::ScalarType::U32; // TODO: use float if the Renderer backend
-                                    // supports scaled attributes
+        return ir::ScalarType::I32; // converted to float in the shader
     case engines::VertexAttribType::Uscaled:
         return ir::ScalarType::U32; // TODO: use float if the Renderer backend
                                     // supports scaled attributes

@@ -153,7 +153,21 @@ class Gpu {
         return found == video_frames.end() ? nullptr : found->second;
     }
 
-    video::Syncpoints& getVideoSyncpoints() { return video_syncpoints; }
+    video::Syncpoints& getVideoSyncpoints() { return *video_syncpoints; }
+
+    // GPU fences. A submission that asks for a fence gets a syncpoint value
+    // the host reaches when it finished the submission's work. Off by default
+    // (every fence then reads as reached): HYDRA_GPU_FENCES=1 enables them.
+    bool reserveFence(Fence& out_fence);
+    // Reaches the fence of a submission
+    std::function<void()> makeFenceSignal(const Fence& fence) const {
+        return [syncpoints = video_syncpoints, id = fence.id] {
+            syncpoints->complete(id, 1);
+        };
+    }
+    bool isFenceSyncpoint(u32 id) const {
+        return fence_syncpoint != 0 && id == fence_syncpoint;
+    }
 
     // Engines
     std::optional<engines::EngineBase*> getEngineAtSubchannel(u32 subchannel) {
@@ -208,7 +222,15 @@ class Gpu {
     std::mutex video_frames_mutex;
     std::map<u64, std::shared_ptr<const video::Frame>> video_frames;
     usize video_frame_bytes = 0;
-    video::Syncpoints video_syncpoints;
+    std::shared_ptr<video::Syncpoints> video_syncpoints =
+        std::make_shared<video::Syncpoints>();
+    std::mutex fence_mutex;
+    std::atomic<u32> fence_syncpoint{0};
+    u32 fence_target{0};
+
+    // Puller (host) methods of the channel: semaphores and syncpoints
+    void pullerMethod(u32 method, u32 arg);
+    u32 puller_regs[0x40] = {};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

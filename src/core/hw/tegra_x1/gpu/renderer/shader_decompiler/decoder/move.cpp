@@ -48,7 +48,7 @@ void emitMovC(DecoderContext& context, InstMovC inst) {
 void emitMovI(DecoderContext& context, InstMovI inst) {
     emitMove(context, inst.base.pred, inst.base.pred_inv, inst.base.dst,
              ir::Value::createConstantU(
-                 getIntImm20(inst.imm20_0, inst.imm20_19, false)));
+                 getIntImm20(inst.imm20_0, inst.imm20_19, true)));
 }
 
 void emitMov32I(DecoderContext& context, InstMov32I inst) {
@@ -57,37 +57,18 @@ void emitMov32I(DecoderContext& context, InstMov32I inst) {
 }
 
 void emitS2R(DecoderContext& context, InstS2R inst) {
-    constexpr u32 SR_LANE_ID = 0x00;
-    constexpr u32 SR_Y_DIRECTION = 0x12;
-
-    // Thread and block IDs, lane masks
+    // Thread and block IDs only exist in compute shaders, other stages read
+    // zero
     const auto sr = static_cast<u32>(inst.sr);
-    if (context.decomp_context.type == ShaderType::Compute &&
-        (sr == SR_LANE_ID || (sr >= 0x20 && sr <= 0x23) ||
-         (sr >= 0x25 && sr <= 0x27) || (sr >= 0x38 && sr <= 0x3c))) {
+    if (context.decomp_context.type != ShaderType::Compute &&
+        ((sr >= 0x20 && sr <= 0x23) || (sr >= 0x25 && sr <= 0x27))) {
         emitMove(context, inst.pred, inst.pred_inv, inst.dst,
-                 context.builder.opReadSystemRegister(sr));
+                 ir::Value::createConstantU(0));
         return;
     }
 
-    u32 value = 0;
-    switch (static_cast<u32>(inst.sr)) {
-    case SR_Y_DIRECTION:
-        // TODO: -1.0 when the window origin flips Y
-        value = std::bit_cast<u32>(1.0f);
-        break;
-    case SR_LANE_ID:
-        // TODO: lane ID
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Lane ID");
-        break;
-    default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Special register {:#x}",
-                            static_cast<u32>(inst.sr));
-        break;
-    }
-
     emitMove(context, inst.pred, inst.pred_inv, inst.dst,
-             ir::Value::createConstantU(value));
+             context.builder.opReadSystemRegister(sr));
 }
 
 void emitSelR(DecoderContext& context, InstSelR inst) {

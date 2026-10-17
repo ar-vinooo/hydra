@@ -27,6 +27,12 @@ enum class TextureTypeClass {
 
 TextureTypeClass getTextureTypeClass(TextureType type);
 
+// Adapts the shape of a guest texture to what the host can create: several
+// layers need an array type, levels below 1x1 do not exist and 1D textures
+// have a single level. Returns false for textures the host cannot create.
+bool legalizeTextureShape(TextureType& type, u32 width, u32 height, u32 depth,
+                          u32 layer_count, u32& level_count);
+
 enum class TextureFormat {
     Invalid,
 
@@ -159,6 +165,9 @@ enum class TextureFormat {
     ETC2_RGB_sRGB,
     PTA_ETC2_RGB_sRGB,
     ETC2_RGBA_sRGB,
+    BGR10A2Unorm,
+    S8Uint_Z24Unorm,
+    R1G5B5A5Unorm,
 };
 
 struct TextureFormatInfo {
@@ -173,6 +182,10 @@ const TextureFormatInfo& getTextureFormatInfo(TextureFormat format);
 TextureFormat toTextureFormat(NvColorFormat color_format);
 TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
                               bool is_srgb);
+// Format a TIC is sampled as. A Z24 TIC whose swizzle only reads its stencil
+// component (a uint component) samples the stencil plane, not the depth.
+TextureFormat toSampledTextureFormat(const ImageFormatWord image_format_word,
+                                     bool is_srgb);
 TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format);
 TextureFormat toTextureFormat(DepthSurfaceFormat depth_surface_format);
 
@@ -215,6 +228,10 @@ struct SwizzleChannels {
         return r == other.r && g == other.g && b == other.b && a == other.a;
     }
 };
+
+// Swizzle of the view toSampledTextureFormat returns for a TIC
+SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word,
+                                         bool is_srgb);
 
 struct TextureDescriptor {
     uptr ptr;
@@ -278,12 +295,24 @@ struct TextureViewDescriptor {
         : type{type_}, format{format_}, levels{levels_}, layers{layers_},
           swizzle_channels{swizzle_channels_} {}
 
+    bool operator==(const TextureViewDescriptor& other) const {
+        return type == other.type && format == other.format &&
+               levels.getBegin() == other.levels.getBegin() &&
+               levels.getEnd() == other.levels.getEnd() &&
+               layers.getBegin() == other.layers.getBegin() &&
+               layers.getEnd() == other.layers.getEnd() &&
+               swizzle_channels == other.swizzle_channels;
+    }
+
     u32 getHash() const;
 };
 
 enum class SamplerFilter {
     Nearest = 1,
     Linear = 2,
+    // MIN_ANISO for minification, VCAA_4_TAP for magnification
+    Anisotropic = 3,
+    Vcaa8Tap = 4,
 };
 
 enum class SamplerMipFilter {
@@ -312,6 +341,10 @@ struct SamplerDescriptor {
     SamplerAddressMode address_mode_r;
     engines::CompareOp depth_compare_op;
     uint4 border_color_u;
+    f32 min_lod = 0.0f;
+    f32 max_lod = 15.0f;
+    f32 lod_bias = 0.0f;
+    u32 max_anisotropy = 1;
     // TODO: more
 };
 
@@ -372,6 +405,11 @@ struct Viewport {
 
 using Scissor = UIntRect2D;
 
+struct ClearState {
+    Scissor rect;
+    u32 stencil_write_mask{0xff};
+};
+
 enum class ShaderType {
     Vertex,
     Fragment,
@@ -409,7 +447,64 @@ constexpr u32 getTrackedSamplerWord(u32 index) {
     return index & TRACKED_TEXTURE_WORD_MASK;
 }
 
+// Extra parameters of texture blits. A zero source extent means the extent of
+// the source region is the one given by the source size; a negative extent
+// mirrors the copy
+struct BlitOptions {
+    bool nearest = false;
+    f32 src_width = 0.0f;
+    f32 src_height = 0.0f;
+};
+
+// Component type shaders access an integer texture format with ("uint" or
+// "int"), or nullptr for float formats
+constexpr const char* getIntegerTextureComponentType(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::R8Uint:
+    case TextureFormat::R16Uint:
+    case TextureFormat::R32Uint:
+    case TextureFormat::RG8Uint:
+    case TextureFormat::RG16Uint:
+    case TextureFormat::RG32Uint:
+    case TextureFormat::RGBA8Uint:
+    case TextureFormat::RGBA16Uint:
+    case TextureFormat::RGBA32Uint:
+    case TextureFormat::S8Uint:
+        return "uint";
+    case TextureFormat::R8Sint:
+    case TextureFormat::R16Sint:
+    case TextureFormat::R32Sint:
+    case TextureFormat::RG8Sint:
+    case TextureFormat::RG16Sint:
+    case TextureFormat::RG32Sint:
+    case TextureFormat::RGBA8Sint:
+    case TextureFormat::RGBA16Sint:
+    case TextureFormat::RGBA32Sint:
+        return "int";
+    default:
+        return nullptr;
+    }
+}
+
+// Bindless handles that are shader constants are encoded with an invalid
+// constant buffer slot
+constexpr u32 CONSTANT_TEXTURE_SLOT = 0x1f;
+constexpr u32 CONSTANT_TEXTURE_HANDLE_MASK = (1u << 26) - 1;
+
+constexpr u32 makeConstantTextureIndex(u32 handle) {
+    return TRACKED_TEXTURE_INDEX_FLAG | (CONSTANT_TEXTURE_SLOT << 26) |
+           (handle & CONSTANT_TEXTURE_HANDLE_MASK);
+}
+constexpr bool isConstantTextureIndex(u32 index) {
+    return isTrackedTextureIndex(index) &&
+           getTrackedTextureSlot(index) == CONSTANT_TEXTURE_SLOT;
+}
+constexpr u32 getConstantTextureHandle(u32 index) {
+    return index & CONSTANT_TEXTURE_HANDLE_MASK;
+}
+
 struct ResourceMapping {
+    u32 fragment_output_mask{0xffffffffu};
     // Constant-buffer jump table words used to enumerate indirect branches.
     std::map<std::pair<u32, u32>, u32> branch_constants;
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
@@ -423,6 +518,8 @@ struct ResourceMapping {
     // Storage images (surfaces), keyed like textures
     std::map<u32, u32> images;
     std::map<u32, TextureType> image_types;
+    // The vertex shader exports the render target layer or viewport index
+    bool writes_layer{false};
 
     ResourceMapping() {
         for (auto& uniform_buffer : uniform_buffers)
@@ -437,6 +534,8 @@ struct ShaderDescriptor {
     ShaderBackend backend;
     std::vector<u8> code;
     ResourceMapping resource_mapping;
+    // The vertex shader writes the render target array index
+    bool writes_layer{false};
 };
 
 struct VertexArray {
@@ -490,11 +589,20 @@ struct StencilState {
     StencilFaceState back{};
 };
 
+enum class PrimitiveTopologyClass : u32 {
+    Unspecified,
+    Point,
+    Line,
+    Triangle,
+};
+
 struct PipelineDescriptor {
     ShaderBase* shaders[static_cast<usize>(ShaderType::Count)];
     VertexState vertex_state;
     ColorTargetState color_target_states[COLOR_TARGET_COUNT];
     TextureFormat depth_stencil_format{TextureFormat::Invalid};
+    // Required when the vertex shader selects the layer or viewport
+    PrimitiveTopologyClass topology_class{PrimitiveTopologyClass::Unspecified};
 };
 
 usize getVertexFormatSize(engines::VertexAttribSize size);
@@ -568,7 +676,9 @@ ENABLE_ENUM_FORMATTING(
     ETC2_R_Snorm, "etc2_r_snorm", ETC2_RG_Unorm, "etc2_rg_unorm", ETC2_RG_Snorm,
     "etc2_rg_snorm", ETC2_RGB, "etc2_rgb", PTA_ETC2_RGB, "pta_etc2_rgb",
     ETC2_RGBA, "etc2_rgba", ETC2_RGB_sRGB, "etc2_rgb_srgb", PTA_ETC2_RGB_sRGB,
-    "pta_etc2_rgb_srgb", ETC2_RGBA_sRGB, "etc2_rgba_srgb")
+    "pta_etc2_rgb_srgb", ETC2_RGBA_sRGB, "etc2_rgba_srgb", BGR10A2Unorm,
+    "bgr10a2unorm", S8Uint_Z24Unorm, "s8uint z24unorm", R1G5B5A5Unorm,
+    "r1g5b5a5unorm")
 
 ENABLE_STRUCT_FORMATTING(hydra::hw::tegra_x1::gpu::renderer::SwizzleChannels, r,
                          "", "r", g, "", "g", b, "", "b", a, "", "a")

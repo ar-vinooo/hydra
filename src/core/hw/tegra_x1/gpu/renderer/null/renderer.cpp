@@ -55,7 +55,7 @@ void Renderer::blitTexture(
     [[maybe_unused]] u32 src_layer, [[maybe_unused]] ITextureView* dst,
     [[maybe_unused]] float3 dst_origin, [[maybe_unused]] uint3 dst_size,
     [[maybe_unused]] u32 dst_level, [[maybe_unused]] u32 dst_layer,
-    [[maybe_unused]] u32 level_count, [[maybe_unused]] u32 layer_count) {}
+    [[maybe_unused]] u32 level_count, [[maybe_unused]] u32 layer_count, [[maybe_unused]] const BlitOptions& options) {}
 
 SamplerBase* Renderer::createSampler(const SamplerDescriptor& descriptor) {
     return new Sampler(descriptor);

@@ -1,6 +1,8 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/intrinsic.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/value.hpp"
+#include <span>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 struct GuestShaderState;
@@ -129,6 +131,8 @@ class Emitter {
     virtual void emitBeginIf(const ir::Value& cond) = 0;
     virtual void emitEndIf() = 0;
     virtual void emitBranch(label_t target) = 0;
+    virtual void emitPushReturn(label_t target) = 0;
+    virtual void emitReturnBranch() = 0;
     virtual void emitBranchConditional(const ir::Value& cond,
                                        label_t target_true,
                                        label_t target_false) = 0;
@@ -143,18 +147,23 @@ class Emitter {
                         const std::vector<ir::Value>& elements) = 0;
 
     // Texture
-    virtual void emitTextureSample(const ir::Value& dst, u32 const_buffer_index,
-                                   TextureType type, TextureSampleFlags flags,
-                                   const ir::Value& array_index,
-                                   const ir::Value& coords,
-                                   const ir::Value& cmp_value,
-                                   const ir::Value& lod) = 0;
+    virtual void emitTextureSample(
+        const ir::Value& dst, u32 const_buffer_index, TextureType type,
+        TextureSampleFlags flags, const ir::Value& array_index,
+        const ir::Value& coords, const ir::Value& cmp_value,
+        const ir::Value& lod, const ir::Value& ddx, const ir::Value& ddy,
+        const ir::Value& offset, const ir::Value& offsets, u8 component) = 0;
     virtual void emitTextureGather(const ir::Value& dst, u32 const_buffer_index,
                                    const ir::Value& coords, u8 component,
                                    const ir::Value& cmp_value) = 0;
     virtual void emitTextureQueryDimension(const ir::Value& dst,
                                            u32 const_buffer_index,
-                                           u32 dimension) = 0;
+                                           u32 dimension,
+                                           const ir::Value& lod) = 0;
+    virtual void emitTextureQueryLod(const ir::Value& dst,
+                                     u32 const_buffer_index, TextureType type,
+                                     const ir::Value& coords,
+                                     bool unclamped) = 0;
 
     // Exit
     virtual void emitExit() = 0;
@@ -177,10 +186,17 @@ class Emitter {
                                 const ir::Value& value) = 0;
     virtual void emitAtomicShared(const ir::Value& dst, const ir::Value& addr,
                                   const ir::Value& value, u32 op, bool is_signed) = 0;
+    virtual void emitAtomicSharedCas(const ir::Value& dst, const ir::Value& addr,
+                                     const ir::Value& compare,
+                                     const ir::Value& value) = 0;
     virtual void emitBarrier() = 0;
     virtual void emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,
-                                const std::array<ir::Value, 4>& values) = 0;
+                                const std::array<ir::Value, 4>& values,
+                                u32 raw_size) = 0;
+    virtual void emitImageLoad(const ir::Value& dst, u32 index,
+                               TextureType type, const ir::Value& coords,
+                               u32 raw_size) = 0;
     virtual void emitImageAtomic(const ir::Value& dst, u32 index,
                                  TextureType type, u32 op,
                                  const ir::Value& coords,
@@ -192,6 +208,10 @@ class Emitter {
     virtual void emitBallot(const ir::Value& dst, const ir::Value& pred) = 0;
     virtual void emitShuffle(const ir::Value& dst, const ir::Value& value,
                              const ir::Value& lane) = 0;
+
+    // Intrinsic
+    virtual void emitIntrinsic(const ir::Value& dst, ir::Intrinsic intrinsic,
+                               std::span<const ir::Value> args) = 0;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen

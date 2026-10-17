@@ -4,12 +4,12 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: write_cc, ftz
+// TODO: ftz
 void emitFloatSet(DecoderContext& context, pred_t pred, bool pred_inv,
                   FloatCmpOp op, BoolOp b_op, reg_t dst, reg_t src_a,
                   bool abs_a, bool neg_a, ir::Value src_b, bool abs_b,
                   bool neg_b, pred_t src_pred, bool src_pred_inv,
-                  bool b_float) {
+                  bool b_float, bool write_cc) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = absNegIf(
@@ -22,12 +22,19 @@ void emitFloatSet(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder, ir::Value::createPredicate(src_pred), src_pred_inv);
     res = getLogical(context, b_op, res, pred_v);
 
+    if (write_cc)
+        writeSetConditionCodes(context.builder, res, b_float);
+
     if (b_float) {
         res = context.builder.opSelect(res, ir::Value::createConstantF(1.0f),
                                        ir::Value::createConstantF(0.0f));
         context.builder.opCopy(
             ir::Value::createRegister(dst, ir::ScalarType::F32), res);
     } else {
+        // Without .BF, true is written as 0xffffffff (usable as a bit mask
+        // or as -1), not as 1
+        res = context.builder.opSelect(res, ir::Value::createConstantU(0xffffffffu),
+                                       ir::Value::createConstantU(0u));
         context.builder.opCopy(ir::Value::createRegister(dst), res);
     }
 
@@ -130,7 +137,7 @@ void emitFsetR(DecoderContext& context, InstFsetR inst) {
                  inst.base.abs_a, inst.base.neg_a,
                  ir::Value::createRegister(inst.src_b, ir::ScalarType::F32),
                  inst.base.abs_b, inst.base.neg_b, inst.base.src_pred,
-                 inst.base.src_pred_inv, inst.base.b_float);
+                 inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitFsetC(DecoderContext& context, InstFsetC inst) {
@@ -142,7 +149,7 @@ void emitFsetC(DecoderContext& context, InstFsetC inst) {
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
             ir::ScalarType::F32),
         inst.base.abs_b, inst.base.neg_b, inst.base.src_pred,
-        inst.base.src_pred_inv, inst.base.b_float);
+        inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitFsetI(DecoderContext& context, InstFsetI inst) {
@@ -152,7 +159,7 @@ void emitFsetI(DecoderContext& context, InstFsetI inst) {
         inst.base.neg_a,
         ir::Value::createConstantF(getFloatImm20(inst.imm20_0, inst.imm20_19)),
         inst.base.abs_b, inst.base.neg_b, inst.base.src_pred,
-        inst.base.src_pred_inv, inst.base.b_float);
+        inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitFsetpR(DecoderContext& context, InstFsetpR inst) {

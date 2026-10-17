@@ -137,6 +137,9 @@ void Process::resizeHeap(u64 size) {
 void Process::mapAliasRun(vaddr_t begin, vaddr_t end) {
     if (begin == end)
         return;
+    // DEBUG: random data aborts in freshly mapped alias memory
+    if (std::getenv("HYDRA_TRACE_SVC") != nullptr)
+        LOG_INFO(Kernel, "DEBUG alias map run {:#x}..{:#x}", begin, end);
 
     if (alias_host_base == 0x0) {
         void* ptr = mmap(nullptr, ALIAS_REGION.getSize(), PROT_READ | PROT_WRITE,
@@ -184,6 +187,8 @@ void Process::releaseAliasMemory() {
 
 result_t Process::mapPhysicalMemory(vaddr_t addr, u64 size) {
     std::scoped_lock lock(physical_mem_mutex);
+    if (std::getenv("HYDRA_TRACE_SVC") != nullptr)
+        LOG_INFO(Kernel, "DEBUG map physical {:#x}..{:#x}", addr, addr + size);
 
     // Only the unmapped parts of the range get new memory
     const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
@@ -207,6 +212,8 @@ result_t Process::mapPhysicalMemory(vaddr_t addr, u64 size) {
 
 result_t Process::unmapPhysicalMemory(vaddr_t addr, u64 size) {
     std::scoped_lock lock(physical_mem_mutex);
+    if (std::getenv("HYDRA_TRACE_SVC") != nullptr)
+        LOG_INFO(Kernel, "DEBUG unmap physical {:#x}..{:#x}", addr, addr + size);
 
     const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
 

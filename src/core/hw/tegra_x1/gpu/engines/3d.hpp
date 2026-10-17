@@ -111,8 +111,8 @@ struct TextureSamplerControl {
     u32 : 9;
 
     // 0x04
-    u32 mag_filter : 2;
-    u32 : 2;
+    u32 mag_filter : 3;
+    u32 min_lod_clamp_integer_only : 1;
     u32 min_filter : 2;
     u32 mip_filter : 2;
     u32 cubemap_anisotropy : 1;
@@ -146,6 +146,8 @@ struct TextureSamplerControl {
     // 0x1C
     u32 border_color_a;
 };
+
+renderer::SamplerDescriptor decodeSampler(const TextureSamplerControl& tsc);
 
 struct RenderTarget {
     Iova addr;
@@ -436,7 +438,10 @@ struct Regs3D {
 
     u32 end;
     struct {
-        PrimitiveType primitive_type : 26;
+        PrimitiveType primitive_type : 16;
+        u32 : 8;
+        bool32 primitive_id_reset : 1;
+        u32 : 1;
         bool32 instance_next : 1;
         bool32 instance_ctrl : 1; // TODO: is the name correct?
     } begin;
@@ -546,19 +551,30 @@ struct Regs3D {
     u32 padding_0x983[0x37d];
 
     // 0xd00
-    u32 mme_scratch[0x80];
+    u32 mme_scratch[0x100];
 };
+static_assert(sizeof(Regs3D) == MACRO_METHODS_REGION * sizeof(u32));
 
-class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
+class ThreeD : public EngineWithRegsBase<Regs3D>,
+               public InlineBase,
+               public macro::MacroHost {
   public:
     explicit ThreeD(Gpu& gpu_);
 
     void method(u32 method, u32 arg) override;
+    void methodHot(u32 method, u32 arg);
 
     void flushMacro() override;
+    void flushMacroHot();
 
     // Getters
     const Regs3D& getRegs() const { return regs; }
+
+    // Macros
+    u32 readMacroRegister(u32 reg) override { return getReg(reg); }
+    void callMacroMethod(u32 method, u32 arg) override {
+        this->method(method, arg);
+    }
 
     // Helpers (also used by the compute engine)
     // Write usage is for storage images
@@ -566,7 +582,34 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     getTexture(const TextureImageControl& tic,
                std::optional<renderer::TextureType> shader_type = std::nullopt,
                renderer::TextureUsage usage = renderer::TextureUsage::Read) const;
-    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc) const;
+    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc,
+                                      bool force_nearest = false) const;
+    // Samplers are immutable and never evicted, so they are memoized by the
+    // raw TSC words instead of hashing a descriptor for every binding
+    struct SamplerMemo {
+        std::array<u64, 4> key{};
+        renderer::SamplerBase* sampler{nullptr};
+    };
+    mutable std::array<SamplerMemo, 256> sampler_memo{};
+    mutable std::array<SamplerMemo, 256> sampler_nearest_memo{};
+    // Texture lookups of the previous draws, reused while the texture cache
+    // epoch only changed by this draw's own render target lookups
+    struct TextureMemo {
+        std::array<u64, 4> tic{};
+        u32 type{0};
+        renderer::ITextureView* view{nullptr};
+    };
+    static constexpr u32 TEXTURE_MEMO_SLOTS = 32;
+    std::array<std::array<TextureMemo, TEXTURE_MEMO_SLOTS>, 5> texture_memo{};
+    u64 texture_memo_epoch{~0ull};
+    const void* texture_memo_render_pass{nullptr};
+    const void* texture_memo_gmmu{nullptr};
+    bool texture_memo_valid{false};
+    // Registers the render target lookups read: with the same values and an
+    // unchanged epoch, the render pass of the previous draw is reused
+    std::vector<u8> render_target_key;
+    std::vector<u8> render_target_memo_key;
+    void makeRenderTargetKey(std::vector<u8>& key) const;
 
   protected:
     void macro(u32 method, u32 arg) override;
@@ -596,21 +639,35 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
 
     // Instance of the current draw
     u32 instance_index{0};
+    // Approximate samples passed counter for occlusion queries
+    // TODO: count the actual samples
+    u64 zpass_pixel_count{0};
     void beginDraw(const u32 index, const u32 arg);
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
+    // Draws with their topology, first vertex or index and count in the
+    // argument. The first draw of an instance group restarts the instances.
+    void drawVertexArrayCompact(const u32 index, const u32 arg);
+    // Conditional rendering: draws and clears are skipped while rendering is
+    // disabled
+    bool shouldExecute() const;
+    void drawVertexElementsCompact(const u32 index, const u32 arg);
 
     struct ClearBufferData {
         bool depth : 1;
         bool stencil : 1;
         u8 color_mask : 4;
         u32 target_id : 4;
-        u32 layer_id : 11;
+        u32 layer_id : 16;
     };
+
+    // Area a clear is restricted to by the clear control register
+    renderer::Scissor getClearRect() const;
 
     void clearBuffer(const u32 index, const ClearBufferData data);
 
     // HACK
+    void resetCounter(const u32 index, const u32 data);
     void setReportSemaphore(const u32 index, const u32 data);
 
     void firmwareCall4(const u32 index, const u32 data);
@@ -631,20 +688,27 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
     void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
     bool isHighlightedDraw() const;
     void profileDraw(u32 count);
+    void labelCaptureDraw(u32 count);
+    u32 capture_draw_index{0};
 
     renderer::Viewport getViewport(u32 index);
     renderer::Scissor getScissor(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
     renderer::ShaderBase* getShader(ShaderStage stage,
-                                    u32 fragment_input_mask = 0);
+                                    u32 fragment_input_mask = 0,
+                                    u32 layer_output_addr = 0);
+    u32 getGeometryLayerSource();
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
+    bool isVertexArrayInstanced(u32 vertex_array_index) const;
 
     void configureShaderStage(const ShaderStage stage,
                               const TextureImageControl* tex_header_pool,
                               const TextureSamplerControl* tex_sampler_pool);
 
     bool drawInternal();
+    void selectVisualResources();
+    void captureVisualDraw(bool after);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

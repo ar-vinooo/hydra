@@ -2,7 +2,19 @@
 
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
+#include <chrono>
+
 namespace hydra::hw::tegra_x1::gpu::engines {
+
+// GPU timestamp of semaphore releases: ticks at 614.4 MHz derived from the
+// host clock
+inline u64 getGpuTimestamp() {
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    return ns / 625 * 384;
+}
 
 struct Iova {
     u32 hi;
@@ -96,7 +108,26 @@ enum class VertexAttribSize : u32 {
     // Misc arrangements
     _10_10_10_2 = 0x30,
     _11_11_10 = 0x31,
+
+    // Arrangements fetched like the ones above (Eden does the same)
+    G8R8 = 0x32,
+    X8B8G8R8 = 0x33,
+    A8 = 0x34,
 };
+
+// The fetch size the arrangement is read as
+inline VertexAttribSize getFetchSize(VertexAttribSize size) {
+    switch (size) {
+    case VertexAttribSize::G8R8:
+        return VertexAttribSize::_2x8;
+    case VertexAttribSize::X8B8G8R8:
+        return VertexAttribSize::_4x8;
+    case VertexAttribSize::A8:
+        return VertexAttribSize::_1x8;
+    default:
+        return size;
+    }
+}
 
 struct VertexAttribState {
     u32 buffer_id : 5;
@@ -105,8 +136,10 @@ struct VertexAttribState {
     u32 offset : 14;
     VertexAttribSize size : 6;
     VertexAttribType type : 3;
-    bool bgra : 1;
+    u32 padding2 : 1;
+    bool bgra : 1; // Bit 31
 };
+static_assert(sizeof(VertexAttribState) == sizeof(u32));
 
 enum class ShaderStage : u32 {
     VertexA,

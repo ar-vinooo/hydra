@@ -12,7 +12,7 @@ struct ClearDepthPipelineDescriptor {
 
 class ClearDepthPipelineCache
     : public CacheBase<ClearDepthPipelineCache, MTL::RenderPipelineState*,
-                       ClearDepthPipelineDescriptor> {
+                       ClearDepthPipelineDescriptor, true> {
   public:
     explicit ClearDepthPipelineCache(MTL::Device* device_);
 
@@ -22,6 +22,8 @@ class ClearDepthPipelineCache
     create(const ClearDepthPipelineDescriptor& descriptor);
     void update([[maybe_unused]] MTL::RenderPipelineState* pipeline) {}
     static u32 hash(const ClearDepthPipelineDescriptor& descriptor);
+    static bool equals(const ClearDepthPipelineDescriptor& a,
+                       const ClearDepthPipelineDescriptor& b);
 
     static void destroyElement(MTL::RenderPipelineState* pipeline);
 
@@ -29,6 +31,12 @@ class ClearDepthPipelineCache
     MTL::Device* device;
 
     MTL::RenderPipelineDescriptor* pipeline_descriptor;
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    MTL::RenderPipelineState*
+    createHot0(const ClearDepthPipelineDescriptor& descriptor);
+    static u32 hashHot1(const ClearDepthPipelineDescriptor& descriptor);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -1,9 +1,11 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/hot/table.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
 #include <CommonCrypto/CommonDigest.h>
 #include <fstream>
 #include <pthread.h>
+#include <unistd.h>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 namespace {
@@ -13,6 +15,11 @@ std::string sourceKey(std::string_view source) {
     std::string key;
     for (auto byte : digest)
         key += fmt::format("{:02x}", byte);
+    // Compiler-option changes must not hit libraries from an older image.
+    // Live revisions are local to this process, so don't reuse their disk
+    // entries in a later session that may have different implementation code.
+    if (const auto revision = ::hydra::hot::generation(); revision != 0)
+        key += fmt::format("-hot-{}-{}", getpid(), revision);
     return key;
 }
 } // namespace
@@ -46,7 +53,7 @@ ShaderLibraryCache::~ShaderLibraryCache() {
         entry.library->release();
     device->release();
 }
-MTL::Library* ShaderLibraryCache::compile(std::string_view source,
+MTL::Library* ShaderLibraryCache::compileHot0(std::string_view source,
                                           NS::Error** error) {
     NS_STACK_SCOPED auto options = MTL::CompileOptions::alloc()->init();
     options->setPreserveInvariance(true);
@@ -66,7 +73,7 @@ void ShaderLibraryCache::insert(const std::string& key, MTL::Library* library) {
     }
     libraries.emplace(key, Entry{library->retain(), ++clock});
 }
-MTL::Library* ShaderLibraryCache::get(std::string_view source,
+MTL::Library* ShaderLibraryCache::getHot1(std::string_view source,
                                       NS::Error** error) {
     const auto key = sourceKey(source);
     if (enabled) {
@@ -116,6 +123,7 @@ void ShaderLibraryCache::prewarm() {
     });
     usize compiled = 0;
     for (auto& file : files) {
+        ::hydra::hot::Scope hot_scope;
         {
             std::lock_guard lock(mutex);
             if (stopping || compiled >= MAX_LIBRARIES)

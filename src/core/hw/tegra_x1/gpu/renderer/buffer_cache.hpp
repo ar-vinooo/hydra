@@ -48,6 +48,14 @@ class BufferCache {
 
   public:
     REF_GETTER(mutex, getMutex);
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    BufferView getHot0(ICommandBuffer* command_buffer, ztd::Range<uptr> range);
+    void invalidateMemoryHot1(ztd::Range<uptr> range);
+    void updateRangeHot2(ICommandBuffer* command_buffer, BufferEntry& entry,
+                         ztd::Range<uptr> range);
+    BufferEntry& findHot3(ztd::Range<uptr> range);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

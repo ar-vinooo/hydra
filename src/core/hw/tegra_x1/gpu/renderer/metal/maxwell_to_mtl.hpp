@@ -11,6 +11,7 @@ struct PixelFormatInfo {
     MTL::PixelFormat pixel_format;
     bool has_depth{false};
     bool has_stencil{false};
+    // Host channel of each guest component (R, G, B, A)
     uchar4 component_indices;
     // TODO: format decoder
 };

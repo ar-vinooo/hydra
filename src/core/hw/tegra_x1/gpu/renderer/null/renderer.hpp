@@ -59,7 +59,7 @@ class Renderer : public IRenderer {
                      float3 src_origin, uint3 src_size, u32 src_level,
                      u32 src_layer, ITextureView* dst, float3 dst_origin,
                      uint3 dst_size, u32 dst_level, u32 dst_layer,
-                     u32 level_count, u32 layer_count) override;
+                     u32 level_count, u32 layer_count, const BlitOptions& options) override;
 
     // Sampler
     SamplerBase* createSampler(const SamplerDescriptor& descriptor) override;
@@ -73,6 +73,9 @@ class Renderer : public IRenderer {
     void bindRenderPass(const RenderPassBase* render_pass) override;
 
     // Clear
+    void setClearState(const ClearState& clear_state) override {
+        (void)clear_state;
+    }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
                     u32 layer, u8 mask, const uint4 color) override;
     void clearDepth(ICommandBuffer* command_buffer, u32 layer,
@@ -97,6 +100,7 @@ class Renderer : public IRenderer {
     void setCullState([[maybe_unused]] bool enabled,
                       [[maybe_unused]] engines::CullFaceMode mode,
                       [[maybe_unused]] engines::Winding front_face) override {}
+    void setDepthClamp([[maybe_unused]] bool enabled) override {}
 
     // Viewport and scissor
     void setViewport(u32 index, const Viewport& viewport) override;

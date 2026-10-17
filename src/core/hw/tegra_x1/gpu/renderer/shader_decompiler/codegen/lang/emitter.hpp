@@ -104,6 +104,8 @@ class LangEmitter : public Emitter {
     void emitBeginIf(const ir::Value& cond) override;
     void emitEndIf() override;
     void emitBranch(label_t target) override;
+    void emitPushReturn(label_t target) override;
+    void emitReturnBranch() override;
     void emitBranchConditional(const ir::Value& cond, label_t target_true,
                                label_t target_false) override;
 
@@ -245,12 +247,34 @@ class LangEmitter : public Emitter {
             case ir::ScalarType::F32:
                 return getConstantStr<f32>(std::bit_cast<f32>(imm));
             }
+            break;
+        }
+        case ir::TypeKind::Vector: {
+            // A register word: the elements of 2 x 16-bit vectors are its
+            // halves
+            const auto& vec_type = type.getVectorType();
+            const auto element = vec_type.getElementType();
+            const bool halves =
+                vec_type.getSize() == 2 &&
+                (element == ir::ScalarType::F16 ||
+                 element == ir::ScalarType::U16 || element == ir::ScalarType::I16);
+            std::string elements;
+            for (u32 i = 0; i < vec_type.getSize(); i++) {
+                if (i != 0)
+                    elements += ", ";
+                elements += getConstantStr(halves ? (imm >> (i * 16)) & 0xffff
+                                                  : imm,
+                                           element);
+            }
+            return fmt::format("{}({})", getTypeStr(type), elements);
         }
         default:
-            LOG_ERROR(ShaderDecompiler, "Unsupported type for immediate ({})",
-                      type);
-            return INVALID_VALUE;
+            break;
         }
+
+        LOG_ERROR(ShaderDecompiler, "Unsupported type for immediate ({})",
+                  type);
+        return INVALID_VALUE;
     }
 
     static std::string getLocalStr(local_t local) {

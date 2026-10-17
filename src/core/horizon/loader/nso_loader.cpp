@@ -176,8 +176,11 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
         std::ofstream out(fmt::format("{}/{}_0x{:08x}.bin", dump_dir, name,
                                       base),
                           std::ios::binary);
-        out.write(reinterpret_cast<const char*>(ptr),
-                  static_cast<std::streamsize>(executable_size));
+        // Copy first: writing protected guest pages directly fails
+        std::vector<char> image(executable_size);
+        std::memcpy(image.data(), reinterpret_cast<const void*>(ptr),
+                    executable_size);
+        out.write(image.data(), static_cast<std::streamsize>(image.size()));
     }
 
     // Debug symbols

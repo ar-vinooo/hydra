@@ -24,6 +24,7 @@ DEFINE_IOCTL_TABLE(
 
 NvResult ChannelBase::submit(IoctlContext* context) {
     video::traceSubmission(videoEngineName(), *context);
+    const auto result = [&]() -> NvResult {
     if (!videoEngineName().empty()) {
         if (!context->in_stream || !context->process)
             return NvResult::BadParameter;
@@ -112,6 +113,13 @@ NvResult ChannelBase::submit(IoctlContext* context) {
     if (videoEngineName().empty())
         LOG_FUNC_STUBBED(Services);
     return NvResult::Success;
+    }();
+    // Failed video submissions are otherwise silent: the guest just stops
+    // receiving frames.
+    if (result != NvResult::Success && !videoEngineName().empty())
+        LOG_WARN(Services, "{} submit failed: {}", videoEngineName(),
+                 static_cast<u32>(result));
+    return result;
 }
 
 NvResult ChannelBase::getSyncpoint(IoctlContext* context, u32 module_id, u32* out_value) {

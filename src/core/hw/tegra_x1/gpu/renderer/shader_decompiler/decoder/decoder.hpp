@@ -16,6 +16,7 @@ struct Block {
     // TODO: rework this
     std::stack<label_t> sync_point_stack;
     std::stack<label_t> break_point_stack;
+    std::stack<label_t> continue_point_stack;
 };
 
 class Decoder {
@@ -77,11 +78,16 @@ class Decoder {
         crnt_block->break_point_stack.push(break_point);
     }
 
+    void pushContinuePoint(label_t continue_point) {
+        crnt_block->continue_point_stack.push(continue_point);
+    }
+
     void inheritSyncPoints(label_t label) {
         auto& block = ensureBlock(label);
         // TODO: if the block already has sync points, make sure they match
         block.sync_point_stack = crnt_block->sync_point_stack;
         block.break_point_stack = crnt_block->break_point_stack;
+        block.continue_point_stack = crnt_block->continue_point_stack;
     }
 };
 

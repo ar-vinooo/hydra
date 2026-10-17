@@ -35,8 +35,11 @@ struct FixedPoint {
     u32 fractional;
     u32 integer;
 
+    // Signed 32.32 fixed point
     explicit operator f64() const {
-        return static_cast<f64>(integer) + (static_cast<f64>(fractional) / static_cast<f64>(1llu << 32llu));
+        const auto raw = static_cast<i64>((static_cast<u64>(integer) << 32) |
+                                          static_cast<u64>(fractional));
+        return static_cast<f64>(raw) / static_cast<f64>(1llu << 32llu);
     }
 };
 
@@ -73,7 +76,17 @@ struct Regs2D {
     // 0x8c
     Texture2DInfo src;
 
-    u32 padding_0x96[0x196];
+    u32 padding_0x96[0x18d];
+
+    // 0x223
+    struct {
+        u32 origin : 1;
+        u32 : 3;
+        u32 filter : 1;
+        u32 : 27;
+    } sample_mode;
+
+    u32 padding_0x224[0x8];
 
     // 0x22c
     PixelsFromMemory pixels_from_memory;
@@ -84,8 +97,11 @@ class TwoD : public EngineWithRegsBase<Regs2D> {
     explicit TwoD(Gpu& gpu_) : gpu{gpu_} {}
 
     void method(u32 method, u32 arg) override;
+    void methodHot(u32 method, u32 arg);
 
   private:
+    void copyGuestMemory(u32 bpp, u32 src_x, u32 src_y, u32 width,
+                         u32 height);
     Gpu& gpu;
 
     // Commands

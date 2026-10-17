@@ -46,14 +46,24 @@ NvResult NvHostGpu::submitGpfifo(
     const hw::tegra_x1::gpu::GpfifoEntry* entries) {
     (void)gpfifo;
 
-    system->getGpu().getPfifo().submitEntries(
+    auto& gpu = system->getGpu();
+    const hw::tegra_x1::gpu::GpfifoFlags flags =
+        inout_flags_and_detailed_error;
+    // A fence is reached when the host finished the submission
+    hw::tegra_x1::gpu::Fence fence{};
+    std::function<void()> on_complete;
+    if (any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceGet) &&
+        gpu.reserveFence(fence))
+        on_complete = gpu.makeFenceSignal(fence);
+
+    gpu.getPfifo().submitEntries(
         process->getGMmu(),
         std::span<const hw::tegra_x1::gpu::GpfifoEntry>(entries, num_entries),
-        inout_flags_and_detailed_error);
+        flags, std::move(on_complete));
 
-    // HACK
+    // No error is reported
     inout_flags_and_detailed_error = 0;
-    inout_fence = hw::tegra_x1::gpu::Fence{};
+    inout_fence = fence;
     return NvResult::Success;
 }
 

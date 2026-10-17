@@ -30,11 +30,11 @@ ir::Value getIntCmp(DecoderContext& context, IntCmpOp op, ir::Value a,
     }
 }
 
-// TODO: x, write_cc
+// TODO: x
 void emitIntSet(DecoderContext& context, pred_t pred, bool pred_inv,
                 IntCmpOp op, BoolOp b_op, bool is_signed, reg_t dst,
                 reg_t src_a, ir::Value src_b, pred_t src_pred,
-                bool src_pred_inv, bool b_float) {
+                bool src_pred_inv, bool b_float, bool write_cc) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = ir::Value::createRegister(src_a, getDataType(is_signed));
@@ -44,12 +44,19 @@ void emitIntSet(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder, ir::Value::createPredicate(src_pred), src_pred_inv);
     res = getLogical(context, b_op, res, pred_v);
 
+    if (write_cc)
+        writeSetConditionCodes(context.builder, res, b_float);
+
     if (b_float) {
         res = context.builder.opSelect(res, ir::Value::createConstantF(1.0f),
                                        ir::Value::createConstantF(0.0f));
         context.builder.opCopy(
             ir::Value::createRegister(dst, ir::ScalarType::F32), res);
     } else {
+        // Without .BF, true is written as 0xffffffff (usable as a bit mask
+        // or as -1), not as 1
+        res = context.builder.opSelect(res, ir::Value::createConstantU(0xffffffffu),
+                                       ir::Value::createConstantU(0u));
         context.builder.opCopy(ir::Value::createRegister(dst), res);
     }
 
@@ -57,7 +64,7 @@ void emitIntSet(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: x, write_cc
+// TODO: x
 void emitIntSetPredicate(DecoderContext& context, pred_t pred, bool pred_inv,
                          IntCmpOp op, BoolOp b_op, bool is_signed,
                          pred_t dst_pred, pred_t dst_inv_pred, reg_t src_a,
@@ -134,7 +141,7 @@ void emitIsetR(DecoderContext& context, InstIsetR inst) {
         context, inst.base.pred, inst.base.pred_inv, inst.base.op,
         inst.base.b_op, inst.base.is_signed, inst.base.dst, inst.base.src_a,
         ir::Value::createRegister(inst.src_b, getDataType(inst.base.is_signed)),
-        inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float);
+        inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitIsetC(DecoderContext& context, InstIsetC inst) {
@@ -144,7 +151,7 @@ void emitIsetC(DecoderContext& context, InstIsetC inst) {
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
             getDataType(inst.base.is_signed)),
-        inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float);
+        inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitIsetI(DecoderContext& context, InstIsetI inst) {
@@ -154,7 +161,7 @@ void emitIsetI(DecoderContext& context, InstIsetI inst) {
                ir::Value::createConstant(
                    getIntImm20(inst.imm20_0, inst.imm20_19, true),
                    getDataType(inst.base.is_signed)),
-               inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float);
+               inst.base.src_pred, inst.base.src_pred_inv, inst.base.b_float, inst.base.write_cc);
 }
 
 void emitIsetpR(DecoderContext& context, InstIsetpR inst) {

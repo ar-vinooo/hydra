@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -28,6 +30,7 @@ class Syncpoints {
         if (!id || id >= next) return std::nullopt;
         values[id] += increments;
         const auto value = values[id];
+        reached_cv.notify_all();
         std::vector<std::function<void()>> ready;
         for (auto it = waits.begin(); it != waits.end();) {
             if (it->second.id == id && reached(value, it->second.threshold)) {
@@ -55,6 +58,16 @@ class Syncpoints {
         waits.emplace(token, Wait{id, threshold, std::move(callback)});
         return token;
     }
+    // Blocks the calling thread until the counter reaches the threshold or
+    // the time passes. Returns whether it was reached.
+    bool waitFor(std::uint32_t id, std::uint32_t threshold,
+                 std::chrono::milliseconds timeout) {
+        std::unique_lock lock(mutex);
+        if (!id || id >= next) return false;
+        return reached_cv.wait_for(lock, timeout, [&] {
+            return reached(values[id], threshold);
+        });
+    }
     void cancelWait(std::uint64_t token) {
         std::scoped_lock lock(mutex);
         waits.erase(token);
@@ -64,6 +77,7 @@ class Syncpoints {
     }
   private:
     std::mutex mutex;
+    std::condition_variable reached_cv;
     std::array<std::uint32_t, 192> values{};
     std::uint32_t next = 1;
     struct Wait {

@@ -7,6 +7,7 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 
@@ -36,6 +37,9 @@ ztd::Range<uptr> Compute::getConstBuffer(const ComputeQmd& qmd,
 
 std::optional<u32> Compute::readTextureHandle(const ComputeQmd& qmd,
                                               u32 binding_index) const {
+    if (renderer::isConstantTextureIndex(binding_index))
+        return renderer::getConstantTextureHandle(binding_index);
+
     u32 slot = regs.tex_cb_index;
     u32 word = binding_index;
     u32 sampler_word = renderer::TRACKED_TEXTURE_NO_SAMPLER;
@@ -70,7 +74,9 @@ void Compute::launch(const u32 index, const u32 arg) {
     auto& renderer = gpu.getRenderer();
     auto& three_d = gpu.get3DEngine();
 
-    std::scoped_lock texture_cache_lock(renderer.getTextureCache().getMutex());
+    // Same order as draws: the buffer cache, then the texture cache
+    std::scoped_lock caches_lock(renderer.getBufferCache().getMutex(),
+                                 renderer.getTextureCache().getMutex());
 
     // Flush tracked pages
     tls_crnt_gmmu->getMmu()->flushTrackedPages();
@@ -123,7 +129,7 @@ void Compute::launch(const u32 index, const u32 arg) {
         if (!handle)
             return std::nullopt;
         const auto image_handle = getImageHandle(*handle);
-        if (regs.tic_limit != 0 && image_handle > regs.tic_limit)
+        if (image_handle > regs.tic_limit)
             return std::nullopt;
         return tic_pool[image_handle];
     };
@@ -157,14 +163,27 @@ void Compute::launch(const u32 index, const u32 arg) {
              resource_mapping.textures) {
             const auto type_it =
                 resource_mapping.texture_types.find(binding_index);
-            if (type_it == resource_mapping.texture_types.end() ||
-                type_it->second != renderer::TextureType::_1D)
-                continue;
+            const bool is_1d =
+                type_it != resource_mapping.texture_types.end() &&
+                type_it->second == renderer::TextureType::_1D;
+            const auto handle = readTextureHandle(qmd, binding_index);
+            if (handle && tsc_pool != nullptr && getSamplerHandle(*handle) <= regs.tsc_limit) {
+                const auto bias = decodeSampler(tsc_pool[getSamplerHandle(*handle)]).lod_bias;
+                if (bias != 0.0f)
+                    descriptor.state.texture_lod_bias.emplace(binding_index, bias);
+            }
             const auto tic = get_tic(binding_index);
-            if (tic && tic->hdr_version == TicHdrVersion::_1DBuffer)
-                descriptor.state.buffer_texture_formats.emplace(
-                    binding_index, renderer::toTextureFormat(tic->format_word,
-                                                             tic->is_srgb));
+            if (!tic)
+                continue;
+            const auto format =
+                renderer::toSampledTextureFormat(tic->format_word, tic->is_srgb);
+            if (is_1d && tic->hdr_version == TicHdrVersion::_1DBuffer)
+                descriptor.state.buffer_texture_formats.emplace(binding_index,
+                                                                format);
+            else if (tic->hdr_version != TicHdrVersion::_1DBuffer &&
+                     renderer::getIntegerTextureComponentType(format))
+                descriptor.state.integer_texture_formats.emplace(
+                    binding_index, format);
         }
         for (const auto& [binding_index, renderer_index] :
              resource_mapping.images) {
@@ -174,7 +193,9 @@ void Compute::launch(const u32 index, const u32 arg) {
                     binding_index, renderer::toTextureFormat(tic->format_word,
                                                              tic->is_srgb));
         }
-        if (!descriptor.state.buffer_texture_formats.empty() ||
+        if (!descriptor.state.texture_lod_bias.empty() ||
+            !descriptor.state.buffer_texture_formats.empty() ||
+            !descriptor.state.integer_texture_formats.empty() ||
             !descriptor.state.image_formats.empty())
             shader = renderer.getShaderCache().find(descriptor);
         if (shader == nullptr)
@@ -205,13 +226,19 @@ void Compute::launch(const u32 index, const u32 arg) {
     }
 
     // Textures
+    struct TracedTexture {
+        u32 binding_index;
+        TextureImageControl tic;
+        renderer::ITextureView* view;
+    };
+    std::vector<TracedTexture> traced_textures;
     for (const auto& [binding_index, renderer_index] :
          resource_mapping.textures) {
         if (tsc_pool == nullptr)
             break;
         const auto handle = readTextureHandle(qmd, binding_index);
         const auto tic = get_tic(binding_index);
-        if (!handle || !tic)
+        if (!handle || !tic || getSamplerHandle(*handle) > regs.tsc_limit)
             continue;
 
         const auto type_it = resource_mapping.texture_types.find(binding_index);
@@ -219,10 +246,17 @@ void Compute::launch(const u32 index, const u32 arg) {
             *tic, type_it != resource_mapping.texture_types.end()
                       ? std::optional(type_it->second)
                       : std::nullopt);
-        const auto sampler =
-            three_d.getSampler(tsc_pool[getSamplerHandle(*handle)]);
-        if (texture != nullptr && sampler != nullptr)
+        const auto sampler = three_d.getSampler(
+            tsc_pool[getSamplerHandle(*handle)],
+            texture != nullptr && renderer::getIntegerTextureComponentType(
+                                      texture->getDescriptor().format) !=
+                                      nullptr);
+        if (texture != nullptr && sampler != nullptr) {
             dispatch.textures.push_back({renderer_index, texture, sampler});
+            // DEBUG: record and dump the textures in the frame trace
+            if (FrameTracer::instance().isActive())
+                traced_textures.push_back({binding_index, *tic, texture});
+        }
     }
 
     // Images
@@ -301,6 +335,31 @@ void Compute::launch(const u32 index, const u32 arg) {
                 renderer::toTextureFormat(tic->format_word, tic->is_srgb),
                 tic->width_minus_one + 1, tic->height_minus_one + 1,
                 tic->depth_minus_one + 1, static_cast<u32>(tic->hdr_version));
+        }
+        auto& tracer = FrameTracer::instance();
+        for (const auto& traced : traced_textures) {
+            const auto format = renderer::toTextureFormat(
+                traced.tic.format_word, traced.tic.is_srgb);
+            str += fmt::format("    texture {:#x}: addr={:#x} fmt={} {}x{}x{}\n",
+                               traced.binding_index,
+                               makeAddr(traced.tic.addr_lo, traced.tic.addr_hi),
+                               format, traced.tic.width_minus_one + 1,
+                               traced.tic.height_minus_one + 1,
+                               traced.tic.depth_minus_one + 1);
+            if (!tracer.isDumpEnabled() ||
+                traced.tic.hdr_version == TicHdrVersion::_1DBuffer ||
+                !tracer.markDumped(traced.view))
+                continue;
+            const auto path =
+                tracer.getDir() /
+                fmt::format("f{}_c{:x}_tex{:x}_{}_{}x{}.png",
+                            tracer.getFrameIndex(), program_addr,
+                            traced.binding_index, format,
+                            traced.tic.width_minus_one + 1,
+                            traced.tic.height_minus_one + 1);
+            if (tracer.allowImageDump())
+                renderer.debugDumpTexture(tls_crnt_command_buffer, traced.view,
+                                          path.string());
         }
         str += fmt::format("    textures={} images={}\n",
                            dispatch.textures.size(), dispatch.images.size());

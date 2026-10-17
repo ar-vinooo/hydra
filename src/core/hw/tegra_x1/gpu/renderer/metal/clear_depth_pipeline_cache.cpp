@@ -50,7 +50,7 @@ ClearDepthPipelineCache::ClearDepthPipelineCache(MTL::Device* device_)
 void ClearDepthPipelineCache::destroy() { pipeline_descriptor->release(); }
 
 MTL::RenderPipelineState*
-ClearDepthPipelineCache::create(
+ClearDepthPipelineCache::createHot0(
     const ClearDepthPipelineDescriptor& descriptor) {
     // Pipeline
     setDepthStencilPixelFormat(pipeline_descriptor,
@@ -72,13 +72,22 @@ ClearDepthPipelineCache::create(
     return pipeline;
 }
 
-u32 ClearDepthPipelineCache::hash(
+u32 ClearDepthPipelineCache::hashHot1(
     const ClearDepthPipelineDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
     hash.add(descriptor.depth_stencil_pixel_format);
     for (const auto pixel_format : descriptor.color_pixel_formats)
         hash.add(pixel_format);
     return hash.toHashCode();
+}
+
+// The fields of the hash
+bool ClearDepthPipelineCache::equals(const ClearDepthPipelineDescriptor& a,
+                                     const ClearDepthPipelineDescriptor& b) {
+    return a.depth_stencil_pixel_format == b.depth_stencil_pixel_format &&
+           std::equal(std::begin(a.color_pixel_formats),
+                      std::end(a.color_pixel_formats),
+                      std::begin(b.color_pixel_formats));
 }
 
 void ClearDepthPipelineCache::destroyElement(

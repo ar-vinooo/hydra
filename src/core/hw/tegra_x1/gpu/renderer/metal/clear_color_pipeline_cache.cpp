@@ -45,7 +45,7 @@ ClearColorPipelineCache::ClearColorPipelineCache(MTL::Device* device_)
 
 void ClearColorPipelineCache::destroy() { pipeline_descriptor->release(); }
 
-MTL::RenderPipelineState* ClearColorPipelineCache::create(
+MTL::RenderPipelineState* ClearColorPipelineCache::createHot0(
     const ClearColorPipelineDescriptor& descriptor) {
     const char* color_type = "float4";
     switch (descriptor.pixel_formats[descriptor.render_target_id]) {
@@ -132,7 +132,7 @@ MTL::RenderPipelineState* ClearColorPipelineCache::create(
     return pipeline;
 }
 
-u32 ClearColorPipelineCache::hash(
+u32 ClearColorPipelineCache::hashHot1(
     const ClearColorPipelineDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
     for (const auto pixel_format : descriptor.pixel_formats)
@@ -141,6 +141,15 @@ u32 ClearColorPipelineCache::hash(
     hash.add(descriptor.mask);
     hash.add(descriptor.depth_stencil_pixel_format);
     return hash.toHashCode();
+}
+
+// The fields of the hash
+bool ClearColorPipelineCache::equals(const ClearColorPipelineDescriptor& a,
+                                     const ClearColorPipelineDescriptor& b) {
+    return std::equal(std::begin(a.pixel_formats), std::end(a.pixel_formats),
+                      std::begin(b.pixel_formats)) &&
+           a.render_target_id == b.render_target_id && a.mask == b.mask &&
+           a.depth_stencil_pixel_format == b.depth_stencil_pixel_format;
 }
 
 void ClearColorPipelineCache::destroyElement(

@@ -14,7 +14,7 @@ struct ClearColorPipelineDescriptor {
 
 class ClearColorPipelineCache
     : public CacheBase<ClearColorPipelineCache, MTL::RenderPipelineState*,
-                       ClearColorPipelineDescriptor> {
+                       ClearColorPipelineDescriptor, true> {
   public:
     explicit ClearColorPipelineCache(MTL::Device* device_);
 
@@ -24,6 +24,8 @@ class ClearColorPipelineCache
     create(const ClearColorPipelineDescriptor& descriptor);
     void update([[maybe_unused]] MTL::RenderPipelineState* pipeline) {}
     static u32 hash(const ClearColorPipelineDescriptor& descriptor);
+    static bool equals(const ClearColorPipelineDescriptor& a,
+                       const ClearColorPipelineDescriptor& b);
 
     static void destroyElement(MTL::RenderPipelineState* pipeline);
 
@@ -31,6 +33,12 @@ class ClearColorPipelineCache
     MTL::Device* device;
 
     MTL::RenderPipelineDescriptor* pipeline_descriptor;
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    MTL::RenderPipelineState*
+    createHot0(const ClearColorPipelineDescriptor& descriptor);
+    static u32 hashHot1(const ClearColorPipelineDescriptor& descriptor);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -87,9 +87,16 @@ void emitSharedAccess(DecoderContext& context, instruction_t inst, bool store,
                                     shift);
             const auto value = builder.opBitwiseAnd(
                 builder.opShiftLeft(getRegOffset(data, 0), shift), mask);
-            const auto kept =
-                builder.opBitwiseAnd(word, builder.opBitwiseNot(mask));
-            storeMem(addr, builder.opBitwiseOr(kept, value));
+            if (local) {
+                const auto kept =
+                    builder.opBitwiseAnd(word, builder.opBitwiseNot(mask));
+                storeMem(addr, builder.opBitwiseOr(kept, value));
+            } else {
+                // Other threads can store the other bytes of the word
+                builder.opAtomicShared(addr, builder.opBitwiseNot(mask), 5,
+                                       false);
+                builder.opAtomicShared(addr, value, 6, false);
+            }
         } else {
             auto res = ir::Value::createUndefined();
             if (is_signed)
@@ -327,6 +334,32 @@ void emitR2p(DecoderContext& context, instruction_t inst, u32 variant) {
     if (conditional) b.opEndIf();
 }
 
+// ATOMS.CAS Rd, [Ra + offset], Rb (compare), Rb + 1 (new value)
+void emitAtomsCas(DecoderContext& context, instruction_t inst) {
+    const u32 sub_op = static_cast<u32>(extractBits(inst, 52, 4));
+    if (sub_op != 4) {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "ATOMS.CAS sub-operation {}",
+                            sub_op);
+        return;
+    }
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
+    const auto addr_reg = getReg(inst, 8);
+    const auto offset = signExtend<i32, 24>(
+        static_cast<i32>(static_cast<u32>(extractBits(inst, 30, 22)) << 2));
+    auto addr = ir::Value::createConstantU(std::bit_cast<u32>(offset));
+    if (addr_reg != RZ)
+        addr = b.opAdd(ir::Value::createRegister(addr_reg), addr);
+    const auto data = getReg(inst, 20);
+    const auto result =
+        b.opAtomicSharedCas(addr, getRegOffset(data, 0), getRegOffset(data, 1));
+    const auto dst = getReg(inst, 0);
+    if (dst != RZ)
+        b.opCopy(ir::Value::createRegister(dst), result);
+    if (conditional)
+        b.opEndIf();
+}
+
 void emitAtoms(DecoderContext& context, instruction_t inst) {
     const u32 size = static_cast<u32>(extractBits(inst, 28, 2));
     const u32 op = static_cast<u32>(extractBits(inst, 52, 4));
@@ -397,6 +430,7 @@ void emitSust(DecoderContext& context, instruction_t inst) {
     std::array<ir::Value, 4> values = {
         ir::Value::createConstantU(0), ir::Value::createConstantU(0),
         ir::Value::createConstantU(0), ir::Value::createConstantU(0)};
+    u32 raw_size = ir::IMAGE_FORMATTED;
     if (extractBits(inst, 52, 1) == 0) {
         // Formatted, the mask selects the components
         const auto mask = static_cast<u32>(extractBits(inst, 20, 4));
@@ -406,15 +440,90 @@ void emitSust(DecoderContext& context, instruction_t inst) {
                 values[i] = getRegOffset(data, reg_offset++);
         }
     } else {
-        // TODO: convert raw data to the image format
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Sized surface store"));
-        const auto size = static_cast<u32>(extractBits(inst, 20, 3));
-        const u32 count = (size <= 4 ? 1 : size == 5 ? 2 : 4);
+        // Raw words of the given size, converted to the image format
+        raw_size = static_cast<u32>(extractBits(inst, 20, 3));
+        const u32 count = (raw_size <= 4 ? 1 : raw_size == 5 ? 2 : 4);
         for (u32 i = 0; i < count; i++)
             values[i] = getRegOffset(data, i);
     }
 
-    builder.opImageStore(*index, type, coords, values);
+    builder.opImageStore(*index, type, coords, values, raw_size);
+
+    if (conditional)
+        builder.opEndIf();
+}
+
+void emitSuld(DecoderContext& context, instruction_t inst) {
+    auto& builder = context.builder;
+
+    const bool is_bound = extractBits(inst, 51, 1) != 0;
+    std::optional<u32> index;
+    if (is_bound)
+        index = static_cast<u32>(extractBits(inst, 36, 13));
+    else
+        index = trackBindlessResource(context, getReg(inst, 39));
+    if (!index)
+        return;
+
+    const auto conditional =
+        handlePredCond(builder, getPred(inst), getPredInv(inst));
+
+    const auto type = getSurfaceType(static_cast<u32>(extractBits(inst, 33, 3)));
+    const auto coords = getSurfaceCoords(builder, getReg(inst, 8), type);
+    const auto dst = getReg(inst, 0);
+
+    if (extractBits(inst, 52, 1) == 0) {
+        // Formatted: the mask selects the components, which go to consecutive
+        // registers
+        const auto value =
+            builder.opImageLoad(*index, type, coords, ir::IMAGE_FORMATTED);
+        const auto mask = static_cast<u32>(extractBits(inst, 20, 4));
+        u32 reg_offset = 0;
+        for (u32 i = 0; i < 4; i++) {
+            if ((mask & (1u << i)) == 0)
+                continue;
+            builder.opCopy(
+                ir::Value::createRegister(
+                    static_cast<reg_t>(dst + reg_offset++), ir::ScalarType::U32),
+                builder.opVectorExtract(value, static_cast<u8>(i)));
+        }
+    } else {
+        // Raw words of the given size
+        const auto raw_size = static_cast<u32>(extractBits(inst, 20, 3));
+        const u32 count = (raw_size <= 4 ? 1 : raw_size == 5 ? 2 : 4);
+        const auto value = builder.opImageLoad(*index, type, coords, raw_size);
+        for (u32 i = 0; i < count; i++)
+            builder.opCopy(
+                ir::Value::createRegister(static_cast<reg_t>(dst + i),
+                                          ir::ScalarType::U32),
+                builder.opVectorExtract(value, static_cast<u8>(i)));
+    }
+
+    if (conditional)
+        builder.opEndIf();
+}
+
+// Reduction on a surface: an atomic whose result is dropped
+void emitSured(DecoderContext& context, instruction_t inst) {
+    auto& builder = context.builder;
+
+    const bool is_bound = extractBits(inst, 51, 1) != 0;
+    std::optional<u32> index;
+    if (is_bound)
+        index = static_cast<u32>(extractBits(inst, 36, 13));
+    else
+        index = trackBindlessResource(context, getReg(inst, 39));
+    if (!index)
+        return;
+
+    const auto conditional =
+        handlePredCond(builder, getPred(inst), getPredInv(inst));
+
+    const auto type = getSurfaceType(static_cast<u32>(extractBits(inst, 33, 3)));
+    const auto op = static_cast<u32>(extractBits(inst, 24, 3));
+    const auto coords = getSurfaceCoords(builder, getReg(inst, 8), type);
+    builder.opImageAtomic(*index, type, op, coords,
+                          getRegOffset(getReg(inst, 0), 0));
 
     if (conditional)
         builder.opEndIf();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_cache.hpp"
@@ -8,6 +9,10 @@
 #include "core/hw/tegra_x1/gpu/renderer/sampler_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
+
+#include <atomic>
+#include <filesystem>
+#include <fstream>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -91,6 +96,14 @@ class IRenderer {
         }
     }
 
+    // Writes GPU-rendered textures in the range back to guest memory, from a
+    // CPU thread that is about to access it (memory tracking faults)
+    void flushMemoryForCpu(ztd::Range<uptr> range) {
+        std::scoped_lock lock(texture_cache.getMutex());
+        std::unique_ptr<ICommandBuffer> command_buffer(createCommandBuffer());
+        texture_cache.flushMemory(command_buffer.get(), range);
+    }
+
     virtual u64 getAllocatedResourceBytes() const { return 0; }
 
     // Surface
@@ -124,7 +137,7 @@ class IRenderer {
                              u32 src_layer, ITextureView* dst,
                              float3 dst_origin, uint3 dst_size, u32 dst_level,
                              u32 dst_layer, u32 level_count,
-                             u32 layer_count) = 0;
+                             u32 layer_count, const BlitOptions& options) = 0;
 
     // Sampler
     virtual SamplerBase* createSampler(const SamplerDescriptor& descriptor) = 0;
@@ -138,6 +151,8 @@ class IRenderer {
     virtual void bindRenderPass(const RenderPassBase* render_pass) = 0;
 
     // Clear
+    // Area and stencil write mask of the following clears
+    virtual void setClearState(const ClearState& clear_state) = 0;
     virtual void clearColor(ICommandBuffer* command_buffer,
                             u32 render_target_id, u32 layer, u8 mask,
                             const uint4 color) = 0;
@@ -163,6 +178,8 @@ class IRenderer {
     virtual void setStencilState(const StencilState& stencil) = 0;
     virtual void setCullState(bool enabled, engines::CullFaceMode mode,
                               engines::Winding front_face) = 0;
+    // Depth outside the clip range is clamped instead of clipped
+    virtual void setDepthClamp(bool enabled) = 0;
 
     // DEBUG: save the current contents of a texture to a PNG file
     virtual void
@@ -214,17 +231,40 @@ class IRenderer {
 
     // Debug
     void captureFrames(u32 count) { frames_to_capture = count; }
+    bool isCapturing() const {
+        return capturing.load(std::memory_order_relaxed);
+    }
+    // Debug group name for the next draw while a GPU capture is active
+    void setCaptureDrawLabel(std::string label) {
+        capture_draw_label = std::move(label);
+    }
+    // Called on presentation. Only requests capture transitions: stopping a
+    // capture while the GPU thread is encoding crashes Metal's capture layer.
     void notifyDebugFrameBoundary() {
-        if (frames_to_capture > 0) {
-            if (capturing) {
-                if (--frames_to_capture == 0) {
-                    endCapture();
-                    capturing = false;
-                }
-            } else {
-                beginCapture();
-                capturing = true;
-            }
+        pollCaptureTrigger();
+        if (frames_to_capture == 0)
+            return;
+        const auto phase = capture_phase.load(std::memory_order_acquire);
+        if (phase == CapturePhase::Idle)
+            capture_phase.store(CapturePhase::BeginRequested,
+                                std::memory_order_release);
+        else if (phase == CapturePhase::Capturing && --frames_to_capture == 0)
+            capture_phase.store(CapturePhase::EndRequested,
+                                std::memory_order_release);
+    }
+    // Called by the GPU thread between command buffers, when nothing is
+    // being encoded
+    void applyCaptureRequests() {
+        const auto phase = capture_phase.load(std::memory_order_acquire);
+        if (phase == CapturePhase::BeginRequested) {
+            beginCapture();
+            capturing = true;
+            capture_phase.store(CapturePhase::Capturing,
+                                std::memory_order_release);
+        } else if (phase == CapturePhase::EndRequested) {
+            capturing = false;
+            endCapture();
+            capture_phase.store(CapturePhase::Idle, std::memory_order_release);
         }
     }
 
@@ -234,6 +274,9 @@ class IRenderer {
     // Capture
     virtual void beginCapture() = 0;
     virtual void endCapture() = 0;
+
+    // Consumed by the backend's draw calls (GPU thread)
+    std::string capture_draw_label;
 
   private:
     // Caches
@@ -246,8 +289,35 @@ class IRenderer {
     IndexCache index_cache;
 
     // Capture
+    enum class CapturePhase {
+        Idle,
+        BeginRequested,
+        Capturing,
+        EndRequested,
+    };
     u32 frames_to_capture{0};
-    bool capturing{false};
+    std::atomic<CapturePhase> capture_phase{CapturePhase::Idle};
+    std::atomic<bool> capturing{false};
+
+    // HYDRA_GPU_CAPTURE_DIR=<dir>: creating "<dir>/trigger" (optionally
+    // containing a frame count, 1..8) captures the following frames as a
+    // .gputrace in <dir>. Requires MTL_CAPTURE_ENABLED=1 outside Xcode.
+    void pollCaptureTrigger() {
+        static const char* dir = std::getenv("HYDRA_GPU_CAPTURE_DIR");
+        if (dir == nullptr || frames_to_capture != 0)
+            return;
+        const auto trigger = std::filesystem::path(dir) / "trigger";
+        std::error_code ec;
+        if (!std::filesystem::exists(trigger, ec))
+            return;
+        u32 count = 1;
+        {
+            std::ifstream in(trigger);
+            in >> count;
+        }
+        std::filesystem::remove(trigger, ec);
+        captureFrames(std::clamp(count, 1u, 8u));
+    }
 
   public:
     CONST_REF_GETTER(info, getInfo);

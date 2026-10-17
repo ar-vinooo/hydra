@@ -19,6 +19,10 @@ inline ir::Value getLogical(DecoderContext& context, BoolOp op, ir::Value a,
         return context.builder.opBitwiseOr(a, b);
     case BoolOp::Xor:
         return context.builder.opBitwiseXor(a, b);
+    default:
+        ONCE(LOG_WARN(ShaderDecompiler, "Invalid boolean operation {}",
+                      static_cast<u32>(op)));
+        return context.builder.opBitwiseAnd(a, b);
     }
 }
 

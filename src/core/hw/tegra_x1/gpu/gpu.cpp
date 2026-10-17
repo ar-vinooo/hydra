@@ -69,13 +69,23 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
             LOG_NOT_IMPLEMENTED(Gpu, "GPFIFO engine");
             break;
         default:
-            LOG_ERROR(Gpu, "Unknown engine class ID 0x{:08x}",
-                      set_object_arg.class_id);
-            break;
+            // Keep the current binding: dropping the engine would discard
+            // every later method sent to this subchannel
+            LOG_ERROR(Gpu,
+                      "Unknown engine class ID 0x{:08x} for subchannel {}, "
+                      "keeping the current engine",
+                      set_object_arg.class_id, subchannel);
+            return;
         }
 
         subchannels[subchannel] = engine;
 
+        return;
+    }
+
+    // Methods below 0x40 belong to the channel, not to the bound engine
+    if (method < 0x40) {
+        pullerMethod(method, arg);
         return;
     }
 
@@ -87,6 +97,136 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
     }
 
     (*engine)->method(method, arg);
+}
+
+bool Gpu::reserveFence(Fence& out_fence) {
+    static const bool enabled = std::getenv("HYDRA_GPU_FENCES") != nullptr;
+    if (!enabled)
+        return false;
+    std::scoped_lock lock(fence_mutex);
+    if (fence_syncpoint == 0) {
+        const auto id = video_syncpoints->allocate();
+        if (!id)
+            return false;
+        fence_syncpoint = *id;
+    }
+    out_fence = {fence_syncpoint, ++fence_target};
+    return true;
+}
+
+void Gpu::pullerMethod(u32 method, u32 arg) {
+    // Method numbers of the channel's own registers (Eden's puller)
+    constexpr u32 SEMAPHORE_ADDRESS_HIGH = 0x4;
+    constexpr u32 SEMAPHORE_ADDRESS_LOW = 0x5;
+    constexpr u32 SEMAPHORE_SEQUENCE = 0x6;
+    constexpr u32 SEMAPHORE_TRIGGER = 0x7;
+    constexpr u32 SEMAPHORE_ACQUIRE = 0x1a;
+    constexpr u32 SEMAPHORE_RELEASE = 0x1b;
+    constexpr u32 SYNCPOINT_PAYLOAD = 0x1c;
+    constexpr u32 SYNCPOINT_OPERATION = 0x1d;
+    constexpr u32 WAIT_FOR_IDLE = 0x1e;
+    puller_regs[method] = arg;
+
+    const auto semaphore_address = [&] {
+        return (static_cast<u64>(puller_regs[SEMAPHORE_ADDRESS_HIGH] & 0xff)
+                << 32) |
+               puller_regs[SEMAPHORE_ADDRESS_LOW];
+    };
+    // Host pointer of the semaphore if the memory is mapped
+    const auto resolve = [&](u64 size) -> u8* {
+        uptr base;
+        const auto as = tls_crnt_gmmu != nullptr
+                            ? tls_crnt_gmmu->findAddr(semaphore_address(), base)
+                            : std::nullopt;
+        if (!as || as->ptr == 0 ||
+            semaphore_address() - base + size > as->size) {
+            ONCE(LOG_WARN(Gpu, "Semaphore in unmapped memory {:#x}",
+                          semaphore_address()));
+            return nullptr;
+        }
+        return reinterpret_cast<u8*>(as->ptr + (semaphore_address() - base));
+    };
+    const auto invalidate = [&](u8* ptr, u64 size) {
+        renderer->invalidateMemory(
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
+    };
+    // The CPU writes acquired semaphores: wait for it, bounded so a missed
+    // release cannot stall the GPU thread for good
+    const auto acquire = [&](auto&& satisfied) {
+        auto* ptr = resolve(sizeof(u32));
+        if (ptr == nullptr)
+            return;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(100);
+        while (true) {
+            u32 word;
+            std::memcpy(&word, ptr, sizeof(word));
+            if (satisfied(word))
+                return;
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ONCE(LOG_WARN(Gpu, "Semaphore acquire timed out ({:#x})",
+                              semaphore_address()));
+                return;
+            }
+            std::this_thread::yield();
+        }
+    };
+
+    switch (method) {
+    case SEMAPHORE_ADDRESS_HIGH:
+    case SEMAPHORE_ADDRESS_LOW:
+    case SEMAPHORE_SEQUENCE:
+    case SYNCPOINT_PAYLOAD:
+    case WAIT_FOR_IDLE: // The GPU executes in order
+        break;
+    case SEMAPHORE_TRIGGER: {
+        const u32 payload = puller_regs[SEMAPHORE_SEQUENCE];
+        switch (arg & 0xf) {
+        case 0x1: // Acquire equal
+            acquire([&](u32 word) { return word == payload; });
+            break;
+        case 0x2: { // Release: payload and timestamp
+            if (auto* ptr = resolve(16)) {
+                const u64 timestamp = engines::getGpuTimestamp();
+                std::memcpy(ptr, &payload, sizeof(payload));
+                std::memcpy(ptr + 8, &timestamp, sizeof(timestamp));
+                invalidate(ptr, 16);
+            }
+            break;
+        }
+        case 0x4: // Acquire greater or equal
+            acquire([&](u32 word) { return static_cast<i32>(word - payload) >= 0; });
+            break;
+        case 0x8: // Acquire mask
+            acquire([&](u32 word) { return (word & payload) != 0; });
+            break;
+        default:
+            ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Semaphore operation {:#x}", arg));
+            break;
+        }
+        break;
+    }
+    case SEMAPHORE_ACQUIRE:
+        acquire([&](u32 word) { return word == arg; });
+        break;
+    case SEMAPHORE_RELEASE:
+        if (auto* ptr = resolve(sizeof(u32))) {
+            std::memcpy(ptr, &arg, sizeof(arg));
+            invalidate(ptr, sizeof(u32));
+        }
+        break;
+    case SYNCPOINT_OPERATION: {
+        // Bit 0: 1 increments the syncpoint in bits 8-31 (0 waits for it, the
+        // GPU executes in order)
+        const u32 id = arg >> 8;
+        if ((arg & 1) != 0 && isFenceSyncpoint(id))
+            video_syncpoints->complete(id, 1);
+        break;
+    }
+    default:
+        ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Channel method {:#x}", method));
+        break;
+    }
 }
 
 renderer::ITextureView*

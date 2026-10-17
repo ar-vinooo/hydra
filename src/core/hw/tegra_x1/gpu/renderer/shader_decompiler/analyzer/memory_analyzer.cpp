@@ -4,18 +4,22 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::analyzer {
 
 namespace {
 
-void pushSv(std::unordered_set<SvSemantic>& svs,
-            std::unordered_set<u8>& stage_in_outs, u64 addr) {
-    const auto sv = getSvAccessFromAddr(addr).sv;
-    if (sv.semantic == SvSemantic::UserInOut)
-        stage_in_outs.insert(sv.index);
-    else
-        svs.insert(sv.semantic);
+SvAccess pushSv(std::unordered_set<SvSemantic>& svs,
+                std::unordered_set<u8>& stage_in_outs, u64 addr) {
+    const auto access = getSvAccessFromAddr(addr);
+    if (access.sv.semantic == SvSemantic::UserInOut)
+        stage_in_outs.insert(access.sv.index);
+    else if (access.sv.semantic != SvSemantic::Invalid)
+        svs.insert(access.sv.semantic);
+    return access;
 }
 
 } // namespace
 
 void MemoryAnalyzer::analyze(const ir::Module& modul) {
+    // Textures that are only queried still need a declaration. Their type is
+    // unknown, so other accesses decide it.
+    std::vector<u32> queried_textures;
     for (const auto& [name, function] : modul.getFunctions()) {
         for (const auto& [label, block] : function.getBlocks()) {
             for (const auto& instruction : block.getInstructions()) {
@@ -79,6 +83,12 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                         instruction.getOperand(1).getRawValue<TextureType>(),
                         false);
                     break;
+                case ir::Opcode::ImageLoad:
+                    handleImageAccess(
+                        instruction.getOperand(0).getRawValue<u32>(),
+                        instruction.getOperand(1).getRawValue<TextureType>(),
+                        false, true);
+                    break;
                 case ir::Opcode::ImageAtomic:
                     handleImageAccess(
                         instruction.getOperand(0).getRawValue<u32>(),
@@ -89,13 +99,40 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                 case ir::Opcode::StoreLocal:
                     uses_local_memory = true;
                     break;
-                // TODO: TextureQueryDimension?
+                case ir::Opcode::PushReturn:
+                case ir::Opcode::ReturnBranch:
+                    uses_call_stack = true;
+                    break;
+                case ir::Opcode::ReadSystemRegister:
+                    system_registers.insert(
+                        instruction.getOperand(0).getRawValue<u32>());
+                    break;
+                case ir::Opcode::Intrinsic:
+                    intrinsics.insert(
+                        instruction.getOperand(0).getRawValue<ir::Intrinsic>());
+                    break;
+                case ir::Opcode::TextureQueryLod:
+                    // Needs the sampler like a sample does
+                    handleTextureAccess(
+                        instruction.getOperand(0).getRawValue<u32>(),
+                        TextureInfo{.type = instruction.getOperand(1)
+                                                .getRawValue<TextureType>(),
+                                    .is_depth = false});
+                    break;
+                case ir::Opcode::TextureQueryDimension:
+                    queried_textures.push_back(
+                        instruction.getOperand(0).getRawValue<u32>());
+                    break;
                 default:
                     break;
                 }
             }
         }
     }
+
+    for (const auto index : queried_textures)
+        textures.emplace(index, TextureInfo{.type = TextureType::_2D,
+                                            .is_depth = false});
 }
 
 void MemoryAnalyzer::handleAMemLoad(const AMem amem) {
@@ -113,7 +150,10 @@ void MemoryAnalyzer::handleAMemStore(const AMem amem) {
     // TODO: support indexing with src
     ASSERT_DEBUG(amem.reg == RZ, ShaderDecompiler,
                  "Indexing not implemented (src: {})", amem.reg);
-    pushSv(output_svs, stage_outputs, amem.imm);
+    const auto access = pushSv(output_svs, stage_outputs, amem.imm);
+    if (access.sv.semantic == SvSemantic::ClipDistance)
+        clip_distance_outputs |=
+            1u << (access.sv.index * 4 + access.component_index);
 }
 
 void MemoryAnalyzer::handleTextureAccess(u32 const_buffer_index,
@@ -127,12 +167,13 @@ void MemoryAnalyzer::handleTextureAccess(u32 const_buffer_index,
 }
 
 void MemoryAnalyzer::handleImageAccess(u32 index, TextureType type,
-                                       bool is_atomic) {
-    const auto res = images.emplace(index, ImageInfo{type, is_atomic});
+                                       bool is_atomic, bool is_read) {
+    const auto res = images.emplace(index, ImageInfo{type, is_atomic, is_read});
     if (!res.second) {
         if (res.first->second.type != type)
             LOG_WARN(ShaderDecompiler, "Image type mismatch");
         res.first->second.is_atomic |= is_atomic;
+        res.first->second.is_read |= is_read;
     }
 }
 

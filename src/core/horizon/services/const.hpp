@@ -24,7 +24,7 @@
         switch (id) {                                                          \
             ZTD_FOR_EACH_1_2(SERVICE_COMMAND_CASE, service, __VA_ARGS__)       \
         default:                                                               \
-            LOG_WARN(Services, "Unknown request {}", id);                      \
+            LOG_WARN(Services, "Unknown request {} for " #service, id);       \
             return MAKE_RESULT(Svc, 0); /* TODO */                             \
         }                                                                      \
     }

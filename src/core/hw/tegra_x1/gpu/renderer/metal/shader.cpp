@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
@@ -43,6 +44,12 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor,
 
         NS::Error* error = nullptr;
         library = library_cache.get(source, &error);
+        if (auto& visual = VisualDiagnostics::instance(); visual.selected())
+            visual.event("metal_library_result", {{"cache_key", cache_key},
+                {"source_fnv1a64", VisualDiagnostics::contentId(descriptor.code)},
+                {"library_available", library ? "1" : "0"},
+                {"message", error ? error->localizedDescription()->utf8String() : ""},
+                {"note", "library cache may satisfy this request; this does not establish semantic correctness"}});
         if (library == nullptr) {
             LOG_ERROR(MetalRenderer, "Failed to create Metal library: {}",
                       error ? error->localizedDescription()->utf8String()
@@ -88,6 +95,8 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor,
         descriptor.resource_mapping.sampler_buffer_index != invalid<u32>())
         sampler_encoder = function->newArgumentEncoder(
             descriptor.resource_mapping.sampler_buffer_index);
+    if (auto& visual = VisualDiagnostics::instance(); visual.selected())
+        visual.event("metal_entry_point", {{"cache_key", cache_key}, {"main_available", function ? "1" : "0"}});
     library->release();
 }
 

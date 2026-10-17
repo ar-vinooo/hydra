@@ -1,4 +1,11 @@
 add_library(hydra-core
+    hot/hot_reload.cpp
+    hot/table.cpp
+    hot/routes.cpp
+    hot/table.hpp
+    hot/texture_cache_hot.cpp
+    hw/tegra_x1/gpu/visual_diagnostics.cpp
+    hw/tegra_x1/gpu/visual_diagnostics.hpp
     video/submit_trace.cpp
     video/submit_trace.hpp
     video/submit.hpp
@@ -527,6 +534,7 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/block.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/function.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/builder.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/ir/intrinsic.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/const.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.hpp
@@ -542,6 +550,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_min_max.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_logical.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_logical.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/comparison_helper.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.hpp
@@ -580,6 +590,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/emitter.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/intrinsics.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/intrinsics.hpp
     hw/tegra_x1/gpu/renderer/const.cpp
     hw/tegra_x1/gpu/renderer/const.hpp
     hw/tegra_x1/gpu/renderer/command_buffer.hpp
@@ -698,6 +710,7 @@ if (HYPERVISOR_ENABLED)
         hw/tegra_x1/cpu/hypervisor/page_table.hpp
         hw/tegra_x1/cpu/hypervisor/memory.hpp
         hw/tegra_x1/cpu/hypervisor/mmu.cpp
+        hw/tegra_x1/cpu/hypervisor/stage2_tracker.cpp
         hw/tegra_x1/cpu/hypervisor/mmu.hpp
         hw/tegra_x1/cpu/hypervisor/thread.cpp
         hw/tegra_x1/cpu/hypervisor/thread.hpp

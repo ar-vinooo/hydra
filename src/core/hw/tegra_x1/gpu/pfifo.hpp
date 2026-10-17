@@ -15,6 +15,9 @@ struct GpfifoEntryList {
     GMmu& gmmu;
     std::vector<GpfifoEntry> entries;
     GpfifoFlags flags;
+    uint64_t correlation_id;
+    // Runs when the host finished the work of the entries
+    std::function<void()> on_complete;
 };
 
 class Pfifo {
@@ -24,7 +27,8 @@ class Pfifo {
     void shutdown();
 
     void submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
-                       GpfifoFlags flags);
+                       GpfifoFlags flags,
+                       std::function<void()> on_complete = {});
 
     // Number of entry lists submitted so far
     u64 getSubmittedCount();

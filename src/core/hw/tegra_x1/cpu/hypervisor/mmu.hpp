@@ -27,8 +27,14 @@ class Mmu : public IMmu {
                             horizon::kernel::MemoryAttribute mask,
                             horizon::kernel::MemoryAttribute value) override;
 
+    // Write tracking and GPU write protection use stage 2 permissions, see
+    // Stage2Tracker
+    bool trackWrite(ztd::Range<vaddr_t> range) override;
+    void flushTrackedPages() override;
+    void protectGpuWritten(ztd::Range<uptr> range) override;
+    bool protectsGpuWrites() const override;
+
   protected:
-    // Write tracking
     void setWriteTrackingEnabled(ztd::Range<vaddr_t> range,
                                  bool enable) override;
     bool trySuspendWriteTracking(ztd::Range<vaddr_t> range) override;

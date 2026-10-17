@@ -15,7 +15,7 @@ Buffer::Buffer(MTL::Buffer* buffer_)
 
 Buffer::~Buffer() { buffer->release(); }
 
-void Buffer::copyFrom(ICommandBuffer* command_buffer, ITextureView* src,
+void Buffer::copyFromHot0(ICommandBuffer* command_buffer, ITextureView* src,
                       const uint3 src_origin, const uint3 src_size,
                       const ztd::Range<u32> src_levels,
                       const ztd::Range<u32> src_layers, u64 dst_offset) {
@@ -43,12 +43,12 @@ void Buffer::copyFrom(ICommandBuffer* command_buffer, ITextureView* src,
     }
 }
 
-void Buffer::copyFromImpl(const uptr data, u64 dst_offset, u64 size_) {
+void Buffer::copyFromImplHot1(const uptr data, u64 dst_offset, u64 size_) {
     memcpy(reinterpret_cast<u8*>(buffer->contents()) + dst_offset,
            reinterpret_cast<void*>(data), size_);
 }
 
-void Buffer::copyFromImpl(ICommandBuffer* command_buffer, BufferBase* src,
+void Buffer::copyFromImplHot2(ICommandBuffer* command_buffer, BufferBase* src,
                           u64 dst_offset, u64 src_offset, u64 size_) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);

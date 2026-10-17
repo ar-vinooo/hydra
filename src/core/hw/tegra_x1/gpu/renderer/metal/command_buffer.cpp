@@ -43,6 +43,14 @@ CommandBuffer::~CommandBuffer() {
                     static_cast<u64>(dt * 1'000'000'000.0);
         });
     }
+    if (!completion_callbacks.empty()) {
+        command_buffer->addCompletedHandler(
+            [callbacks = std::move(completion_callbacks)](MTL::CommandBuffer*) {
+                for (const auto& callback : callbacks)
+                    callback();
+            });
+        completion_callbacks.clear();
+    }
     // GPU faults and timeouts are otherwise silent. This runs on a Metal
     // dispatch thread the logger does not know about, so print directly.
     command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
@@ -64,7 +72,7 @@ CommandBuffer::~CommandBuffer() {
     command_buffer->release();
 }
 
-void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
+void CommandBuffer::retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> pool,
                                        MTL::Buffer* buffer) {
     ASSERT(!upload_pool || upload_pool == pool, MetalRenderer,
            "An upload command buffer cannot mix buffer pools");
@@ -72,7 +80,7 @@ void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
     retired_upload_buffers.push_back(buffer);
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
+MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     if (render_pass_descriptor == encoder_state.render_pass)
         return getRenderCommandEncoderUnchecked();
@@ -81,7 +89,7 @@ MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
     return createRenderCommandEncoder(render_pass_descriptor);
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
+MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     endEncoding();
 
@@ -98,7 +106,7 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
     return getRenderCommandEncoderUnchecked();
 }
 
-MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoder() {
+MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     if (encoder_type == EncoderType::Blit)
         return getBlitCommandEncoderUnchecked();
 
@@ -114,7 +122,7 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoder() {
     return getBlitCommandEncoderUnchecked();
 }
 
-MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoder() {
+MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
     if (encoder_type == EncoderType::Compute)
         return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
 
@@ -130,7 +138,7 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoder() {
     return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
 }
 
-f64 CommandBuffer::debugCommitAndWait() {
+f64 CommandBuffer::debugCommitAndWaitHot5() {
     endEncoding();
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
@@ -144,7 +152,7 @@ f64 CommandBuffer::debugCommitAndWait() {
     return ms;
 }
 
-void CommandBuffer::endEncoding() {
+void CommandBuffer::endEncodingHot6() {
     if (encoder_type == EncoderType::None)
         return;
 
@@ -157,7 +165,7 @@ void CommandBuffer::endEncoding() {
     encoder_state.render_pass = nullptr;
 }
 
-void CommandBuffer::setRenderPipelineState(MTL::RenderPipelineState* pipeline) {
+void CommandBuffer::setRenderPipelineStateHot7(MTL::RenderPipelineState* pipeline) {
     auto& bound_pipeline = encoder_state.render.pipeline;
     if (pipeline == bound_pipeline)
         return;
@@ -166,7 +174,7 @@ void CommandBuffer::setRenderPipelineState(MTL::RenderPipelineState* pipeline) {
     bound_pipeline = pipeline;
 }
 
-void CommandBuffer::setDepthStencilState(
+void CommandBuffer::setDepthStencilStateHot8(
     MTL::DepthStencilState* depth_stencil_state) {
     auto& bound_depth_stencil_state = encoder_state.render.depth_stencil_state;
     if (depth_stencil_state == bound_depth_stencil_state)
@@ -177,7 +185,7 @@ void CommandBuffer::setDepthStencilState(
     bound_depth_stencil_state = depth_stencil_state;
 }
 
-void CommandBuffer::setCullMode(MTL::CullMode cull_mode) {
+void CommandBuffer::setCullModeHot9(MTL::CullMode cull_mode) {
     auto& bound_cull_mode = encoder_state.render.cull_mode;
     if (cull_mode == bound_cull_mode)
         return;
@@ -186,7 +194,7 @@ void CommandBuffer::setCullMode(MTL::CullMode cull_mode) {
     bound_cull_mode = cull_mode;
 }
 
-void CommandBuffer::setFrontFaceWinding(MTL::Winding front_face_winding) {
+void CommandBuffer::setFrontFaceWindingHot10(MTL::Winding front_face_winding) {
     auto& bound_front_face_winding = encoder_state.render.front_face_winding;
     if (front_face_winding == bound_front_face_winding)
         return;
@@ -204,7 +212,7 @@ bool rasterCacheEnabled() {
 }
 } // namespace
 
-void CommandBuffer::setDepthBias(float constant, float slope, float clamp) {
+void CommandBuffer::setDepthBiasHot11(float constant, float slope, float clamp) {
     const std::array<float, 3> value{constant, slope, clamp};
     auto& cached = encoder_state.render.depth_bias;
     if (rasterCacheEnabled() && cached && *cached == value) {
@@ -216,7 +224,7 @@ void CommandBuffer::setDepthBias(float constant, float slope, float clamp) {
     ++raster_updates;
 }
 
-void CommandBuffer::setBlendColor(float r, float g, float b, float a) {
+void CommandBuffer::setBlendColorHot12(float r, float g, float b, float a) {
     const std::array<float, 4> value{r, g, b, a};
     auto& cached = encoder_state.render.blend_color;
     if (rasterCacheEnabled() && cached && *cached == value) {
@@ -228,7 +236,7 @@ void CommandBuffer::setBlendColor(float r, float g, float b, float a) {
     ++raster_updates;
 }
 
-void CommandBuffer::setStencilReferences(u32 front, u32 back) {
+void CommandBuffer::setStencilReferencesHot13(u32 front, u32 back) {
     const std::array<u32, 2> value{front, back};
     auto& cached = encoder_state.render.stencil_references;
     if (rasterCacheEnabled() && cached && *cached == value) {
@@ -240,7 +248,7 @@ void CommandBuffer::setStencilReferences(u32 front, u32 back) {
     ++raster_updates;
 }
 
-void CommandBuffer::setViewports(std::span<const MTL::Viewport> values) {
+void CommandBuffer::setViewportsHot14(std::span<const MTL::Viewport> values) {
     ASSERT(!values.empty() && values.size() <= VIEWPORT_COUNT, MetalRenderer,
            "Invalid raster rectangle count {}", values.size());
     auto& cached = encoder_state.render;
@@ -262,7 +270,7 @@ void CommandBuffer::setViewports(std::span<const MTL::Viewport> values) {
     ++raster_updates;
 }
 
-void CommandBuffer::setScissors(std::span<const MTL::ScissorRect> values) {
+void CommandBuffer::setScissorsHot15(std::span<const MTL::ScissorRect> values) {
     ASSERT(!values.empty() && values.size() <= VIEWPORT_COUNT, MetalRenderer,
            "Invalid raster rectangle count {}", values.size());
     auto& cached = encoder_state.render;
@@ -284,7 +292,7 @@ void CommandBuffer::setScissors(std::span<const MTL::ScissorRect> values) {
     ++raster_updates;
 }
 
-void CommandBuffer::setBuffer(MTL::Buffer* buffer, u64 offset,
+void CommandBuffer::setBufferHot16(MTL::Buffer* buffer, u64 offset,
                               ShaderType shader_type, u32 index) {
     ASSERT_DEBUG(index < BUFFER_COUNT, MetalRenderer, "Invalid buffer index {}",
                  index);
@@ -313,7 +321,7 @@ void CommandBuffer::setBuffer(MTL::Buffer* buffer, u64 offset,
     bound_buffer.offset = offset;
 }
 
-void CommandBuffer::setTexture(MTL::Texture* texture, ShaderType shader_type,
+void CommandBuffer::setTextureHot17(MTL::Texture* texture, ShaderType shader_type,
                                u32 index) {
     ASSERT_DEBUG(index < TEXTURE_COUNT, MetalRenderer,
                  "Invalid texture index {}", index);
@@ -337,7 +345,7 @@ void CommandBuffer::setTexture(MTL::Texture* texture, ShaderType shader_type,
     bound_texture = texture;
 }
 
-void CommandBuffer::setSampler(MTL::SamplerState* sampler,
+void CommandBuffer::setSamplerHot18(MTL::SamplerState* sampler,
                                ShaderType shader_type, u32 index) {
     ASSERT_DEBUG(index < TEXTURE_COUNT, MetalRenderer,
                  "Invalid texture index {}", index);

@@ -18,7 +18,7 @@ class ITexture {
     createView(const TextureViewDescriptor& view_descriptor) = 0;
 
     // Copying
-    // Raw bytes shared by buffer textures, including different texel formats.
+    // Raw guest-layout bytes shared by buffer textures and supported 2D aliases.
     virtual void copyBufferBytes(ICommandBuffer* command_buffer,
                                  const ITexture* src, u64 src_offset,
                                  u64 dst_offset, u64 size) = 0;

@@ -3,6 +3,8 @@
 #include "core/horizon/services/nvdrv/ioctl/fd_base.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
+#include <map>
+
 namespace hydra::horizon::services::nvdrv::ioctl {
 
 enum class AllocSpaceFlags : u32 {
@@ -52,7 +54,8 @@ class NvHostAsGpu : public FdBase {
                         Aligned<AllocSpaceFlags, 8> flags,
                         InOut<u64, gpu_vaddr_t> align_and_offset);
     NvResult freeSpace(vaddr_t offset, u32 pages, u32 page_size);
-    NvResult unmapBuffer(gpu_vaddr_t addr);
+    NvResult unmapBuffer(System* system, kernel::Process* process,
+                         gpu_vaddr_t addr);
     NvResult mapBufferEx(System* system, kernel::Process* process,
                          MapBufferFlags flags, hw::tegra_x1::gpu::NvKind kind,
                          Handle nvmap_handle, [[maybe_unused]] u32 reserved,
@@ -62,8 +65,8 @@ class NvHostAsGpu : public FdBase {
                           InOutSingle<u32> inout_buffer_size,
                           [[maybe_unused]] u32 reserved,
                           std::array<VaRegion, 2>* out_va_regions);
-    NvResult allocAsEx(kernel::Process* process, u32 big_page_size, i32 as_fd,
-                       u32 flags, [[maybe_unused]] u32 reserved,
+    NvResult allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
+                       u32 big_page_size, [[maybe_unused]] u32 reserved,
                        u64 va_range_start, u64 va_range_end,
                        u64 va_range_split);
     NvResult remap(IoctlContext* context, const RemapOp* entries);
@@ -71,6 +74,8 @@ class NvHostAsGpu : public FdBase {
   private:
     // Remap offsets are expressed in big pages
     u64 as_big_page_size{0x10000};
+    // Guest range of each buffer mapping, by GPU address
+    std::map<gpu_vaddr_t, std::pair<vaddr_t, u64>> buffer_mappings;
 
   public:
     NvResult getVaRegions3(gpu_vaddr_t buffer_addr,

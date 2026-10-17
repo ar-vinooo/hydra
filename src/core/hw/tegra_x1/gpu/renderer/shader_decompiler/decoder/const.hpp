@@ -127,6 +127,60 @@ inline ir::Value notIf(ir::Builder& builder, const ir::Value& value,
     return not_ ? builder.opNot(value) : value;
 }
 
+// Maxwell flow tests combine Z, S, C and O independently of predication.
+inline ir::Value getFlowTest(ir::Builder& b, u32 test) {
+    const auto z = ir::Value::createConditionFlag(0);
+    const auto s = ir::Value::createConditionFlag(1);
+    const auto c = ir::Value::createConditionFlag(2);
+    const auto o = ir::Value::createConditionFlag(3);
+    switch (test) {
+    case 0: return ir::Value::createConstantB(false);
+    case 1: return b.opBitwiseXor(b.opBitwiseAnd(s, b.opNot(z)), o);
+    case 2: return b.opBitwiseAnd(b.opNot(s), z);
+    case 3: return b.opBitwiseXor(s, b.opBitwiseOr(z, o));
+    case 4: return b.opBitwiseAnd(b.opBitwiseXor(b.opNot(s), o), b.opNot(z));
+    case 5: return b.opNot(z);
+    case 6: return b.opNot(b.opBitwiseXor(s, o));
+    case 7: return b.opBitwiseOr(b.opNot(s), b.opNot(z));
+    case 8: return b.opBitwiseAnd(s, z);
+    case 9: return b.opBitwiseXor(s, o);
+    case 10: return z;
+    case 11: return b.opBitwiseOr(b.opBitwiseXor(s, o), z);
+    case 12: return b.opBitwiseXor(b.opNot(s), b.opBitwiseOr(z, o));
+    case 13: return b.opBitwiseOr(s, b.opNot(z));
+    case 14: return b.opBitwiseXor(b.opBitwiseOr(b.opNot(s), z), o);
+    case 15: return ir::Value::createConstantB(true);
+    case 16: return b.opNot(o);
+    case 17: return b.opNot(c);
+    case 18: return b.opNot(s);
+    case 19: return b.opBitwiseOr(z, b.opNot(c));
+    case 20: return b.opBitwiseAnd(c, b.opNot(z));
+    case 21: return s;
+    case 22: return c;
+    case 23: return o;
+    case 30: return b.opBitwiseOr(s, z);
+    case 31: return b.opBitwiseAnd(b.opNot(s), b.opNot(z));
+    default:
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Flow test {}", test);
+        return ir::Value::createConstantB(false);
+    }
+}
+
+inline ir::Value getFlowCondition(ir::Builder& b, pred_t pred, bool inv,
+                                   u32 test) {
+    const auto guard = notIf(b, ir::Value::createPredicate(pred), inv);
+    return test == 15 ? guard : b.opBitwiseAnd(guard, getFlowTest(b, test));
+}
+
+inline void writeSetConditionCodes(ir::Builder& b, ir::Value result,
+                                    bool b_float) {
+    b.opCopy(ir::Value::createConditionFlag(0), b.opNot(result));
+    b.opCopy(ir::Value::createConditionFlag(1),
+             b_float ? ir::Value::createConstantB(false) : result);
+    b.opCopy(ir::Value::createConditionFlag(2), ir::Value::createConstantB(false));
+    b.opCopy(ir::Value::createConditionFlag(3), ir::Value::createConstantB(false));
+}
+
 inline ir::Value saturateIf(ir::Builder& builder, const ir::Value& value,
                             bool sat) {
     return sat ? builder.opClamp(value, ir::Value::createConstantF(0.0f),
@@ -207,6 +261,17 @@ inline ir::Value getSwizzledHalf(ir::Builder& builder, HalfSwizzle swizzle,
     }
 
     return builder.opVectorConstruct(ir::ScalarType::F16, {src_v, src_v});
+}
+
+// Half instructions read a constant buffer operand as one F32, used for both
+// halves
+inline ir::Value getHalfConstMemory(ir::Builder& builder, u32 slot,
+                                    u32 offset) {
+    const auto value = builder.opCast(
+        ir::Value::createConstMemory(CMem(slot, RZ, static_cast<u64>(offset) * 4),
+                                     ir::ScalarType::F32),
+        ir::ScalarType::F16);
+    return builder.opVectorConstruct(ir::ScalarType::F16, {value, value});
 }
 
 inline ir::Value getFloatCmp(DecoderContext& context, FloatCmpOp op,

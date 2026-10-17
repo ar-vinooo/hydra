@@ -82,7 +82,18 @@ NvResult NvHostCtrl::syncptWaitEvent(IoctlContext* context, u32 id, u32 tresh, i
         Services, "ID: {}, treshold: {}, timeout: {}", id, tresh, timeout));
 
     if (id == 0) { *out_value = 0; return NvResult::Success; } // Existing GPU path.
-    const auto value = context->system.getGpu().getVideoSyncpoints().read(id);
+    auto& gpu = context->system.getGpu();
+    auto& syncpoints_ref = gpu.getVideoSyncpoints();
+    // A GPU fence is reached when the host finishes the work: wait for it,
+    // bounded so a lost fence cannot hang the guest
+    if (gpu.isFenceSyncpoint(id)) {
+        const auto wait = timeout < 0 ? std::chrono::milliseconds(10000)
+                                      : std::chrono::milliseconds(timeout);
+        if (!syncpoints_ref.waitFor(id, tresh, wait))
+            ONCE(LOG_WARN(Services, "GPU fence {}:{} not reached in {} ms", id,
+                          tresh, wait.count()));
+    }
+    const auto value = syncpoints_ref.read(id);
     if (!value) return NvResult::BadValue;
     *out_value = *value;
     return video::Syncpoints::reached(*value, tresh) ? NvResult::Success : NvResult::Timeout;

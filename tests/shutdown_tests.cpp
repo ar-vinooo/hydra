@@ -388,9 +388,9 @@ void testNvdecWriteback(System& system, kernel::Process* process) {
                       "VIC crops and preserves decoded luma in pitch and block-linear output");
         for (usize row = 0; row < 4; ++row)
             for (usize column = 0; column < 32; column += 2)
-                check(vic_uv[row * 64 + column] == uv[row * 64 + column + 1] &&
-                      vic_uv[row * 64 + column + 1] == uv[row * 64 + column],
-                      "VIC converts decoded NV12 chroma to NV21");
+                check(vic_uv[row * 64 + column] == uv[row * 64 + column] &&
+                      vic_uv[row * 64 + column + 1] == uv[row * 64 + column + 1],
+                      "VIC keeps decoded NV12 chroma order for Y8___U8V8_N420 output");
         // Limited-range BT.601 conversion, including negative coefficients,
         // translation, nonzero matrix shift, alpha and packed channel order.
         configWord(0xa0, 1023u << 10); configWord(0xa4, 1023);
@@ -694,7 +694,7 @@ int main(int argc, char** argv) {
             System system(ui);
             auto* process = system.getOs().getKernel().getProcessManager().createProcess("Video writeback test");
             testNvdecWriteback(system, process);
-            std::cout << "PASS: NVDEC and VIC NV21/RGB matrix writeback in both layouts\n";
+            std::cout << "PASS: NVDEC and VIC NV12/RGB matrix writeback in both layouts\n";
             return 0;
         }
 #endif

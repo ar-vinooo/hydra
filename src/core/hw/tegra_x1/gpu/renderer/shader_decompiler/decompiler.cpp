@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
+#include <memory>
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
@@ -7,6 +9,10 @@
 
 // HACK
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/cfg.hpp"
+
+#include <array>
+#include <bit>
+#include <cstring>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp {
 
@@ -81,7 +87,7 @@ struct ShaderHeader {
 };
 #pragma pack(pop)
 
-void decompile(
+void decompileHot(
     ztd::io::MemoryStream& code_stream, const ShaderType type,
     const GuestShaderState& state, ShaderBackend& out_backend,
     std::vector<u8>& out_code, ResourceMapping& out_resource_mapping,
@@ -110,6 +116,13 @@ void decompile(
     context.read_const_word = read_const_word;
     context.branch_constants = &out_resource_mapping.branch_constants;
     if (type == ShaderType::Fragment) {
+        context.fragment_output_mask = header.ps.omap_target;
+        u32 color_registers = 0;
+        for (u32 i = 0; i < COLOR_TARGET_COUNT; ++i)
+            if (((header.ps.omap_target >> (i * 4)) & 0xf) != 0)
+                color_registers += 4;
+        if (header.ps.omap_depth)
+            context.fragment_depth_register = color_registers + 1;
         for (u32 i = 0; i < PIXEL_IMAP_COUNT; i++) {
             const auto imap = header.ps.imap_generic_vector[i];
             context.frag.pixel_imaps[i] = {
@@ -148,22 +161,26 @@ void decompile(
     }
 #endif
 
+    auto& visual = VisualDiagnostics::instance();
+    if (visual.shaderActive()) visual.shaderArtifact("decoded.ir", fmt::format("{}", modul));
+
     // Analyze
 
     // Memory
     analyzer::MemoryAnalyzer mem_analyzer;
     mem_analyzer.analyze(modul);
+    if (visual.shaderActive()) visual.shaderArtifact("analyzed.ir", fmt::format("{}", modul));
 
     // Debug
     LOG_DEBUG(ShaderDecompiler, "Module:\n{}", modul);
 
     // Decompile
-    codegen::Emitter* emitter;
+    std::unique_ptr<codegen::Emitter> emitter;
     out_backend = CONFIG_INSTANCE.getShaderBackend();
     // NOLINTNEXTLINE(readability-trivial-switch)
     switch (out_backend) {
     case ShaderBackend::Msl: {
-        emitter = new codegen::lang::msl::MslEmitter(
+        emitter = std::make_unique<codegen::lang::msl::MslEmitter>(
             context, mem_analyzer, state, out_code, out_resource_mapping);
         break;
     }
@@ -178,6 +195,67 @@ void decompile(
     }
 
     emitter->emit(modul);
+}
+
+std::optional<u32> findGeometryLayerSource(std::span<const u8> code) {
+    constexpr usize HEADER_SIZE = 0x50;
+    constexpr u32 LAYER_ADDR = 0x64;
+    constexpr u32 USER_ATTR_BASE = 0x80;
+    constexpr u32 USER_ATTR_END = 0x280;
+    constexpr u32 UNKNOWN = invalid<u32>();
+
+    // Attribute address each register was loaded from
+    std::array<u32, 256> reg_sources;
+    reg_sources.fill(UNKNOWN);
+    std::optional<u32> source;
+    for (usize offset = HEADER_SIZE; offset + 8 <= code.size(); offset += 8) {
+        // Every 4th word holds scheduling info
+        if (((offset - HEADER_SIZE) / 8) % 4 == 0)
+            continue;
+
+        u64 inst;
+        std::memcpy(&inst, code.data() + offset, sizeof(inst));
+        if (inst == 0)
+            break;
+
+        const auto count = static_cast<u32>(extractBits(inst, 47, 2)) + 1;
+        if ((inst & 0xfff8000000000000) == 0xefd8000000000000) {
+            // ALD: only loads from input attributes are tracked
+            const auto dst = static_cast<u32>(extractBits(inst, 0, 8));
+            const auto addr = static_cast<u32>(extractBits(inst, 20, 11));
+            const bool is_output = extractBits(inst, 32, 1) != 0;
+            for (u32 i = 0; i < count && dst + i < RZ; i++)
+                reg_sources[dst + i] = is_output ? UNKNOWN : addr + i * 4;
+        } else if ((inst & 0xfff8000000000000) == 0x5c98000000000000) {
+            // MOV register
+            const auto dst = static_cast<u32>(extractBits(inst, 0, 8));
+            const auto src = static_cast<u32>(extractBits(inst, 20, 8));
+            if (dst != RZ)
+                reg_sources[dst] = (src == RZ ? UNKNOWN : reg_sources[src]);
+        } else if ((inst & 0xfff8000000000000) == 0xeff0000000000000) {
+            // AST
+            const auto src = static_cast<u32>(extractBits(inst, 0, 8));
+            const auto addr = static_cast<u32>(extractBits(inst, 20, 11));
+            if (addr > LAYER_ADDR || addr + count * 4 <= LAYER_ADDR)
+                continue;
+
+            const auto reg = src + (LAYER_ADDR - addr) / 4;
+            const auto layer_source = (reg < RZ ? reg_sources[reg] : UNKNOWN);
+            if (layer_source < USER_ATTR_BASE ||
+                layer_source >= USER_ATTR_END ||
+                (source && *source != layer_source))
+                return std::nullopt;
+            source = layer_source;
+        } else {
+            // Conservatively assume other instructions overwrite their usual
+            // destination register
+            const auto dst = static_cast<u32>(extractBits(inst, 0, 8));
+            if (dst != RZ)
+                reg_sources[dst] = UNKNOWN;
+        }
+    }
+
+    return source;
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp

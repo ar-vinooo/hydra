@@ -10,6 +10,8 @@ enum class FloatFormat {
     F64 = 3,
 };
 
+// Integer rounding of same-size F2F, from bits 39-40 and 42 (bit 41 selects
+// the half of an F16 source)
 enum class RoundMode2 {
     Pass = 1,
     Round = 4,
@@ -41,13 +43,11 @@ union InstF2fBase {
 
 DEFINE_INST_SRC1_VARIANTS(F2f);
 
-enum class IntegerFormat {
-    U16 = 1,
-    U32 = 2,
-    U64 = 3,
-    S16 = 5,
-    S32 = 6,
-    S64 = 7,
+enum class IntegerWidth {
+    Invalid = 0,
+    _16 = 1,
+    _32 = 2,
+    _64 = 3,
 };
 
 enum class RoundMode3 {
@@ -59,9 +59,9 @@ enum class RoundMode3 {
 
 union InstF2iBase {
     BitField64<reg_t, 0, 8> dst;
-    BitField64<u32, 8, 2> dst_fmt_0;
+    BitField64<IntegerWidth, 8, 2> dst_width;
     BitField64<FloatFormat, 10, 2> src_fmt;
-    BitField64<u32, 12, 1> dst_fmt_2;
+    BitField64<bool, 12, 1> dst_signed;
     BitField64<pred_t, 16, 3> pred;
     BitField64<bool, 19, 1> pred_inv;
     BitField64<RoundMode3, 39, 2> round_mode;
@@ -70,54 +70,31 @@ union InstF2iBase {
     BitField64<bool, 45, 1> neg;
     BitField64<bool, 47, 1> write_cc;
     BitField64<bool, 49, 1> abs;
-
-    IntegerFormat getDstFmt() const {
-        return static_cast<IntegerFormat>(dst_fmt_0.get() |
-                                          (dst_fmt_2.get() << 2));
-    }
 };
 
 DEFINE_INST_SRC1_VARIANTS(F2i);
 
-enum class ByteSelect {
-    B0 = 0,
-    B1 = 1,
-    B2 = 2,
-    B3 = 3,
-};
-
-enum class IntegerFormat2 {
-    U8 = 0,
-    U16 = 1,
-    U32 = 2,
-    S8 = 4,
-    S16 = 5,
-    S32 = 6,
+// 8, 16 and 32-bit integers (3 is 64-bit for I2F)
+enum class SmallIntegerWidth {
+    _8 = 0,
+    _16 = 1,
+    _32 = 2,
+    _64 = 3,
 };
 
 union InstI2iBase {
     BitField64<reg_t, 0, 8> dst;
-    BitField64<u32, 8, 2> dst_fmt_0;
-    BitField64<u32, 10, 2> src_fmt_0;
-    BitField64<u32, 12, 1> dst_fmt_2;
-    BitField64<u32, 13, 2> src_fmt_2;
+    BitField64<SmallIntegerWidth, 8, 2> dst_width;
+    BitField64<SmallIntegerWidth, 10, 2> src_width;
+    BitField64<bool, 12, 1> dst_signed;
+    BitField64<bool, 13, 1> src_signed;
     BitField64<pred_t, 16, 3> pred;
     BitField64<bool, 19, 1> pred_inv;
-    BitField64<ByteSelect, 41, 2> byte_sel;
+    BitField64<u32, 41, 3> byte_sel;
     BitField64<bool, 45, 1> neg;
     BitField64<bool, 47, 1> write_cc;
     BitField64<bool, 49, 1> abs;
-    BitField64<bool, 51, 1> sat;
-
-    IntegerFormat2 getDstFmt() const {
-        return static_cast<IntegerFormat2>(dst_fmt_0.get() |
-                                           (dst_fmt_2.get() << 2));
-    }
-
-    IntegerFormat2 getSrcFmt() const {
-        return static_cast<IntegerFormat2>(src_fmt_0.get() |
-                                           (src_fmt_2.get() << 2));
-    }
+    BitField64<bool, 50, 1> sat;
 };
 
 DEFINE_INST_SRC1_VARIANTS(I2i);
@@ -125,20 +102,15 @@ DEFINE_INST_SRC1_VARIANTS(I2i);
 union InstI2fBase {
     BitField64<reg_t, 0, 8> dst;
     BitField64<FloatFormat, 8, 2> dst_fmt;
-    BitField64<u32, 10, 2> src_fmt_0;
-    BitField64<u32, 13, 2> src_fmt_2;
+    BitField64<SmallIntegerWidth, 10, 2> src_width;
+    BitField64<bool, 13, 1> src_signed;
     BitField64<pred_t, 16, 3> pred;
     BitField64<bool, 19, 1> pred_inv;
     BitField64<RoundMode, 39, 2> round_mode;
-    BitField64<ByteSelect, 41, 2> byte_sel;
+    BitField64<u32, 41, 2> byte_sel;
     BitField64<bool, 45, 1> neg;
     BitField64<bool, 47, 1> write_cc;
     BitField64<bool, 49, 1> abs;
-
-    IntegerFormat2 getSrcFmt() const {
-        return static_cast<IntegerFormat2>(src_fmt_0.get() |
-                                           (src_fmt_2.get() << 2));
-    }
 };
 
 DEFINE_INST_SRC1_VARIANTS(I2f);

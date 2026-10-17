@@ -3,11 +3,52 @@
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 
+#ifdef ZTD_PLATFORM_APPLE
+#include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
+namespace hydra::hw::tegra_x1::gpu::renderer::metal {
+std::shared_ptr<UploadBufferPool> snapshotBufferPool(MTL::Device* device);
+}
+#endif
+
 namespace hydra::hw::tegra_x1::gpu::renderer {
+namespace {
+std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
+    if (snapshot == nullptr)
+        return {};
+#ifdef ZTD_PLATFORM_APPLE
+    auto* native = static_cast<metal::Buffer*>(snapshot)->getBuffer();
+    auto pool = metal::snapshotBufferPool(native->device());
+    return std::shared_ptr<BufferBase>(snapshot, [pool](BufferBase* buffer) {
+        // CPU views may outlive the command buffer that created a snapshot.
+        // Retire only at the last CPU release, on the current ordered GPU
+        // command buffer. Without a GPU-thread context, release normally.
+        if (tls_crnt_command_buffer != nullptr) {
+            auto* native_buffer =
+                static_cast<metal::Buffer*>(buffer)->getBuffer();
+            native_buffer->retain();
+            static_cast<metal::CommandBuffer*>(tls_crnt_command_buffer)
+                ->getCommandBuffer()->addCompletedHandler(
+                    [pool, native_buffer](MTL::CommandBuffer* completed) {
+                        if (completed->status() ==
+                            MTL::CommandBufferStatusCompleted)
+                            pool->recycle(native_buffer);
+                        else
+                            native_buffer->release();
+                    });
+        }
+        delete buffer;
+    });
+#else
+    return std::shared_ptr<BufferBase>(snapshot);
+#endif
+}
+} // namespace
 
 BufferCache::~BufferCache() = default;
 
-BufferView BufferCache::get(ICommandBuffer* command_buffer,
+BufferView BufferCache::getHot0(ICommandBuffer* command_buffer,
                             ztd::Range<uptr> range) {
     auto& entry = find(range);
     if (entry.buffer != nullptr) {
@@ -23,7 +64,7 @@ BufferView BufferCache::get(ICommandBuffer* command_buffer,
         }
     } else {
         // Create new buffer
-        entry.buffer.reset(renderer.createCpuBufferSnapshot(entry.range));
+        entry.buffer = ownSnapshot(renderer.createCpuBufferSnapshot(entry.range));
         if (!entry.buffer) {
             entry.buffer.reset(renderer.createBuffer(entry.range.getSize()));
             updateRange(command_buffer, entry, entry.range);
@@ -34,7 +75,7 @@ BufferView BufferCache::get(ICommandBuffer* command_buffer,
                       range.getSize()};
 }
 
-void BufferCache::invalidateMemory(ztd::Range<uptr> range) {
+void BufferCache::invalidateMemoryHot1(ztd::Range<uptr> range) {
     auto it = entries.upper_bound(range.getBegin());
     if (it != entries.begin())
         it--;
@@ -57,13 +98,26 @@ void BufferCache::invalidateMemory(ztd::Range<uptr> range) {
     }
 }
 
-void BufferCache::updateRange(ICommandBuffer* command_buffer,
+void BufferCache::updateRangeHot2(ICommandBuffer* command_buffer,
                               BufferEntry& entry, ztd::Range<uptr> range) {
+    // CPU write tracking invalidates whole pages, often touching many small
+    // constant buffers whose bytes did not change. Host-visible snapshots are
+    // immutable: compare the invalidated bytes before allocating a replacement.
+    // Bound the comparison to the small-buffer snapshot path.
+    if (entry.range.getSize() <= 64 * 1024) {
+        const auto previous = entry.buffer->getPtr();
+        if (previous != 0 &&
+            std::memcmp(reinterpret_cast<const void*>(range.getBegin()),
+                        reinterpret_cast<const void*>(previous + range.getBegin() -
+                                                       entry.range.getBegin()),
+                        range.getSize()) == 0)
+            return;
+    }
     if (auto* snapshot = renderer.createCpuBufferSnapshot(entry.range)) {
         // Replace the resource instead of mutating bytes the GPU may still
         // read. BufferViews retain the old owner; Metal retains encoded GPU
         // resources until their command buffer completes.
-        entry.buffer.reset(snapshot);
+        entry.buffer = ownSnapshot(snapshot);
     } else if (entry.inline_copy) {
         // Do an inline update if possible
         entry.buffer->copyFrom(range.getBegin(),
@@ -83,7 +137,7 @@ void BufferCache::updateRange(ICommandBuffer* command_buffer,
     }
 }
 
-BufferEntry& BufferCache::find(ztd::Range<uptr> range) {
+BufferEntry& BufferCache::findHot3(ztd::Range<uptr> range) {
     // Check for containing interval
     auto it = entries.upper_bound(range.getBegin());
     if (it != entries.begin()) {

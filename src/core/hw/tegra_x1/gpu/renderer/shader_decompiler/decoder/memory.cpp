@@ -110,10 +110,42 @@ void emitLoadConstant(DecoderContext& context, pred_t pred, bool pred_inv,
                             static_cast<u32>(address_mode), cbuf_slot, src,
                             cbuf_offset);
 
-    // TODO: handle small ints
+    // Register indexed offsets are signed
+    if (src != RZ)
+        cbuf_offset = static_cast<u32>(signExtend<i32, 16>(
+            static_cast<i32>(cbuf_offset & 0xffff)));
+
+    // Small integers are extracted from the word containing them
     if (size == LsSize2::U8 || size == LsSize2::S8 || size == LsSize2::U16 ||
-        size == LsSize2::S16)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Small integer loading");
+        size == LsSize2::S16) {
+        auto& b = context.builder;
+        const bool is_byte = size == LsSize2::U8 || size == LsSize2::S8;
+        const bool is_signed = size == LsSize2::S8 || size == LsSize2::S16;
+        const auto word = b.opCopy(
+            ir::Value::createConstMemory(CMem(cbuf_slot, src, cbuf_offset)));
+        const auto address =
+            src == RZ ? ir::Value::createConstantU(cbuf_offset)
+                      : b.opAdd(b.opCopy(ir::Value::createRegister(src)),
+                                ir::Value::createConstantU(cbuf_offset));
+        const auto shift = b.opShiftLeft(
+            b.opBitwiseAnd(address, ir::Value::createConstantU(is_byte ? 3 : 2)),
+            ir::Value::createConstantU(3));
+        const u32 bits = is_byte ? 8 : 16;
+        // Move the value to the top, then shift it down logically or
+        // arithmetically
+        const auto top = b.opShiftLeft(
+            b.opShiftRight(word, shift), ir::Value::createConstantU(32 - bits));
+        const auto value =
+            is_signed
+                ? b.opBitCast(b.opShiftRight(b.opBitCast(top, ir::ScalarType::I32),
+                                             ir::Value::createConstantU(32 - bits)),
+                              ir::ScalarType::U32)
+                : b.opShiftRight(top, ir::Value::createConstantU(32 - bits));
+        b.opCopy(ir::Value::createRegister(dst), value);
+        if (conditional)
+            b.opEndIf();
+        return;
+    }
 
     std::vector<ir::Value> values;
     values.reserve(count);
@@ -190,6 +222,24 @@ void emitInterpolateAttribute(DecoderContext& context, pred_t pred,
 
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
+    // Integer system values (front facing, primitive ID, layer) are copied
+    // as raw bits
+    const bool is_generic =
+        src_a_imm >= SV_USER_IN_OUT_BASE && src_a_imm < SV_USER_IN_OUT_END;
+    const bool is_integer =
+        !indexed && (src_a_imm == SV_FRONT_FACING_BASE ||
+                     src_a_imm == SV_PRIMITIVE_ID_BASE ||
+                     src_a_imm == SV_LAYER_BASE ||
+                     src_a_imm == SV_VIEWPORT_INDEX_BASE);
+    if (is_integer) {
+        context.builder.opCopy(
+            ir::Value::createRegister(dst),
+            ir::Value::createAttrMemory(AMem(RZ, src_a_imm, true)));
+        if (conditional)
+            context.builder.opEndIf();
+        return;
+    }
+
     auto res = ir::Value::createAttrMemory(
         AMem(indexed ? src_a_r : RZ, !indexed ? src_a_imm : 0, true),
         ir::ScalarType::F32);
@@ -197,7 +247,7 @@ void emitInterpolateAttribute(DecoderContext& context, pred_t pred,
     // Perspective multiply
     // TODO: why force perspective multiply when indexing?
     if (indexed ||
-        (src_a_imm >= 0x80 &&
+        (is_generic &&
          context.decomp_context.frag.pixel_imaps[(src_a_imm - 0x80) >> 0x4]
                  .getFirstUsedType() == PixelImapType::Perspective)) {
         res = context.builder.opMultiply(

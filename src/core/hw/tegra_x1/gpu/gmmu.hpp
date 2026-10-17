@@ -12,6 +12,8 @@ namespace hydra::hw::tegra_x1::gpu {
 struct AddressSpace {
     uptr ptr;
     u64 size;
+    // Guest virtual address backing ptr (0 for host-only memory)
+    u64 guest{0};
 };
 
 // TODO: free memory
@@ -20,16 +22,6 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
     explicit GMmu(cpu::IMmu* mmu_) : mmu{mmu_} {}
 
     static u64 implGetSize(const AddressSpace& as) { return as.size; }
-
-    AddressSpace& unmapAddrToAddressSpace(uptr gpu_addr) {
-        uptr base;
-        auto addr_space = findAddrImplRef(gpu_addr, base);
-        ASSERT_DEBUG(addr_space, Gpu,
-                     "Address space not found for Gpu address 0x{:x}",
-                     gpu_addr);
-
-        return *addr_space;
-    }
 
     uptr unmapAddr(uptr gpu_addr) const;
 
@@ -59,7 +51,8 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
   private:
     // Mappings are kept disjoint: a buffer replaces whatever it overlaps,
-    // while a reservation only fills the parts that are still unmapped
+    // while a reservation only fills the parts that are still unmapped. The
+    // caller holds the mapping mutex exclusively.
     void carveOut(uptr begin, uptr end);
     void mapIntoGaps(uptr base, AddressSpace as);
 

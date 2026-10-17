@@ -42,7 +42,7 @@ enum class SemaphoreReduction : u32 {
     Fadd = 10,
 };
 
-enum class BypassL2 {
+enum class BypassL2 : u32 {
     UsePteSetting,
     ForceVolatile,
 };
@@ -124,6 +124,7 @@ class Copy : public EngineWithRegsBase<RegsCopy> {
     explicit Copy(Gpu& gpu_) : gpu{gpu_} {}
 
     void method(u32 method, u32 arg) override;
+    void methodHot(u32 method, u32 arg);
 
   private:
     Gpu& gpu;
@@ -148,6 +149,11 @@ class Copy : public EngineWithRegsBase<RegsCopy> {
     };
 
     void launchDma(const u32 index, const LaunchDMAData data);
+    // Copies the data of a launch (not its semaphore)
+    void executeCopy(const LaunchDMAData data);
+    void releaseSemaphore(const LaunchDMAData data);
+    // Pitch to pitch copy with component remapping (also used as a fill)
+    void remapPitchCopy(const LaunchDMAData data);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

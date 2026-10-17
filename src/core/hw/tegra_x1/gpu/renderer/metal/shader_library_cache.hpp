@@ -50,6 +50,11 @@ class ShaderLibraryCache {
     void insert(const std::string& key, MTL::Library* library);
     void run();
     void prewarm();
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    MTL::Library* compileHot0(std::string_view source, NS::Error** error);
+    MTL::Library* getHot1(std::string_view source, NS::Error** error);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

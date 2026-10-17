@@ -1,4 +1,8 @@
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+
+#include <cmath>
+#include <fstream>
 
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -49,6 +53,13 @@ Renderer::Renderer()
         device->newDepthStencilState(depth_stencil_descriptor);
     depth_stencil_descriptor->release();
 
+    // No depth or stencil test (color clears)
+    {
+        auto desc = MTL::DepthStencilDescriptor::alloc()->init();
+        depth_stencil_state_disabled = device->newDepthStencilState(desc);
+        desc->release();
+    }
+
     // Clear stencil (depth untouched)
     {
         auto desc = MTL::DepthStencilDescriptor::alloc()->init();
@@ -94,6 +105,7 @@ Renderer::~Renderer() {
 
     depth_stencil_state_always_and_write->release();
     depth_stencil_state_clear_stencil->release();
+    depth_stencil_state_disabled->release();
 
     // TODO: destroy caches here?
 
@@ -101,7 +113,7 @@ Renderer::~Renderer() {
     device->release();
 }
 
-void Renderer::setSurface(void* surface) {
+void Renderer::setSurfaceHot0(void* surface) {
     ca_layer = reinterpret_cast<CA::MetalLayer*>(surface);
     ca_layer->setDevice(device);
     // The console display ignores alpha. Games often clear to transparent
@@ -112,7 +124,7 @@ void Renderer::setSurface(void* surface) {
     // TODO: set pixel format
 }
 
-ISurfaceCompositor* Renderer::acquireNextSurface() {
+ISurfaceCompositor* Renderer::acquireNextSurfaceHot1() {
     // Drawable
     if (ca_layer == nullptr)
         return nullptr;
@@ -124,16 +136,31 @@ ISurfaceCompositor* Renderer::acquireNextSurface() {
     return new SurfaceCompositor(*this, ca_drawable);
 }
 
-BufferBase* Renderer::createBuffer(u64 size) {
+BufferBase* Renderer::createBufferHot2(u64 size) {
     return new Buffer(device, size);
 }
 
-BufferBase* Renderer::createCpuBufferSnapshot(ztd::Range<uptr> range) {
+// Shared by snapshot allocation and its last-owner deleter. A snapshot remains
+// ineligible for reuse until both CPU views and prior GPU commands release it.
+std::shared_ptr<UploadBufferPool> snapshotBufferPool(MTL::Device* device) {
+    static std::mutex mutex;
+    static std::map<MTL::Device*, std::weak_ptr<UploadBufferPool>> pools;
+    std::scoped_lock lock(mutex);
+    auto pool = pools[device].lock();
+    if (!pool) {
+        pool = std::make_shared<UploadBufferPool>(device, 64 * 1024 * 1024, 8192);
+        pools[device] = pool;
+    }
+    return pool;
+}
+
+BufferBase* Renderer::createCpuBufferSnapshotHot3(ztd::Range<uptr> range) {
     static const bool disabled =
         std::getenv("HYDRA_DISABLE_BUFFER_SNAPSHOTS") != nullptr;
     if (disabled || range.getSize() > 64 * 1024)
         return nullptr;
-    auto* snapshot = allocateTemporaryBuffer(range.getSize());
+    BufferBase* snapshot =
+        new Buffer(snapshotBufferPool(device)->acquire(range.getSize()));
     snapshot->copyFrom(range.getBegin());
     if (PerfStats::isEnabled()) {
         PerfStats::instance().buffer_snapshots++;
@@ -142,13 +169,13 @@ BufferBase* Renderer::createCpuBufferSnapshot(ztd::Range<uptr> range) {
     return snapshot;
 }
 
-BufferBase* Renderer::allocateTemporaryBuffer(const u64 size) {
+BufferBase* Renderer::allocateTemporaryBufferHot4(const u64 size) {
     // TODO: use a buffer allocator instead
     auto buffer = device->newBuffer(size, MTL::ResourceStorageModeShared);
     return new Buffer(buffer);
 }
 
-BufferBase* Renderer::allocateTextureUploadBuffer(u64 size) {
+BufferBase* Renderer::allocateTextureUploadBufferHot5(u64 size) {
     static const bool disabled =
         std::getenv("HYDRA_DISABLE_UPLOAD_POOL") != nullptr;
     if (disabled) {
@@ -159,7 +186,7 @@ BufferBase* Renderer::allocateTextureUploadBuffer(u64 size) {
     return new Buffer(upload_buffer_pool->acquire(size));
 }
 
-void Renderer::retireTextureUploadBuffer(ICommandBuffer* command_buffer,
+void Renderer::retireTextureUploadBufferHot6(ICommandBuffer* command_buffer,
                                          BufferBase* buffer) {
     static const bool disabled =
         std::getenv("HYDRA_DISABLE_UPLOAD_POOL") != nullptr;
@@ -171,27 +198,23 @@ void Renderer::retireTextureUploadBuffer(ICommandBuffer* command_buffer,
     delete buffer;
 }
 
-void Renderer::freeTemporaryBuffer(BufferBase* buffer) {
+void Renderer::freeTemporaryBufferHot7(BufferBase* buffer) {
     auto buffer_impl = static_cast<Buffer*>(buffer);
 
     // TODO: use a buffer allocator instead
     delete buffer_impl;
 }
 
-ITexture* Renderer::createTexture(const TextureDescriptor& descriptor) {
+ITexture* Renderer::createTextureHot8(const TextureDescriptor& descriptor) {
     return new Texture(device, descriptor);
 }
 
-void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
+void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src,
                            float3 src_origin, uint3 src_size, u32 src_level,
                            u32 src_layer, ITextureView* dst, float3 dst_origin,
                            uint3 dst_size, u32 dst_level, u32 dst_layer,
-                           u32 level_count, u32 layer_count) {
+                           u32 level_count, u32 layer_count, const BlitOptions& options) {
     // TODO: what about 3D textures?
-    (void)src_level;
-    (void)dst_level;
-    (void)level_count;
-    (void)layer_count;
 
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
@@ -250,6 +273,60 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         return;
     }
 
+    const auto is_2d = [](MTL::TextureType type) {
+        return type == MTL::TextureType2D || type == MTL::TextureType2DArray;
+    };
+    const auto integral_origin = [](float3 origin) {
+        return std::isfinite(origin.x()) && std::isfinite(origin.y()) &&
+               origin.x() >= 0 && origin.y() >= 0 && origin.z() == 0 &&
+               std::floor(origin.x()) == origin.x() &&
+               std::floor(origin.y()) == origin.y();
+    };
+    if (src_mtl != dst_mtl && src_mtl->pixelFormat() == dst_mtl->pixelFormat() &&
+        !isTextureFormatCompressed(src->getBase()->getDescriptor().format) &&
+        !isTextureFormatCompressed(dst->getBase()->getDescriptor().format) &&
+        is_2d(src_mtl->textureType()) && is_2d(dst_mtl->textureType()) &&
+        src_mtl->sampleCount() == 1 && dst_mtl->sampleCount() == 1 &&
+        level_count == 1 && layer_count == 1 &&
+        src_level < src_mtl->mipmapLevelCount() &&
+        dst_level < dst_mtl->mipmapLevelCount() &&
+        src_layer < src_mtl->arrayLength() && dst_layer < dst_mtl->arrayLength() &&
+        src_size.x() == dst_size.x() && src_size.y() == dst_size.y() &&
+        src_size.z() == 1 && dst_size.z() == 1 &&
+        (options.src_width == 0.0f ||
+         options.src_width == static_cast<f32>(src_size.x())) &&
+        (options.src_height == 0.0f ||
+         options.src_height == static_cast<f32>(src_size.y())) &&
+        integral_origin(src_origin) && integral_origin(dst_origin)) {
+        const auto src_width = std::max<u64>(src_mtl->width() >> src_level, 1);
+        const auto src_height = std::max<u64>(src_mtl->height() >> src_level, 1);
+        const auto dst_width = std::max<u64>(dst_mtl->width() >> dst_level, 1);
+        const auto dst_height = std::max<u64>(dst_mtl->height() >> dst_level, 1);
+        if (static_cast<f64>(src_origin.x()) <= static_cast<f64>(src_width) &&
+            static_cast<f64>(src_origin.y()) <= static_cast<f64>(src_height) &&
+            static_cast<f64>(dst_origin.x()) <= static_cast<f64>(dst_width) &&
+            static_cast<f64>(dst_origin.y()) <= static_cast<f64>(dst_height)) {
+            const auto sx = static_cast<u64>(src_origin.x());
+            const auto sy = static_cast<u64>(src_origin.y());
+            const auto dx = static_cast<u64>(dst_origin.x());
+            const auto dy = static_cast<u64>(dst_origin.y());
+            if (src_size.x() <= src_width - sx && src_size.y() <= src_height - sy &&
+                dst_size.x() <= dst_width - dx && dst_size.y() <= dst_height - dy) {
+                if (src_size.x() == 0 || src_size.y() == 0) return;
+                auto encoder = command_buffer_impl->getBlitCommandEncoder();
+                encoder->copyFromTexture(src_mtl, src_layer, src_level,
+                    MTL::Origin(sx, sy, 0), MTL::Size(src_size.x(), src_size.y(), 1),
+                    dst_mtl, dst_layer, dst_level, MTL::Origin(dx, dy, 0));
+                if (auto& visual = VisualDiagnostics::instance(); visual.active())
+                    visual.event("native_texture_copy", {
+                        {"width", std::to_string(src_size.x())},
+                        {"height", std::to_string(src_size.y())},
+                        {"components", "all_raw_bits_including_alpha"}});
+                return;
+            }
+        }
+    }
+
     // Render pass
     NS_STACK_SCOPED auto render_pass_descriptor =
         MTL::RenderPassDescriptor::alloc()->init();
@@ -267,9 +344,19 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
         command_buffer_impl->createRenderCommandEncoder(render_pass_descriptor);
 
     // Draw
+    const auto data_type = [](ITextureView* view) -> u8 {
+        const auto type = getIntegerTextureComponentType(
+            view->getBase()->getDescriptor().format);
+        return type == nullptr ? 0 : (type[0] == 'u' ? 1 : 2);
+    };
+    const auto src_type = data_type(src);
+    const auto dst_type = data_type(dst);
     encoder->setRenderPipelineState(blit_pipeline_cache.find(
-        {.pixel_format = src_impl->getTexture()->pixelFormat(),
-         .transparent = false}));
+        {.pixel_format = dst_impl->getTexture()->pixelFormat(),
+         .transparent = false,
+         .copy_alpha = true,
+         .src_type = src_type,
+         .dst_type = dst_type}));
     encoder->setViewport(MTL::Viewport(
         static_cast<f64>(dst_origin.x()), static_cast<f64>(dst_origin.y()),
         static_cast<f64>(dst_size.x()), static_cast<f64>(dst_size.y()), 0.0,
@@ -277,43 +364,66 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
     encoder->setVertexBytes(&dst_layer, sizeof(dst_layer), 0);
     const auto src_width = static_cast<f32>(src_impl->getTexture()->width());
     const auto src_height = static_cast<f32>(src_impl->getTexture()->height());
+    const auto extent_x =
+        options.src_width != 0.0f ? options.src_width
+                                  : static_cast<f32>(src_size.x());
+    const auto extent_y =
+        options.src_height != 0.0f ? options.src_height
+                                   : static_cast<f32>(src_size.y());
     BlitParams params = {
         .src_offset = {static_cast<f32>(src_origin.x()) / src_width,
                        static_cast<f32>(src_origin.y()) / src_height},
-        .src_scale = {static_cast<f32>(src_size.x()) / src_width,
-                      static_cast<f32>(src_size.y()) / src_height},
+        .src_scale = {extent_x / src_width, extent_y / src_height},
         .opacity = 1.0f,
     };
     encoder->setFragmentBytes(&params, sizeof(params), 0);
     encoder->setFragmentTexture(src_impl->getTexture(),
                                 static_cast<NS::UInteger>(0));
     encoder->setFragmentSamplerState(
-        linear_sampler,
-        static_cast<NS::UInteger>(0)); // TODO: use the correct sampler
+        options.nearest ? nearest_sampler : linear_sampler,
+        static_cast<NS::UInteger>(0));
 
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
                             static_cast<NS::UInteger>(0),
                             static_cast<NS::UInteger>(3));
 }
 
-SamplerBase* Renderer::createSampler(const SamplerDescriptor& descriptor) {
+SamplerBase* Renderer::createSamplerHot10(const SamplerDescriptor& descriptor) {
     return new Sampler(device, descriptor);
 }
 
-ICommandBuffer* Renderer::createCommandBuffer() {
+ICommandBuffer* Renderer::createCommandBufferHot11() {
     return new CommandBuffer(command_queue);
 }
 
 RenderPassBase*
-Renderer::createRenderPass(const RenderPassDescriptor& descriptor) {
+Renderer::createRenderPassHot12(const RenderPassDescriptor& descriptor) {
     return new RenderPass(descriptor);
 }
 
-void Renderer::bindRenderPass(const RenderPassBase* render_pass) {
+void Renderer::bindRenderPassHot13(const RenderPassBase* render_pass) {
     state.render_pass = static_cast<const RenderPass*>(render_pass);
 }
 
-void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
+void Renderer::beginClear(CommandBuffer* command_buffer,
+                          MTL::DepthStencilState* depth_stencil_state) {
+    const auto width = state.render_pass->getWidth();
+    const auto height = state.render_pass->getHeight();
+    const MTL::Viewport viewport(0.0, 0.0, static_cast<f64>(width),
+                                 static_cast<f64>(height), 0.0, 1.0);
+    const auto& rect = state.clear.rect;
+    const u32 x = std::min(rect.origin.x(), width);
+    const u32 y = std::min(rect.origin.y(), height);
+    const MTL::ScissorRect scissor(x, y, std::min(rect.size.x(), width - x),
+                                   std::min(rect.size.y(), height - y));
+    command_buffer->setViewports(std::span(&viewport, 1));
+    command_buffer->setScissors(std::span(&scissor, 1));
+    command_buffer->setDepthBias(0.0f, 0.0f, 0.0f);
+    command_buffer->setCullMode(MTL::CullModeNone);
+    command_buffer->setDepthStencilState(depth_stencil_state);
+}
+
+void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target_id,
                           u32 layer, u8 mask, const uint4 color) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
@@ -329,11 +439,9 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
         return;
     }
 
-    // TODO: layer
-    ASSERT_DEBUG(layer == 0, MetalRenderer,
-                 "Layered clears (layer: {}) not implemented", layer);
-
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
+    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0)
+        return;
 
     ClearColorPipelineDescriptor pipeline_descriptor{
         .render_target_id = render_target_id,
@@ -342,8 +450,7 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
     getColorPixelFormats(pipeline_descriptor.pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_color_pipeline_cache.find(pipeline_descriptor));
-    command_buffer_impl->setCullMode(MTL::CullModeNone);
-    // TODO: set viewport and scissor
+    beginClear(command_buffer_impl, depth_stencil_state_disabled);
     encoder->setVertexBytes(&layer, sizeof(layer), 0);
     encoder->setFragmentBytes(&color, sizeof(color), 0);
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
@@ -351,7 +458,7 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
                             static_cast<NS::UInteger>(3));
 }
 
-void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
+void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
                           const float value) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
@@ -373,6 +480,8 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
     }
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
+    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0)
+        return;
 
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
@@ -380,10 +489,7 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));
-    command_buffer_impl->setCullMode(MTL::CullModeNone);
-    command_buffer_impl->setDepthStencilState(
-        depth_stencil_state_always_and_write);
-    // TODO: set viewport and scissor
+    beginClear(command_buffer_impl, depth_stencil_state_always_and_write);
     struct {
         u32 layer_id;
         float value;
@@ -394,7 +500,7 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
                             static_cast<NS::UInteger>(3));
 }
 
-void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
+void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
                             const u32 value) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
@@ -403,58 +509,74 @@ void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
     if (texture == nullptr || !hasStencilAttachment())
         return;
 
-    // TODO: layer
-    (void)layer;
-
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
+    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0 ||
+        (state.clear.stencil_write_mask & 0xff) == 0)
+        return;
 
-    // Draw a full screen triangle that replaces the stencil value, while
-    // keeping depth intact
+    // Draw a full screen triangle that replaces the stencil value through
+    // the write mask, while keeping depth intact
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
             toMtlPixelFormat(texture->getDescriptor().format)};
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));
-    command_buffer_impl->setCullMode(MTL::CullModeNone);
-    command_buffer_impl->setDepthStencilState(
-        depth_stencil_state_clear_stencil);
+    const StencilFaceState replace{
+        .func = engines::CompareOp::Always,
+        .fail_op = StencilOp::Replace,
+        .depth_fail_op = StencilOp::Replace,
+        .pass_op = StencilOp::Replace,
+        .ref = value,
+        .func_mask = 0xff,
+        .write_mask = state.clear.stencil_write_mask & 0xff,
+    };
+    beginClear(command_buffer_impl,
+               depth_stencil_state_cache.find({
+                   .depth_test_enabled = false,
+                   .depth_write_enabled = false,
+                   .depth_compare_op = engines::CompareOp::Always,
+                   .stencil_enabled = true,
+                   .stencil_front = replace,
+                   .stencil_back = replace,
+               }));
     command_buffer_impl->setStencilReferences(value & 0xff, value & 0xff);
     struct {
         u32 layer_id;
         float value;
-    } params = {.layer_id = 0, .value = 0.0f};
+    } params = {.layer_id = layer, .value = 0.0f};
     encoder->setVertexBytes(&params, sizeof(params), 0);
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
                             static_cast<NS::UInteger>(0),
                             static_cast<NS::UInteger>(3));
 }
 
-ShaderBase* Renderer::createShader(const ShaderDescriptor& descriptor) {
+ShaderBase* Renderer::createShaderHot17(const ShaderDescriptor& descriptor) {
     return new Shader(device, descriptor, shader_library_cache);
 }
 
-PipelineBase* Renderer::createPipeline(const PipelineDescriptor& descriptor) {
+PipelineBase* Renderer::createPipelineHot18(const PipelineDescriptor& descriptor) {
     return new Pipeline(device, descriptor, binary_archive_cache);
 }
 
-void Renderer::bindPipeline(const PipelineBase* pipeline) {
+void Renderer::bindPipelineHot19(const PipelineBase* pipeline) {
     state.pipeline = static_cast<const Pipeline*>(pipeline);
 }
 
-void Renderer::setDepthTestEnabled(bool enabled) {
+void Renderer::setDepthTestEnabledHot20(bool enabled) {
     state.depth_test_enabled = enabled;
 }
 
-void Renderer::setDepthWriteEnabled(bool enabled) {
+void Renderer::setDepthWriteEnabledHot21(bool enabled) {
     state.depth_write_enabled = enabled;
 }
 
-void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
+void Renderer::debugDumpTextureHot22(ICommandBuffer* command_buffer,
                                 ITextureView* view, const std::string& path) {
     auto texture = static_cast<TextureView*>(view)->getTexture();
     const u32 level_count =
-        texture->textureType() == MTL::TextureTypeCube
+        (texture->textureType() == MTL::TextureTypeCube ||
+         texture->textureType() == MTL::TextureTypeCubeArray)
             ? std::min(static_cast<u32>(texture->mipmapLevelCount()), 5u)
             : 1u;
     for (u32 level = 0; level < level_count; level++)
@@ -463,7 +585,7 @@ void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
             level == 0 ? path : fmt::format("{}_mip{}.png", path, level));
 }
 
-void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
+void Renderer::debugDumpTextureLevelHot23(ICommandBuffer* command_buffer,
                                      ITextureView* view, u32 level,
                                      const std::string& path) {
     auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
@@ -471,10 +593,15 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
     const auto texture_type = texture->textureType();
     if (texture_type != MTL::TextureType2D &&
         texture_type != MTL::TextureType2DArray &&
-        texture_type != MTL::TextureTypeCube)
+        texture_type != MTL::TextureTypeCube &&
+        texture_type != MTL::TextureTypeCubeArray)
         return;
     // Cube faces are stitched horizontally
-    const u32 slice_count = texture_type == MTL::TextureTypeCube ? 6 : 1;
+    const u32 slice_count =
+        texture_type == MTL::TextureTypeCube ? 6
+        : texture_type == MTL::TextureTypeCubeArray
+            ? std::min(static_cast<u32>(texture->arrayLength()) * 6, 96u)
+            : 1;
 
     const auto pixel_format = texture->pixelFormat();
     const bool is_bc1 = pixel_format == MTL::PixelFormatBC1_RGBA ||
@@ -498,6 +625,7 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
     case MTL::PixelFormatBGRA8Unorm_sRGB:
     case MTL::PixelFormatR32Float:
     case MTL::PixelFormatRG16Float:
+    case MTL::PixelFormatRG16Unorm:
     case MTL::PixelFormatDepth32Float:
     case MTL::PixelFormatRGB10A2Unorm:
     case MTL::PixelFormatRG11B10Float:
@@ -517,9 +645,13 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
         is_bc1 ? std::max((width + 3) / 4, 1u) * 8 : width * bpp;
     const u32 rows = is_bc1 ? std::max((height + 3) / 4, 1u) : height;
     const usize image_size = static_cast<usize>(bytes_per_row) * rows;
+    if (!VisualDiagnostics::instance().reserveImage(path,
+            std::max<uint64_t>(image_size, u64(width) * height * 4) * slice_count))
+        return;
     auto buffer = device->newBuffer(image_size * slice_count,
                                     MTL::ResourceStorageModeShared);
 
+    if (!buffer) return;
     auto encoder = command_buffer_impl->getBlitCommandEncoder();
     for (u32 slice = 0; slice < slice_count; slice++)
         encoder->copyFromTexture(texture, slice, level, MTL::Origin(0, 0, 0),
@@ -527,9 +659,61 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
                                  image_size * slice, bytes_per_row, image_size);
 
     command_buffer_impl->getCommandBuffer()->addCompletedHandler(
-        [=](MTL::CommandBuffer*) {
+        [=](MTL::CommandBuffer* completed) {
+            if (completed->status() != MTL::CommandBufferStatusCompleted) {
+                buffer->release();
+                return;
+            }
             const auto all_data =
                 reinterpret_cast<const u8*>(buffer->contents());
+
+            // RGBA16F layered textures (cubemaps): stitch the slices tone
+            // mapped and write per slice statistics
+            if (pixel_format == MTL::PixelFormatRGBA16Float &&
+                slice_count > 1) {
+                const usize pixels = static_cast<usize>(width) * height;
+                const u32 out_width = width * slice_count;
+                std::vector<u8> out(static_cast<usize>(out_width) * height * 4,
+                                    255);
+                std::string stats;
+                for (u32 slice = 0; slice < slice_count; slice++) {
+                    const auto* px = reinterpret_cast<const _Float16*>(
+                        all_data + image_size * slice);
+                    f32 max = 0.0f;
+                    f64 sum = 0.0;
+                    u32 nans = 0, infs = 0;
+                    for (usize i = 0; i < pixels; i++) {
+                        for (u32 c = 0; c < 3; c++) {
+                            const f32 v = static_cast<f32>(px[i * 4 + c]);
+                            if (std::isnan(v)) {
+                                nans++;
+                                continue;
+                            }
+                            if (std::isinf(v)) {
+                                infs++;
+                                continue;
+                            }
+                            max = std::max(max, v);
+                            sum += static_cast<f64>(v);
+                            const f32 t = std::max(v, 0.0f);
+                            out[(static_cast<usize>(i / width) * out_width +
+                                 slice * width + i % width) *
+                                    4 +
+                                c] = static_cast<u8>(t / (1.0f + t) * 255.0f);
+                        }
+                    }
+                    stats += fmt::format("slice {} max {} mean {} nan {} inf "
+                                         "{}\n",
+                                         slice, max, sum / static_cast<f64>(pixels * 3),
+                                         nans, infs);
+                }
+                stbi_write_png(path.c_str(), static_cast<int>(out_width),
+                               static_cast<int>(height), 4, out.data(),
+                               static_cast<int>(out_width * 4));
+                std::ofstream(path + ".txt") << stats;
+                buffer->release();
+                return;
+            }
 
             // BC1: decode every slice into a horizontally stitched image
             if (is_bc1) {
@@ -624,6 +808,19 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
             };
 
             switch (pixel_format) {
+            case MTL::PixelFormatRG16Unorm:
+                // Full precision next to the PNG
+                std::ofstream(path + ".raw", std::ios::binary)
+                    .write(reinterpret_cast<const char*>(data),
+                           static_cast<std::streamsize>(pixel_count * 4));
+                // Raw high bytes, e.g. UE4 velocity: 128 is no motion
+                for (usize i = 0; i < pixel_count; i++) {
+                    const auto* px = reinterpret_cast<const u16*>(data) + i * 2;
+                    rgba[i * 4 + 0] = static_cast<u8>(px[0] >> 8);
+                    rgba[i * 4 + 1] = static_cast<u8>(px[1] >> 8);
+                    rgba[i * 4 + 2] = 0;
+                }
+                break;
             case MTL::PixelFormatRGBA8Unorm:
             case MTL::PixelFormatRGBA8Unorm_sRGB:
                 std::memcpy(rgba.data(), data, pixel_count * 4);
@@ -724,11 +921,11 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
         });
 }
 
-void Renderer::setStencilState(const StencilState& stencil) {
+void Renderer::setStencilStateHot24(const StencilState& stencil) {
     state.stencil = stencil;
 }
 
-bool Renderer::hasStencilAttachment() const {
+bool Renderer::hasStencilAttachmentHot25() const {
     switch (getDepthStencilPixelFormat()) {
     case MTL::PixelFormatDepth24Unorm_Stencil8:
     case MTL::PixelFormatDepth32Float_Stencil8:
@@ -741,51 +938,47 @@ bool Renderer::hasStencilAttachment() const {
     }
 }
 
-void Renderer::setCullState(bool enabled, engines::CullFaceMode mode,
+void Renderer::setCullStateHot26(bool enabled, engines::CullFaceMode mode,
                             engines::Winding front_face) {
-    if (!enabled) {
-        state.cull_mode = MTL::CullModeNone;
-        return;
-    }
-
-    // TODO: front and back culling should discard all polygons
-    state.cull_mode = toMtlCullMode(mode);
+    // The winding also selects two-sided stencil and front facing
     state.front_face_winding = toMtlWinding(front_face);
+    // Front and back culling skips the draw in the engine
+    state.cull_mode = enabled ? toMtlCullMode(mode) : MTL::CullModeNone;
 }
 
-void Renderer::setDepthBias(f32 constant, f32 slope, f32 clamp) {
+void Renderer::setDepthBiasHot27(f32 constant, f32 slope, f32 clamp) {
     state.depth_bias_constant = constant;
     state.depth_bias_slope = slope;
     state.depth_bias_clamp = clamp;
 }
 
-void Renderer::setBlendConstant(const float4 color) {
+void Renderer::setBlendConstantHot28(const float4 color) {
     state.blend_constant = color;
 }
 
-void Renderer::setDepthCompareOp(engines::CompareOp op) {
+void Renderer::setDepthCompareOpHot29(engines::CompareOp op) {
     state.depth_compare_op = op;
 }
 
-void Renderer::setViewport(u32 index, const Viewport& viewport) {
+void Renderer::setViewportHot30(u32 index, const Viewport& viewport) {
     state.viewports[index] = viewport;
 }
 
-void Renderer::setScissor(u32 index, const Scissor& scissor) {
+void Renderer::setScissorHot31(u32 index, const Scissor& scissor) {
     state.scissors[index] = scissor;
 }
 
-void Renderer::bindVertexBuffer(const BufferView& buffer, u32 index) {
+void Renderer::bindVertexBufferHot32(const BufferView& buffer, u32 index) {
     state.vertex_buffers[index] = buffer;
 }
 
-void Renderer::bindIndexBuffer(const BufferView& index_buffer,
+void Renderer::bindIndexBufferHot33(const BufferView& index_buffer,
                                engines::IndexType index_type) {
     state.index_buffer = index_buffer;
     state.index_type = index_type;
 }
 
-void Renderer::bindUniformBuffer(const BufferView& buffer,
+void Renderer::bindUniformBufferHot34(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
     // HACK
     if (shader_type == ShaderType::Count)
@@ -794,18 +987,26 @@ void Renderer::bindUniformBuffer(const BufferView& buffer,
     state.uniform_buffers[static_cast<u32>(shader_type)][index] = buffer;
 }
 
-void Renderer::bindTexture(ITextureView* texture, SamplerBase* sampler,
+void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
                            ShaderType shader_type, u32 index) {
     // HACK
     if (shader_type == ShaderType::Count)
         return;
 
+    if (texture != nullptr && sampler != nullptr &&
+        getIntegerTextureComponentType(texture->getDescriptor().format) != nullptr) {
+        auto descriptor = sampler->getDescriptor();
+        descriptor.min_filter = descriptor.mag_filter = SamplerFilter::Nearest;
+        descriptor.mip_filter = SamplerMipFilter::Nearest;
+        descriptor.max_anisotropy = 1;
+        sampler = getSamplerCache().find(descriptor);
+    }
     state.textures[static_cast<u32>(shader_type)][index] = {
         .texture_view = static_cast<TextureView*>(texture),
         .sampler = static_cast<Sampler*>(sampler)};
 }
 
-void Renderer::unbindUniformBuffers(ShaderType shader_type) {
+void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
     // HACK
     if (shader_type == ShaderType::Count)
         return;
@@ -813,7 +1014,7 @@ void Renderer::unbindUniformBuffers(ShaderType shader_type) {
     state.uniform_buffers[static_cast<u32>(shader_type)] = {};
 }
 
-void Renderer::unbindTextures(ShaderType shader_type) {
+void Renderer::unbindTexturesHot37(ShaderType shader_type) {
     // HACK
     if (shader_type == ShaderType::Count)
         return;
@@ -821,7 +1022,7 @@ void Renderer::unbindTextures(ShaderType shader_type) {
     state.textures[static_cast<u32>(shader_type)] = {};
 }
 
-void Renderer::draw(ICommandBuffer* command_buffer,
+void Renderer::drawHot38(ICommandBuffer* command_buffer,
                     const engines::PrimitiveType primitive_type,
                     const u32 start, const u32 count, const u32 base_instance,
                     const u32 instance_count) {
@@ -829,19 +1030,34 @@ void Renderer::draw(ICommandBuffer* command_buffer,
         static_cast<CommandBuffer*>(command_buffer);
 
     // Check for errors
-    if (!canDraw())
+    if (!canDraw()) {
+        if (auto& visual = VisualDiagnostics::instance(); visual.selected())
+            visual.event("metal_draw_rejected", {{"reason", "pipeline or render pass unavailable"}});
         return;
+    }
 
     bindDrawState(command_buffer_impl);
 
     auto encoder = command_buffer_impl->getRenderCommandEncoderUnchecked();
 
+    if (auto& visual = VisualDiagnostics::instance(); visual.selected()) {
+        const auto group = fmt::format("hydra s{} p{} d{}", visual.submissionId(), visual.frameId(), visual.drawIndex());
+        encoder->insertDebugSignpost(toNsString(group));
+        visual.event("metal_draw_encoded", {{"count", std::to_string(count)}, {"signpost", group}});
+    }
+    const bool capture_group = isCapturing() && !capture_draw_label.empty();
+    if (capture_group)
+        encoder->pushDebugGroup(toNsString(capture_draw_label));
     // Draw
     encoder->drawPrimitives(toMtlPrimitiveType(primitive_type), start, count,
                             instance_count, base_instance);
+    if (capture_group) {
+        encoder->popDebugGroup();
+        capture_draw_label.clear();
+    }
 }
 
-void Renderer::drawIndexed(ICommandBuffer* command_buffer,
+void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
                            const engines::PrimitiveType primitive_type,
                            const u32 start, const u32 count,
                            const u32 base_vertex, const u32 base_instance,
@@ -850,13 +1066,21 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
         static_cast<CommandBuffer*>(command_buffer);
 
     // Check for errors
-    if (!canDraw())
+    if (!canDraw()) {
+        if (auto& visual = VisualDiagnostics::instance(); visual.selected())
+            visual.event("metal_draw_rejected", {{"reason", "pipeline or render pass unavailable"}});
         return;
+    }
 
     bindDrawState(command_buffer_impl);
 
     auto encoder = command_buffer_impl->getRenderCommandEncoderUnchecked();
 
+    if (auto& visual = VisualDiagnostics::instance(); visual.selected()) {
+        const auto group = fmt::format("hydra s{} p{} d{}", visual.submissionId(), visual.frameId(), visual.drawIndex());
+        encoder->insertDebugSignpost(toNsString(group));
+        visual.event("metal_draw_encoded", {{"count", std::to_string(count)}, {"signpost", group}});
+    }
     // Draw
     auto index_buffer_mtl =
         static_cast<Buffer*>(state.index_buffer.getBase())->getBuffer();
@@ -864,17 +1088,24 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
     const auto index_buffer_offset =
         static_cast<u64>(start) * engines::getIndexTypeSize(state.index_type) +
         state.index_buffer.getOffset();
+    const bool capture_group = isCapturing() && !capture_draw_label.empty();
+    if (capture_group)
+        encoder->pushDebugGroup(toNsString(capture_draw_label));
     encoder->drawIndexedPrimitives(toMtlPrimitiveType(primitive_type), count,
                                    toMtlIndexType(state.index_type),
                                    index_buffer_mtl, index_buffer_offset,
                                    instance_count, base_vertex, base_instance);
+    if (capture_group) {
+        encoder->popDebugGroup();
+        capture_draw_label.clear();
+    }
 }
 
-f64 Renderer::debugSyncCommandBuffer(ICommandBuffer* command_buffer) {
+f64 Renderer::debugSyncCommandBufferHot40(ICommandBuffer* command_buffer) {
     return static_cast<CommandBuffer*>(command_buffer)->debugCommitAndWait();
 }
 
-void Renderer::dispatchCompute(ICommandBuffer* command_buffer,
+void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                                const ComputeDispatch& dispatch) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
@@ -1023,7 +1254,7 @@ void Renderer::dispatchCompute(ICommandBuffer* command_buffer,
     }
 }
 
-void Renderer::getColorPixelFormats(
+void Renderer::getColorPixelFormatsHot42(
     MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const {
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
         const auto texture =
@@ -1037,7 +1268,7 @@ void Renderer::getColorPixelFormats(
     }
 }
 
-MTL::PixelFormat Renderer::getDepthStencilPixelFormat() const {
+MTL::PixelFormat Renderer::getDepthStencilPixelFormatHot43() const {
     if (state.render_pass == nullptr)
         return MTL::PixelFormatInvalid;
     const auto texture =
@@ -1048,16 +1279,16 @@ MTL::PixelFormat Renderer::getDepthStencilPixelFormat() const {
 }
 
 MTL::RenderCommandEncoder*
-Renderer::getRenderCommandEncoder(CommandBuffer* command_buffer) const {
+Renderer::getRenderCommandEncoderHot44(CommandBuffer* command_buffer) const {
     return command_buffer->getRenderCommandEncoder(
         state.render_pass->getRenderPassDescriptor());
 }
 
-void Renderer::setRenderPipelineState(CommandBuffer* command_buffer) const {
+void Renderer::setRenderPipelineStateHot45(CommandBuffer* command_buffer) const {
     command_buffer->setRenderPipelineState(state.pipeline->getPipeline());
 }
 
-void Renderer::setDepthStencilState(CommandBuffer* command_buffer) {
+void Renderer::setDepthStencilStateHot46(CommandBuffer* command_buffer) {
     // Depth testing without a depth attachment is invalid in Metal
     const bool has_depth =
         getDepthStencilPixelFormat() != MTL::PixelFormatInvalid;
@@ -1074,7 +1305,7 @@ void Renderer::setDepthStencilState(CommandBuffer* command_buffer) {
         depth_stencil_state_cache.find(descriptor));
 }
 
-void Renderer::setVertexBuffer(CommandBuffer* command_buffer, u32 index) {
+void Renderer::setVertexBufferHot47(CommandBuffer* command_buffer, u32 index) {
     ASSERT_DEBUG(index < VERTEX_ARRAY_COUNT, MetalRenderer,
                  "Invalid vertex buffer index {}", index);
 
@@ -1087,7 +1318,7 @@ void Renderer::setVertexBuffer(CommandBuffer* command_buffer, u32 index) {
         ShaderType::Vertex, getVertexBufferIndex(index));
 }
 
-void Renderer::setUniformBuffer(CommandBuffer* command_buffer,
+void Renderer::setUniformBufferHot48(CommandBuffer* command_buffer,
                                 ShaderType shader_type, u32 index) {
     // TODO: get the index from resource mapping
 
@@ -1104,7 +1335,7 @@ void Renderer::setUniformBuffer(CommandBuffer* command_buffer,
         shader_type, index);
 }
 
-void Renderer::setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
+void Renderer::setTextureHot49(CommandBuffer* command_buffer, ShaderType shader_type,
                           u32 index) {
     const auto texture = state.textures[static_cast<u32>(shader_type)][index];
     // Unbind empty slots, otherwise the shader would sample a stale texture
@@ -1121,7 +1352,7 @@ void Renderer::setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
                                    index);
 }
 
-void Renderer::beginCapture() {
+void Renderer::beginCaptureHot50() {
     auto capture_manager = MTL::CaptureManager::sharedCaptureManager();
     auto desc = MTL::CaptureDescriptor::alloc()->init();
     desc->setCaptureObject(device);
@@ -1131,9 +1362,14 @@ void Renderer::beginCapture() {
             MTL::CaptureDestinationDeveloperTools)) {
         desc->setDestination(MTL::CaptureDestinationDeveloperTools);
     } else {
-        // TODO: don't hardcode the directory
+        const char* env_dir = std::getenv("HYDRA_GPU_CAPTURE_DIR");
         const std::string gpu_capture_dir =
-            fmt::format("{}/gpu_captures", CONFIG_INSTANCE.getAppDataPath());
+            env_dir != nullptr
+                ? std::string(env_dir)
+                : fmt::format("{}/gpu_captures",
+                              CONFIG_INSTANCE.getAppDataPath());
+        std::error_code mkdir_error;
+        std::filesystem::create_directories(gpu_capture_dir, mkdir_error);
         if (gpu_capture_dir.empty()) {
             LOG_ERROR(
                 MetalRenderer,
@@ -1160,6 +1396,7 @@ void Renderer::beginCapture() {
             fmt::format("{}/hydra_{}.gputrace", gpu_capture_dir, now_str);
         desc->setDestination(MTL::CaptureDestinationGPUTraceDocument);
         desc->setOutputURL(toNsurl(capture_path));
+        LOG_INFO(MetalRenderer, "GPU capture to {}", capture_path);
     }
 
     NS::Error* error = nullptr;
@@ -1170,12 +1407,13 @@ void Renderer::beginCapture() {
     }
 }
 
-void Renderer::endCapture() {
+void Renderer::endCaptureHot51() {
     auto captureManager = MTL::CaptureManager::sharedCaptureManager();
     captureManager->stopCapture();
+    LOG_INFO(MetalRenderer, "GPU capture stopped");
 }
 
-bool Renderer::canDraw() const {
+bool Renderer::canDrawHot52() const {
     if (state.pipeline->getPipeline() == nullptr) {
         ONCE(LOG_WARN(MetalRenderer, "Pipeline not present, skipping draw"));
         return false;
@@ -1184,7 +1422,7 @@ bool Renderer::canDraw() const {
     return true;
 }
 
-void Renderer::bindDrawState(CommandBuffer* command_buffer) {
+void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
     const auto start = PerfStats::isEnabled()
                            ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
@@ -1197,6 +1435,8 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
     // Culling
     command_buffer->setCullMode(state.cull_mode);
     command_buffer->setFrontFaceWinding(state.front_face_winding);
+    command_buffer->getRenderCommandEncoderUnchecked()->setDepthClipMode(
+        state.depth_clip_mode);
 
     // Stencil reference
     command_buffer->setStencilReferences(state.stencil.front.ref & 0xff,
@@ -1248,19 +1488,26 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
     // Resources
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++)
         setVertexBuffer(command_buffer, i);
+    // Bind only resources declared by the active stage. In particular, do not
+    // walk every texture slot (and its hot-reload trampoline) for every draw.
+    // Used slots still pass through setTexture even when null, clearing stale
+    // bindings before a shader can read them.
     for (u32 shader_type = 0; shader_type < GRAPHICS_SHADER_TYPE_COUNT;
          shader_type++) {
-        for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++)
-            setUniformBuffer(command_buffer, ShaderType(shader_type), i);
-    }
-    // TODO: storage buffers
-    for (u32 shader_type = 0; shader_type < GRAPHICS_SHADER_TYPE_COUNT;
-         shader_type++) {
-        for (u32 i = 0; i < TEXTURE_COUNT; i++)
-            setTexture(command_buffer, ShaderType(shader_type), i);
         const auto shader = static_cast<Shader*>(
             state.pipeline->getDescriptor().shaders[shader_type]);
-        if (shader == nullptr || shader->getSamplerEncoder() == nullptr)
+        if (shader == nullptr)
+            continue;
+        const auto& mapping = shader->getDescriptor().resource_mapping;
+        for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
+            if (mapping.uniform_buffers[i] != invalid<u32>())
+                setUniformBuffer(command_buffer, ShaderType(shader_type), i);
+        }
+        for (const auto& [binding, index] : mapping.textures) {
+            (void)binding;
+            setTexture(command_buffer, ShaderType(shader_type), index);
+        }
+        if (shader->getSamplerEncoder() == nullptr)
             continue;
         const auto sampler_encoder = shader->getSamplerEncoder();
         auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());

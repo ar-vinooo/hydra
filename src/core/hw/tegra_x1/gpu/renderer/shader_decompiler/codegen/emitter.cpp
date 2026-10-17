@@ -167,6 +167,12 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         emitBranchConditional(inst.getOperand(0), inst.getOperand(1).getLabel(),
                               inst.getOperand(2).getLabel());
         break;
+    case ir::Opcode::PushReturn:
+        emitPushReturn(inst.getOperand(0).getLabel());
+        break;
+    case ir::Opcode::ReturnBranch:
+        emitReturnBranch();
+        break;
 
     // Vector
     case ir::Opcode::VectorExtract:
@@ -187,7 +193,10 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
                           inst.getOperand(1).getRawValue<TextureType>(),
                           inst.getOperand(2).getRawValue<TextureSampleFlags>(),
                           inst.getOperand(3), inst.getOperand(4),
-                          inst.getOperand(5), inst.getOperand(6));
+                          inst.getOperand(5), inst.getOperand(6),
+                          inst.getOperand(7), inst.getOperand(8),
+                          inst.getOperand(9), inst.getOperand(10),
+                          inst.getOperand(11).getRawValue<u8>());
         break;
     case ir::Opcode::TextureGather:
         emitTextureGather(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
@@ -198,7 +207,15 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
     case ir::Opcode::TextureQueryDimension:
         emitTextureQueryDimension(inst.getDst(),
                                   inst.getOperand(0).getRawValue<u32>(),
-                                  inst.getOperand(1).getRawValue<u32>());
+                                  inst.getOperand(1).getRawValue<u32>(),
+                                  inst.getOperand(2));
+        break;
+    case ir::Opcode::TextureQueryLod:
+        emitTextureQueryLod(inst.getDst(),
+                            inst.getOperand(0).getRawValue<u32>(),
+                            inst.getOperand(1).getRawValue<TextureType>(),
+                            inst.getOperand(2),
+                            inst.getOperand(3).getRawValue<u32>() != 0);
         break;
 
     // Exit
@@ -240,6 +257,10 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
                          inst.getOperand(2).getRawValue<u32>(),
                          inst.getOperand(3).getRawValue<bool>());
         break;
+    case ir::Opcode::AtomicSharedCas:
+        emitAtomicSharedCas(inst.getDst(), inst.getOperand(0),
+                            inst.getOperand(1), inst.getOperand(2));
+        break;
     case ir::Opcode::Barrier:
         emitBarrier();
         break;
@@ -248,7 +269,13 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
                        inst.getOperand(1).getRawValue<TextureType>(),
                        inst.getOperand(2),
                        {inst.getOperand(3), inst.getOperand(4),
-                        inst.getOperand(5), inst.getOperand(6)});
+                        inst.getOperand(5), inst.getOperand(6)},
+                       inst.getOperand(7).getRawValue<u32>());
+        break;
+    case ir::Opcode::ImageLoad:
+        emitImageLoad(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                      inst.getOperand(1).getRawValue<TextureType>(),
+                      inst.getOperand(2), inst.getOperand(3).getRawValue<u32>());
         break;
     case ir::Opcode::ImageAtomic:
         emitImageAtomic(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
@@ -267,6 +294,12 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         break;
     case ir::Opcode::Shuffle:
         emitShuffle(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
+        break;
+    // Intrinsic
+    case ir::Opcode::Intrinsic:
+        emitIntrinsic(inst.getDst(),
+                      inst.getOperand(0).getRawValue<ir::Intrinsic>(),
+                      std::span<const ir::Value>(inst.getOperands()).subspan(1));
         break;
     }
 }

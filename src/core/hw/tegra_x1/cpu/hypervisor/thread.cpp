@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/cpu/hypervisor/thread.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/stage2_tracker.hpp"
 
 #include <mach/mach_time.h>
 #include <thread>
@@ -343,7 +344,17 @@ void Thread::run() {
                     "BRK instruction");
                 return;
             case ExceptionClass::DataAbortLowerEl: {
-                LOG_FATAL(Hypervisor, "This should not happen");
+                // Stage 2 permission fault from memory tracking. The access
+                // is retried once the page is accessible.
+                const bool is_write = (syndrome & (1ull << 6)) != 0;
+                if (Stage2Tracker::instance().handleFault(
+                        exit->exception.physical_address, is_write))
+                    break;
+                LOG_FATAL(Hypervisor,
+                          "Unhandled stage 2 data abort (PC: {:#x}, VA: {:#x}, "
+                          "PA: {:#x}, ESR: {:#x})",
+                          getReg(HV_REG_PC), exit->exception.virtual_address,
+                          exit->exception.physical_address, syndrome);
                 break;
             }
             case ExceptionClass::BreakpointLowerEl: {

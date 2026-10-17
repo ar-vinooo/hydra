@@ -129,7 +129,9 @@ fragment float4 f(constant float4& color [[buffer(0)]]) { return color; }
         left = {};
         check(merged_owner.expired(),
               "Merged-away buffer freed when last view releases it");
-        check(cache.getCachedBytes() == 48,
+        // Two live entries, each in a 4 KiB snapshot size class: the buffer
+        // merged away is no longer counted
+        check(cache.getCachedBytes() == (snapshots ? 2 * 4096 : 48),
               "Only live merged resources count in cache budget");
         check(renderer.createCpuBufferSnapshot(
                   ztd::Range<uptr>::fromSize(ptr, 65537)) == nullptr,

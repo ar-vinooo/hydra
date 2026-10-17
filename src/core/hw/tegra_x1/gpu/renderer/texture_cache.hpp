@@ -25,6 +25,8 @@ struct TextureStorage {
     // Last time the guest modified this texture, in memory that also contains
     // render targets
     TextureCacheTimePoint cpu_modified_timestamp;
+    // Last GPU write that was copied back to guest memory
+    TextureCacheTimePoint flushed_timestamp;
 
     void markUpdated() { update_timestamp = TextureCacheClock::now(); }
 };
@@ -101,7 +103,6 @@ struct TextureMem {
 };
 
 // TODO: destroy textures
-// TODO: texture readback
 class TextureCache {
   public:
     explicit TextureCache(IRenderer& renderer_) : renderer{renderer_} {}
@@ -115,12 +116,36 @@ class TextureCache {
                        TextureUsage usage);
 
     void invalidateMemory(ztd::Range<uptr> range);
+    // The GPU writes to the range are also in guest memory (written there
+    // directly), so they must not be written back over it
+    void markGpuWritesInGuest(ztd::Range<uptr> range);
+
+    // Copies textures rendered by the GPU in the range back to guest memory,
+    // waiting for the GPU. Engines that read guest memory directly (DMA
+    // copies used for readbacks) would otherwise see stale data.
+    void flushMemory(ICommandBuffer* command_buffer, ztd::Range<uptr> range);
+    // The range is about to be overwritten entirely by guest memory writes:
+    // GPU writes to textures inside it are dropped instead of waiting for a
+    // readback, textures only partially inside it are still flushed
+    void discardGpuWrites(ICommandBuffer* command_buffer,
+                          ztd::Range<uptr> range);
 
     // Returns the format of a depth stencil texture at the same address with
     // the same dimensions and pixel size as the descriptor, if there is one.
     // Games copy depth buffers with the 2D engine using color formats.
     std::optional<TextureFormat>
     findDepthStencilAlias(const TextureDescriptor& descriptor);
+    // Whether a compressed storage overlaps the range (copies through color
+    // formats of the same block size alias them)
+    bool overlapsCompressedStorage(ztd::Range<uptr> range);
+    // Whether a storage overlapping the range has GPU writes that guest memory
+    // does not have yet
+    bool hasUnflushedGpuWrites(ztd::Range<uptr> range);
+
+    // Changes whenever a lookup could return another view or need a
+    // synchronization: GPU writes, invalidations, flushes and new storages.
+    // Engines can reuse a previous lookup while it stays the same.
+    u64 getEpoch() const { return epoch; }
 
     // Debug
     usize getMemoryCount() const { return entries.size(); }
@@ -131,13 +156,29 @@ class TextureCache {
         return it->second;
     }
 
+    // Hot reloadable implementations (core/hot/texture_cache_hot.cpp), call
+    // the functions above instead
+    void invalidateMemoryImpl(ztd::Range<uptr> range);
+    void markGpuWritesInGuestImpl(ztd::Range<uptr> range);
+    void flushMemoryImpl(ICommandBuffer* command_buffer,
+                         ztd::Range<uptr> range);
+    void updateImpl(ICommandBuffer* command_buffer, TextureStorage& storage,
+                    TextureMem& mem, TextureUsage usage);
+    void encodeTextureImpl(ICommandBuffer* command_buffer,
+                           TextureStorage& storage, ztd::Range<uptr> range);
+
   private:
     IRenderer& renderer;
 
     std::mutex mutex;
     std::map<uptr, TextureMem> entries;
+    u64 epoch{0};
 
     static void mergeMemories(TextureMem& mem, TextureMem& other);
+    // Storage keys are hashes of the descriptor that created the storage
+    static std::optional<u32>
+    findStorageKey(TextureGroup& group, const TextureDescriptor& descriptor);
+    static u32 getFreeStorageKey(TextureGroup& group, u32 key);
     ITextureView* addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                               const TextureDescriptor& descriptor,
                               const TextureViewDescriptor& view_descriptor,
@@ -171,10 +212,22 @@ class TextureCache {
     // Helpers
     static u32 getDataHash(const ITexture* texture);
     void decodeTexture(ICommandBuffer* command_buffer, TextureStorage& storage);
-    // TODO: encode texture
+    void encodeTexture(ICommandBuffer* command_buffer, TextureStorage& storage,
+                       ztd::Range<uptr> range);
 
   public:
     REF_GETTER(mutex, getMutex);
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    static void synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
+                                        TextureStorage& storage,
+                                        TextureStorage& other_storage);
+    static void synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
+                                        TextureStorage& storage,
+                                        TextureStorage& other_storage);
+    void decodeTextureHot2(ICommandBuffer* command_buffer,
+                           TextureStorage& storage);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

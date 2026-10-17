@@ -34,8 +34,10 @@ struct State {
     f32 depth_bias_slope{0.0f};
     f32 depth_bias_clamp{0.0f};
     StencilState stencil{};
+    ClearState clear{};
     MTL::CullMode cull_mode{MTL::CullModeNone};
     MTL::Winding front_face_winding{MTL::WindingClockwise};
+    MTL::DepthClipMode depth_clip_mode{MTL::DepthClipModeClip};
     Viewport viewports[VIEWPORT_COUNT];
     Scissor scissors[VIEWPORT_COUNT];
     BufferView index_buffer;
@@ -74,7 +76,7 @@ class Renderer : public IRenderer {
                      float3 src_origin, uint3 src_size, u32 src_level,
                      u32 src_layer, ITextureView* dst, float3 dst_origin,
                      uint3 dst_size, u32 dst_level, u32 dst_layer,
-                     u32 level_count, u32 layer_count) override;
+                     u32 level_count, u32 layer_count, const BlitOptions& options) override;
 
     // Sampler
     SamplerBase* createSampler(const SamplerDescriptor& descriptor) override;
@@ -88,6 +90,9 @@ class Renderer : public IRenderer {
     void bindRenderPass(const RenderPassBase* render_pass) override;
 
     // Clear
+    void setClearState(const ClearState& clear_state) override {
+        state.clear = clear_state;
+    }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
                     u32 layer, u8 mask, const uint4 color) override;
     void clearDepth(ICommandBuffer* command_buffer, u32 layer,
@@ -112,6 +117,10 @@ class Renderer : public IRenderer {
     void setStencilState(const StencilState& stencil) override;
     void setCullState(bool enabled, engines::CullFaceMode mode,
                       engines::Winding front_face) override;
+    void setDepthClamp(bool enabled) override {
+        state.depth_clip_mode =
+            enabled ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip;
+    }
     void debugDumpTexture(ICommandBuffer* command_buffer, ITextureView* view,
                           const std::string& path) override;
     void debugDumpTextureLevel(ICommandBuffer* command_buffer,
@@ -196,6 +205,10 @@ class Renderer : public IRenderer {
     // Depth stencil states
     MTL::DepthStencilState* depth_stencil_state_always_and_write;
     MTL::DepthStencilState* depth_stencil_state_clear_stencil;
+    MTL::DepthStencilState* depth_stencil_state_disabled{nullptr};
+    // Raster state of clears: the clear area only, no depth bias or culling
+    void beginClear(CommandBuffer* command_buffer,
+                    MTL::DepthStencilState* depth_stencil_state);
 
     // Samplers
     MTL::SamplerState* nearest_sampler;
@@ -218,6 +231,91 @@ class Renderer : public IRenderer {
     GETTER(device, getDevice);
     REF_GETTER(blit_pipeline_cache, getBlitPipelineCache);
     GETTER(linear_sampler, getLinearSampler);
+
+  public:
+    // ABI-stable implementations selected by the live module.
+    void setSurfaceHot0(void* surface);
+    ISurfaceCompositor* acquireNextSurfaceHot1();
+    BufferBase* createBufferHot2(u64 size);
+    BufferBase* createCpuBufferSnapshotHot3(ztd::Range<uptr> range);
+    BufferBase* allocateTemporaryBufferHot4(const u64 size);
+    BufferBase* allocateTextureUploadBufferHot5(u64 size);
+    void retireTextureUploadBufferHot6(ICommandBuffer* command_buffer,
+                                       BufferBase* buffer);
+    void freeTemporaryBufferHot7(BufferBase* buffer);
+    ITexture* createTextureHot8(const TextureDescriptor& descriptor);
+    void blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src,
+                         float3 src_origin, uint3 src_size, u32 src_level,
+                         u32 src_layer, ITextureView* dst, float3 dst_origin,
+                         uint3 dst_size, u32 dst_level, u32 dst_layer,
+                         u32 level_count, u32 layer_count, const BlitOptions& options);
+    SamplerBase* createSamplerHot10(const SamplerDescriptor& descriptor);
+    ICommandBuffer* createCommandBufferHot11();
+    RenderPassBase*
+    createRenderPassHot12(const RenderPassDescriptor& descriptor);
+    void bindRenderPassHot13(const RenderPassBase* render_pass);
+    void clearColorHot14(ICommandBuffer* command_buffer, u32 render_target_id,
+                         u32 layer, u8 mask, const uint4 color);
+    void clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
+                         const float value);
+    void clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
+                           const u32 value);
+    ShaderBase* createShaderHot17(const ShaderDescriptor& descriptor);
+    PipelineBase* createPipelineHot18(const PipelineDescriptor& descriptor);
+    void bindPipelineHot19(const PipelineBase* pipeline);
+    void setDepthTestEnabledHot20(bool enabled);
+    void setDepthWriteEnabledHot21(bool enabled);
+    void debugDumpTextureHot22(ICommandBuffer* command_buffer,
+                               ITextureView* view, const std::string& path);
+    void debugDumpTextureLevelHot23(ICommandBuffer* command_buffer,
+                                    ITextureView* view, u32 level,
+                                    const std::string& path);
+    void setStencilStateHot24(const StencilState& stencil);
+    bool hasStencilAttachmentHot25() const;
+    void setCullStateHot26(bool enabled, engines::CullFaceMode mode,
+                           engines::Winding front_face);
+    void setDepthBiasHot27(f32 constant, f32 slope, f32 clamp);
+    void setBlendConstantHot28(const float4 color);
+    void setDepthCompareOpHot29(engines::CompareOp op);
+    void setViewportHot30(u32 index, const Viewport& viewport);
+    void setScissorHot31(u32 index, const Scissor& scissor);
+    void bindVertexBufferHot32(const BufferView& buffer, u32 index);
+    void bindIndexBufferHot33(const BufferView& index_buffer,
+                              engines::IndexType index_type);
+    void bindUniformBufferHot34(const BufferView& buffer,
+                                ShaderType shader_type, u32 index);
+    void bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
+                          ShaderType shader_type, u32 index);
+    void unbindUniformBuffersHot36(ShaderType shader_type);
+    void unbindTexturesHot37(ShaderType shader_type);
+    void drawHot38(ICommandBuffer* command_buffer,
+                   const engines::PrimitiveType primitive_type, const u32 start,
+                   const u32 count, const u32 base_instance,
+                   const u32 instance_count);
+    void drawIndexedHot39(ICommandBuffer* command_buffer,
+                          const engines::PrimitiveType primitive_type,
+                          const u32 start, const u32 count,
+                          const u32 base_vertex, const u32 base_instance,
+                          const u32 instance_count);
+    f64 debugSyncCommandBufferHot40(ICommandBuffer* command_buffer);
+    void dispatchComputeHot41(ICommandBuffer* command_buffer,
+                              const ComputeDispatch& dispatch);
+    void getColorPixelFormatsHot42(
+        MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const;
+    MTL::PixelFormat getDepthStencilPixelFormatHot43() const;
+    MTL::RenderCommandEncoder*
+    getRenderCommandEncoderHot44(CommandBuffer* command_buffer) const;
+    void setRenderPipelineStateHot45(CommandBuffer* command_buffer) const;
+    void setDepthStencilStateHot46(CommandBuffer* command_buffer);
+    void setVertexBufferHot47(CommandBuffer* command_buffer, u32 index);
+    void setUniformBufferHot48(CommandBuffer* command_buffer,
+                               ShaderType shader_type, u32 index);
+    void setTextureHot49(CommandBuffer* command_buffer, ShaderType shader_type,
+                         u32 index);
+    void beginCaptureHot50();
+    void endCaptureHot51();
+    bool canDrawHot52() const;
+    void bindDrawStateHot53(CommandBuffer* command_buffer);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

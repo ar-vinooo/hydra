@@ -47,7 +47,7 @@ BlitPipelineCache::BlitPipelineCache(MTL::Device* device_) : device{device_} {
 void BlitPipelineCache::destroy() { pipeline_descriptor->release(); }
 
 MTL::RenderPipelineState*
-BlitPipelineCache::create(const BlitPipelineDescriptor& descriptor) {
+BlitPipelineCache::createHot0(const BlitPipelineDescriptor& descriptor) {
     // Source
     auto shader_source = R"(
         #include <metal_stdlib>
@@ -65,29 +65,54 @@ BlitPipelineCache::create(const BlitPipelineDescriptor& descriptor) {
             float opacity;
         };
 
-        // TODO: choose the correct color data type
-        fragment float4 fragment_blit(VertexBlitOut in [[stage_in]], constant BlitParams& params [[buffer(0)]], texture2d<float> tex [[texture(0)]], sampler samplr [[sampler(0)]]) {
+        fragment DST4 fragment_blit(VertexBlitOut in [[stage_in]], constant BlitParams& params [[buffer(0)]], texture2d<SRC_T> tex [[texture(0)]], sampler samplr [[sampler(0)]]) {
             float2 tex_coord = params.src_offset + in.tex_coord * params.src_scale;
-            float4 color = tex.sample(samplr, tex_coord);
-            color.a *= params.opacity;
-            return color;
+            SAMPLE
+            OPACITY
+            return DST4(color);
         }
     )";
+    // Integer textures can't be filtered, they are read texel by texel
+    static const char* const types[] = {"float", "uint", "int"};
+    std::string source = shader_source;
+    const auto replace = [&](const std::string& from, const std::string& to) {
+        for (auto pos = source.find(from); pos != std::string::npos;
+             pos = source.find(from, pos + to.size()))
+            source.replace(pos, from.size(), to);
+    };
+    const std::string src_type = types[descriptor.src_type];
+    replace("SRC_T", src_type);
+    replace("DST4", std::string(types[descriptor.dst_type]) + "4");
+    if (descriptor.src_type == 0) {
+        replace("SAMPLE", "float4 color = tex.sample(samplr, tex_coord);");
+    } else {
+        replace("SAMPLE",
+                "int2 size = int2(tex.get_width(), tex.get_height());"
+                " int2 texel = clamp(int2(floor(tex_coord * float2(size))),"
+                " int2(0), size - 1);"
+                " " + src_type + "4 color = tex.read(uint2(texel));");
+    }
+    replace("OPACITY", descriptor.src_type == 0 && descriptor.dst_type == 0
+                           ? "color.a *= params.opacity;"
+                           : "");
 
     // Function
     auto fragment_blit =
-        createFunctionFromSource(device, shader_source, "fragment_blit");
+        createFunctionFromSource(device, source.c_str(), "fragment_blit");
 
     // Pipeline
     pipeline_descriptor->setFragmentFunction(fragment_blit);
     auto color_attachment = pipeline_descriptor->colorAttachments()->object(0);
     color_attachment->setPixelFormat(descriptor.pixel_format);
-    // The console display ignores alpha. Keep the drawable's cleared alpha of
+    // Guest texture copies include alpha. The console display ignores alpha;
+    // keep the drawable's cleared alpha of
     // 1 so transparent game pixels do not show the window behind the view
     // (CALayer.opaque is not honored for layers hosted by SwiftUI views).
-    color_attachment->setWriteMask(MTL::ColorWriteMaskRed |
-                                   MTL::ColorWriteMaskGreen |
-                                   MTL::ColorWriteMaskBlue);
+    color_attachment->setWriteMask(
+        descriptor.copy_alpha
+            ? MTL::ColorWriteMaskAll
+            : (MTL::ColorWriteMaskRed | MTL::ColorWriteMaskGreen |
+               MTL::ColorWriteMaskBlue));
     if (descriptor.transparent) {
         color_attachment->setBlendingEnabled(true);
         color_attachment->setRgbBlendOperation(MTL::BlendOperationAdd);
@@ -114,9 +139,12 @@ BlitPipelineCache::create(const BlitPipelineDescriptor& descriptor) {
     return pipeline;
 }
 
-u32 BlitPipelineCache::hash(const BlitPipelineDescriptor& descriptor) {
+u32 BlitPipelineCache::hashHot1(const BlitPipelineDescriptor& descriptor) {
     return static_cast<u32>(descriptor.pixel_format) |
-           (static_cast<u32>(descriptor.transparent) << 12);
+           (static_cast<u32>(descriptor.transparent) << 12) |
+           (static_cast<u32>(descriptor.copy_alpha) << 13) |
+           (static_cast<u32>(descriptor.src_type) << 14) |
+           (static_cast<u32>(descriptor.dst_type) << 16);
 }
 
 void BlitPipelineCache::destroyElement(MTL::RenderPipelineState* pipeline) {

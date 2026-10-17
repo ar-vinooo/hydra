@@ -110,6 +110,23 @@ void check(bool value, const char* message) {
 }
 int main() {
     try {
+        // Vertex attribute register layout: UE4 vertex colors (B8G8R8A8)
+        // set the BGRA flag in bit 31
+        {
+            const auto attrib = std::bit_cast<engines::VertexAttribState>(
+                u32{0x80000000} | (u32{2} << 27) | (u32{0x0a} << 21) |
+                (u32{0x24} << 7) | u32{3});
+            check(attrib.bgra, "Vertex attribute BGRA flag is bit 31");
+            check(attrib.type == engines::VertexAttribType::Unorm &&
+                      attrib.size == engines::VertexAttribSize::_4x8 &&
+                      attrib.offset == 0x24 && attrib.buffer_id == 3 &&
+                      !attrib.is_fixed,
+                  "Vertex attribute fields decode");
+            check(!std::bit_cast<engines::VertexAttribState>(u32{0x40000000})
+                       .bgra,
+                  "Vertex attribute bit 30 is not BGRA");
+        }
+
         std::array<u8, 4096> code{};
         GMmu gpu_mmu(nullptr);
         gpu_mmu.map(0x10000, {reinterpret_cast<uptr>(code.data()), code.size()});

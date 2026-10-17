@@ -10,6 +10,7 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 // Shared memory
 void emitLds(DecoderContext& context, instruction_t inst);
 void emitAtoms(DecoderContext& context, instruction_t inst);
+void emitAtomsCas(DecoderContext& context, instruction_t inst);
 void emitSts(DecoderContext& context, instruction_t inst);
 
 // Local memory
@@ -21,6 +22,8 @@ void emitBar(DecoderContext& context, instruction_t inst);
 
 // Surfaces
 void emitSust(DecoderContext& context, instruction_t inst);
+void emitSuld(DecoderContext& context, instruction_t inst);
+void emitSured(DecoderContext& context, instruction_t inst);
 void emitSuatom(DecoderContext& context, instruction_t inst);
 
 // Integer

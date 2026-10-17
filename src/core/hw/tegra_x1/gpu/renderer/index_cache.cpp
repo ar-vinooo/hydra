@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 
 #include <cstddef>
+#include <cstring>
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
@@ -9,182 +10,195 @@ namespace hydra::hw::tegra_x1::gpu::renderer {
 
 namespace {
 
-inline void decode_u8_indices(uptr in, uptr out, u32 count) {
-    for (u32 i = 0; i < count; i++)
-        reinterpret_cast<u16*>(out)[i] = reinterpret_cast<u8*>(in)[i];
-}
+constexpr usize MAX_CACHED_INDEX_BUFFERS = 4096;
 
-inline u32 get_index_count_quads_to_triangles(u32 count) {
-    return count / 4 * 6;
-}
-
-inline engines::PrimitiveType get_primitive_type_quads_to_triangles() {
-    return engines::PrimitiveType::Triangles;
-}
-
-inline u32 get_index_count_triangle_fan_to_triangle_strip(u32 count) {
-    return count;
-}
-
-inline engines::PrimitiveType
-get_primitive_type_triangle_fan_to_triangle_strip() {
-    return engines::PrimitiveType::TriangleStrip;
-}
-
-#define GET_INDEX(idx, index)                                                  \
-    switch (index_type) {                                                      \
-    case engines::IndexType::UInt8:                                            \
-        idx = GET_INDEX_IMPL(u8, index);                                       \
-        break;                                                                 \
-    case engines::IndexType::UInt16:                                           \
-        idx = GET_INDEX_IMPL(u16, index);                                      \
-        break;                                                                 \
-    case engines::IndexType::UInt32:                                           \
-        idx = GET_INDEX_IMPL(u32, index);                                      \
-        break;                                                                 \
-    default:                                                                   \
-        unreachable();                                                         \
+// Primitives Metal draws natively, with indices it supports
+bool needsDecoding(const IndexDescriptor& descriptor) {
+    switch (descriptor.primitive_type) {
+    case engines::PrimitiveType::Quads:
+    case engines::PrimitiveType::QuadStrip:
+    case engines::PrimitiveType::TriangleFan:
+    case engines::PrimitiveType::Polygon:
+    case engines::PrimitiveType::LineLoop:
+        return true;
+    default:
+        return descriptor.mem_range &&
+               descriptor.type == engines::IndexType::UInt8;
     }
+}
 
-#define ADD_INDEX(index)                                                       \
-    switch (index_type) {                                                      \
-    case engines::IndexType::UInt8:                                            \
-        *reinterpret_cast<u8*>(out) = static_cast<u8>(index);                  \
-        out += sizeof(u16);                                                    \
-        break;                                                                 \
-    case engines::IndexType::UInt16:                                           \
-        *reinterpret_cast<u16*>(out) = static_cast<u16>(index);                \
-        out += sizeof(u16);                                                    \
-        break;                                                                 \
-    case engines::IndexType::UInt32:                                           \
-        *reinterpret_cast<u32*>(out) = index;                                  \
-        out += sizeof(u32);                                                    \
-        break;                                                                 \
-    default:                                                                   \
-        break;                                                                 \
+engines::PrimitiveType getDecodedPrimitiveType(engines::PrimitiveType type) {
+    switch (type) {
+    case engines::PrimitiveType::Quads:
+    case engines::PrimitiveType::QuadStrip:
+    case engines::PrimitiveType::TriangleFan:
+    case engines::PrimitiveType::Polygon:
+        return engines::PrimitiveType::Triangles;
+    case engines::PrimitiveType::LineLoop:
+        return engines::PrimitiveType::LineStrip;
+    default:
+        return type;
     }
+}
 
-#define ADD_INDEX_AUTO(index)                                                  \
-    {                                                                          \
-        u32 idx;                                                               \
-        GET_INDEX(idx, index);                                                 \
-        ADD_INDEX(idx);                                                        \
+u32 getDecodedCount(engines::PrimitiveType type, u32 count) {
+    switch (type) {
+    case engines::PrimitiveType::Quads:
+        return count / 4 * 6;
+    case engines::PrimitiveType::QuadStrip:
+        return count >= 4 ? (count - 2) / 2 * 6 : 0;
+    case engines::PrimitiveType::TriangleFan:
+    case engines::PrimitiveType::Polygon:
+        return count >= 3 ? (count - 2) * 3 : 0;
+    case engines::PrimitiveType::LineLoop:
+        return count > 1 ? count + 1 : count;
+    default:
+        return count;
     }
+}
 
-#define DEFINE_DECODER_PROTOTYPE(name)                                         \
-    void decode_##name##_auto([[maybe_unused]] uptr in_unused, uptr out,       \
-                              engines::IndexType index_type, u32 count)
-#define GET_INDEX_IMPL(type, index) (index)
+// Calls emit with the position of each vertex of the decoded primitives,
+// keeping the winding of the guest primitives
+template <typename Emit>
+void forEachDecodedVertex(engines::PrimitiveType type, u32 count, Emit emit) {
+    switch (type) {
+    case engines::PrimitiveType::Quads:
+        for (u32 base = 0; base + 3 < count; base += 4) {
+            for (const u32 offset : {0u, 1u, 2u, 0u, 2u, 3u})
+                emit(base + offset);
+        }
+        break;
+    case engines::PrimitiveType::QuadStrip:
+        // Quad i is made of the vertices 2i, 2i + 1, 2i + 3 and 2i + 2
+        for (u32 base = 0; base + 3 < count; base += 2) {
+            for (const u32 offset : {0u, 1u, 3u, 0u, 3u, 2u})
+                emit(base + offset);
+        }
+        break;
+    case engines::PrimitiveType::TriangleFan:
+    case engines::PrimitiveType::Polygon:
+        for (u32 i = 1; i + 1 < count; i++) {
+            emit(0);
+            emit(i);
+            emit(i + 1);
+        }
+        break;
+    case engines::PrimitiveType::LineLoop:
+        for (u32 i = 0; i < count; i++)
+            emit(i);
+        if (count > 1)
+            emit(0);
+        break;
+    default:
+        for (u32 i = 0; i < count; i++)
+            emit(i);
+        break;
+    }
+}
 
-#include "core/hw/tegra_x1/gpu/renderer/index_decoders.inc"
+u32 readIndex(uptr in, engines::IndexType type, u32 position) {
+    switch (type) {
+    case engines::IndexType::UInt8:
+        return reinterpret_cast<const u8*>(in)[position];
+    case engines::IndexType::UInt16:
+        return reinterpret_cast<const u16*>(in)[position];
+    default:
+        return reinterpret_cast<const u32*>(in)[position];
+    }
+}
 
-#undef GET_INDEX_IMPL
-#undef DEFINE_DECODER_PROTOTYPE
-
-#define DEFINE_DECODER_PROTOTYPE(name)                                         \
-    void decode_##name(uptr in, uptr out, engines::IndexType index_type,       \
-                       u32 count)
-#define GET_INDEX_IMPL(type, index) reinterpret_cast<type*>(in)[index]
-
-#include "core/hw/tegra_x1/gpu/renderer/index_decoders.inc"
-
-#undef GET_INDEX_IMPL
-#undef DEFINE_DECODER_PROTOTYPE
+bool isSameDescriptor(const IndexDescriptor& a, const IndexDescriptor& b) {
+    if (a.type != b.type || a.primitive_type != b.primitive_type ||
+        a.count != b.count || a.mem_range.has_value() != b.mem_range.has_value())
+        return false;
+    return !a.mem_range ||
+           (a.mem_range->getBegin() == b.mem_range->getBegin() &&
+            a.mem_range->getEnd() == b.mem_range->getEnd());
+}
 
 } // namespace
 
-IndexCache::~IndexCache() {
-    for (auto& [key, index_buffer] : cache)
-        renderer.freeTemporaryBuffer(index_buffer);
-}
+IndexCache::~IndexCache() = default;
 
-BufferView IndexCache::decode(ICommandBuffer* command_buffer,
+BufferView IndexCache::decodeHot0(ICommandBuffer* command_buffer,
                               const IndexDescriptor& descriptor,
                               engines::IndexType& out_type,
                               engines::PrimitiveType& out_primitive_type,
                               u32& out_count) {
-#define PRIMITIVE_TYPE_SWITCH(macro, u8_index_macro)                           \
-    switch (descriptor.primitive_type) {                                       \
-    case engines::PrimitiveType::Quads:                                        \
-        /* TODO: check for quads support */                                    \
-        macro(quads_to_triangles);                                             \
-        break;                                                                 \
-    case engines::PrimitiveType::TriangleFan:                                  \
-        /* TODO: check for triangle fan support */                             \
-        macro(triangle_fan_to_triangle_strip);                                 \
-        break;                                                                 \
-    default:                                                                   \
-        /* TODO: check for U8 support */                                       \
-        if (descriptor.type == engines::IndexType::UInt8) {                    \
-            u8_index_macro();                                                  \
-            break;                                                             \
-        } else {                                                               \
-            if (descriptor.mem_range)                                          \
-                return renderer.getBufferCache().get(command_buffer,           \
-                                                     *descriptor.mem_range);   \
-            else                                                               \
-                return BufferView();                                           \
-        }                                                                      \
-    }
-
     out_type = descriptor.type;
     out_primitive_type = descriptor.primitive_type;
     out_count = descriptor.count;
-
-#define GET_PARAMS(name)                                                       \
-    out_primitive_type = get_primitive_type_##name();                          \
-    out_count = get_index_count_##name(descriptor.count)
-
-#define GET_PARAMS_U8_INDEX() out_type = engines::IndexType::UInt16;
-
-    // Returns src index buffer if no decoding is needed
-    PRIMITIVE_TYPE_SWITCH(GET_PARAMS, GET_PARAMS_U8_INDEX)
-
-    switch (out_count) {
-    case 0u ... 0xffu:
-        // TODO: check for u8 support
-        out_type = engines::IndexType::UInt16;
-        break;
-    case 0x100u ... 0xffffu:
-        out_type = engines::IndexType::UInt16;
-        break;
-    default:
-        out_type = engines::IndexType::UInt32;
-        break;
+    if (!needsDecoding(descriptor)) {
+        if (descriptor.mem_range)
+            return renderer.getBufferCache().get(command_buffer,
+                                                 *descriptor.mem_range);
+        return BufferView();
     }
 
-    const auto hash_value = hash(descriptor);
-    auto& index_buffer = cache[hash_value];
-    if (index_buffer != nullptr)
-        return BufferView{index_buffer};
-
-    const auto index_size = getIndexTypeSize(out_type);
-    index_buffer = renderer.allocateTemporaryBuffer(
-        static_cast<u64>(out_count) * static_cast<u64>(index_size));
-    uptr in_ptr = 0x0;
+    out_primitive_type = getDecodedPrimitiveType(descriptor.primitive_type);
+    out_count = getDecodedCount(descriptor.primitive_type, descriptor.count);
+    // Generated indices are vertex positions, below the vertex count
     if (descriptor.mem_range)
-        in_ptr = descriptor.mem_range->getBegin();
-    auto out_ptr = index_buffer->getPtr();
+        out_type = descriptor.type == engines::IndexType::UInt32
+                       ? engines::IndexType::UInt32
+                       : engines::IndexType::UInt16;
+    else
+        out_type = descriptor.count > 0x10000 ? engines::IndexType::UInt32
+                                              : engines::IndexType::UInt16;
+    if (out_count == 0)
+        return BufferView();
 
-#define DECODE(name) decode_##name(in_ptr, out_ptr, out_type, descriptor.count)
+    const auto* source =
+        descriptor.mem_range
+            ? reinterpret_cast<const u8*>(descriptor.mem_range->getBegin())
+            : nullptr;
+    const usize source_size =
+        descriptor.mem_range ? descriptor.mem_range->getSize() : 0;
 
-#define DECODE_MACRO_AUTO(name) DECODE(name##_auto);
-#define DECODE_MACRO(name) DECODE(name);
+    // Buffers in use stay alive: Metal retains what commands reference
+    if (cache.size() >= MAX_CACHED_INDEX_BUFFERS)
+        cache.clear();
+    const auto hash_value = hash(descriptor);
+    auto& entry = cache[hash_value];
+    if (entry.buffer != nullptr &&
+        isSameDescriptor(entry.descriptor, descriptor) &&
+        entry.source.size() == source_size &&
+        (source_size == 0 ||
+         std::memcmp(entry.source.data(), source, source_size) == 0))
+        return BufferView{entry.buffer};
 
-#define DECODE_MACRO_AUTO_U8_INDEX() unreachable();
-#define DECODE_MACRO_U8_INDEX()                                                \
-    decode_u8_indices(in_ptr, out_ptr, descriptor.count);
+    // Deleted directly: views can outlive the renderer's backend
+    const auto index_size = getIndexTypeSize(out_type);
+    std::shared_ptr<BufferBase> index_buffer(renderer.allocateTemporaryBuffer(
+        static_cast<u64>(out_count) * static_cast<u64>(index_size)));
+    entry.descriptor = descriptor;
+    entry.source.assign(source, source + source_size);
+    entry.buffer = index_buffer;
 
+    auto out = index_buffer->getPtr();
+    const auto write = [&](u32 index) {
+        if (out_type == engines::IndexType::UInt32) {
+            *reinterpret_cast<u32*>(out) = index;
+            out += sizeof(u32);
+        } else {
+            *reinterpret_cast<u16*>(out) = static_cast<u16>(index);
+            out += sizeof(u16);
+        }
+    };
     if (descriptor.mem_range) {
-        PRIMITIVE_TYPE_SWITCH(DECODE_MACRO, DECODE_MACRO_U8_INDEX)
+        const uptr in = descriptor.mem_range->getBegin();
+        forEachDecodedVertex(descriptor.primitive_type, descriptor.count,
+                             [&](u32 position) {
+                                 write(readIndex(in, descriptor.type, position));
+                             });
     } else {
-        PRIMITIVE_TYPE_SWITCH(DECODE_MACRO_AUTO, DECODE_MACRO_AUTO_U8_INDEX)
+        forEachDecodedVertex(descriptor.primitive_type, descriptor.count, write);
     }
 
     return BufferView{index_buffer};
-} // namespace hydra::hw::tegra_x1::gpu::renderer
+}
 
-u32 IndexCache::hash(const IndexDescriptor& descriptor) {
+u32 IndexCache::hashHot1(const IndexDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
     hash.add(descriptor.type);
     hash.add(descriptor.primitive_type);
