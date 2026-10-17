@@ -199,9 +199,10 @@ TextureFormatInfo texture_format_infos[] = {
     COLOR_FORMAT(4, 1, 1),         // BGR10A2Unorm
     DEPTH_STENCIL_FORMAT(4, 1, 1), // S8Uint_Z24Unorm
     COLOR_FORMAT(2, 1, 1),         // R1G5B5A5Unorm
+    COLOR_FORMAT(1, 1, 1),         // RG4Unorm (expanded to RG8 on the host)
 };
 static_assert(std::size(texture_format_infos) ==
-              static_cast<usize>(TextureFormat::R1G5B5A5Unorm) + 1);
+              static_cast<usize>(TextureFormat::RG4Unorm) + 1);
 
 #undef DEPTH_STENCIL_FORMAT
 #undef COLOR_FORMAT
@@ -211,6 +212,37 @@ static_assert(std::size(texture_format_infos) ==
 
 const TextureFormatInfo& getTextureFormatInfo(TextureFormat format) {
     return texture_format_infos[static_cast<usize>(format)];
+}
+
+TextureFormat getHostTextureFormat(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::RGB32Float: return TextureFormat::RGBA32Float;
+    case TextureFormat::RGB32Uint: return TextureFormat::RGBA32Uint;
+    case TextureFormat::RGB32Sint: return TextureFormat::RGBA32Sint;
+    case TextureFormat::RG4Unorm: return TextureFormat::RG8Unorm;
+    default: return format;
+    }
+}
+
+void expandTexturePixels(TextureFormat format, const u8* guest, u8* host,
+                         usize pixel_count) {
+    if (format == TextureFormat::RG4Unorm) {
+        for (usize i = 0; i < pixel_count; ++i) {
+            host[i * 2] = static_cast<u8>((guest[i] & 15) * 17);
+            host[i * 2 + 1] = static_cast<u8>((guest[i] >> 4) * 17);
+        }
+    } else if (format == TextureFormat::RGB32Float ||
+               format == TextureFormat::RGB32Uint ||
+               format == TextureFormat::RGB32Sint) {
+        const u32 alpha = format == TextureFormat::RGB32Float ? 0x3f800000u : 1u;
+        for (usize i = 0; i < pixel_count; ++i) {
+            std::memcpy(host + i * 16, guest + i * 12, 12);
+            std::memcpy(host + i * 16 + 12, &alpha, sizeof(alpha));
+        }
+    } else {
+        std::memcpy(host, guest,
+                    pixel_count * getTextureFormatInfo(format).bytes_per_block);
+    }
 }
 
 TextureFormat toTextureFormat(NvColorFormat color_format) {
@@ -472,6 +504,10 @@ TextureFormat toTextureFormatUncached(const ImageFormatWord image_format_word,
     IMAGE_FORMAT_CASE(R16, Sint, Sint, Sint, Sint, R16Sint)
     IMAGE_FORMAT_CASE(R32, Uint, Uint, Uint, Uint, R32Uint)
     IMAGE_FORMAT_CASE(R32, Sint, Sint, Sint, Sint, R32Sint)
+    IMAGE_FORMAT_CASE(RGB32, Float, Float, Float, Float, RGB32Float)
+    IMAGE_FORMAT_CASE(RGB32, Uint, Uint, Uint, Uint, RGB32Uint)
+    IMAGE_FORMAT_CASE(RGB32, Sint, Sint, Sint, Sint, RGB32Sint)
+    IMAGE_FORMAT_CASE(GR4, Unorm, Unorm, Unorm, Unorm, RG4Unorm)
     IMAGE_FORMAT_CASE(R32G32, Float, Float, Float, Float, RG32Float)
     IMAGE_FORMAT_CASE(R32G32, Uint, Uint, Uint, Uint, RG32Uint)
     IMAGE_FORMAT_CASE(R32G32, Sint, Sint, Sint, Sint, RG32Sint)

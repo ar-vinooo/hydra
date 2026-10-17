@@ -32,7 +32,7 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [x] CLAMP_OGL → border with linear filtering, edge with nearest; nearest sampler variant for integer textures; no per-sampler logs
 - [x] Cross-format texture copies: same format blit, same texel size via view, single-plane depth/color via buffer, others skipped with log (TEX D-5)
 - [x] Alpha test (func/ref in fragment shader key, discard on RT0 alpha)
-- [x] Viewport: LOWER_LEFT offset flips by surface height, scissor flipped, viewport transform disable (window-space VS positions converted in the shader, tested), depth range defaults 0..1 + clamp (3D-FE B18-B20)
+- [x] Viewport (window-space path is NOT selected by register 0x64B, see README): LOWER_LEFT offset flips by surface height, scissor flipped, viewport transform disable (window-space VS positions converted in the shader, tested), depth range defaults 0..1 + clamp (3D-FE B18-B20)
 - [x] SSCALED attributes signed; vertex sizes G8R8/X8B8G8R8/A8; compact draws 0x485/0x486 and 0x5F9-0x5FE (3D-FE B9 partly, B21, B22)
 - [x] Dual-source blending: SRC1 factors on RT0 export shader output 1 as `color(0), index(1)` (3D-BE B8)
 - [x] 32-bit signed IR arithmetic wraps through unsigned bits (no signed-overflow UB in MSL)
@@ -42,7 +42,7 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 
 - [x] DMA: semaphores (1/4 word releases), BL→BL, transfer NONE; puller semaphores + host fences behind `HYDRA_GPU_FENCES` (default off)
 - [x] Control flow CAL/RET/PRET/PCNT/CONT; TMML; SULD/SURED/SUST.D/SUATOM variants
-- [x] Conditional rendering TRUE/FALSE/override (compare modes still need visibility buffers)
+- [x] Local conditional rendering TRUE/FALSE/CONDITIONAL/EQ/NE and override; comparison data is read across mappings and checked against real query reports.
 - [x] 2D: signed fixed point, exact du/dx extents, SAMPLE_MODE filter, integer blit pipelines, no source layer from word 0x90
 - [x] Shader corpus tool (`hydra-shader-corpus-tests`)
 
@@ -52,19 +52,29 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - hydra-xci-tests FIXTURES: the XCI part needs `prod.keys` in the fixture dir (fails there by design here); `--check-gpu-memory` aborts on DiskFile("") during system init (environment)
 
 ## P1 — widespread correctness
-- [ ] Primitive restart index remap / disable (3D-FE B23); inline index draws 0x57A/0x57C/0x4C1 and DRAW_AUTO (B9)
-- [ ] ALU: FMZ; IADD3/ISCADD/LEA in u32; BFE signed replicate for offset >= 32; IADD32I.PO
-- [ ] Exact sampler border colors (shader emulation, TEX D-9); unnormalized coordinates (TEX P2-10)
-- [ ] Global memory + SSBO end to end
-- [ ] Report semaphores deferred to completion, real occlusion counts
-- [ ] 2D: sample origin CORNER, clip rectangle, ROP/operations (SRCCOPY only), 2D slices
-- [ ] DMA slices; PEXIT/JMP; TXD dims, TEX AOFFI
-- [ ] Buffer queue rewrite (services B9-B13), vsync 60 Hz pacing (B14)
+- [x] Indexed primitive restart enable/custom index (3D-FE B23): segmented assembly for u8/u16/u32, disabled maximum-index preservation, cache identity; native fixed-index u16/u32 strips retained. Decoder tests pass; gameplay pending. See `primitive-restart-2026-10-17.md`.
+- [x] Inline index draws 0x57A/0x57C/0x4C1: unpack u32/u16/u8 words, accumulate until END, submit as u32 indices through the shared indexed path. Method/lifecycle tests pass with rasterization disabled; pixel coverage pending.
+- [ ] Restart topology-change modes, inline alignment controls, DRAW_AUTO (needs transform feedback). Non-indexed restart is a hardware no-op.
+- [x] ALU: FMZ for FMUL/FFMA/HMUL2/HFMA2 operand variants; IADD3/ISCADD/LEA u32 overflow regression tests; BFE signed replicate for offset >= 32 + CC; IADD32I.PO decoder mask. Metal result tests pass. Float rounding/FTZ/CC completeness remains outside this item.
+- [x] Unnormalized TIC coordinates specialized in graphics/compute shaders; TEX/gather coordinates, explicit TXD gradients and TMML LOD coordinates scale by texture dimensions. TEX/TXD result tests and fragment TMML compilation pass. Cube coordinates retain direction semantics.
+- [ ] Exact sampler border colors (shader emulation, TEX D-9)
+- [x] Global memory + SSBO: LDG/STG/ATOM/RED/ATOM.CAS via NVN descriptor tracking, guest-memory aliasing, bounds-checked MSL, buffer-cache coherence for GPU-written ranges (`global-memory-2026-10-17.md`, `fp64-reports-2026-10-17.md`). Open: texture-cache invalidation, 64-bit atomics, indirect descriptors. No corpus shader uses it yet.
+- [x] Completion-ordered payload/ZPASS reports and real Metal occlusion counts (0x2/0x15). Register 0x545 gates counting; reset epochs, indexed draws, cross-pass/submission accumulation, page rollover/folding, report sizes/mapping boundaries and conditional comparisons have tests. Reports currently wait for GPU completion.
+- [x] Report semaphore acquire (bounded wait) and reduction (`fp64-reports-2026-10-17.md`).
+- [ ] Report awaken/trap, other report counters, asynchronous report publication with owned guest-memory lifetime.
+- [x] 2D clip rectangles and destination bounds preserve scaled/mirrored source coordinates; CORNER follows the reference whole-texel derivative correction, preserving 1:1 alignment. Geometry tests pass; gameplay pending.
+- [x] 2D: binary ROP truth tables on raw copies, volume slices, overlapping copies (Codex; see `queue-vsync-slices-2026-10-17.md`). Other operations still rejected.
+- [x] PEXIT target stacks and direct absolute JMP, including predicates and program/header relocation; Metal result tests pass.
+- [x] DMA slices (LINE_COUNT across Z, LAYER start, bounds)
+- [x] Constant-buffer JMP, BRX through bounded cbuf tables (`testIndirectBranch`), TXD 3D/cube and TEX AOFFI tests exist. Unbounded BRX targets stay unsupported.
+- [x] Buffer queue state machine + host-completion release, fixed 60 Hz vsync thread, separate dispdrv server (B9-B14). Gameplay pending.
 
 ## P2 — completeness
-- [ ] FP64 soft-float (DADD/DMUL/DFMA/DMNMX/DSET/DSETP)
-- [ ] Video ops (VMAD/VADD/VABSDIFF/VMNMX/VSET/VSETP/VSHL/VSHR)
-- [ ] Geometry shader emulation, tessellation
-- [ ] Logic op, MSAA, alpha-to-coverage, sample shading
-- [ ] Transform feedback
-- [ ] Texture formats: BC6H, BC7 sRGB, ETC2/EAC, E5B9G9R9...
+- [x] FP64 soft-float: DADD/DMUL/DFMA/DMNMX/DSET/DSETP and exact F2I/I2F/F2F conversions (`fp64-reports-2026-10-17.md`). `.CC` and FTZ on doubles open.
+- [~] Video ops: VMAD, VMNMX, VSETP done; VADD/VABSDIFF/VSET/VSHL/VSHR left because their saturation/signedness semantics are unverified (envytools lists encodings only, Eden has none); CC/scaling open (`video-instructions-2026-10-17.md`)
+- [ ] Geometry shader emulation, tessellation (no Metal stage, needs compute emulation)
+- [ ] Logic op (framebuffer-fetch emulation), MSAA, alpha-to-coverage, sample shading (multisample targets)
+- [ ] Transform feedback (compute emulation)
+See `fp64-reports-2026-10-17.md` for why these were not started.
+- [x] Texture formats BC6H, BC7 sRGB, ETC2/EAC and E5B9G9R9 are already mapped and covered by host allocation tests (see Done above). This duplicated open item was stale.
+- [x] G4R4 (→RG8) and R32G32B32 (→RGBA32) upload expansion, tested (`testExpandedFormats`). Neither is a render target, so no readback.

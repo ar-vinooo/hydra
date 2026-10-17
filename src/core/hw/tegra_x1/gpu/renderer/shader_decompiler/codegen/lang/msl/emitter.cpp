@@ -74,6 +74,112 @@ std::string textureTypeToStr(TextureType type, bool is_depth) {
     }
 }
 
+// Sampler border emulation (see GuestShaderState::border_samplers)
+struct BorderAxis {
+    const char* address;
+    bool mirror;
+    bool border;
+};
+
+BorderAxis getBorderAxis(renderer::SamplerAddressMode mode) {
+    switch (mode) {
+    case renderer::SamplerAddressMode::Repeat:
+        return {"repeat", false, false};
+    case renderer::SamplerAddressMode::MirroredRepeat:
+        return {"mirrored_repeat", false, false};
+    case renderer::SamplerAddressMode::ClampToBorder:
+        return {"clamp_to_border", false, true};
+    case renderer::SamplerAddressMode::MirrorClampToBorder:
+        return {"clamp_to_border", true, true};
+    case renderer::SamplerAddressMode::MirrorClampToEdge:
+    case renderer::SamplerAddressMode::MirrorClamp:
+        return {"clamp_to_edge", true, false};
+    default:
+        return {"clamp_to_edge", false, false};
+    }
+}
+
+const char* getMslCompareFunc(engines::CompareOp op) {
+    switch (op) {
+    case engines::CompareOp::Never:
+        return "never";
+    case engines::CompareOp::Less:
+        return "less";
+    case engines::CompareOp::Equal:
+        return "equal";
+    case engines::CompareOp::LessEqual:
+        return "less_equal";
+    case engines::CompareOp::Greater:
+        return "greater";
+    case engines::CompareOp::NotEqual:
+        return "not_equal";
+    case engines::CompareOp::GreaterEqual:
+        return "greater_equal";
+    default:
+        return "always";
+    }
+}
+
+// 1.0 when `reference <op> depth` passes (the Metal depth comparison sense)
+std::string getDepthCompareStr(engines::CompareOp op,
+                               const std::string& reference,
+                               const std::string& depth) {
+    switch (op) {
+    case engines::CompareOp::Never:
+        return "0.0";
+    case engines::CompareOp::Less:
+        return fmt::format("float(({}) < ({}))", reference, depth);
+    case engines::CompareOp::Equal:
+        return fmt::format("float(({}) == ({}))", reference, depth);
+    case engines::CompareOp::LessEqual:
+        return fmt::format("float(({}) <= ({}))", reference, depth);
+    case engines::CompareOp::Greater:
+        return fmt::format("float(({}) > ({}))", reference, depth);
+    case engines::CompareOp::NotEqual:
+        return fmt::format("float(({}) != ({}))", reference, depth);
+    case engines::CompareOp::GreaterEqual:
+        return fmt::format("float(({}) >= ({}))", reference, depth);
+    default:
+        return "1.0";
+    }
+}
+
+// Cube maps are seamless and buffers are not sampled, so neither has borders
+bool supportsBorderEmulation(TextureType type) {
+    return type != TextureType::Cube && type != TextureType::CubeArray &&
+           type != TextureType::Buffer;
+}
+
+std::string getBorderSamplerDeclaration(u32 index, const char* variant,
+                                        const renderer::SamplerDescriptor& d,
+                                        bool compare, bool white) {
+    const auto filter = [](renderer::SamplerFilter filter) {
+        return filter == renderer::SamplerFilter::Nearest ? "nearest"
+                                                          : "linear";
+    };
+    const char* mip = "none";
+    if (d.mip_filter == renderer::SamplerMipFilter::Nearest)
+        mip = "nearest";
+    else if (d.mip_filter == renderer::SamplerMipFilter::Linear)
+        mip = "linear";
+    std::string result = fmt::format(
+        "constexpr sampler hydra_bs{}_{}(coord::normalized, s_address::{}, "
+        "t_address::{}, r_address::{}, mag_filter::{}, min_filter::{}, "
+        "mip_filter::{}, border_color::{}, lod_clamp({:.6f}, {:.6f})",
+        index, variant, getBorderAxis(d.address_mode_s).address,
+        getBorderAxis(d.address_mode_t).address,
+        getBorderAxis(d.address_mode_r).address, filter(d.mag_filter),
+        filter(d.min_filter), mip, white ? "opaque_white" : "transparent_black",
+        d.min_lod, d.max_lod);
+    if (const auto anisotropy = renderer::getEffectiveSamplerAnisotropy(d);
+        anisotropy > 1)
+        result += fmt::format(", max_anisotropy({})", anisotropy);
+    if (compare)
+        result += fmt::format(", compare_func::{}",
+                              getMslCompareFunc(d.depth_compare_op));
+    return result + ")";
+}
+
 std::string textureDeclaration(const GuestShaderState& state, u32 index,
                                const analyzer::TextureInfo& info) {
     const auto it = state.buffer_texture_formats.find(index);
@@ -388,8 +494,6 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
         out_resource_mapping.uniform_buffers[index] = index;
     }
 
-    // TODO: storage buffers
-
     u32 texture_index = 0;
     for (const auto& [const_buffer_index, info] :
          memory_analyzer.getTextures()) {
@@ -416,6 +520,24 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
         }
         ASSERT(out_resource_mapping.sampler_buffer_index != invalid<u32>(),
                ShaderDecompiler, "No buffer slot available for shader samplers");
+    }
+
+    // Storage buffers take the remaining buffer slots below the vertex buffers
+    {
+        const u32 limit = context.type == ShaderType::Vertex ? 15 : 31;
+        u32 next_index = 0;
+        for (const auto& [binding, info] : memory_analyzer.getStorageBuffers()) {
+            while (next_index < limit &&
+                   (out_resource_mapping.uniform_buffers[next_index] !=
+                        invalid<u32>() ||
+                    next_index == out_resource_mapping.sampler_buffer_index))
+                next_index++;
+            ASSERT(next_index < limit, ShaderDecompiler,
+                   "No buffer slot available for storage buffer");
+            out_resource_mapping.storage_buffers.push_back(
+                {binding >> 16, (binding & 0xffff) * 4, next_index++,
+                 info.written});
+        }
     }
 
     if (context.type == ShaderType::Vertex) {
@@ -447,6 +569,71 @@ void MslEmitter::emitHeader() {
     out_resource_mapping.fragment_output_mask = context.fragment_output_mask;
     write("#include <metal_stdlib>");
     write("using namespace metal;");
+
+    // Samplers of textures with emulated borders. The guest sampler is baked
+    // into the shader, so the bound sampler of these bindings is unused. Per
+    // binding: p0/pw sample without comparison with a transparent/white
+    // border, c0 compares with a transparent border
+    bool has_border_samplers = false;
+    for (const auto& [index, sampler] : state.border_samplers) {
+        const auto texture_it = memory_analyzer.getTextures().find(index);
+        if (texture_it == memory_analyzer.getTextures().end() ||
+            !supportsBorderEmulation(texture_it->second.type) ||
+            state.buffer_texture_formats.contains(index))
+            continue;
+        if (!has_border_samplers) {
+            has_border_samplers = true;
+            write("{}", R"(
+                // Border emulation. Sampling with a transparent and an opaque
+                // white border differs by the filter weight that fell on the
+                // border, in every channel the texture swizzle does not fix.
+                inline float hydra_border_coverage(float4 base, float4 white) {
+                    const float4 d = white - base;
+                    return clamp(max(max(d.x, d.y), max(d.z, d.w)), 0.0, 1.0);
+                }
+                inline float4 hydra_border_color(float4 base, float4 white, float4 border) {
+                    return base + hydra_border_coverage(base, white) * border;
+                }
+                inline float hydra_border_color(float base, float white, float4 border) {
+                    return base + clamp(white - base, 0.0, 1.0) * border.x;
+                }
+                inline float4 hydra_border_lanes(float4 base, float4 white, float border) {
+                    return base + clamp(white - base, 0.0, 1.0) * border;
+                }
+                inline float hydra_border_depth(float compared, float plain, float white, float delta) {
+                    return compared + clamp(white - plain, 0.0, 1.0) * delta;
+                }
+                inline float4 hydra_border_depth_lanes(float4 compared, float4 plain, float4 white, float delta) {
+                    return compared + clamp(white - plain, 0.0, 1.0) * delta;
+                }
+                inline float hydra_mirror_axes(float c, bool3 m) {
+                    return m.x ? abs(c) : c;
+                }
+                inline float2 hydra_mirror_axes(float2 c, bool3 m) {
+                    return float2(m.x ? abs(c.x) : c.x, m.y ? abs(c.y) : c.y);
+                }
+                inline float3 hydra_mirror_axes(float3 c, bool3 m) {
+                    return float3(m.x ? abs(c.x) : c.x, m.y ? abs(c.y) : c.y, m.z ? abs(c.z) : c.z);
+                }
+                inline bool hydra_border_inside(float c, bool3 m) {
+                    return !m.x || (c >= 0.0 && c < 1.0);
+                }
+                inline bool hydra_border_inside(float2 c, bool3 m) {
+                    return (!m.x || (c.x >= 0.0 && c.x < 1.0)) &&
+                           (!m.y || (c.y >= 0.0 && c.y < 1.0));
+                }
+                inline bool hydra_border_inside(float3 c, bool3 m) {
+                    return (!m.x || (c.x >= 0.0 && c.x < 1.0)) &&
+                           (!m.y || (c.y >= 0.0 && c.y < 1.0)) &&
+                           (!m.z || (c.z >= 0.0 && c.z < 1.0));
+                }
+            )");
+        }
+        write("{};", getBorderSamplerDeclaration(index, "p0", sampler, false, false));
+        write("{};", getBorderSamplerDeclaration(index, "pw", sampler, false, true));
+        if (sampler.depth_compare_op != engines::CompareOp::Invalid)
+            write("{};", getBorderSamplerDeclaration(index, "c0", sampler, true, false));
+    }
     if (context.type == ShaderType::Compute) {
         write("{}", R"(
             // Retries spurious failures, returns the previous value
@@ -475,6 +662,79 @@ void MslEmitter::emitHeader() {
         write("    array<sampler, {}> values [[id(0)]];",
               memory_analyzer.getTextures().size());
         write("}};");
+    }
+
+    if (!memory_analyzer.getStorageBuffers().empty()) {
+        write("{}", R"(
+            // Storage buffer accesses outside of the bound size read zero and
+            // are dropped. Access: 0 U8, 1 S8, 2 U16, 3 S16, 4 B32
+            inline bool hydra_ssbo_in_range(uint offset, uint size, uint access) {
+                const uint width = access == 4u ? 4u : (access < 2u ? 1u : 2u);
+                return size >= width && offset <= size - width;
+            }
+            inline uint hydra_ssbo_load(device uint* buffer, uint offset, uint size, uint access) {
+                if (!hydra_ssbo_in_range(offset, size, access)) return 0u;
+                const uint word = buffer[offset >> 2u];
+                switch (access) {
+                case 0u: return (word >> ((offset & 3u) * 8u)) & 0xffu;
+                case 1u: return uint(int(word << (24u - (offset & 3u) * 8u)) >> 24);
+                case 2u: return (word >> ((offset & 2u) * 8u)) & 0xffffu;
+                case 3u: return uint(int(word << (16u - (offset & 2u) * 8u)) >> 16);
+                default: return word;
+                }
+            }
+            inline void hydra_ssbo_store(device uint* buffer, uint offset, uint size, uint value, uint access) {
+                if (!hydra_ssbo_in_range(offset, size, access)) return;
+                if (access == 4u) {
+                    buffer[offset >> 2u] = value;
+                    return;
+                }
+                const uint shift = (access < 2u ? (offset & 3u) : (offset & 2u)) * 8u;
+                const uint mask = (access < 2u ? 0xffu : 0xffffu) << shift;
+                device atomic_uint* word = reinterpret_cast<device atomic_uint*>(buffer + (offset >> 2u));
+                uint old = atomic_load_explicit(word, memory_order_relaxed);
+                while (!atomic_compare_exchange_weak_explicit(word, &old,
+                        (old & ~mask) | ((value << shift) & mask),
+                        memory_order_relaxed, memory_order_relaxed)) {}
+            }
+            inline uint hydra_ssbo_cas(device uint* buffer, uint offset, uint size, uint compare, uint value) {
+                if (!hydra_ssbo_in_range(offset, size, 4u)) return 0u;
+                device atomic_uint* word = reinterpret_cast<device atomic_uint*>(buffer + (offset >> 2u));
+                uint expected = compare;
+                while (!atomic_compare_exchange_weak_explicit(word, &expected, value,
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    if (expected != compare) return expected;
+                }
+                return compare;
+            }
+            inline uint hydra_ssbo_atomic(device uint* buffer, uint offset, uint size, uint value, uint op, bool is_signed) {
+                if (!hydra_ssbo_in_range(offset, size, 4u)) return 0u;
+                device atomic_uint* word = reinterpret_cast<device atomic_uint*>(buffer + (offset >> 2u));
+                switch (op) {
+                case 0u: return atomic_fetch_add_explicit(word, value, memory_order_relaxed);
+                case 1u:
+                    if (is_signed)
+                        return uint(atomic_fetch_min_explicit(reinterpret_cast<device atomic_int*>(word), int(value), memory_order_relaxed));
+                    return atomic_fetch_min_explicit(word, value, memory_order_relaxed);
+                case 2u:
+                    if (is_signed)
+                        return uint(atomic_fetch_max_explicit(reinterpret_cast<device atomic_int*>(word), int(value), memory_order_relaxed));
+                    return atomic_fetch_max_explicit(word, value, memory_order_relaxed);
+                case 5u: return atomic_fetch_and_explicit(word, value, memory_order_relaxed);
+                case 6u: return atomic_fetch_or_explicit(word, value, memory_order_relaxed);
+                case 7u: return atomic_fetch_xor_explicit(word, value, memory_order_relaxed);
+                case 8u: return atomic_exchange_explicit(word, value, memory_order_relaxed);
+                case 9u: {
+                    uint old = atomic_load_explicit(word, memory_order_relaxed);
+                    while (!atomic_compare_exchange_weak_explicit(word, &old,
+                            as_type<uint>(as_type<float>(old) + as_type<float>(value)),
+                            memory_order_relaxed, memory_order_relaxed)) {}
+                    return old;
+                }
+                default: return atomic_load_explicit(word, memory_order_relaxed);
+                }
+            }
+        )");
     }
 
     // Intrinsic helpers
@@ -704,7 +964,8 @@ void MslEmitter::emitStateBindings() {
     }
 
     // Storage buffers
-    // TODO
+    for (const auto& [binding, info] : memory_analyzer.getStorageBuffers())
+        writeStatement("device uint* {}", getStorageBufferName(binding));
 
     // Images
     for (const auto& [index, info] : memory_analyzer.getImages())
@@ -723,7 +984,8 @@ void MslEmitter::emitStateBindings() {
 
 void MslEmitter::emitStateBindingAssignments() {
     // Storage buffers
-    // TODO
+    for (const auto& [binding, info] : memory_analyzer.getStorageBuffers())
+        writeStatement("state.{0} = {0}", getStorageBufferName(binding));
 
     // Images
     for (const auto& [index, _] : memory_analyzer.getImages())
@@ -800,7 +1062,11 @@ void MslEmitter::emitMainPrototype() {
     }
 
     // Storage buffers
-    // TODO
+    for (const auto& buffer : out_resource_mapping.storage_buffers)
+        ADD_ARG("device uint* {} [[buffer({})]]",
+                getStorageBufferName(buffer.cbuf_slot << 16 |
+                                     buffer.cbuf_offset / 4),
+                buffer.host_index);
 
     // Textures
     if (out_resource_mapping.sampler_buffer_index != invalid<u32>())
@@ -1136,31 +1402,161 @@ void MslEmitter::emitTextureSample(
     const auto has_lod =
         any(flags & (TextureSampleFlags::Lod | TextureSampleFlags::LodZero));
 
-    if (any(flags & TextureSampleFlags::Gather)) {
+    std::string coord_scale;
+    const bool unnormalized =
+        std::find(state.unnormalized_textures.begin(),
+                  state.unnormalized_textures.end(), const_buffer_index) !=
+        state.unnormalized_textures.end();
+    if (unnormalized && !int_coords && type != TextureType::Cube &&
+        type != TextureType::CubeArray) {
+        const auto axes = coords.getType().getVectorType().getSize();
+        coord_scale = fmt::format("float(state.tex{}.get_width())", const_buffer_index);
+        if (axes >= 2)
+            coord_scale += fmt::format(", float(state.tex{}.get_height())", const_buffer_index);
+        if (axes == 3)
+            coord_scale += fmt::format(", float(state.tex{}.get_depth())", const_buffer_index);
+        if (axes > 1)
+            coord_scale = fmt::format("float{}({})", axes, coord_scale);
+    }
+    const auto normalize = [&](const ir::Value& value) {
+        const auto text = getValueStr(value);
+        return coord_scale.empty() ? text
+                                   : fmt::format("(({}) / ({}))", text, coord_scale);
+    };
+    const auto is_gather = any(flags & TextureSampleFlags::Gather);
+
+    // Guest border handling Metal cannot express: the shader samples with its
+    // own samplers and blends the border in
+    const renderer::SamplerDescriptor* border = nullptr;
+    std::string mirror_mask, border_mask;
+    bool mirrors = false;
+    if (const auto border_it = state.border_samplers.find(const_buffer_index);
+        border_it != state.border_samplers.end() && !is_buffer && !int_coords) {
+        const auto texture_it =
+            memory_analyzer.getTextures().find(const_buffer_index);
+        if (texture_it == memory_analyzer.getTextures().end() ||
+            !supportsBorderEmulation(texture_it->second.type)) {
+            // Seamless cube maps have no border
+        } else if (depth_compare &&
+                   border_it->second.depth_compare_op ==
+                       engines::CompareOp::Invalid) {
+            ONCE(LOG_NOT_IMPLEMENTED(
+                ShaderDecompiler,
+                "Depth comparison without a comparing sampler with borders"));
+        } else if (is_integer && is_gather) {
+            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                                     "Integer texture gathers with borders"));
+        } else {
+            border = &border_it->second;
+            const std::array axes = {getBorderAxis(border->address_mode_s),
+                                     getBorderAxis(border->address_mode_t),
+                                     getBorderAxis(border->address_mode_r)};
+            mirrors = axes[0].mirror || axes[1].mirror || axes[2].mirror;
+            mirror_mask = fmt::format("bool3({}, {}, {})", axes[0].mirror,
+                                      axes[1].mirror, axes[2].mirror);
+            border_mask = fmt::format("bool3({}, {}, {})", axes[0].border,
+                                      axes[1].border, axes[2].border);
+            if (mirrors && any(flags & (TextureSampleFlags::Offset |
+                                        TextureSampleFlags::Offsets))) {
+                ONCE(LOG_NOT_IMPLEMENTED(
+                    ShaderDecompiler,
+                    "Texel offsets of mirrored border addressing (applied "
+                    "after the mirroring)"));
+            }
+            if (is_integer && any(flags & TextureSampleFlags::Offset)) {
+                ONCE(LOG_NOT_IMPLEMENTED(
+                    ShaderDecompiler,
+                    "Texel offsets of integer texture borders (not "
+                    "considered for the border)"));
+            }
+        }
+    }
+    const auto mirror_axes = [&](const std::string& location) {
+        return mirrors ? fmt::format("hydra_mirror_axes({}, {})", location,
+                                     mirror_mask)
+                       : location;
+    };
+    const auto border_name = [&](const char* variant) {
+        return fmt::format("hydra_bs{}_{}", const_buffer_index, variant);
+    };
+    const auto border_bits = [&]() {
+        return fmt::format("uint4({:#010x}u, {:#010x}u, {:#010x}u, {:#010x}u)",
+                           border->border_color_u.x(),
+                           border->border_color_u.y(),
+                           border->border_color_u.z(),
+                           border->border_color_u.w());
+    };
+    const auto border_float = [&](u32 component) {
+        const std::array<u32, 4> words = {
+            border->border_color_u.x(), border->border_color_u.y(),
+            border->border_color_u.z(), border->border_color_u.w()};
+        return fmt::format("as_type<float>({:#010x}u)", words[component & 3]);
+    };
+    // 1.0 where the border depth passes minus where depth 0 passes: the
+    // difference of a border texel from the transparent border of c0
+    const auto border_compare_delta = [&]() {
+        const auto reference = getValueStr(cmp_value);
+        return fmt::format(
+            "({} - {})",
+            getDepthCompareStr(border->depth_compare_op, reference,
+                               border_float(0)),
+            getDepthCompareStr(border->depth_compare_op, reference, "0.0"));
+    };
+
+    const auto normalized_location = normalize(coords);
+
+    if (is_gather) {
         const bool cube =
             type == TextureType::Cube || type == TextureType::CubeArray;
         ASSERT(!(cube && any(flags & (TextureSampleFlags::Offset |
                                       TextureSampleFlags::Offsets))),
                ShaderDecompiler, "Cube gathers cannot have texel offsets");
-        const auto gather = [&](const std::string& location,
-                                const std::string& texel_offset) {
-            auto arguments =
-                fmt::format("state.samplr{}, {}", const_buffer_index, location);
+        const auto gather_with = [&](const std::string& location,
+                                     const std::string& texel_offset,
+                                     const std::string& sampler, bool compare,
+                                     bool with_component) {
+            auto arguments = fmt::format("{}, {}", sampler, location);
             if (is_array)
                 arguments += fmt::format(", {}", getValueStr(array_index));
-            if (depth_compare)
+            if (compare)
                 arguments += fmt::format(", {}", getValueStr(cmp_value));
             if (!cube)
                 arguments += ", " + texel_offset;
-            if (!depth_compare)
+            if (with_component)
                 arguments +=
                     fmt::format(", component::{}", componentToStr(component));
-            auto result = fmt::format(
-                "state.tex{}.{}({})", const_buffer_index,
-                depth_compare ? "gather_compare" : "gather", arguments);
+            auto result = fmt::format("state.tex{}.{}({})", const_buffer_index,
+                                      compare ? "gather_compare" : "gather",
+                                      arguments);
             if (is_integer)
                 result = fmt::format("as_type<float4>({})", result);
             return result;
+        };
+        const auto gather = [&](const std::string& location,
+                                const std::string& texel_offset) {
+            const auto bound = fmt::format("state.samplr{}", const_buffer_index);
+            if (border == nullptr)
+                return gather_with(location, texel_offset, bound,
+                                   depth_compare, !depth_compare);
+            const auto mirrored = mirror_axes(location);
+            if (depth_compare) {
+                return fmt::format(
+                    "hydra_border_depth_lanes({}, {}, {}, {})",
+                    gather_with(mirrored, texel_offset, border_name("c0"),
+                                true, false),
+                    gather_with(mirrored, texel_offset, border_name("p0"),
+                                false, false),
+                    gather_with(mirrored, texel_offset, border_name("pw"),
+                                false, false),
+                    border_compare_delta());
+            }
+            return fmt::format(
+                "hydra_border_lanes({}, {}, {})",
+                gather_with(mirrored, texel_offset, border_name("p0"), false,
+                            true),
+                gather_with(mirrored, texel_offset, border_name("pw"), false,
+                            true),
+                border_float(component));
         };
         if (any(flags & TextureSampleFlags::Offsets)) {
             // PTP packs eight signed six-bit values in two registers, one
@@ -1174,13 +1570,13 @@ void MslEmitter::emitTextureSample(
                     "int2(int({} << {}u) >> 26, int({} << {}u) >> 26)", word,
                     26 - base, word, 18 - base);
                 samples[lane] = fmt::format(
-                    "({}).{}", gather(getValueStr(coords), pair), "xyzw"[lane]);
+                    "({}).{}", gather(normalized_location, pair), "xyzw"[lane]);
             }
             storeValue(dst, "float4({}, {}, {}, {})", samples[0], samples[1],
                        samples[2], samples[3]);
         } else {
             storeValue(dst, "{}",
-                       gather(getValueStr(coords),
+                       gather(normalized_location,
                               any(flags & TextureSampleFlags::Offset)
                                   ? fmt::format("int2({})", getValueStr(offset))
                                   : "int2(0)"));
@@ -1188,7 +1584,7 @@ void MslEmitter::emitTextureSample(
         return;
     }
 
-    std::string sample_coords = getValueStr(coords);
+    std::string sample_coords = normalized_location;
     // Metal 1D textures have a single level and no sampling options: texel
     // offsets move the normalized coordinate instead
     const bool is_1d = !is_buffer && (type == TextureType::_1D ||
@@ -1207,6 +1603,12 @@ void MslEmitter::emitTextureSample(
                 sample_coords, getValueStr(offset), const_buffer_index);
         }
     }
+    if (border != nullptr)
+        sample_coords = mirror_axes(sample_coords);
+    // Placeholders for the sampler and the comparison value, which differ
+    // between the samples of an emulated border
+    constexpr char SAMPLER_MARK = '\x01';
+    constexpr char COMPARE_MARK = '\x02';
     std::string func_name;
     std::string args;
     if (int_coords) {
@@ -1242,15 +1644,14 @@ void MslEmitter::emitTextureSample(
         func_name = "sample";
         if (depth_compare)
             func_name += "_compare";
-        args = fmt::format("state.samplr{}, {}", const_buffer_index,
-                           sample_coords);
+        args = fmt::format("{}, {}", SAMPLER_MARK, sample_coords);
     }
 
     // Args
     if (is_array && !is_buffer)
         args += fmt::format(", uint({})", getValueStr(array_index));
     if (depth_compare)
-        args += fmt::format(", {}", getValueStr(cmp_value));
+        args += COMPARE_MARK;
     if (is_1d && !int_coords) {
         // No LOD, bias or gradient options
     } else if (any(flags & TextureSampleFlags::Derivatives) && !int_coords) {
@@ -1261,11 +1662,11 @@ void MslEmitter::emitTextureSample(
             : coords.getType().getVectorType().getSize() == 2 ? "gradient2d"
                                                               : "gradient3d";
         if (sampler_bias == 0.0f)
-            args += fmt::format(", {}({}, {})", gradient, getValueStr(ddx), getValueStr(ddy));
+            args += fmt::format(", {}({}, {})", gradient, normalize(ddx), normalize(ddy));
         else
             args += fmt::format(", {}(({}) * exp2({}), ({}) * exp2({}))", gradient,
-                                getValueStr(ddx), getValueStr(ir::Value::createConstantF(sampler_bias)),
-                                getValueStr(ddy), getValueStr(ir::Value::createConstantF(sampler_bias)));
+                                normalize(ddx), getValueStr(ir::Value::createConstantF(sampler_bias)),
+                                normalize(ddy), getValueStr(ir::Value::createConstantF(sampler_bias)));
         if (has_lod)
             args += fmt::format(", min_lod_clamp({})", getValueStr(lod));
     } else if (has_lod && !is_buffer) {
@@ -1292,8 +1693,49 @@ void MslEmitter::emitTextureSample(
                                               getValueStr(offset));
     }
 
-    std::string res =
-        fmt::format("state.tex{}.{}({})", const_buffer_index, func_name, args);
+    const auto make_sample = [&](const char* function,
+                                 const std::string& sampler,
+                                 bool with_compare) {
+        std::string text;
+        text.reserve(args.size() + 32);
+        for (const char c : args) {
+            if (c == SAMPLER_MARK)
+                text += sampler;
+            else if (c == COMPARE_MARK) {
+                if (with_compare)
+                    text += fmt::format(", {}", getValueStr(cmp_value));
+            } else
+                text += c;
+        }
+        return fmt::format("state.tex{}.{}({})", const_buffer_index, function,
+                           text);
+    };
+    std::string res;
+    if (border == nullptr) {
+        res = make_sample(func_name.c_str(),
+                          fmt::format("state.samplr{}", const_buffer_index),
+                          depth_compare);
+    } else if (is_integer) {
+        // Nearest sampling: a texel is either inside or the border
+        res = fmt::format(
+            "(hydra_border_inside({}, {}) ? {} : as_type<{}4>({}))",
+            sample_coords, border_mask,
+            make_sample("sample", border_name("p0"), false),
+            renderer::getIntegerTextureComponentType(int_it->second),
+            border_bits());
+    } else if (depth_compare) {
+        res = fmt::format(
+            "hydra_border_depth({}, {}, {}, {})",
+            make_sample("sample_compare", border_name("c0"), true),
+            make_sample("sample", border_name("p0"), false),
+            make_sample("sample", border_name("pw"), false),
+            border_compare_delta());
+    } else {
+        res = fmt::format(
+            "hydra_border_color({}, {}, as_type<float4>({}))",
+            make_sample("sample", border_name("p0"), false),
+            make_sample("sample", border_name("pw"), false), border_bits());
+    }
     // Depth comparisons return the result in RGB and 1 in alpha
     if (depth_compare)
         res = fmt::format("float4(float3({}), 1.0)", res);
@@ -1336,9 +1778,23 @@ void MslEmitter::emitTextureQueryLod(const ir::Value& dst,
         storeValue(dst, "0.0");
         return;
     }
+    auto location = getValueStr(coords);
+    if (type != TextureType::Cube && type != TextureType::CubeArray &&
+        std::find(state.unnormalized_textures.begin(),
+                  state.unnormalized_textures.end(), const_buffer_index) !=
+            state.unnormalized_textures.end()) {
+        const bool volume = type == TextureType::_3D;
+        auto size = fmt::format(
+            "float(state.tex{}.get_width()), float(state.tex{}.get_height())",
+            const_buffer_index, const_buffer_index);
+        if (volume)
+            size += fmt::format(", float(state.tex{}.get_depth())", const_buffer_index);
+        location = fmt::format("(({}) / float{}({}))", location,
+                               volume ? 3 : 2, size);
+    }
     storeValue(dst, "state.tex{}.calculate_{}_lod(state.samplr{}, {})",
                const_buffer_index, unclamped ? "unclamped" : "clamped",
-               const_buffer_index, getValueStr(coords));
+               const_buffer_index, location);
 }
 
 void MslEmitter::emitTextureQueryDimension(const ir::Value& dst,
@@ -1525,6 +1981,51 @@ void MslEmitter::emitAtomicSharedCas(const ir::Value& dst,
                "&state.smem[min(uint({}) >> 2u, {}u)]._u32), uint({}), uint({}))",
                getBitwiseOperandStr(addr), shared_word_count - 1,
                getBitwiseOperandStr(compare), getBitwiseOperandStr(value));
+}
+
+std::string MslEmitter::getStorageBufferName(u32 binding) {
+    return fmt::format("ssbo{}_{}", binding >> 16, binding & 0xffff);
+}
+
+void MslEmitter::emitLoadStorage(const ir::Value& dst, u32 binding,
+                                 const ir::Value& offset,
+                                 const ir::Value& size, u32 access) {
+    storeValue(dst, "hydra_ssbo_load(state.{}, uint({}), uint({}), {}u)",
+               getStorageBufferName(binding), getBitwiseOperandStr(offset),
+               getBitwiseOperandStr(size), access);
+}
+
+void MslEmitter::emitStoreStorage(u32 binding, const ir::Value& offset,
+                                  const ir::Value& size,
+                                  const ir::Value& value, u32 access) {
+    writeStatement("hydra_ssbo_store(state.{}, uint({}), uint({}), uint({}), {}u)",
+                   getStorageBufferName(binding), getBitwiseOperandStr(offset),
+                   getBitwiseOperandStr(size), getBitwiseOperandStr(value),
+                   access);
+}
+
+void MslEmitter::emitAtomicStorage(const ir::Value& dst, u32 binding,
+                                   const ir::Value& offset,
+                                   const ir::Value& size,
+                                   const ir::Value& value, u32 op,
+                                   bool is_signed) {
+    storeValue(dst,
+               "hydra_ssbo_atomic(state.{}, uint({}), uint({}), uint({}), {}u, {})",
+               getStorageBufferName(binding), getBitwiseOperandStr(offset),
+               getBitwiseOperandStr(size), getBitwiseOperandStr(value), op,
+               is_signed);
+}
+
+void MslEmitter::emitAtomicStorageCas(const ir::Value& dst, u32 binding,
+                                      const ir::Value& offset,
+                                      const ir::Value& size,
+                                      const ir::Value& compare,
+                                      const ir::Value& value) {
+    storeValue(dst,
+               "hydra_ssbo_cas(state.{}, uint({}), uint({}), uint({}), uint({}))",
+               getStorageBufferName(binding), getBitwiseOperandStr(offset),
+               getBitwiseOperandStr(size), getBitwiseOperandStr(compare),
+               getBitwiseOperandStr(value));
 }
 
 void MslEmitter::emitBarrier() {

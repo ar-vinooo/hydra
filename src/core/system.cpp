@@ -744,8 +744,6 @@ void System::progressFrame(u32 width, u32 height,
     delete command_buffer;
     delete compositor;
 
-    // Signal V-Sync
-    os.getDisplayDriver().signalVSync();
 }
 
 bool System::isRunning() const {

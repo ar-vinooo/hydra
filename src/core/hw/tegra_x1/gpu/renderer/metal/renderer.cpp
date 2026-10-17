@@ -987,6 +987,45 @@ void Renderer::bindUniformBufferHot34(const BufferView& buffer,
     state.uniform_buffers[static_cast<u32>(shader_type)][index] = buffer;
 }
 
+BufferView Renderer::getGuestMemoryBuffer(ztd::Range<uptr> range) {
+    // Metal wraps whole pages. The shader only touches the bound range, so
+    // the rest of the first and last page is never accessed
+    const auto page_size = static_cast<uptr>(sysconf(_SC_PAGESIZE));
+    const uptr begin = range.getBegin() & ~(page_size - 1);
+    const uptr end = (range.getEnd() + page_size - 1) & ~(page_size - 1);
+
+    std::scoped_lock lock(guest_memory_buffers_mutex);
+    auto& entry = guest_memory_buffers[begin];
+    if (entry.buffer == nullptr || entry.end < end) {
+        auto* native = device->newBuffer(reinterpret_cast<void*>(begin),
+                                         end - begin,
+                                         MTL::ResourceStorageModeShared,
+                                         nullptr);
+        if (native == nullptr) {
+            guest_memory_buffers.erase(begin);
+            LOG_ERROR(MetalRenderer, "Cannot wrap guest memory {:#x}..{:#x}",
+                      range.getBegin(), range.getEnd());
+            return {};
+        }
+        entry = {std::make_shared<Buffer>(native), end};
+        // Entries are only dropped here, bound views keep theirs alive
+        if (guest_memory_buffers.size() > 256) {
+            const auto crnt = entry;
+            guest_memory_buffers.clear();
+            guest_memory_buffers[begin] = crnt;
+        }
+    }
+    return BufferView{guest_memory_buffers[begin].buffer,
+                      range.getBegin() - begin, range.getSize()};
+}
+
+void Renderer::bindStorageBuffer(const BufferView& buffer,
+                                 ShaderType shader_type, u32 index) {
+    if (shader_type == ShaderType::Count)
+        return;
+    state.storage_buffers[static_cast<u32>(shader_type)][index] = buffer;
+}
+
 void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
                            ShaderType shader_type, u32 index) {
     // HACK
@@ -1014,12 +1053,71 @@ void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
     state.uniform_buffers[static_cast<u32>(shader_type)] = {};
 }
 
+void Renderer::unbindStorageBuffers(ShaderType shader_type) {
+    if (shader_type == ShaderType::Count)
+        return;
+    state.storage_buffers[static_cast<u32>(shader_type)] = {};
+}
+
 void Renderer::unbindTexturesHot37(ShaderType shader_type) {
     // HACK
     if (shader_type == ShaderType::Count)
         return;
 
     state.textures[static_cast<u32>(shader_type)] = {};
+}
+
+bool Renderer::synchronize(ICommandBuffer* command_buffer) {
+    auto* commands = static_cast<CommandBuffer*>(command_buffer);
+    commands->debugCommitAndWait();
+    return commands->lastSubmissionSucceeded();
+}
+
+void Renderer::resetOcclusionCounter() {
+    occlusion_count = 0;
+    occlusion_valid = true;
+    occlusion_pages.clear();
+}
+
+std::optional<u64> Renderer::getOcclusionCounter(ICommandBuffer* command_buffer) {
+    if (!occlusion_valid)
+        return std::nullopt;
+    if (!synchronize(command_buffer)) {
+        occlusion_valid = false;
+        return std::nullopt;
+    }
+    for (const auto& page : occlusion_pages) {
+        const auto* counts = static_cast<const u64*>(page.buffer->contents());
+        for (u32 i = 0; i < page.count; i++)
+            occlusion_count += counts[i];
+    }
+    occlusion_pages.clear();
+    return occlusion_count;
+}
+
+std::optional<u64> Renderer::prepareOcclusionQuery(CommandBuffer* command_buffer) {
+    if (!occlusion_enabled || !occlusion_valid)
+        return std::nullopt;
+    if (occlusion_pages.empty() ||
+        occlusion_pages.back().count == OCCLUSION_PAGE_SIZE ||
+        !command_buffer->hasRenderPass(state.render_pass->getRenderPassDescriptor()) ||
+        command_buffer->getVisibilityResultBuffer() != occlusion_pages.back().buffer.get()) {
+        // Queries can stay enabled indefinitely without a report/reset.
+        if (occlusion_pages.size() >= MAX_OCCLUSION_PAGES &&
+            !getOcclusionCounter(command_buffer))
+            return std::nullopt;
+        auto* buffer = device->newBuffer(OCCLUSION_PAGE_SIZE * sizeof(u64),
+                                          MTL::ResourceStorageModeShared);
+        ASSERT(buffer != nullptr, MetalRenderer, "Cannot allocate visibility buffer");
+        std::memset(buffer->contents(), 0, OCCLUSION_PAGE_SIZE * sizeof(u64));
+        occlusion_pages.push_back(
+            {std::shared_ptr<MTL::Buffer>(buffer, [](MTL::Buffer* value) {
+                 value->release();
+             }), 0});
+    }
+    auto& page = occlusion_pages.back();
+    command_buffer->setVisibilityResultBuffer(page.buffer.get());
+    return static_cast<u64>(page.count++) * sizeof(u64);
 }
 
 void Renderer::drawHot38(ICommandBuffer* command_buffer,
@@ -1036,6 +1134,7 @@ void Renderer::drawHot38(ICommandBuffer* command_buffer,
         return;
     }
 
+    const auto visibility_offset = prepareOcclusionQuery(command_buffer_impl);
     bindDrawState(command_buffer_impl);
 
     auto encoder = command_buffer_impl->getRenderCommandEncoderUnchecked();
@@ -1048,9 +1147,14 @@ void Renderer::drawHot38(ICommandBuffer* command_buffer,
     const bool capture_group = isCapturing() && !capture_draw_label.empty();
     if (capture_group)
         encoder->pushDebugGroup(toNsString(capture_draw_label));
+    if (visibility_offset)
+        encoder->setVisibilityResultMode(MTL::VisibilityResultModeCounting,
+                                         *visibility_offset);
     // Draw
     encoder->drawPrimitives(toMtlPrimitiveType(primitive_type), start, count,
                             instance_count, base_instance);
+    if (visibility_offset)
+        encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
         encoder->popDebugGroup();
         capture_draw_label.clear();
@@ -1072,6 +1176,7 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
         return;
     }
 
+    const auto visibility_offset = prepareOcclusionQuery(command_buffer_impl);
     bindDrawState(command_buffer_impl);
 
     auto encoder = command_buffer_impl->getRenderCommandEncoderUnchecked();
@@ -1081,6 +1186,9 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
         encoder->insertDebugSignpost(toNsString(group));
         visual.event("metal_draw_encoded", {{"count", std::to_string(count)}, {"signpost", group}});
     }
+    if (visibility_offset)
+        encoder->setVisibilityResultMode(MTL::VisibilityResultModeCounting,
+                                         *visibility_offset);
     // Draw
     auto index_buffer_mtl =
         static_cast<Buffer*>(state.index_buffer.getBase())->getBuffer();
@@ -1095,6 +1203,8 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
                                    toMtlIndexType(state.index_type),
                                    index_buffer_mtl, index_buffer_offset,
                                    instance_count, base_vertex, base_instance);
+    if (visibility_offset)
+        encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
         encoder->popDebugGroup();
         capture_draw_label.clear();
@@ -1170,6 +1280,13 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         encoder->setBuffer(static_cast<Buffer*>(buffer.getBase())->getBuffer(),
                            buffer.getOffset(), i);
     }
+    for (const auto& binding : dispatch.storage_buffers) {
+        if (binding.buffer.getBase() == nullptr)
+            continue;
+        encoder->setBuffer(
+            static_cast<Buffer*>(binding.buffer.getBase())->getBuffer(),
+            binding.buffer.getOffset(), binding.index);
+    }
     for (const auto& binding : dispatch.textures) {
         encoder->setTexture(
             binding.texture != nullptr
@@ -1217,6 +1334,12 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                 enc->setBuffer(
                     static_cast<Buffer*>(buffer.getBase())->getBuffer(),
                     buffer.getOffset(), i);
+        }
+        for (const auto& binding : dispatch.storage_buffers) {
+            if (binding.buffer.getBase() != nullptr)
+                enc->setBuffer(
+                    static_cast<Buffer*>(binding.buffer.getBase())->getBuffer(),
+                    binding.buffer.getOffset(), binding.index);
         }
         for (const auto& binding : dispatch.textures) {
             if (binding.texture != nullptr)
@@ -1330,6 +1453,17 @@ void Renderer::setUniformBufferHot48(CommandBuffer* command_buffer,
     if (buffer.getBase() == nullptr)
         return;
 
+    command_buffer->setBuffer(
+        static_cast<Buffer*>(buffer.getBase())->getBuffer(), buffer.getOffset(),
+        shader_type, index);
+}
+
+void Renderer::setStorageBuffer(CommandBuffer* command_buffer,
+                                ShaderType shader_type, u32 index) {
+    const auto& buffer =
+        state.storage_buffers[static_cast<u32>(shader_type)][index];
+    if (buffer.getBase() == nullptr)
+        return;
     command_buffer->setBuffer(
         static_cast<Buffer*>(buffer.getBase())->getBuffer(), buffer.getOffset(),
         shader_type, index);
@@ -1503,6 +1637,9 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
             if (mapping.uniform_buffers[i] != invalid<u32>())
                 setUniformBuffer(command_buffer, ShaderType(shader_type), i);
         }
+        for (const auto& storage : mapping.storage_buffers)
+            setStorageBuffer(command_buffer, ShaderType(shader_type),
+                             storage.host_index);
         for (const auto& [binding, index] : mapping.textures) {
             (void)binding;
             setTexture(command_buffer, ShaderType(shader_type), index);

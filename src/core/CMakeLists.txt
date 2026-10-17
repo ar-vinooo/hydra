@@ -552,6 +552,9 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_logical.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/double_arithmetic.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/video.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/video.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/comparison_helper.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.hpp

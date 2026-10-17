@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include <memory>
 
@@ -141,7 +142,9 @@ void decompileHot(
         ztd::io::StreamView stream(&code_stream, code_stream.getSeek());
         decoder::Decoder decoder({.decomp_context = context,
                                   .code_stream = &stream,
-                                  .builder = builder});
+                                  .builder = builder,
+                                  .code_offset = static_cast<u64>(state.program_offset) +
+                                                 code_stream.getSeek()});
         decoder.decode();
     }
 

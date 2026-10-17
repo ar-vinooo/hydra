@@ -244,10 +244,19 @@ Gpu::getTexture(renderer::ICommandBuffer* command_buffer, cpu::IMmu* mmu,
     const bool is_linear =
         (plane.kind == NvKind::Pitch || plane.kind == NvKind::PitchNoSwizzle);
 
+    const auto map = getMap(static_cast<u32>(buff.nvmap_id));
+    if (!map || (*map)->addr == 0 || plane.offset >= (*map)->size) {
+        ONCE(LOG_WARN(Gpu, "Present buffer refers to a missing nvmap"));
+        return nullptr;
+    }
+    // TODO: pin the nvmap across queued/acquired buffer ownership.
+    const auto guest_address = (*map)->addr + plane.offset;
+    if (!mmu || guest_address < (*map)->addr)
+        return nullptr;
+
     // TODO: why are there more planes?
     const renderer::TextureDescriptor descriptor(
-        mmu->unmapAddr(getMap(static_cast<u32>(buff.nvmap_id)).value()->addr +
-                       plane.offset),
+        mmu->unmapAddr(guest_address),
         renderer::TextureType::_2D,
         renderer::toTextureFormat(plane.color_format), is_linear, plane.pitch,
         plane.width, plane.height, 1, 1, 1, 0x0, plane.block_height_gobs_log2,

@@ -9,11 +9,17 @@ class ShaderBase;
 class IRenderer;
 
 struct GuestShaderState {
+    u32 program_offset{0};
     std::map<std::pair<u32, u32>, u32> branch_constants;
     std::map<u32, TextureFormat> buffer_texture_formats;
     // Sampled (non-buffer) textures with integer formats
     std::map<u32, TextureFormat> integer_texture_formats;
     std::map<u32, f32> texture_lod_bias;
+    // Textures whose sampler border handling Metal cannot express (custom
+    // border colors, integer borders, mirror to border). The shader samples
+    // them with its own samplers and blends the border in
+    std::map<u32, SamplerDescriptor> border_samplers;
+    std::vector<u32> unnormalized_textures;
     // User inputs read by the fragment shader, which the vertex shader must
     // write (bit per location)
     u32 fragment_input_mask{0};

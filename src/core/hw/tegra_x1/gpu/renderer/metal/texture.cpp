@@ -44,9 +44,7 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
     const auto host_matches_guest = [](TextureFormat format,
                                        const PixelFormatInfo& host) {
         return !(host.has_depth && host.has_stencil) &&
-               format != TextureFormat::RGB32Float &&
-               format != TextureFormat::RGB32Uint &&
-               format != TextureFormat::RGB32Sint;
+               getHostTextureFormat(format) == format;
     };
     const bool sizes_match = same_texel &&
                              host_matches_guest(src_format, src_host) &&
@@ -138,7 +136,9 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
         const auto alignment =
             device->minimumLinearTextureAlignmentForPixelFormat(
                 pixel_format_info.pixel_format);
-        const auto bytes = align(static_cast<u64>(descriptor.size),
+        const u64 host_size = getTextureFormatStride(
+            getHostTextureFormat(descriptor.format), descriptor.width);
+        const auto bytes = align(std::max(static_cast<u64>(descriptor.size), host_size),
                                  static_cast<u64>(alignment));
         desc->setUsage(MTL::TextureUsageShaderRead |
                        MTL::TextureUsagePixelFormatView | write_usage);
@@ -321,7 +321,8 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
 
     auto encoder = command_buffer_impl->getBlitCommandEncoder();
 
-    if (buffer_backing) {
+    const bool expanded = getHostTextureFormat(descriptor.format) != descriptor.format;
+    if (buffer_backing && !expanded) {
         encoder->copyFromBuffer(mtl_src, 0, buffer_backing, 0, descriptor.size);
         return;
     }
@@ -342,7 +343,29 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
                 descriptor.format, dims.x(), dims.y());
 
             // Copy
-            if (is_packed_depth_stencil) {
+            if (expanded) {
+                const auto host_format = getHostTextureFormat(descriptor.format);
+                const auto host_stride = getTextureFormatStride(host_format, dims.x());
+                const u64 host_slice = static_cast<u64>(host_stride) * dims.y();
+                const u64 host_size = host_slice * dims.z();
+                ASSERT(mtl_src->contents() != nullptr, MetalRenderer,
+                       "Expanded texture uploads require mapped source bytes");
+                auto* staging = texture->device()->newBuffer(
+                    host_size, MTL::ResourceStorageModeShared);
+                expandTexturePixels(descriptor.format,
+                    static_cast<const u8*>(mtl_src->contents()) + offset,
+                    static_cast<u8*>(staging->contents()),
+                    static_cast<usize>(dims.x()) * dims.y() * dims.z());
+                if (buffer_backing) {
+                    encoder->copyFromBuffer(staging, 0, buffer_backing, 0, host_size);
+                } else {
+                    encoder->copyFromBuffer(staging, 0, host_stride, host_slice,
+                                            MTL::Size(dims.x(), dims.y(), dims.z()),
+                                            texture, layer, level,
+                                            MTL::Origin(0, 0, 0));
+                }
+                staging->release();
+            } else if (is_packed_depth_stencil) {
                 copyDepthStencilFromBuffer(
                     encoder,
                     reinterpret_cast<const u8*>(mtl_src->contents()) + offset,

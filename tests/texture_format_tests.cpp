@@ -608,6 +608,44 @@ void testTextureShapeLegalization() {
 
 // Storages are keyed by a 32-bit hash: two textures of one memory whose
 // descriptors collide must not share a storage
+// Formats the host cannot hold are expanded on upload: G4R4 to RG8 and RGB32 to
+// RGBA32 with an opaque alpha
+void testExpandedFormats() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    check(getHostTextureFormat(TextureFormat::RG4Unorm) == TextureFormat::RG8Unorm,
+           "G4R4 is stored as RG8 on the host");
+    check(getHostTextureFormat(TextureFormat::RGB32Float) == TextureFormat::RGBA32Float &&
+               getHostTextureFormat(TextureFormat::RGB32Uint) == TextureFormat::RGBA32Uint &&
+               getHostTextureFormat(TextureFormat::RGB32Sint) == TextureFormat::RGBA32Sint,
+           "RGB32 is stored as RGBA32 on the host");
+    check(getHostTextureFormat(TextureFormat::RGBA8Unorm) == TextureFormat::RGBA8Unorm,
+           "Other formats are not expanded");
+
+    const std::array<u8, 3> g4r4{0x21, 0xf0, 0x0f};
+    std::array<u8, 6> rg8{};
+    expandTexturePixels(TextureFormat::RG4Unorm, g4r4.data(), rg8.data(), 3);
+    // The low nibble is red and the high nibble green, both scaled to 8 bits
+    check(rg8[0] == 0x11 && rg8[1] == 0x22 && rg8[2] == 0x00 &&
+               rg8[3] == 0xff && rg8[4] == 0xff && rg8[5] == 0x00,
+           "G4R4 expands each nibble to a full byte");
+
+    const std::array<u32, 6> rgb{0x3f800000, 0x40000000, 0x40400000,
+                                 0x00000001, 0x00000002, 0x00000003};
+    std::array<u32, 8> rgba{};
+    expandTexturePixels(TextureFormat::RGB32Float,
+                        reinterpret_cast<const u8*>(rgb.data()),
+                        reinterpret_cast<u8*>(rgba.data()), 2);
+    check(rgba[0] == rgb[0] && rgba[1] == rgb[1] && rgba[2] == rgb[2] &&
+               rgba[3] == 0x3f800000 && rgba[4] == rgb[3] && rgba[7] == 0x3f800000,
+           "RGB32 float gains an alpha of 1.0");
+    expandTexturePixels(TextureFormat::RGB32Uint,
+                        reinterpret_cast<const u8*>(rgb.data()),
+                        reinterpret_cast<u8*>(rgba.data()), 2);
+    check(rgba[3] == 1 && rgba[7] == 1 && rgba[5] == rgb[4],
+           "RGB32 integer formats gain an alpha of 1");
+    std::cout << "PASS: G4R4 and RGB32 upload expansion\n";
+}
+
 void testStorageHashCollision() {
     // The hashes depend on the address: try a few until two collide
     std::vector<u8> memory(4096 * 256 * 4 + 64 * 0x100, 0);
@@ -753,6 +791,7 @@ void runTextureFormatTests() {
     testCrossFormatCopies();
     testSamplerDecoding();
     testTextureShapeLegalization();
+    testExpandedFormats();
     testStorageHashCollision();
     testAliasQueries();
     testSurfaceFormatConversions();

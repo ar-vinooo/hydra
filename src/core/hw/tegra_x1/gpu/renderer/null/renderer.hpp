@@ -112,11 +112,15 @@ class Renderer : public IRenderer {
                          engines::IndexType index_type) override;
     void bindUniformBuffer(const BufferView& buffer, ShaderType shader_type,
                            u32 index) override;
+    BufferView getGuestMemoryBuffer(ztd::Range<uptr> range) override;
+    void bindStorageBuffer(const BufferView& buffer, ShaderType shader_type,
+                           u32 index) override;
     void bindTexture(ITextureView* texture, SamplerBase* sampler,
                      ShaderType shader_type, u32 index) override;
 
     // Resource unbinding
     void unbindUniformBuffers(ShaderType shader_type) override;
+    void unbindStorageBuffers(ShaderType shader_type) override;
     void unbindTextures(ShaderType shader_type) override;
 
     // Draw

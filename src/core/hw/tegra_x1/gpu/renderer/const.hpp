@@ -168,6 +168,7 @@ enum class TextureFormat {
     BGR10A2Unorm,
     S8Uint_Z24Unorm,
     R1G5B5A5Unorm,
+    RG4Unorm,
 };
 
 struct TextureFormatInfo {
@@ -178,6 +179,10 @@ struct TextureFormatInfo {
 };
 
 const TextureFormatInfo& getTextureFormatInfo(TextureFormat format);
+// Metal stores these packed guest formats using wider host texels.
+TextureFormat getHostTextureFormat(TextureFormat format);
+void expandTexturePixels(TextureFormat format, const u8* guest, u8* host,
+                         usize pixel_count);
 
 TextureFormat toTextureFormat(NvColorFormat color_format);
 TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
@@ -345,8 +350,117 @@ struct SamplerDescriptor {
     f32 max_lod = 15.0f;
     f32 lod_bias = 0.0f;
     u32 max_anisotropy = 1;
-    // TODO: more
+    // The sampled texture has an integer format: the border color holds raw
+    // component bits
+    bool integer_texture = false;
 };
+
+constexpr bool isSrgbTextureFormat(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::RGBX8Unorm_sRGB:
+    case TextureFormat::RGBA8Unorm_sRGB:
+    case TextureFormat::BGRX8Unorm_sRGB:
+    case TextureFormat::BGRA8Unorm_sRGB:
+    case TextureFormat::BC1_RGB_sRGB:
+    case TextureFormat::BC1_RGBA_sRGB:
+    case TextureFormat::BC2_RGBA_sRGB:
+    case TextureFormat::BC3_RGBA_sRGB:
+    case TextureFormat::BC7_RGBAUnorm_sRGB:
+    case TextureFormat::ASTC_RGBA_4x4_sRGB:
+    case TextureFormat::ASTC_RGBA_5x4_sRGB:
+    case TextureFormat::ASTC_RGBA_5x5_sRGB:
+    case TextureFormat::ASTC_RGBA_6x5_sRGB:
+    case TextureFormat::ASTC_RGBA_6x6_sRGB:
+    case TextureFormat::ASTC_RGBA_8x5_sRGB:
+    case TextureFormat::ASTC_RGBA_8x6_sRGB:
+    case TextureFormat::ASTC_RGBA_8x8_sRGB:
+    case TextureFormat::ASTC_RGBA_10x5_sRGB:
+    case TextureFormat::ASTC_RGBA_10x6_sRGB:
+    case TextureFormat::ASTC_RGBA_10x8_sRGB:
+    case TextureFormat::ASTC_RGBA_10x10_sRGB:
+    case TextureFormat::ASTC_RGBA_12x10_sRGB:
+    case TextureFormat::ASTC_RGBA_12x12_sRGB:
+    case TextureFormat::ETC2_RGB_sRGB:
+    case TextureFormat::PTA_ETC2_RGB_sRGB:
+    case TextureFormat::ETC2_RGBA_sRGB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Metal only has three border colors. Every other guest border color (and
+// mirrored-to-border addressing) is emulated in the shader.
+enum class SamplerBorderPreset {
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+    Custom,
+};
+
+constexpr bool isBorderAddressMode(SamplerAddressMode mode) {
+    return mode == SamplerAddressMode::ClampToBorder ||
+           mode == SamplerAddressMode::MirrorClampToBorder;
+}
+
+constexpr bool samplerUsesBorder(const SamplerDescriptor& descriptor) {
+    return isBorderAddressMode(descriptor.address_mode_s) ||
+           isBorderAddressMode(descriptor.address_mode_t) ||
+           isBorderAddressMode(descriptor.address_mode_r);
+}
+
+constexpr bool samplerMirrorsToBorder(const SamplerDescriptor& descriptor) {
+    return descriptor.address_mode_s == SamplerAddressMode::MirrorClampToBorder ||
+           descriptor.address_mode_t == SamplerAddressMode::MirrorClampToBorder ||
+           descriptor.address_mode_r == SamplerAddressMode::MirrorClampToBorder;
+}
+
+inline SamplerBorderPreset
+getSamplerBorderPreset(const SamplerDescriptor& descriptor) {
+    const auto r = descriptor.border_color_u.x();
+    const auto g = descriptor.border_color_u.y();
+    const auto b = descriptor.border_color_u.z();
+    const auto a = descriptor.border_color_u.w();
+    if (descriptor.integer_texture) {
+        return (r | g | b | a) == 0 ? SamplerBorderPreset::TransparentBlack
+                                    : SamplerBorderPreset::Custom;
+    }
+    constexpr u32 zero = 0x00000000u;
+    constexpr u32 one = 0x3f800000u;
+    // Depth comparisons use the first component as the border depth
+    if (descriptor.depth_compare_op != engines::CompareOp::Invalid) {
+        if (r == zero)
+            return SamplerBorderPreset::TransparentBlack;
+        if (r == one)
+            return SamplerBorderPreset::OpaqueWhite;
+        return SamplerBorderPreset::Custom;
+    }
+    if (r == zero && g == zero && b == zero) {
+        if (a == zero)
+            return SamplerBorderPreset::TransparentBlack;
+        if (a == one)
+            return SamplerBorderPreset::OpaqueBlack;
+    } else if (r == one && g == one && b == one && a == one) {
+        return SamplerBorderPreset::OpaqueWhite;
+    }
+    return SamplerBorderPreset::Custom;
+}
+
+// Whether the shader has to emulate the sampler's border handling because
+// Metal cannot express it
+inline bool samplerNeedsBorderEmulation(const SamplerDescriptor& descriptor) {
+    return samplerMirrorsToBorder(descriptor) ||
+           (samplerUsesBorder(descriptor) &&
+            getSamplerBorderPreset(descriptor) == SamplerBorderPreset::Custom);
+}
+
+// Anisotropic filtering needs linear minification and mip filtering
+constexpr u32 getEffectiveSamplerAnisotropy(const SamplerDescriptor& descriptor) {
+    if (descriptor.min_filter != SamplerFilter::Nearest &&
+        descriptor.mip_filter == SamplerMipFilter::Linear)
+        return std::clamp(descriptor.max_anisotropy, 1u, 16u);
+    return 1u;
+}
 
 enum class BlendOperation {
     Add = 1,
@@ -508,7 +622,15 @@ struct ResourceMapping {
     // Constant-buffer jump table words used to enumerate indirect branches.
     std::map<std::pair<u32, u32>, u32> branch_constants;
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
-    // TODO: storage buffers
+    // Global memory buffers. Their address and size are read from the NVN
+    // descriptor at `cbuf_offset` in constant buffer `cbuf_slot`
+    struct StorageBuffer {
+        u32 cbuf_slot;
+        u32 cbuf_offset;
+        u32 host_index;
+        bool written;
+    };
+    std::vector<StorageBuffer> storage_buffers;
     std::map<u32, u32> textures;
     // Texture type the shader declares for each binding
     std::map<u32, TextureType> texture_types;
@@ -524,8 +646,6 @@ struct ResourceMapping {
     ResourceMapping() {
         for (auto& uniform_buffer : uniform_buffers)
             uniform_buffer = invalid<u32>();
-        // TODO: storage buffers
-        // TODO: images
     }
 };
 
@@ -678,7 +798,7 @@ ENABLE_ENUM_FORMATTING(
     ETC2_RGBA, "etc2_rgba", ETC2_RGB_sRGB, "etc2_rgb_srgb", PTA_ETC2_RGB_sRGB,
     "pta_etc2_rgb_srgb", ETC2_RGBA_sRGB, "etc2_rgba_srgb", BGR10A2Unorm,
     "bgr10a2unorm", S8Uint_Z24Unorm, "s8uint z24unorm", R1G5B5A5Unorm,
-    "r1g5b5a5unorm")
+    "r1g5b5a5unorm", RG4Unorm, "rg4unorm")
 
 ENABLE_STRUCT_FORMATTING(hydra::hw::tegra_x1::gpu::renderer::SwizzleChannels, r,
                          "", "r", g, "", "g", b, "", "b", a, "", "a")

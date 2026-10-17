@@ -15,9 +15,7 @@ Sampler::Sampler(MTL::Device* device, const SamplerDescriptor& descriptor)
     desc->setLodMinClamp(descriptor.min_lod);
     desc->setLodMaxClamp(descriptor.max_lod);
     // Bias is combined with the instruction bias in generated MSL.
-    if (descriptor.min_filter != SamplerFilter::Nearest &&
-        descriptor.mip_filter == SamplerMipFilter::Linear)
-        desc->setMaxAnisotropy(std::clamp(descriptor.max_anisotropy, 1u, 16u));
+    desc->setMaxAnisotropy(getEffectiveSamplerAnisotropy(descriptor));
     // CLAMP_OGL clamps to the border when filtering linearly (like Eden)
     const bool linear = descriptor.min_filter != SamplerFilter::Nearest ||
                         descriptor.mag_filter != SamplerFilter::Nearest;
@@ -32,33 +30,20 @@ Sampler::Sampler(MTL::Device* device, const SamplerDescriptor& descriptor)
     if (descriptor.depth_compare_op != engines::CompareOp::Invalid)
         desc->setCompareFunction(toMtlCompareFunc(descriptor.depth_compare_op));
 
-    // Border color: Metal has transparent black, opaque black and opaque
-    // white. Use the closest one (a color between them is approximated).
-    const auto border_color = std::bit_cast<float4>(descriptor.border_color_u);
-    const f32 alpha = std::clamp(border_color.w(), 0.0f, 1.0f);
-    const f32 luminance = (std::clamp(border_color.x(), 0.0f, 1.0f) +
-                           std::clamp(border_color.y(), 0.0f, 1.0f) +
-                           std::clamp(border_color.z(), 0.0f, 1.0f)) /
-                          3.0f;
-    const auto distance = [&](f32 white, f32 target_alpha) {
-        return (luminance - white) * (luminance - white) +
-               (alpha - target_alpha) * (alpha - target_alpha);
-    };
+    // Metal only has the three presets. Other colors (and mirrored-to-border
+    // addressing) are emulated by the shader, which does not use this sampler
+    // for those bindings; the transparent preset is the neutral base there.
     MTL::SamplerBorderColor mtl_border_color =
         MTL::SamplerBorderColorTransparentBlack;
-    f32 best = distance(0.0f, 0.0f);
-    if (const f32 d = distance(0.0f, 1.0f); d < best) {
-        best = d;
+    switch (getSamplerBorderPreset(descriptor)) {
+    case SamplerBorderPreset::OpaqueBlack:
         mtl_border_color = MTL::SamplerBorderColorOpaqueBlack;
-    }
-    if (const f32 d = distance(1.0f, 1.0f); d < best) {
-        best = d;
+        break;
+    case SamplerBorderPreset::OpaqueWhite:
         mtl_border_color = MTL::SamplerBorderColorOpaqueWhite;
-    }
-    if (best > 0.0f) {
-        ONCE(LOG_WARN(MetalRenderer,
-                      "Unsupported border color {}, using the closest preset",
-                      border_color));
+        break;
+    default:
+        break;
     }
     desc->setBorderColor(mtl_border_color);
 

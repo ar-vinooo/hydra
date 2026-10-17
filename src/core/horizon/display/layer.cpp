@@ -23,11 +23,22 @@ bool Layer::acquirePresentTexture(
 
     // Wait for the GPU to finish rendering the buffer
     system.getGpu().getPfifo().waitForCompletion(gpu_fence);
-    const auto& buffer = binder.getBuffer(slot);
+    const auto release = binder.releaseCallback(slot);
+    const auto buffer = binder.getBuffer(slot);
+    if (!buffer) {
+        release();
+        return false;
+    }
+    command_buffer->onCompleted(release);
 
     // Texture
-    present_texture = system.getGpu().getTexture(
-        command_buffer, process->getMmu(), buffer.nv_buffer);
+    auto* texture = system.getGpu().getTexture(
+        command_buffer, process->getMmu(), buffer->nv_buffer);
+    if (texture == nullptr) {
+        present_texture.reset();
+        return false;
+    }
+    present_texture = texture;
 
     // Rect
     src_rect = {};

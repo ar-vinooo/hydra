@@ -2,15 +2,22 @@
 // the engines issue (clears), checked on Metal where pixels are involved.
 #include "core/hw/tegra_x1/gpu/macro/interpreter/driver.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
+#include <sys/mman.h>
+#include <unistd.h>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -316,6 +323,85 @@ std::vector<u8> readTexture(MTL::Device* device, MTL::Texture* texture,
 
 // Clears only depend on the clear state: a color clear after a depth clear
 // keeps the depth, and every clear is limited to the clear area
+// Storage buffers wrap guest memory pages: GPU writes must appear in the
+// guest's bytes, and a range inside a page must keep its neighbours intact
+void testGuestMemoryBuffer() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    const auto page_size = static_cast<usize>(sysconf(_SC_PAGESIZE));
+    auto* memory = static_cast<u8*>(mmap(nullptr, 3 * page_size,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    expect(memory != MAP_FAILED, "Guest memory allocation");
+    std::memset(memory, 0xcd, 3 * page_size);
+
+    metal::Renderer renderer;
+    // 32 bytes straddling the first page boundary, 16 byte aligned
+    const auto range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(memory) + page_size - 16, 32);
+    const auto view = renderer.getGuestMemoryBuffer(range);
+    expect(view.isValid(), "Guest memory buffer is created");
+    expect(view.getSize() == 32, "View covers the requested bytes");
+    // The same pages are shared by a second request
+    const auto again = renderer.getGuestMemoryBuffer(range);
+    expect(again.getBase() == view.getBase(), "Guest memory buffers are cached");
+
+    NS_STACK_SCOPED auto device = MTL::CreateSystemDefaultDevice();
+    const char* source = R"(
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void fill(device uint* b [[buffer(0)]],
+                         uint t [[thread_position_in_grid]]) { b[t] = t + 1u; })";
+    NS::Error* error = nullptr;
+    NS_STACK_SCOPED auto library = device->newLibrary(
+        NS::String::string(source, NS::UTF8StringEncoding), nullptr, &error);
+    NS_STACK_SCOPED auto function = library->newFunction(
+        NS::String::string("fill", NS::UTF8StringEncoding));
+    NS_STACK_SCOPED auto pipeline =
+        device->newComputePipelineState(function, &error);
+    expect(pipeline != nullptr, "Fill kernel compiles");
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->computeCommandEncoder();
+    encoder->setComputePipelineState(pipeline);
+    encoder->setBuffer(static_cast<metal::Buffer*>(view.getBase())->getBuffer(),
+                       view.getOffset(), 0);
+    encoder->dispatchThreads(MTL::Size(8, 1, 1), MTL::Size(8, 1, 1));
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    expect(commands->status() == MTL::CommandBufferStatusCompleted,
+           "Kernel writes guest memory");
+
+    const u8* written = reinterpret_cast<const u8*>(range.getBegin());
+    for (u32 i = 0; i < 8; ++i) {
+        u32 value;
+        std::memcpy(&value, written + i * 4, 4);
+        expect(value == i + 1, "GPU writes reach the guest bytes");
+    }
+    expect(written[-1] == 0xcd && written[32] == 0xcd,
+           "Bytes next to the range are untouched");
+    // Ranges a shader writes are served as views of the live memory, other
+    // ranges keep the CPU snapshots
+    std::unique_ptr<ICommandBuffer> cache_commands(renderer.createCommandBuffer());
+    auto& buffer_cache = renderer.getBufferCache();
+    const auto gpu_written_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(memory) + 2 * page_size, 256);
+    const auto untouched = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(memory) + 64, 256);
+    {
+        std::scoped_lock lock(buffer_cache.getMutex());
+        buffer_cache.markGpuModified(gpu_written_range);
+        expect(buffer_cache.get(cache_commands.get(), gpu_written_range).getPtr() == gpu_written_range.getBegin(),
+               "GPU-gpu_written_range ranges read the guest memory directly");
+        expect(buffer_cache.get(cache_commands.get(), untouched).getPtr() != untouched.getBegin(),
+               "Other ranges are still snapshots");
+    }
+    cache_commands.reset();
+    munmap(memory, 3 * page_size);
+    std::cout << "PASS: storage buffers alias guest memory\n";
+}
+
 void testRendererClears() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
     setenv("HYDRA_GPU_SYNC", "1", 1);
@@ -376,6 +462,325 @@ void testRendererClears() {
                  "attachments untouched\n";
 }
 
+void testOcclusionReports() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    auto* device = renderer.getDevice();
+    std::vector<u8> image_memory(0x20000, 0);
+    std::array<u8, 32> report_memory{};
+    GMmu gmmu(nullptr);
+    constexpr u64 REPORT = 0x400000;
+    gmmu.map(REPORT, {reinterpret_cast<uptr>(report_memory.data()), report_memory.size()});
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    auto& cache = renderer.getTextureCache();
+    const auto ptr = reinterpret_cast<uptr>(image_memory.data());
+    auto* color = cache.find(commands.get(),
+        TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+                          false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
+    auto* depth = cache.find(commands.get(),
+        TextureDescriptor(ptr + 0x10000, TextureType::_2D, TextureFormat::Z32Float,
+                          false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
+    RenderPassDescriptor pass_descriptor{};
+    pass_descriptor.color_targets[0].texture = color;
+    pass_descriptor.depth_stencil_target.texture = depth;
+    std::unique_ptr<RenderPassBase> pass(renderer.createRenderPass(pass_descriptor));
+    renderer.bindRenderPass(pass.get());
+    const auto shader = [&](ShaderType type, const std::string& code) {
+        ShaderDescriptor descriptor{};
+        descriptor.type = type;
+        descriptor.backend = ShaderBackend::Msl;
+        descriptor.code.assign(code.begin(), code.end());
+        return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+    };
+    const auto vertex = shader(ShaderType::Vertex, R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+    return float4(p[id], 0.5, 1);
+})");
+    const auto fragment = shader(ShaderType::Fragment, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_() { return float4(1); }
+)");
+    PipelineDescriptor pipeline_descriptor{};
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+    pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+    pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+    pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
+    std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+    renderer.bindPipeline(pipeline.get());
+    const Scissor full(uint2({0, 0}), uint2({4, 4}));
+    for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+        renderer.setViewport(i, {FloatRect2D(float2({0, 0}), float2({4, 4})), 0, 1});
+        renderer.setScissor(i, full);
+    }
+    renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
+    renderer.setDepthTestEnabled(true);
+    renderer.setDepthWriteEnabled(false);
+    renderer.setDepthCompareOp(engines::CompareOp::Less);
+    renderer.setStencilState({});
+    renderer.setClearState({.rect = full});
+    renderer.clearDepth(commands.get(), 0, 0.25f);
+    tls_crnt_gmmu = &gmmu;
+    renderer.setOcclusionCounterEnabled(true);
+    engine.method(0x54c, 1);
+    const auto draw = [&] {
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+    };
+    const auto report = [&](u32 counter, bool short_query = false) {
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(REPORT));
+        engine.method(0x6c3, 2 | (counter << 23) | (static_cast<u32>(short_query) << 28));
+        u64 value = 0;
+        std::memcpy(&value, report_memory.data(), short_query ? 4 : 8);
+        return value;
+    };
+    draw();
+    expect(report(0x15) == 0, "Fully occluded geometry reports zero samples");
+    std::copy_n(report_memory.data(), 16, report_memory.data() + 16);
+    renderer.clearDepth(commands.get(), 0, 0.75f);
+    draw();
+    expect(report(0x15) == 16, "Visible geometry reports pixels, not draw calls");
+    engine.method(0x554, 0);
+    engine.method(0x555, static_cast<u32>(REPORT));
+    engine.method(0x556, 3);
+    expect(!engine.shouldExecute(), "Real occlusion reports drive unequal render conditions");
+    engine.method(0x556, 4);
+    expect(engine.shouldExecute(), "A visible report differs from a zero-sample report");
+    engine.method(0x556, 1);
+    u64 first_timestamp;
+    std::memcpy(&first_timestamp, report_memory.data() + 8, 8);
+    expect(first_timestamp != 0, "Long reports include a completion timestamp");
+    std::unique_ptr<BufferBase> indices(renderer.allocateTemporaryBuffer(6));
+    const u16 triangle[] = {0, 1, 2};
+    std::memcpy(reinterpret_cast<void*>(indices->getPtr()), triangle, sizeof(triangle));
+    const u32 guard_word = 0xcafebabe;
+    std::memcpy(report_memory.data() + 4, &guard_word, sizeof(guard_word));
+    renderer.bindIndexBuffer(BufferView(indices.get()), engines::IndexType::UInt16);
+    renderer.drawIndexed(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 0, 1);
+    expect(report(0x2, true) == 32, "Indexed draws add their visible samples to the counter");
+    u32 kept_word;
+    u64 kept_timestamp;
+    std::memcpy(&kept_word, report_memory.data() + 4, 4);
+    std::memcpy(&kept_timestamp, report_memory.data() + 8, 8);
+    expect(kept_word == guard_word && kept_timestamp == first_timestamp,
+           "Short reports leave the following words and timestamp untouched");
+    renderer.setOcclusionCounterEnabled(false);
+    draw();
+    expect(report(0x15) == 32, "Disabled counters preserve the accumulated value");
+    engine.method(0x54c, 1);
+    expect(report(0x15) == 0, "Counter reset clears the accumulated result");
+    renderer.setOcclusionCounterEnabled(true);
+    draw();
+    engine.method(0x54c, 1); // Drop an in-flight epoch before committing it.
+    draw();
+    expect(report(0x15) == 16, "Reset does not include draws from the prior in-flight epoch");
+    engine.method(0x54c, 1);
+    draw();
+    commands.reset();
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    draw();
+    const auto across_submissions = report(0x15);
+    expect(across_submissions == 32,
+           fmt::format("Queries accumulate across command-buffer submissions (got {})",
+                       across_submissions).c_str());
+    engine.method(0x54c, 1);
+    draw();
+    renderer.clearColor(commands.get(), 0, 0, 0xf, uint4({0, 0, 0, 0}));
+    renderer.clearDepth(commands.get(), 0, 0.75f);
+    draw();
+    expect(report(0x15) == 32, "Clear passes preserve earlier counts and add no samples");
+    engine.method(0x54c, 1);
+    for (u32 i = 0; i < VIEWPORT_COUNT; i++)
+        renderer.setScissor(i, Scissor(uint2({0, 0}), uint2({2, 2})));
+    draw();
+    expect(report(0x15) == 4, "Scissor coverage determines the actual sample count");
+    for (u32 i = 0; i < VIEWPORT_COUNT; i++)
+        renderer.setScissor(i, full);
+    engine.method(0x54c, 1);
+    for (u32 i = 0; i < 5000; i++)
+        draw();
+    expect(report(0x15) == 80000, "Large query batches survive visibility-buffer rollover");
+    engine.method(0x54c, 1);
+    for (u32 i = 0; i < 160; i++) {
+        draw();
+        static_cast<metal::CommandBuffer*>(commands.get())->getBlitCommandEncoder();
+    }
+    expect(report(0x15) == 2560,
+           "Long-lived counters fold completed pages without losing samples");
+
+    NS_STACK_SCOPED auto witness = device->newBuffer(16, MTL::ResourceStorageModeShared);
+    std::memset(witness->contents(), 0, 16);
+    auto* metal_commands = static_cast<metal::CommandBuffer*>(commands.get());
+    metal_commands->getBlitCommandEncoder()->fillBuffer(witness, NS::Range(0, 16), 0x5a);
+    auto completion = std::make_shared<std::promise<void>>();
+    auto finished = completion->get_future();
+    commands->onCompleted([completion] { completion->set_value(); });
+    engine.method(0x6c0, 0xffffff00); // Reserved upper-address bits are ignored.
+    engine.method(0x6c2, 0x12345678);
+    engine.method(0x6c3, 1u << 28); // Short payload release.
+    u32 payload;
+    std::memcpy(&payload, report_memory.data(), 4);
+    expect(payload == 0x12345678 && static_cast<const u8*>(witness->contents())[0] == 0x5a,
+           "A semaphore payload is published only after preceding GPU writes finish");
+    expect(finished.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout,
+           "A report checkpoint does not complete the whole logical submission");
+    std::array<u8, 4> split_head{};
+    std::array<u8, 12> split_tail{};
+    gmmu.map(REPORT + 0x100, {reinterpret_cast<uptr>(split_head.data()), 4});
+    gmmu.map(REPORT + 0x104, {reinterpret_cast<uptr>(split_tail.data()), 12});
+    engine.method(0x6c1, static_cast<u32>(REPORT + 0x100));
+    engine.method(0x6c2, 0x87654321);
+    engine.method(0x6c3, 0);
+    const auto split_report = gmmu.readMappedBytes(REPORT + 0x100, 16);
+    u64 split_value, split_time;
+    std::memcpy(&split_value, split_report.data(), 8);
+    std::memcpy(&split_time, split_report.data() + 8, 8);
+    expect(split_value == 0x87654321 && split_time >= first_timestamp,
+           "Long reports span separate host mappings without losing the timestamp");
+    gmmu.unmap(REPORT + 0x104);
+    engine.method(0x6c2, 0xdeadbeef);
+    engine.method(0x6c3, 0);
+    u32 unchanged;
+    std::memcpy(&unchanged, split_head.data(), 4);
+    expect(unchanged == 0x87654321, "Unmapped report tails do not cause partial writes");
+    renderer.setOcclusionCounterEnabled(false);
+    commands.reset();
+    expect(finished.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
+           "Logical completion callbacks remain attached to final submission");
+    tls_crnt_command_buffer = nullptr;
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: real occlusion counts, reset epochs, rollover and completion-ordered reports\n";
+}
+
+// Release semaphores with a reduction combine the payload with memory, and
+// acquires wait for the value another writer releases
+void testReportSemaphoreReductionAndAcquire() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    std::array<u32, 8> memory{};
+    GMmu gmmu(nullptr);
+    constexpr u64 SEMAPHORE = 0x500000;
+    gmmu.map(SEMAPHORE, {reinterpret_cast<uptr>(memory.data()), sizeof(memory)});
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    tls_crnt_gmmu = &gmmu;
+    engine.method(0x6c0, 0);
+    engine.method(0x6c1, static_cast<u32>(SEMAPHORE));
+
+    const auto reduce = [&](u32 op, u32 format, u32 initial, u32 payload) {
+        memory[0] = initial;
+        engine.method(0x6c2, payload);
+        // Short release with reduction enabled
+        engine.method(0x6c3, (1u << 28) | (1u << 3) | (op << 9) | (format << 17));
+        return memory[0];
+    };
+    expect(reduce(0, 0, 10, 5) == 15, "Release reduction ADD");
+    expect(reduce(1, 0, 10, 5) == 5, "Release reduction MIN unsigned");
+    expect(reduce(1, 1, 0xfffffffeu, 3) == 0xfffffffeu,
+           "Release reduction MIN signed treats the high bit as a sign");
+    expect(reduce(2, 0, 10, 5) == 10, "Release reduction MAX unsigned");
+    expect(reduce(3, 0, 3, 3) == 0 && reduce(3, 0, 2, 3) == 3,
+           "Release reduction INC wraps at the payload");
+    expect(reduce(4, 0, 0, 7) == 7 && reduce(4, 0, 5, 7) == 4,
+           "Release reduction DEC wraps to the payload");
+    expect(reduce(5, 0, 0xf0f0, 0xff00) == 0xf000, "Release reduction AND");
+    expect(reduce(6, 0, 0xf0, 0x0f) == 0xff, "Release reduction OR");
+    expect(reduce(7, 0, 0xff, 0x0f) == 0xf0, "Release reduction XOR");
+    memory[1] = 0x77777777;
+    engine.method(0x6c2, 1);
+    memory[0] = 1;
+    engine.method(0x6c3, (1u << 28) | (1u << 3));
+    expect(memory[0] == 2 && memory[1] == 0x77777777,
+           "A reduction does not write a timestamp or neighbouring words");
+
+    // Acquire returns at once when the value is already there
+    memory[0] = 42;
+    engine.method(0x6c2, 42);
+    engine.method(0x6c3, 1);
+    // GE accepts a larger value, wrapping like a signed difference
+    memory[0] = 50;
+    engine.method(0x6c3, 1 | (1u << 16));
+    // And waits for a writer on another thread
+    memory[0] = 0;
+    engine.method(0x6c2, 7);
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        std::atomic_ref<u32>(memory[0]).store(7, std::memory_order_release);
+    });
+    const auto start = std::chrono::steady_clock::now();
+    engine.method(0x6c3, 1);
+    const auto waited = std::chrono::steady_clock::now() - start;
+    writer.join();
+    expect(waited >= std::chrono::milliseconds(40) &&
+               waited < std::chrono::milliseconds(900),
+           "Acquire waits for the semaphore release");
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: report semaphore reduction and acquire\n";
+}
+
+void testConditionalRendering() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    std::array<u32, 6> compare{5, 1, 0xdead, 0xbeef, 5, 1};
+    GMmu gmmu(nullptr);
+    constexpr u64 ADDRESS = 0x100400000ull;
+    // The comparison spans mappings and uses the high address register.
+    gmmu.map(ADDRESS, {reinterpret_cast<uptr>(compare.data()), 12});
+    gmmu.map(ADDRESS + 12, {reinterpret_cast<uptr>(compare.data()) + 12, 12});
+    tls_crnt_gmmu = &gmmu;
+    engine.method(0x554, static_cast<u32>(ADDRESS >> 32));
+    engine.method(0x555, static_cast<u32>(ADDRESS));
+    engine.method(0x651, 0);
+    engine.method(0x556, 0);
+    expect(!engine.shouldExecute(), "FALSE rendering mode disables execution");
+    engine.method(0x556, 1);
+    expect(engine.shouldExecute(), "TRUE rendering mode enables execution");
+    engine.method(0x556, 2);
+    expect(engine.shouldExecute(), "Conditional mode requires both initial words nonzero");
+    compare[0] = 0;
+    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial sequence");
+    compare[0] = 5;
+    compare[1] = 0;
+    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial mode");
+    compare[1] = 1;
+    engine.method(0x556, 3);
+    expect(engine.shouldExecute(), "RENDER_IF_EQUAL compares both report words");
+    compare[5] = 2;
+    expect(!engine.shouldExecute(), "Equal mode rejects a mode-word mismatch");
+    engine.method(0x556, 4);
+    expect(engine.shouldExecute(), "RENDER_IF_NOT_EQUAL accepts either word differing");
+    compare[5] = 1;
+    expect(!engine.shouldExecute(), "Not-equal mode rejects matching report words");
+    compare[4] = 6;
+    expect(engine.shouldExecute(), "Not-equal mode accepts a sequence-word mismatch");
+    engine.method(0x651, 2);
+    expect(!engine.shouldExecute(), "NEVER override wins over comparison results");
+    engine.method(0x556, 0);
+    engine.method(0x651, 1);
+    expect(engine.shouldExecute(), "ALWAYS override wins over FALSE mode");
+    engine.method(0x651, 0);
+    engine.method(0x556, 3);
+    gmmu.unmap(ADDRESS + 12);
+    expect(!engine.shouldExecute(), "Incomplete comparison data safely disables execution");
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: conditional render comparisons, high addresses and overrides\n";
+}
+
 // Decoded index buffers follow the guest indices: rewriting them at the same
 // address must not reuse the previous decode
 void testIndexDecoding() {
@@ -408,18 +813,18 @@ void testIndexDecoding() {
     engines::IndexType type;
     engines::PrimitiveType primitive;
     u32 count;
-    const auto first = decode(engines::PrimitiveType::Triangles, 8, type,
+    const auto first = decode(engines::PrimitiveType::Points, 8, type,
                               primitive, count);
     expect(type == engines::IndexType::UInt16 && count == 8,
            "U8 indices decode to U16");
     expect(read_u16(first, 8) == std::vector<u16>({3, 1, 4, 1, 5, 9, 2, 6}),
            "U8 indices are widened");
-    expect(decode(engines::PrimitiveType::Triangles, 8, type, primitive, count)
+    expect(decode(engines::PrimitiveType::Points, 8, type, primitive, count)
                    .getBase() == first.getBase(),
            "Unchanged indices reuse their decode");
 
     indices[2] = 42;
-    const auto rewritten = decode(engines::PrimitiveType::Triangles, 8, type,
+    const auto rewritten = decode(engines::PrimitiveType::Points, 8, type,
                                   primitive, count);
     expect(rewritten.getBase() != first.getBase() &&
                read_u16(rewritten, 8)[2] == 42,
@@ -449,9 +854,9 @@ void testIndexDecoding() {
            "Quad strips become two triangles per quad");
     const auto loop = decode(engines::PrimitiveType::LineLoop, 3, type,
                              primitive, count);
-    expect(primitive == engines::PrimitiveType::LineStrip && count == 4 &&
-               read_u16(loop, 4) == std::vector<u16>({3, 1, 42, 3}),
-           "Line loops are closed line strips");
+    expect(primitive == engines::PrimitiveType::Lines && count == 6 &&
+               read_u16(loop, 6) == std::vector<u16>({3, 1, 1, 42, 42, 3}),
+           "Line loops become closed line lists");
     expect(!decode(engines::PrimitiveType::TriangleFan, 2, type, primitive,
                    count)
                 .isValid() &&
@@ -477,6 +882,197 @@ void testIndexDecoding() {
            "U32 quads keep 32-bit indices");
     commands.reset();
     std::cout << "PASS: decoded index buffers follow rewritten guest indices\n";
+}
+
+template <typename T>
+void checkPrimitiveRestart(engines::IndexType input_type) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    metal::Renderer renderer;
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    auto& cache = renderer.getIndexCache();
+    using P = engines::PrimitiveType;
+    struct Case {
+        P input;
+        P output;
+        std::vector<u32> expected;
+    };
+    const Case cases[] = {
+        {P::Points, P::Points, {1, 2, 3, 4, 5, 6, 7, 8}},
+        {P::Lines, P::Lines, {1, 2, 3, 4, 5, 6, 7, 8}},
+        {P::Triangles, P::Triangles, {1, 2, 3, 5, 6, 7}},
+        {P::LineStrip, P::Lines, {1, 2, 2, 3, 3, 4, 5, 6, 6, 7, 7, 8}},
+        {P::LineLoop, P::Lines,
+         {1, 2, 2, 3, 3, 4, 4, 1, 5, 6, 6, 7, 7, 8, 8, 5}},
+        {P::TriangleStrip, P::Triangles, {1, 2, 3, 3, 2, 4, 5, 6, 7, 7, 6, 8}},
+        {P::TriangleFan, P::Triangles, {1, 2, 3, 1, 3, 4, 5, 6, 7, 5, 7, 8}},
+        {P::Polygon, P::Triangles, {1, 2, 3, 1, 3, 4, 5, 6, 7, 5, 7, 8}},
+        {P::Quads, P::Triangles, {1, 2, 3, 1, 3, 4, 5, 6, 7, 5, 7, 8}},
+        {P::QuadStrip, P::Triangles, {1, 2, 4, 1, 4, 3, 5, 6, 8, 5, 8, 7}},
+    };
+    std::vector<T> source = {99, 1, 2, 3, 4, 99, 99, 5, 6, 7, 8, 99};
+    IndexDescriptor descriptor{
+        .type = input_type,
+        .primitive_type = P::Points,
+        .count = static_cast<u32>(source.size()),
+        .mem_range = ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T)),
+        .restart_enabled = true,
+        .restart_index = 99};
+    engines::IndexType type;
+    P primitive;
+    u32 count;
+    const auto read = [&](const BufferView& view) {
+        std::vector<u32> result;
+        for (u32 i = 0; i < count; i++) {
+            if (type == engines::IndexType::UInt32)
+                result.push_back(reinterpret_cast<const u32*>(view.getPtr())[i]);
+            else
+                result.push_back(reinterpret_cast<const u16*>(view.getPtr())[i]);
+        }
+        return result;
+    };
+    const auto decode = [&] {
+        return cache.decode(commands.get(), descriptor, type, primitive, count);
+    };
+    for (const auto& test : cases) {
+        descriptor.primitive_type = test.input;
+        const auto view = decode();
+        expect(primitive == test.output && read(view) == test.expected,
+               "Restart separates primitive assembly and resets strip winding");
+        expect(decode().getBase() == view.getBase() && count == test.expected.size(),
+               "Cached restart decode restores the segmented output count");
+    }
+
+    descriptor.primitive_type = P::TriangleStrip;
+    descriptor.restart_enabled = false;
+    expect(read(decode()).size() == (source.size() - 2) * 3,
+           "Disabled custom restart keeps every index");
+    descriptor.restart_enabled = true;
+    descriptor.restart_index = 98;
+    expect(read(decode()).size() == (source.size() - 2) * 3,
+           "Changing the restart index invalidates the decoded buffer");
+    descriptor.restart_index = 99;
+    source.assign(source.size(), 99);
+    expect(!decode().isValid() && count == 0,
+           "An all-restart draw produces no primitives");
+
+    // The maximum index remains a vertex when restart is disabled.
+    source = {1, 2, static_cast<T>(~T{0}), 3, 4};
+    descriptor.mem_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T));
+    descriptor.count = static_cast<u32>(source.size());
+    descriptor.restart_index = static_cast<u32>(source[2]);
+    descriptor.restart_enabled = false;
+    const auto maximum = static_cast<u32>(source[2]);
+    expect(read(decode()) == std::vector<u32>({1, 2, maximum, maximum, 2, 3,
+                                             maximum, 3, 4}),
+           "Disabled restart preserves maximum indices without Metal strip cuts");
+    descriptor.restart_enabled = true;
+    const auto native_restart = decode();
+    if (sizeof(T) == 1)
+        expect(!native_restart.isValid() && count == 0,
+               "U8 maximum restart drops incomplete strips on both sides");
+    else
+        expect(primitive == P::TriangleStrip && count == source.size() &&
+                   read(native_restart) == std::vector<u32>({1, 2, maximum, 3, 4}),
+               "Fixed U16/U32 restart uses the native Metal strip path");
+    descriptor.restart_index = 0xffffffff;
+    if (sizeof(T) < sizeof(u32))
+        expect(read(decode()).size() == 9,
+               "Restart compares the full register without truncating to index width");
+}
+
+void testPrimitiveRestart() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    checkPrimitiveRestart<u8>(engines::IndexType::UInt8);
+    checkPrimitiveRestart<u16>(engines::IndexType::UInt16);
+    checkPrimitiveRestart<u32>(engines::IndexType::UInt32);
+    std::cout << "PASS: primitive restart across index widths and topologies\n";
+}
+
+void testInlineIndices() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    engine.method(0xdf, 0); // discard, no shader or guest memory required
+    const auto before = PerfStats::instance().draws.load();
+    engine.method(0x586, static_cast<u32>(engines::PrimitiveType::Triangles));
+    engine.method(0x57a, 70000);
+    engine.method(0x57c, 0xabcd1234);
+    engine.method(0x4c1, 0x04030201);
+    expect(engine.getInlineIndices() ==
+               std::vector<u32>({70000, 0x1234, 0xabcd, 1, 2, 3, 4}),
+           "Inline indices unpack low components first into 32-bit words");
+    expect(PerfStats::instance().draws.load() == before,
+           "Inline methods accumulate until END");
+    engine.method(0x585, 0);
+    expect(engine.getInlineIndices().empty() &&
+               PerfStats::instance().draws.load() == before + 1,
+           "END submits one indexed draw and consumes inline data");
+    engine.method(0x585, 0);
+    expect(PerfStats::instance().draws.load() == before + 1,
+           "Repeated END does not draw consumed indices again");
+    engine.method(0x57a, 42);
+    engine.method(0x586, 4);
+    expect(engine.getInlineIndices().empty(), "BEGIN resets inline accumulation");
+    engine.method(0x591, 1);
+    engine.method(0x592, 99);
+    expect(engine.getRegs().primitive_restart_enabled == 1 &&
+               engine.getRegs().primitive_restart_index == 99,
+           "Restart registers match NVIDIA method offsets");
+    std::cout << "PASS: inline indexed methods, END lifecycle and restart registers\n";
+}
+
+void testClippedBlitRegions() {
+    engines::Regs2D regs{};
+    regs.dst.width = 100;
+    regs.dst.height = 100;
+    auto& p = regs.pixels_from_memory;
+    p.dst_x0 = 10;
+    p.dst_y0 = 20;
+    p.dst_width = 40;
+    p.dst_height = 30;
+    p.dudx = {0, 2};
+    p.dvdy = {0x80000000u, 0};
+    p.src_x0 = {0x40000000u, 5};
+    p.src_y0 = {0, 7};
+    regs.clip_enabled = 1;
+    regs.clip_x = 15;
+    regs.clip_y = 22;
+    regs.clip_width = 20;
+    regs.clip_height = 10;
+    auto region = engines::getBlitRegion(regs);
+    expect(region && region->dst_x == 15 && region->dst_y == 22 &&
+               region->width == 20 && region->height == 10 &&
+               region->src_x == 15.25 && region->src_y == 8.0 &&
+               region->src_width == 40.0 && region->src_height == 5.0,
+           "Clipping adjusts scaled source coordinates without rounding");
+    regs.sample_mode.origin = 1;
+    region = engines::getBlitRegion(regs);
+    expect(region && region->src_x == 14.25 && region->src_y == 8.0,
+           "CORNER applies the reference whole-texel derivative correction");
+    p.dudx = {0, 1};
+    region = engines::getBlitRegion(regs);
+    expect(region && region->src_x == 10.25,
+           "CORNER keeps one-to-one copies aligned to the same texels");
+    regs.sample_mode.origin = 0;
+    p.dudx = {0, 0xffffffffu};
+    region = engines::getBlitRegion(regs);
+    expect(region && region->src_x == 0.25 && region->src_width == -20.0,
+           "Clipping preserves mirrored source extents");
+    regs.clip_x = 60;
+    expect(!engines::getBlitRegion(regs), "Disjoint clip rectangles skip the blit");
+    regs.clip_x = 15;
+    regs.clip_width = 0;
+    expect(!engines::getBlitRegion(regs), "Empty clip rectangles skip the blit");
+    regs.clip_enabled = 0;
+    p.dst_x0 = 90;
+    region = engines::getBlitRegion(regs);
+    expect(region && region->width == 10 && region->height == 30,
+           "Destination bounds clip copies even when guest clipping is disabled");
+    p.dst_x0 = 0xfffffff0u;
+    expect(!engines::getBlitRegion(regs), "Overflowing rectangles do not wrap onto the surface");
+    std::cout << "PASS: scaled, mirrored and empty 2D clip rectangles\n";
 }
 
 // Objects whose descriptors have the same hash stay distinct
@@ -791,15 +1387,25 @@ void testChannelMethodsAndFences() {
 
 } // namespace
 
+void runBlit2DTests();
+
 int main() {
     try {
+        runBlit2DTests();
         testMacroAlu();
         testMacroBitfields();
         testMacroControlFlow();
         testMacroParametersAndNesting();
         testMacroResultOperations();
         testRendererClears();
+        testGuestMemoryBuffer();
+        testOcclusionReports();
+        testReportSemaphoreReductionAndAcquire();
+        testConditionalRendering();
         testIndexDecoding();
+        testPrimitiveRestart();
+        testInlineIndices();
+        testClippedBlitRegions();
         testCacheCollisions();
         testInlineToMemory();
         testDmaCopies();

@@ -261,6 +261,30 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         emitAtomicSharedCas(inst.getDst(), inst.getOperand(0),
                             inst.getOperand(1), inst.getOperand(2));
         break;
+    case ir::Opcode::LoadStorage:
+        emitLoadStorage(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                        inst.getOperand(1), inst.getOperand(2),
+                        inst.getOperand(3).getRawValue<u32>());
+        break;
+    case ir::Opcode::StoreStorage:
+        emitStoreStorage(inst.getOperand(0).getRawValue<u32>(),
+                         inst.getOperand(1), inst.getOperand(2),
+                         inst.getOperand(3),
+                         inst.getOperand(4).getRawValue<u32>());
+        break;
+    case ir::Opcode::AtomicStorage:
+        emitAtomicStorage(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                          inst.getOperand(1), inst.getOperand(2),
+                          inst.getOperand(3),
+                          inst.getOperand(4).getRawValue<u32>(),
+                          inst.getOperand(5).getRawValue<bool>());
+        break;
+    case ir::Opcode::AtomicStorageCas:
+        emitAtomicStorageCas(inst.getDst(),
+                             inst.getOperand(0).getRawValue<u32>(),
+                             inst.getOperand(1), inst.getOperand(2),
+                             inst.getOperand(3), inst.getOperand(4));
+        break;
     case ir::Opcode::Barrier:
         emitBarrier();
         break;

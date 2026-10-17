@@ -5,6 +5,13 @@ Status as of 2026-10-17. This covers the graphics-compatibility work done on bra
 Read sections 1–3 before touching code. Section 5 lists the design decisions that will bite you if you don't know them.
 
 Files in this folder:
+- `occlusion-reports-2026-10-17.md`: native occlusion counts, completion-ordered reports and local conditional rendering.
+- `continuation-all-2026-10-17.md`: subsequent implementation, validated scope and explicitly open work.
+- `primitive-restart-2026-10-17.md`: indexed primitive restart continuation, references, validation and remaining draw scope.
+- `fp64-reports-2026-10-17.md`: FP64 soft float, ATOM.CAS, buffer-cache coherence, report semaphore reduction/acquire, and what was deliberately not started.
+- `global-memory-2026-10-17.md`: LDG/STG/ATOM/RED storage buffers (decoder to Metal binding), tests, open coherence work.
+- `queue-vsync-slices-2026-10-17.md`: buffer queue state machine, 60 Hz vsync, DMA/2D slices and ROP.
+- `video-instructions-2026-10-17.md`: VMAD/VMNMX/VSETP.
 - `implementation-2026-10-17.md`: continuation changes, validation status, remaining scope and failed GPU capture evidence.
 - `README.md`: this document.
 - `backlog.md`: master backlog. `[x]` means done and tested; `[ ]` means open.
@@ -61,9 +68,9 @@ New `.cpp`/`.hpp` files under `src/core` must be added to the explicit source li
 
 | Suite | Result |
 |---|---|
-| shader-library | 44 PASS (includes all shader coverage tests) |
-| texture-cache | 28 PASS (includes texture format tests) |
-| gpu-engine | 9 PASS |
+| shader-library | 50 PASS (includes all shader coverage tests) |
+| texture-cache | 29 PASS (includes texture format tests) |
+| gpu-engine | 17 PASS groups |
 | raster-state, render-hash, register-write, frame-trace, visual-diagnostic, buffer-snapshot | PASS |
 | metal-cache | needs arguments (`<archive-path> <cold\|warm\|…>`), not run |
 | xci | needs a fixture dir and prod.keys; MMU and thread-wait parts pass (section 6) |
@@ -74,12 +81,17 @@ New `.cpp`/`.hpp` files under `src/core` must be added to the explicit source li
 
 ## 3. Where I stopped
 
+**Occlusion/report continuation (2026-10-17):** Real visibility counts now replace the approximate per-draw counter. Payload and ZPASS reports synchronize before publishing guest data; local CONDITIONAL/EQ/NE rendering modes read these reports. See `occlusion-reports-2026-10-17.md` for evidence, regression results and limits. The entire master backlog is still not complete.
+
+**Latest continuation (2026-10-17):** Indexed restart, inline indexed methods, FMZ/BFE/IADD32I.PO edges, PEXIT/direct absolute JMP, unnormalized texture coordinates and 2D clip/CORNER calculations have been added. The final build and all nine regression suites pass. The full backlog is **not complete**; see `continuation-all-2026-10-17.md`, the master backlog and `tests/README-graphics-coverage.md` for the tested subsets and remaining families.
+
 **Update (2026-10-17, later):** Codex finished CC flow tests, GL depth funcs, blend factors, sampler bias/anisotropy and omap outputs. Then (Codex paused) I added:
 - BFE.BREV, bool NOT, CLAMP_OGL, nearest samplers for integer textures, cross-format texture copies, alpha test;
 - the raster batch: raster discard, cull FRONT_AND_BACK, winding, depth bias halving per primitive class, depth clamp, vertex stream bound;
+- **Regression found and fixed (2026-10-17):** the viewport batch treated register 0x64B (SET_VIEWPORT_SCALE_OFFSET) = 0 as "window space", but UE4/NVN titles leave it 0 while drawing clip-space vertices with viewport transforms, so Crash Bandicoot 4 rendered blank (every draw collapsed into one pixel). The transform is now always applied (`viewportTransformEnabled()` in `3d.cpp`); the window-space shader path stays tested at shader level only. Found with `HYDRA_TRACE_DIR` frame/visual captures and hot reload.
 - the viewport batch: LOWER_LEFT flip by surface height, scissor flip, window-space positions when the viewport transform is off (converted in the vertex shader, `GuestShaderState::window_space_*`), default depth range 0..1 with clamping, signed SSCALED attributes, vertex sizes G8R8/X8B8G8R8/A8, compact draws (0x485/0x486, 0x5F9-0x5FE).
 
-- the next batch: dual-source blending (`color(0), index(1)`), wrapping 32-bit signed IR arithmetic, closest Metal border preset, TIC format cache and other per-draw savings, DMA semaphores/block-linear to block-linear/transfer NONE, control flow (CAL/RET/PRET/PCNT/CONT), TMML, SULD/SURED/SUST.D/SUATOM variants, conditional rendering (TRUE/FALSE/override only; compare modes need a visibility buffer), puller semaphores and host fences (`HYDRA_GPU_FENCES=1`, **off by default**; with it a fence completes when the Metal command buffer completes and `nvhost_ctrl` waits block on it);
+- the next batch: dual-source blending (`color(0), index(1)`), wrapping 32-bit signed IR arithmetic, closest Metal border preset, TIC format cache and other per-draw savings, DMA semaphores/block-linear to block-linear/transfer NONE, control flow (CAL/RET/PRET/PCNT/CONT), TMML, SULD/SURED/SUST.D/SUATOM variants, conditional rendering (later expanded to local CONDITIONAL/EQ/NE by the occlusion/report continuation), puller semaphores and host fences (`HYDRA_GPU_FENCES=1`, **off by default**; with it a fence completes when the Metal command buffer completes and `nvhost_ctrl` waits block on it);
 - the 2D batch: signed 32.32 `FixedPoint`, exact du/dx source extents (no truncation, mirrored copies keep their sign), SAMPLE_MODE filter (POINT uses the nearest sampler; origin CORNER is **not** modeled, shifting by du/2 would blur 1:1 copies if the driver uses it differently), integer uint/int blit pipeline variants (point read, `BlitOptions` in `blitTexture`), word 0x90 no longer used as a source layer;
 - tooling: `hydra-shader-corpus-tests <dir> [limit]` decompiles and Metal-compiles every dumped guest shader (`HYDRA_CORPUS_VERBOSE=1` prints names); all 2771 dumped Crash 4/Jump Force shaders pass.
 
@@ -359,13 +371,13 @@ All GPU suites pass (2026-10-17). The buffer-snapshot and thread-wait failures l
 8. **Larger items**:
    - global memory/SSBO (LDG returns 0, STG/ATOM/RED missing; `compute_memory_sync.md` B3, `shader_mem_tex_flow.md` C7);
    - real GPU fences and syncpoints, plus host methods 0x00–0x3F, which are currently forwarded to engines (`compute_memory_sync.md` B1/B2, `services_presentation.md` B3);
-   - deferred and real report semaphores;
+   - remaining semaphore acquire/reduction/awaken/trap and asynchronous report publication (payload/ZPASS completion ordering is implemented);
    - buffer-queue and vsync rework (`services_presentation.md` B9–B14);
    - control flow CONT/PCNT/CAL/RET (C17);
    - SULD and typed SUST.D (D-20, C15).
 9. **P2**: FP64 soft-float, video ops, geometry shader/tessellation emulation, logic ops, MSAA, transform feedback.
 
-**Still to write**: `tests/README-graphics-coverage.md`, the per-subsystem capability classification the mandate asks for. The audits' capability tables are the starting point; update the classification of the items fixed above.
+**Capability classification**: `tests/README-graphics-coverage.md` now records the implemented/tested subsets and the missing or partial families.
 
 ---
 

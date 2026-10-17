@@ -95,6 +95,19 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
                         instruction.getOperand(1).getRawValue<TextureType>(),
                         true);
                     break;
+                case ir::Opcode::LoadStorage:
+                case ir::Opcode::StoreStorage:
+                case ir::Opcode::AtomicStorage:
+                case ir::Opcode::AtomicStorageCas: {
+                    const auto binding =
+                        instruction.getOperand(0).getRawValue<u32>();
+                    auto& info = storage_buffers[binding];
+                    info.written |=
+                        instruction.getOpcode() != ir::Opcode::LoadStorage;
+                    // The descriptor is read from the constant buffer
+                    const_buffers.insert(binding >> 16);
+                    break;
+                }
                 case ir::Opcode::LoadLocal:
                 case ir::Opcode::StoreLocal:
                     uses_local_memory = true;

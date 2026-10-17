@@ -236,6 +236,7 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
     ztd::hash::XxHash32 hash;
     hash.add(static_cast<u32>(descriptor.stage));
     hash.add(descriptor.code_ptr);
+    hash.add(descriptor.state.program_offset);
     hash.add(ShaderOverrides::instance().getGeneration(descriptor.gpu_addr));
     for (const auto& [location, value] : descriptor.state.branch_constants) {
         hash.add(location.first);
@@ -280,6 +281,26 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
         hash.add(index);
         hash.add(bias);
     }
+
+    for (const auto& [index, sampler] : descriptor.state.border_samplers) {
+        hash.add(index);
+        hash.add(sampler.min_filter);
+        hash.add(sampler.mag_filter);
+        hash.add(sampler.mip_filter);
+        hash.add(sampler.address_mode_s);
+        hash.add(sampler.address_mode_t);
+        hash.add(sampler.address_mode_r);
+        hash.add(sampler.depth_compare_op);
+        hash.add(sampler.border_color_u);
+        hash.add(sampler.min_lod);
+        hash.add(sampler.max_lod);
+        hash.add(sampler.max_anisotropy);
+        hash.add(sampler.integer_texture);
+    }
+
+    hash.add(descriptor.state.unnormalized_textures.size());
+    for (const auto index : descriptor.state.unnormalized_textures)
+        hash.add(index);
 
     // Vertex state
     if (descriptor.stage == engines::ShaderStage::VertexB) {

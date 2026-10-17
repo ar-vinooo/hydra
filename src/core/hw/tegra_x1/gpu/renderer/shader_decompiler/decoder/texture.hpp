@@ -266,6 +266,15 @@ void emitTld4s(DecoderContext& context, InstTld4s inst);
 // loaded from, returning the texture binding index
 std::optional<u32> trackBindlessResource(DecoderContext& context, reg_t reg);
 
+// Constant buffer word that holds the 64-bit address of the storage buffer a
+// global memory address in `reg` (low half) points into
+struct StorageBufferWord {
+    u32 slot;
+    u32 word;
+};
+std::optional<StorageBufferWord> trackStorageBuffer(DecoderContext& context,
+                                                    reg_t reg);
+
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder
 
 ENABLE_ENUM_FORMATTING(

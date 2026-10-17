@@ -12,6 +12,8 @@ struct IndexDescriptor {
     engines::PrimitiveType primitive_type;
     u32 count;
     std::optional<ztd::Range<uptr>> mem_range{std::nullopt};
+    bool restart_enabled{false};
+    u32 restart_index{0};
 };
 
 class IndexCache {
@@ -35,6 +37,7 @@ class IndexCache {
         // in place
         std::vector<u8> source;
         std::shared_ptr<BufferBase> buffer;
+        u32 count{0};
     };
     std::map<u32, Entry> cache;
 

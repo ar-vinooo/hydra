@@ -76,8 +76,15 @@ class CommandBuffer final : public ICommandBuffer {
     MTL::ComputeCommandEncoder* getComputeCommandEncoder();
 
     void endEncoding();
-    // DEBUG: commit, wait and continue with a new command buffer
+    // Submit, wait and continue with a new command buffer
     f64 debugCommitAndWait();
+    void setVisibilityResultBuffer(MTL::Buffer* buffer);
+    MTL::Buffer* getVisibilityResultBuffer() const { return visibility_buffer; }
+    bool hasRenderPass(MTL::RenderPassDescriptor* descriptor) const {
+        return encoder_type == EncoderType::Render &&
+               encoder_state.render_pass == descriptor;
+    }
+    bool lastSubmissionSucceeded() const { return last_submission_succeeded; }
     void retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
                             MTL::Buffer* buffer);
 
@@ -104,6 +111,8 @@ class CommandBuffer final : public ICommandBuffer {
     EncoderType encoder_type{EncoderType::None};
 
     EncoderState encoder_state{};
+    MTL::Buffer* visibility_buffer{nullptr};
+    bool last_submission_succeeded{true};
     std::shared_ptr<UploadBufferPool> upload_pool;
     std::vector<MTL::Buffer*> retired_upload_buffers;
     u64 raster_updates{0};

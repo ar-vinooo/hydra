@@ -24,6 +24,7 @@ u32 SamplerCache::hashHot1(const SamplerDescriptor& descriptor) {
     hash.add(descriptor.max_lod);
     hash.add(descriptor.lod_bias);
     hash.add(descriptor.max_anisotropy);
+    hash.add(descriptor.integer_texture);
 
     return hash.toHashCode();
 }
@@ -39,7 +40,8 @@ bool SamplerCache::equals(const SamplerDescriptor& a,
            a.depth_compare_op == b.depth_compare_op &&
            a.border_color_u == b.border_color_u && a.min_lod == b.min_lod &&
            a.max_lod == b.max_lod && a.lod_bias == b.lod_bias &&
-           a.max_anisotropy == b.max_anisotropy;
+           a.max_anisotropy == b.max_anisotropy &&
+           a.integer_texture == b.integer_texture;
 }
 
 void SamplerCache::destroyElement(SamplerBase* sampler) { delete sampler; }

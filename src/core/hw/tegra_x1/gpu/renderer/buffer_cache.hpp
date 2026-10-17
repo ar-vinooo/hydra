@@ -35,7 +35,16 @@ class BufferCache {
 
     void invalidateMemory(ztd::Range<uptr> range);
 
+    // Ranges a shader writes through storage buffers. Their contents live in
+    // guest memory and change on the GPU timeline, so later users of them get
+    // a buffer aliasing that memory instead of a CPU snapshot
+    void markGpuModified(ztd::Range<uptr> range);
+
   private:
+    // Disjoint intervals, begin -> end
+    std::map<uptr, uptr> gpu_modified;
+    bool intersectsGpuModified(ztd::Range<uptr> range) const;
+
     IRenderer& renderer;
 
     std::mutex mutex;

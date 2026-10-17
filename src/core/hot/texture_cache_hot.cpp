@@ -252,6 +252,19 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                 const auto other_range = other_descriptor.getRange();
 
                 if (range.intersects(other_range)) {
+                    // Expanded texels have different host byte offsets. Raw
+                    // alias copies cannot reinterpret them as guest bytes.
+                    const bool expanded =
+                        getHostTextureFormat(descriptor.format) != descriptor.format ||
+                        getHostTextureFormat(other_descriptor.format) != other_descriptor.format;
+                    if (expanded &&
+                        (descriptor.format != other_descriptor.format ||
+                         descriptor.type == TextureType::_1DBuffer ||
+                         other_descriptor.type == TextureType::_1DBuffer)) {
+                        alias_sync_complete = false;
+                        reportUnsupportedAlias(descriptor, other_descriptor);
+                        continue;
+                    }
                     const auto type_class =
                         getTextureTypeClass(descriptor.type);
                     const auto other_type_class =

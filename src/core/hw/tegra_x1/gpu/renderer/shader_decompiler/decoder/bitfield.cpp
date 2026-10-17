@@ -4,9 +4,8 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: write_cc
 void emitBitfieldExtract(DecoderContext& context, pred_t pred, bool pred_inv,
-                         bool is_signed, bool brev, reg_t dst, reg_t src_a,
+                         bool is_signed, bool brev, bool write_cc, reg_t dst, reg_t src_a,
                          ir::Value src_b) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
@@ -26,6 +25,31 @@ void emitBitfieldExtract(DecoderContext& context, pred_t pred, bool pred_inv,
         src_b, ir::Value::createConstantU(8), ir::Value::createConstantU(8));
 
     auto res = context.builder.opBitfieldExtract(src_a_v, position, size);
+    if (is_signed) {
+        const auto negative = context.builder.opCompareLess(
+            src_a_v, ir::Value::createConstantI(0));
+        const auto replicated = context.builder.opSelect(
+            negative, ir::Value::createConstantI(-1),
+            ir::Value::createConstantI(0));
+        res = context.builder.opSelect(
+            context.builder.opCompareGreaterOrEqual(
+                position, ir::Value::createConstantU(32)),
+            replicated, res);
+        res = context.builder.opSelect(
+            context.builder.opCompareEqual(size, ir::Value::createConstantU(0)),
+            ir::Value::createConstantI(0), res);
+    }
+    if (write_cc) {
+        auto& b = context.builder;
+        const auto bits = b.opBitCast(res, ir::ScalarType::U32);
+        b.opCopy(ir::Value::createConditionFlag(0),
+                 b.opCompareEqual(bits, ir::Value::createConstantU(0)));
+        b.opCopy(ir::Value::createConditionFlag(1),
+                 b.opCompareLess(b.opBitCast(bits, ir::ScalarType::I32),
+                                 ir::Value::createConstantI(0)));
+        b.opCopy(ir::Value::createConditionFlag(2), ir::Value::createConstantB(false));
+        b.opCopy(ir::Value::createConditionFlag(3), ir::Value::createConstantB(false));
+    }
     context.builder.opCopy(ir::Value::createRegister(dst), res);
 
     if (conditional)
@@ -36,13 +60,13 @@ void emitBitfieldExtract(DecoderContext& context, pred_t pred, bool pred_inv,
 
 void emitBfeR(DecoderContext& context, InstBfeR inst) {
     emitBitfieldExtract(context, inst.base.pred, inst.base.pred_inv,
-                        inst.base.is_signed, inst.base.brev, inst.base.dst, inst.base.src_a,
+                        inst.base.is_signed, inst.base.brev, inst.base.write_cc, inst.base.dst, inst.base.src_a,
                         ir::Value::createRegister(inst.src_b));
 }
 
 void emitBfeC(DecoderContext& context, InstBfeC inst) {
     emitBitfieldExtract(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev,
+        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev, inst.base.write_cc,
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4))));
@@ -50,7 +74,7 @@ void emitBfeC(DecoderContext& context, InstBfeC inst) {
 
 void emitBfeI(DecoderContext& context, InstBfeI inst) {
     emitBitfieldExtract(
-        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev,
+        context, inst.base.pred, inst.base.pred_inv, inst.base.is_signed, inst.base.brev, inst.base.write_cc,
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstantU(inst.imm20_0 | (inst.imm20_19 << 19)));
 }

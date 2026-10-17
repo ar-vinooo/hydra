@@ -85,6 +85,20 @@ class MslEmitter final : public LangEmitter {
     void emitAtomicSharedCas(const ir::Value& dst, const ir::Value& addr,
                              const ir::Value& compare,
                              const ir::Value& value) override;
+    void emitLoadStorage(const ir::Value& dst, u32 binding,
+                         const ir::Value& offset, const ir::Value& size,
+                         u32 access) override;
+    void emitStoreStorage(u32 binding, const ir::Value& offset,
+                          const ir::Value& size, const ir::Value& value,
+                          u32 access) override;
+    void emitAtomicStorage(const ir::Value& dst, u32 binding,
+                           const ir::Value& offset, const ir::Value& size,
+                           const ir::Value& value, u32 op,
+                           bool is_signed) override;
+    void emitAtomicStorageCas(const ir::Value& dst, u32 binding,
+                              const ir::Value& offset, const ir::Value& size,
+                              const ir::Value& compare,
+                              const ir::Value& value) override;
     void emitBarrier() override;
     void emitImageStore(u32 index, TextureType type, const ir::Value& coords,
                         const std::array<ir::Value, 4>& values,
@@ -116,6 +130,7 @@ class MslEmitter final : public LangEmitter {
 
     // Helpers
     static std::string getSvStr(const Sv& sv);
+    static std::string getStorageBufferName(u32 binding);
     // Bounds check and coordinate arguments for an image access
     std::string getImageBoundsStr(u32 index, TextureType type,
                                   const std::string& coords);

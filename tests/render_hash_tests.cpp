@@ -177,6 +177,14 @@ int main() {
         changed.state.buffer_texture_formats[4] = TextureFormat::R8Unorm;
         check(ShaderCache::hash(changed) != fragment_base,
               "Buffer texture format remains in key");
+        changed = fragment;
+        changed.state.program_offset = 0x100;
+        check(ShaderCache::hash(changed) != fragment_base,
+              "Program offsets remain in the absolute-branch shader key");
+        changed = fragment;
+        changed.state.unnormalized_textures.push_back(4);
+        check(ShaderCache::hash(changed) != fragment_base,
+              "Coordinate normalization remains in shader key");
         PipelineDescriptor pipeline{};
         const auto pipeline_base = PipelineCache::hash(pipeline);
         for (u32 i = 0; i < COLOR_TARGET_COUNT; ++i) {

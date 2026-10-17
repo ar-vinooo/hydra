@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
+#include "core/hw/tegra_x1/gpu/engines/storage_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hot/table.hpp"
@@ -269,6 +270,8 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x485, 2,
                     loadMmeStartAddressRamPointer, u32, 0x48, 1,
                     loadMmeStartAddressRam, u32, 0x35e, 1, drawVertexArray, u32,
                     0x54c, 1, resetCounter, u32, 0x586, 1, beginDraw, u32,
+                    0x585, 1, endDraw, u32, 0x57a, 1, inlineIndex32, u32,
+                    0x57c, 1, inlineIndex16, u32, 0x4c1, 1, inlineIndex8, u32,
                     0x5f8, 1, drawVertexElements, u32, 0x674, 1, clearBuffer,
                     ClearBufferData, 0x6c3, 1, setReportSemaphore, u32, 0x8c4,
                     1, firmwareCall4, u32, 0x8e4, 16, loadConstBuffer, u32,
@@ -280,8 +283,6 @@ ThreeD::ThreeD(Gpu& gpu_) : gpu{gpu_}, macro_driver{createMacroDriver(*this)} {
     // Rasterization and rendering are on at power on
     regs_raw[0xdf] = 1;
     regs_raw[0x556] = 1;
-    // The viewport transform is on until the guest turns it off
-    regs_raw[0x64b] = 1;
 
     const auto reset_blend = [](auto& blend) {
         blend.rgb_op = blend.alpha_op = 1;
@@ -345,20 +346,13 @@ void ThreeD::loadMmeStartAddressRam(const u32 index, const u32 data) {
     macro_driver->loadStartAddressRam(data);
 }
 
-// DEBUG: HYDRA_OFF=viewport,scissor,raster,clamp,alpha,render disables the
-// matching behavior to bisect regressions
-static bool debugOff(const char* name) {
-    static const std::string list = [] {
-        const char* env = std::getenv("HYDRA_OFF");
-        return env != nullptr ? std::string(",") + env + "," : std::string();
-    }();
-    return !list.empty() &&
-           list.find(std::string(",") + name + ",") != std::string::npos;
-}
+// NVN titles (UE4 included) leave SET_VIEWPORT_SCALE_OFFSET at 0 while they
+// draw clip space vertices with viewport transforms, so the register cannot
+// select the window space path: the transform always applies. Treating 0 as
+// "window space" collapsed every UE4 draw into one pixel.
+static bool viewportTransformEnabled() { return true; }
 
 bool ThreeD::shouldExecute() const {
-    if (debugOff("render"))
-        return true;
     // SET_RENDER_ENABLE_C (mode) and the render enable override
     constexpr u32 REG_RENDER_ENABLE_MODE = 0x556;
     constexpr u32 REG_RENDER_ENABLE_OVERRIDE = 0x651;
@@ -370,17 +364,45 @@ bool ThreeD::shouldExecute() const {
     default:
         break;
     }
-    switch (regs_raw[REG_RENDER_ENABLE_MODE] & 0x7) {
-    case 0:
+    const auto mode = regs_raw[REG_RENDER_ENABLE_MODE] & 0x7;
+    if (mode == 0)
         return false;
-    case 1:
+    if (mode == 1)
         return true;
+    if (mode > 4) {
+        ONCE(LOG_NOT_IMPLEMENTED(Engines, "Conditional rendering mode {}", mode));
+        return true;
+    }
+
+    // Reports have already published completion-ordered guest data.
+    const u64 address = (static_cast<u64>(regs_raw[0x554] & 0xff) << 32) |
+                        regs_raw[0x555];
+    std::array<u32, 6> compare{};
+    auto* data = reinterpret_cast<u8*>(compare.data());
+    usize offset = 0;
+    while (offset < sizeof(compare)) {
+        uptr base;
+        const auto as = tls_crnt_gmmu != nullptr
+                            ? tls_crnt_gmmu->findAddr(address + offset, base)
+                            : std::nullopt;
+        if (!as || as->ptr == 0) {
+            ONCE(LOG_WARN(Engines, "Unmapped conditional rendering data {:#x}", address));
+            return false;
+        }
+        const auto bytes = std::min<u64>(sizeof(compare) - offset,
+                                          as->size - (address + offset - base));
+        std::memcpy(data + offset,
+                    reinterpret_cast<const void*>(as->ptr + address + offset - base),
+                    bytes);
+        offset += bytes;
+    }
+    switch (mode) {
+    case 2:
+        return compare[0] != 0 && compare[1] != 0;
+    case 3:
+        return compare[0] == compare[4] && compare[1] == compare[5];
     default:
-        // Conditional modes compare two query reports, which the host does
-        // not produce (occlusion counts are not real): render
-        ONCE(LOG_NOT_IMPLEMENTED(Engines, "Conditional rendering mode {}",
-                                 regs_raw[REG_RENDER_ENABLE_MODE] & 0x7));
-        return true;
+        return compare[0] != compare[4] || compare[1] != compare[5];
     }
 }
 
@@ -425,6 +447,7 @@ void ThreeD::drawVertexElementsCompact(const u32 index, const u32 arg) {
 
 void ThreeD::beginDraw(const u32 index, const u32 arg) {
     writeReg(0x586, arg);
+    inline_indices.clear();
 
     // DEBUG: log begin values while rendering to a 3D target
     if (regs.color_targets[0].tile_mode.is_3d) {
@@ -445,6 +468,30 @@ void ThreeD::beginDraw(const u32 index, const u32 arg) {
     default: // Unchanged
         break;
     }
+}
+
+void ThreeD::inlineIndex32(const u32, const u32 arg) {
+    inline_indices.push_back(arg);
+}
+
+void ThreeD::inlineIndex16(const u32, const u32 arg) {
+    inline_indices.push_back(arg & 0xffff);
+    inline_indices.push_back(arg >> 16);
+}
+
+void ThreeD::inlineIndex8(const u32, const u32 arg) {
+    for (u32 shift = 0; shift < 32; shift += 8)
+        inline_indices.push_back((arg >> shift) & 0xff);
+}
+
+void ThreeD::endDraw(const u32, const u32) {
+    if (inline_indices.empty())
+        return;
+    drawVertexElementsImpl(
+        static_cast<u32>(inline_indices.size()),
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(inline_indices.data()),
+                                   inline_indices.size() * sizeof(u32)));
+    inline_indices.clear();
 }
 
 void ThreeD::drawVertexArray(const u32 index, u32 count) {
@@ -571,13 +618,18 @@ void ThreeD::profileDraw(u32 count) {
     entries.clear();
 }
 
-void ThreeD::drawVertexElements(const u32 index, u32 count) {
+void ThreeD::drawVertexElements(const u32, u32 count) {
+    drawVertexElementsImpl(count, std::nullopt);
+}
+
+void ThreeD::drawVertexElementsImpl(
+    u32 count, std::optional<ztd::Range<uptr>> inline_range) {
     auto& visual = VisualDiagnostics::instance();
     struct DrawEnd {
         VisualDiagnostics& visual;
         ~DrawEnd() { visual.endDraw(); }
     } draw_end{visual};
-    auto index_type = regs.index_type;
+    auto index_type = inline_range ? IndexType::UInt32 : regs.index_type;
     auto primitive_type = regs.begin.primitive_type;
     renderer::BufferView index_buffer;
     {
@@ -596,36 +648,41 @@ void ThreeD::drawVertexElements(const u32 index, u32 count) {
 
         // Index buffer: the draw starts at index FIRST and reads no further
         // than the limit (the address of the last valid byte)
-        const u64 index_size = getIndexTypeSize(regs.index_type);
-        const u64 first_offset =
-            static_cast<u64>(regs.vertex_elements_start) * index_size;
-        const auto index_buffer_addr = static_cast<u64>(regs.index_buffer_addr);
-        const auto index_buffer_limit =
-            static_cast<u64>(regs.index_buffer_limit_addr);
-        if (index_buffer_limit >= index_buffer_addr) {
-            const u64 available = index_buffer_limit - index_buffer_addr + 1;
-            const u64 readable =
-                first_offset < available ? available - first_offset : 0;
-            if (static_cast<u64>(count) * index_size > readable) {
-                ONCE(LOG_WARN(Engines,
-                              "Indexed draw reads past its index buffer "
-                              "(first: {}, count: {})",
-                              regs.vertex_elements_start, count));
-                count = static_cast<u32>(readable / index_size);
+        auto range = inline_range.value_or(ztd::Range<uptr>{});
+        if (!inline_range) {
+            const u64 index_size = getIndexTypeSize(regs.index_type);
+            const u64 first_offset =
+                static_cast<u64>(regs.vertex_elements_start) * index_size;
+            const auto index_buffer_addr = static_cast<u64>(regs.index_buffer_addr);
+            const auto index_buffer_limit =
+                static_cast<u64>(regs.index_buffer_limit_addr);
+            if (index_buffer_limit >= index_buffer_addr) {
+                const u64 available = index_buffer_limit - index_buffer_addr + 1;
+                const u64 readable =
+                    first_offset < available ? available - first_offset : 0;
+                if (static_cast<u64>(count) * index_size > readable) {
+                    ONCE(LOG_WARN(Engines,
+                                  "Indexed draw reads past its index buffer "
+                                  "(first: {}, count: {})",
+                                  regs.vertex_elements_start, count));
+                    count = static_cast<u32>(readable / index_size);
+                }
             }
+            if (count == 0)
+                return;
+            range = ztd::Range<uptr>::fromSize(
+                tls_crnt_gmmu->unmapAddr(index_buffer_addr + first_offset),
+                static_cast<u64>(count) * index_size);
         }
-        if (count == 0)
-            return;
-        const auto range = ztd::Range<uptr>::fromSize(
-            tls_crnt_gmmu->unmapAddr(index_buffer_addr + first_offset),
-            static_cast<u64>(count) * index_size);
 
         index_buffer = gpu.getRenderer().getIndexCache().decode(
             tls_crnt_command_buffer,
             {.type = index_type,
              .primitive_type = primitive_type,
              .count = count,
-             .mem_range = range},
+             .mem_range = range,
+             .restart_enabled = (regs.primitive_restart_enabled & 1) != 0,
+             .restart_index = regs.primitive_restart_index},
             index_type, primitive_type, count);
     }
     if (count == 0)
@@ -702,7 +759,7 @@ void ThreeD::resetCounter(const u32 index, const u32 data) {
     (void)index;
     // 0x1: ZPassPixelCount
     if (data == 0x1)
-        zpass_pixel_count = 0;
+        gpu.getRenderer().resetOcclusionCounter();
 }
 
 void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
@@ -724,14 +781,49 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
                      regs.report_semaphore_payload);
     }
 
+    const u64 semaphore_address = (static_cast<u64>(regs_raw[0x6c0] & 0xff) << 32) |
+                                  regs_raw[0x6c1];
+    // Reduction (bits 3, 9-11 and 17-18) combines the payload into the word
+    // in memory instead of replacing it
+    const bool reduction = operation == 0 && extractBits(data, 3, 1) != 0;
+
     u64 value;
     switch (operation) {
     case 0: // Release
         value = regs.report_semaphore_payload;
         break;
-    case 1: // Acquire
-        // The GPU executes in order, nothing to wait for
-        return;
+    case 1: { // Acquire
+        // Wait until memory equals (or is at least) the payload. Another
+        // channel or the CPU releases it. The wait is bounded so that a
+        // semaphore nobody releases cannot hang the whole GPU.
+        uptr base;
+        const auto as = tls_crnt_gmmu->findAddr(semaphore_address, base);
+        if (!as || as->ptr == 0) {
+            ONCE(LOG_WARN(Engines, "Acquire of unmapped GPU address {:#x}",
+                          semaphore_address));
+            return;
+        }
+        auto* word = reinterpret_cast<u32*>(as->ptr + semaphore_address - base);
+        const u32 payload = regs.report_semaphore_payload;
+        const bool greater_equal = extractBits(data, 16, 1) != 0;
+        const auto start = std::chrono::steady_clock::now();
+        while (true) {
+            const u32 current = std::atomic_ref<u32>(*word).load(
+                std::memory_order_acquire);
+            if (greater_equal ? static_cast<i32>(current - payload) >= 0
+                              : current == payload)
+                return;
+            if (std::chrono::steady_clock::now() - start >
+                std::chrono::seconds(1)) {
+                ONCE(LOG_WARN(Engines,
+                              "Semaphore acquire at {:#x} timed out ({:#x} "
+                              "vs {:#x})",
+                              semaphore_address, current, payload));
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
     case 2: // Counter
         switch (counter_type) {
         case 0x0: // Payload
@@ -739,10 +831,11 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
             break;
         case 0x2:  // ZPassPixelCount
         case 0x15: // ZPassPixelCount64
-            // Every draw counts as visible. The counter grows with each draw,
-            // so both absolute results and begin/end differences are non-zero
-            // for queries that drew something.
-            value = zpass_pixel_count;
+            if (const auto count = gpu.getRenderer().getOcclusionCounter(
+                    tls_crnt_command_buffer))
+                value = *count;
+            else
+                return;
             break;
         default:
             value = 0;
@@ -754,13 +847,114 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
         return;
     }
 
-    const uptr ptr = tls_crnt_gmmu->unmapAddr(regs.report_semaphore_addr);
-    if (short_query) {
-        *reinterpret_cast<u32*>(ptr) = static_cast<u32>(value);
-    } else {
-        reinterpret_cast<u64*>(ptr)[0] = value;
-        reinterpret_cast<u64*>(ptr)[1] = getGpuTimestamp();
+    // Counters already synchronized while reading their visibility buffers.
+    const bool counter = operation == 2 &&
+                         (counter_type == 0x2 || counter_type == 0x15);
+    if (!counter && !gpu.getRenderer().synchronize(tls_crnt_command_buffer))
+        return;
+
+    struct Span {
+        u8* ptr;
+        usize offset;
+        usize size;
+    };
+    std::array<Span, 16> spans{};
+    usize span_count = 0;
+    const usize size = short_query ? 4 : 16;
+    const u64 address = semaphore_address;
+    usize offset = 0;
+    while (offset < size) {
+        uptr base;
+        const auto as = tls_crnt_gmmu->findAddr(address + offset, base);
+        if (!as || as->ptr == 0) {
+            ONCE(LOG_WARN(Engines, "Report to unmapped GPU address {:#x}", address));
+            return;
+        }
+        const auto bytes = std::min<u64>(size - offset,
+                                          as->size - (address + offset - base));
+        spans[span_count++] = {
+            reinterpret_cast<u8*>(as->ptr + address + offset - base),
+            offset, static_cast<usize>(bytes)};
+        offset += bytes;
     }
+    {
+        auto& cache = gpu.getRenderer().getTextureCache();
+        std::scoped_lock lock(cache.getMutex());
+        for (usize i = 0; i < span_count; i++)
+            cache.flushMemory(tls_crnt_command_buffer,
+                              ztd::Range<uptr>::fromSize(
+                                  reinterpret_cast<uptr>(spans[i].ptr), spans[i].size));
+    }
+    if (reduction) {
+        // Atomic read-modify-write of the first word, no timestamp
+        const u32 payload = regs.report_semaphore_payload;
+        const u32 reduction_op = static_cast<u32>(extractBits(data, 9, 3));
+        const bool is_signed = extractBits(data, 17, 2) == 1;
+        std::atomic_ref<u32> word(*reinterpret_cast<u32*>(spans[0].ptr));
+        u32 old = word.load(std::memory_order_relaxed);
+        while (true) {
+            u32 next;
+            switch (reduction_op) {
+            case 0:
+                next = old + payload;
+                break;
+            case 1:
+                next = is_signed ? static_cast<u32>(std::min(
+                                       static_cast<i32>(old),
+                                       static_cast<i32>(payload)))
+                                 : std::min(old, payload);
+                break;
+            case 2:
+                next = is_signed ? static_cast<u32>(std::max(
+                                       static_cast<i32>(old),
+                                       static_cast<i32>(payload)))
+                                 : std::max(old, payload);
+                break;
+            case 3:
+                next = old >= payload ? 0u : old + 1;
+                break;
+            case 4:
+                next = (old == 0 || old > payload) ? payload : old - 1;
+                break;
+            case 5:
+                next = old & payload;
+                break;
+            case 6:
+                next = old | payload;
+                break;
+            default:
+                next = old ^ payload;
+                break;
+            }
+            if (word.compare_exchange_weak(old, next,
+                                           std::memory_order_acq_rel))
+                break;
+        }
+        gpu.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(spans[0].ptr), sizeof(u32)));
+        return;
+    }
+    const auto write = [&](usize begin, const void* data, usize bytes) {
+        for (usize i = 0; i < span_count; i++) {
+            const auto& span = spans[i];
+            const auto first = std::max(begin, span.offset);
+            const auto end = std::min(begin + bytes, span.offset + span.size);
+            if (first < end)
+                std::memcpy(span.ptr + first - span.offset,
+                            static_cast<const u8*>(data) + first - begin,
+                            end - first);
+        }
+    };
+    if (!short_query) {
+        const auto timestamp = getGpuTimestamp();
+        write(8, &timestamp, sizeof(timestamp));
+    }
+    // Publish the result after its timestamp and preceding GPU work.
+    std::atomic_thread_fence(std::memory_order_release);
+    write(0, &value, short_query ? sizeof(u32) : sizeof(u64));
+    for (usize i = 0; i < span_count; i++)
+        gpu.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(spans[i].ptr), spans[i].size));
 }
 
 void ThreeD::firmwareCall4(const u32 index, const u32 data) {
@@ -953,12 +1147,12 @@ renderer::Viewport ThreeD::getViewport(u32 index) {
         any(regs.window_origin_flags & engines::WindowOriginFlags::LowerLeft);
     const f32 surface_height = static_cast<f32>(regs.screen_scissor.vertical.height);
     bool window_space = false;
-    if (regs.viewport_transform_enabled != 0u) {
+    if (viewportTransformEnabled()) {
         auto scale_x = transform.scale_x;
         auto scale_y = transform.scale_y;
         auto offset_y = transform.offset_y;
         // Window rows count from the bottom, memory rows from the top
-        if (lower_left && !debugOff("viewport")) {
+        if (lower_left) {
             scale_y = -scale_y;
             offset_y = surface_height - offset_y;
         }
@@ -1072,8 +1266,7 @@ renderer::Scissor ThreeD::getScissor(u32 index) {
         u32 max_y = scissor.vertical.max;
         // Window rows count from the bottom, memory rows from the top
         if (any(regs.window_origin_flags &
-                engines::WindowOriginFlags::LowerLeft) &&
-            !debugOff("scissor")) {
+                engines::WindowOriginFlags::LowerLeft)) {
             const u32 height = regs.screen_scissor.vertical.height;
             const u32 flipped_min = height > max_y ? height - max_y : 0;
             const u32 flipped_max = height > min_y ? height - min_y : 0;
@@ -1163,12 +1356,12 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     constexpr u32 REG_POINT_SIZE = 0x546;
     constexpr u32 REG_POINT_SPRITE_SELECT = 0x581;
     constexpr u32 REG_ATTRIBUTE_POINT_SIZE = 0x644;
+    descriptor.state.program_offset = regs.shader_programs[static_cast<u32>(stage)].offset;
     descriptor.state.y_negate =
         any(regs.window_origin_flags & WindowOriginFlags::LowerLeft);
     // Without the viewport transform the vertex shader outputs window
     // coordinates, converted to clip space in the shader
-    if (stage == ShaderStage::VertexB &&
-        regs.viewport_transform_enabled == 0u) {
+    if (stage == ShaderStage::VertexB && !viewportTransformEnabled()) {
         descriptor.state.window_space_width = regs.screen_scissor.horizontal.width;
         descriptor.state.window_space_height = regs.screen_scissor.vertical.height;
     }
@@ -1195,7 +1388,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
         constexpr u32 REG_ALPHA_TEST = 0x4bb;
         constexpr u32 REG_ALPHA_REF = 0x4c4;
         constexpr u32 REG_ALPHA_FUNC = 0x4c5;
-        if ((regs_raw[REG_ALPHA_TEST] & 0x1u) != 0 && !debugOff("alpha")) {
+        if ((regs_raw[REG_ALPHA_TEST] & 0x1u) != 0) {
             descriptor.state.alpha_test_func =
                 decodeCompareOp(regs_raw[REG_ALPHA_FUNC]);
             if (descriptor.state.alpha_test_func != CompareOp::Always &&
@@ -1342,20 +1535,24 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             if (image > regs.tex_header_pool_max_index)
                 continue;
             const auto sampler = getSamplerHandle(*handle);
-            if (static_cast<u64>(regs.tex_sampler_pool) != 0 && sampler <= regs.tex_sampler_pool_max_index) {
+            const auto& tic = pool[image];
+            if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
+                !tic.normalized_coords)
+                descriptor.state.unnormalized_textures.push_back(index);
+            const auto format =
+                renderer::toSampledTextureFormat(tic.format_word, tic.is_srgb);
+            if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
+                static_cast<u64>(regs.tex_sampler_pool) != 0 &&
+                sampler <= regs.tex_sampler_pool_max_index) {
                 const auto bytes = tls_crnt_gmmu->readMappedBytes(
                     static_cast<u64>(regs.tex_sampler_pool) + u64(sampler) * sizeof(TextureSamplerControl), sizeof(TextureSamplerControl));
                 if (bytes.size() == sizeof(TextureSamplerControl)) {
                     TextureSamplerControl tsc{};
                     std::memcpy(&tsc, bytes.data(), sizeof(tsc));
-                    const auto bias = decodeSampler(tsc).lod_bias;
-                    if (bias != 0.0f)
-                        descriptor.state.texture_lod_bias.emplace(index, bias);
+                    specializeShaderSampler(descriptor.state, index, tsc,
+                                            format);
                 }
             }
-            const auto& tic = pool[image];
-            const auto format =
-                renderer::toSampledTextureFormat(tic.format_word, tic.is_srgb);
             // Only 1D accesses can be buffer textures. Games can leave stale
             // buffer descriptors in slots the shader samples as another type.
             const auto type_it = resource_mapping.texture_types.find(index);
@@ -1370,6 +1567,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
                                                                  format);
         }
         if (!descriptor.state.texture_lod_bias.empty() ||
+            !descriptor.state.border_samplers.empty() ||
+            !descriptor.state.unnormalized_textures.empty() ||
             !descriptor.state.buffer_texture_formats.empty() ||
             !descriptor.state.integer_texture_formats.empty())
             active_shader = gpu.getRenderer().getShaderCache().find(descriptor);
@@ -1682,7 +1881,6 @@ ThreeD::getTexture(const TextureImageControl& tic,
     }
 
     auto type = toTextureType(tic.texture_type);
-
     u32 depth = tic.depth_minus_one + 1;
     u32 layer_count = 1;
     if (type != renderer::TextureType::_3D) {
@@ -1811,7 +2009,20 @@ ThreeD::getTexture(const TextureImageControl& tic,
         tls_crnt_command_buffer, descriptor, view_descriptor, usage);
 }
 
-renderer::SamplerDescriptor decodeSampler(const TextureSamplerControl& tsc) {
+namespace {
+
+f32 srgbToLinear(u32 value) {
+    const f32 encoded = static_cast<f32>(value) / 255.0f;
+    if (encoded <= 0.04045f)
+        return encoded / 12.92f;
+    return std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+}
+
+} // namespace
+
+renderer::SamplerDescriptor
+decodeSampler(const TextureSamplerControl& tsc,
+              renderer::TextureFormat texture_format) {
     constexpr u32 anisotropy[] = {1, 2, 4, 6, 8, 10, 12, 16};
     const auto address = [&](u32 mode) {
         if (mode == static_cast<u32>(renderer::SamplerAddressMode::Clamp))
@@ -1820,7 +2031,7 @@ renderer::SamplerDescriptor decodeSampler(const TextureSamplerControl& tsc) {
                 : renderer::SamplerAddressMode::ClampToBorder;
         return static_cast<renderer::SamplerAddressMode>(mode);
     };
-    return {
+    renderer::SamplerDescriptor descriptor{
         .min_filter = static_cast<renderer::SamplerFilter>(tsc.min_filter),
         .mag_filter = static_cast<renderer::SamplerFilter>(tsc.mag_filter),
         .mip_filter = static_cast<renderer::SamplerMipFilter>(tsc.mip_filter),
@@ -1836,27 +2047,22 @@ renderer::SamplerDescriptor decodeSampler(const TextureSamplerControl& tsc) {
         .max_lod = static_cast<f32>(tsc.max_lod_clamp) / 256.0f,
         .lod_bias = static_cast<f32>(signExtend<i32, 13>(static_cast<i32>(tsc.mip_lod_bias))) / 256.0f,
         .max_anisotropy = anisotropy[tsc.max_anisotropy],
+        .integer_texture =
+            renderer::getIntegerTextureComponentType(texture_format) != nullptr,
     };
-}
 
-renderer::SamplerBase*
-ThreeD::getSampler(const TextureSamplerControl& tsc,
-                   bool force_nearest) const {
-    static_assert(sizeof(TextureSamplerControl) == 32);
-    std::array<u64, 4> key;
-    std::memcpy(key.data(), &tsc, sizeof(key));
-    const u64 mixed = (key[0] ^ (key[1] * 0x9e3779b97f4a7c15ull) ^
-                       (key[2] * 0xc2b2ae3d27d4eb4full) ^ key[3]) *
-                      0x9e3779b97f4a7c15ull;
-    // Nearest variants (integer textures) are memoized apart
-    auto& memo = (force_nearest ? sampler_nearest_memo
-                                : sampler_memo)[mixed >> 56];
-    if (memo.sampler != nullptr && memo.key == key)
-        return memo.sampler;
+    // sRGB textures use the separate 8-bit border color, converted to linear
+    // (alpha is shared). It is only distinct when sRGB conversion is enabled.
+    if (tsc.srgb_conversion && renderer::isSrgbTextureFormat(texture_format)) {
+        descriptor.border_color_u = uint4(
+            {std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_r)),
+             std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_g)),
+             std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_b)),
+             tsc.border_color_a});
+    }
 
-    auto descriptor = decodeSampler(tsc);
     // Integer textures cannot be filtered (Eden uses a nearest variant too)
-    if (force_nearest) {
+    if (descriptor.integer_texture) {
         descriptor.min_filter = renderer::SamplerFilter::Nearest;
         descriptor.mag_filter = renderer::SamplerFilter::Nearest;
         if (descriptor.mip_filter == renderer::SamplerMipFilter::Linear)
@@ -1864,7 +2070,48 @@ ThreeD::getSampler(const TextureSamplerControl& tsc,
         descriptor.max_anisotropy = 1;
     }
 
-    memo = {key, gpu.getRenderer().getSamplerCache().find(descriptor)};
+    // The color only matters to samplers addressing the border; clearing it
+    // keeps equivalent samplers and shader variants shared
+    if (!renderer::samplerUsesBorder(descriptor))
+        descriptor.border_color_u = uint4({0u, 0u, 0u, 0u});
+    return descriptor;
+}
+
+void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
+                             const TextureSamplerControl& tsc,
+                             renderer::TextureFormat texture_format) {
+    auto descriptor = decodeSampler(tsc, texture_format);
+    if (descriptor.lod_bias != 0.0f)
+        state.texture_lod_bias.emplace(index, descriptor.lod_bias);
+    if (renderer::samplerNeedsBorderEmulation(descriptor)) {
+        // The bias is applied separately (texture_lod_bias)
+        descriptor.lod_bias = 0.0f;
+        state.border_samplers.emplace(index, descriptor);
+    }
+}
+
+renderer::SamplerBase*
+ThreeD::getSampler(const TextureSamplerControl& tsc,
+                   renderer::TextureFormat texture_format) const {
+    static_assert(sizeof(TextureSamplerControl) == 32);
+    std::array<u64, 4> key;
+    std::memcpy(key.data(), &tsc, sizeof(key));
+    const u64 mixed = (key[0] ^ (key[1] * 0x9e3779b97f4a7c15ull) ^
+                       (key[2] * 0xc2b2ae3d27d4eb4full) ^ key[3]) *
+                      0x9e3779b97f4a7c15ull;
+    // Integer textures (nearest) and sRGB textures (own border color) are
+    // memoized apart
+    const bool force_nearest =
+        renderer::getIntegerTextureComponentType(texture_format) != nullptr;
+    const bool srgb_border =
+        tsc.srgb_conversion && renderer::isSrgbTextureFormat(texture_format);
+    auto& memo = sampler_memos[(force_nearest ? 1u : 0u) |
+                               (srgb_border ? 2u : 0u)][mixed >> 56];
+    if (memo.sampler != nullptr && memo.key == key)
+        return memo.sampler;
+
+    memo = {key, gpu.getRenderer().getSamplerCache().find(
+                     decodeSampler(tsc, texture_format))};
     return memo.sampler;
 }
 
@@ -1899,7 +2146,27 @@ void ThreeD::configureShaderStage(
         gpu.getRenderer().bindUniformBuffer(buffer, shader_type, index);
     }
 
-    // TODO: storage buffers
+    // Storage buffers
+    gpu.getRenderer().unbindStorageBuffers(shader_type);
+    for (const auto& storage : resource_mapping.storage_buffers) {
+        const auto range = resolveStorageBuffer(
+            bound_const_buffers[stage_index][storage.cbuf_slot],
+            storage.cbuf_offset);
+        if (!range) {
+            ONCE(LOG_WARN(Engines,
+                          "Storage buffer descriptor c{}[{:#x}] is not valid",
+                          storage.cbuf_slot, storage.cbuf_offset));
+            continue;
+        }
+        gpu.getRenderer().bindStorageBuffer(
+            gpu.getRenderer().getGuestMemoryBuffer(*range), shader_type,
+            storage.host_index);
+        // The shader may write it: users of the range read the live memory
+        if (storage.written) {
+            gpu.getRenderer().getBufferCache().markGpuModified(*range);
+            gpu.getRenderer().getBufferCache().invalidateMemory(*range);
+        }
+    }
 
     // Textures
     if ((tex_header_pool != nullptr) && (tex_sampler_pool != nullptr)) {
@@ -1988,9 +2255,8 @@ void ThreeD::configureShaderStage(
             // Sampler
             const auto& tsc = tex_sampler_pool[sampler_handle];
             const auto sampler = getSampler(
-                tsc, texture != nullptr &&
-                         renderer::getIntegerTextureComponentType(
-                             texture->getDescriptor().format) != nullptr);
+                tsc, texture != nullptr ? texture->getDescriptor().format
+                                        : renderer::TextureFormat::Invalid);
 
             if ((texture != nullptr) && (sampler != nullptr))
                 gpu.getRenderer().bindTexture(texture, sampler, shader_type,
@@ -2592,14 +2858,6 @@ bool ThreeD::drawInternal() {
     };
     visual.beginDraw(shader_address(ShaderStage::VertexB), shader_address(ShaderStage::Fragment));
     PerfStats::instance().draws++;
-    // Every draw counts as visible for occlusion queries
-    zpass_pixel_count++;
-
-    std::scoped_lock texture_cache_lock(
-        gpu.getRenderer().getTextureCache().getMutex());
-
-    // Flush tracked pages
-    tls_crnt_gmmu->getMmu()->flushTrackedPages();
 
     // State
     if (!regs.shader_programs[static_cast<u32>(ShaderStage::VertexB)]
@@ -2611,13 +2869,20 @@ bool ThreeD::drawInternal() {
     // Nothing is rasterized: with rasterization off (stream output only), or
     // polygons with both faces culled
     constexpr u32 REG_RASTER_ENABLE = 0xdf;
-    if (!debugOff("raster") &&
-        ((regs_raw[REG_RASTER_ENABLE] & 0x1u) == 0 || !shouldExecute()))
+    if ((regs_raw[REG_RASTER_ENABLE] & 0x1u) == 0 || !shouldExecute())
         return false;
-    if (!debugOff("raster") && regs.cull_face_enabled != 0 &&
+    if (regs.cull_face_enabled != 0 &&
         regs.cull_face_mode == CullFaceMode::FrontAndBack &&
         getPrimitiveClass(regs.begin.primitive_type) == 2)
         return false;
+
+    std::scoped_lock texture_cache_lock(
+        gpu.getRenderer().getTextureCache().getMutex());
+
+    // Flush tracked pages
+    tls_crnt_gmmu->getMmu()->flushTrackedPages();
+    // SET_ZPASS_PIXEL_COUNT (NVB197, byte offset 0x1514).
+    gpu.getRenderer().setOcclusionCounterEnabled((regs_raw[0x545] & 1) != 0);
 
     auto& texture_cache = gpu.getRenderer().getTextureCache();
     const u64 epoch_before_targets = texture_cache.getEpoch();
@@ -2754,7 +3019,7 @@ bool ThreeD::drawInternal() {
     constexpr u32 REG_VIEWPORT_CLIP_CONTROL = 0x64f;
     const u32 geometry_clip =
         extractBits(regs_raw[REG_VIEWPORT_CLIP_CONTROL], 11, 3);
-    gpu.getRenderer().setDepthClamp(debugOff("clamp") ? false : geometry_clip != 1 && geometry_clip != 3 &&
+    gpu.getRenderer().setDepthClamp(geometry_clip != 1 && geometry_clip != 3 &&
                                     geometry_clip != 5);
 
     for (u32 i = 0; i < VIEWPORT_COUNT; i++) {

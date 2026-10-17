@@ -98,7 +98,51 @@ union InstLdg {
 
 void emitLdg(DecoderContext& context, InstLdg inst);
 
-// TODO: Stg
+// STG has the same layout, with the data register in place of the destination
+using InstStg = InstLdg;
+void emitStg(DecoderContext& context, InstStg inst);
+
+union InstAtom {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> operand;
+    BitField64<u32, 28, 20> imm20;
+    BitField64<bool, 48, 1> e;
+    BitField64<u32, 49, 3> size;
+    BitField64<u32, 52, 4> op;
+};
+
+void emitAtom(DecoderContext& context, InstAtom inst);
+
+union InstRed {
+    BitField64<reg_t, 0, 8> operand;
+    BitField64<reg_t, 8, 8> src;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<u32, 20, 3> size;
+    BitField64<u32, 23, 3> op;
+    BitField64<u32, 28, 20> imm20;
+    BitField64<bool, 48, 1> e;
+};
+
+void emitRed(DecoderContext& context, InstRed inst);
+
+// ATOM.CAS shares the ATOM layout: compare in Rb, new value in Rb + 1 and a
+// 64-bit flag in bit 49
+union InstAtomCas {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<reg_t, 8, 8> src;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<reg_t, 20, 8> operand;
+    BitField64<u32, 28, 20> imm20;
+    BitField64<bool, 48, 1> e;
+    BitField64<bool, 49, 1> is_64;
+};
+
+void emitAtomCas(DecoderContext& context, InstAtomCas inst);
 
 enum class IpaOp {
     Pass = 0,

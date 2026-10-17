@@ -189,6 +189,22 @@ class Emitter {
     virtual void emitAtomicSharedCas(const ir::Value& dst, const ir::Value& addr,
                                      const ir::Value& compare,
                                      const ir::Value& value) = 0;
+    virtual void emitLoadStorage(const ir::Value& dst, u32 binding,
+                                 const ir::Value& offset,
+                                 const ir::Value& size, u32 access) = 0;
+    virtual void emitStoreStorage(u32 binding, const ir::Value& offset,
+                                  const ir::Value& size,
+                                  const ir::Value& value, u32 access) = 0;
+    virtual void emitAtomicStorage(const ir::Value& dst, u32 binding,
+                                   const ir::Value& offset,
+                                   const ir::Value& size,
+                                   const ir::Value& value, u32 op,
+                                   bool is_signed) = 0;
+    virtual void emitAtomicStorageCas(const ir::Value& dst, u32 binding,
+                                      const ir::Value& offset,
+                                      const ir::Value& size,
+                                      const ir::Value& compare,
+                                      const ir::Value& value) = 0;
     virtual void emitBarrier() = 0;
     virtual void emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,

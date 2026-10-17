@@ -25,6 +25,9 @@ class OS {
     explicit OS(System& system_);
     ~OS() { shutdownServices(); }
     void shutdownServices() {
+        display_driver.stopVSync();
+        display_driver.shutdownQueues();
+        display_server.stop();
         nvservices_server.stop();
         others_server.stop();
     }
@@ -56,6 +59,7 @@ class OS {
     kernel::hipc::ServiceManager<u64> service_manager;
     services::Server nvservices_server;
     services::Server others_server;
+    services::Server display_server;
 
     // Managers
     display::Driver display_driver;

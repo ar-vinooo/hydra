@@ -45,6 +45,7 @@ struct DecoderContext {
     const DecompilerContext& decomp_context;
     ztd::io::IStream* code_stream;
     ir::Builder& builder;
+    u64 code_offset{0};
 };
 
 enum class RoundMode {

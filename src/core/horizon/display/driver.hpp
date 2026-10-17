@@ -3,12 +3,17 @@
 #include "core/horizon/display/binder.hpp"
 #include "core/horizon/display/display.hpp"
 #include "core/horizon/handle_pool.hpp"
+#include <condition_variable>
+#include <thread>
 
 namespace hydra::horizon::display {
 
 class Driver {
   public:
     explicit Driver(System& system_);
+    ~Driver() { stopVSync(); }
+    void startVSync();
+    void stopVSync();
 
     // Displays
     Display& getDisplay(Handle handle) {
@@ -76,6 +81,7 @@ class Driver {
                  hw::tegra_x1::gpu::renderer::ISurfaceCompositor* compositor,
                  u32 width, u32 height);
     void signalVSync();
+    void shutdownQueues();
 
     Layer* getFirstLayerForProcess(kernel::Process* process);
 
@@ -88,6 +94,9 @@ class Driver {
     StaticHandlePool<Layer, 8> layer_pool;
     std::mutex binder_mutex;
     StaticHandlePool<Binder, 16> binder_pool;
+    std::mutex vsync_mutex;
+    std::condition_variable_any vsync_cv;
+    std::jthread vsync_thread;
 };
 
 } // namespace hydra::horizon::display

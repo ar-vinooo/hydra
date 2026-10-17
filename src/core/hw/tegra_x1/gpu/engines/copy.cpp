@@ -11,8 +11,28 @@ DEFINE_METHOD_TABLE(Copy, 0xc0, 1, launchDma, LaunchDMAData)
 
 namespace {
 
+// LINE_COUNT may cover more than one Z slice. Each slice starts at the
+// programmed Y origin; LAYER selects the initial slice.
+u32 availableLines(const TextureCopyInfo& info) {
+    if (info.origin.y >= info.height || info.layer >= info.depth)
+        return 0;
+    return static_cast<u32>(std::min<u64>(
+        u64(info.height - info.origin.y) * (info.depth - info.layer),
+        std::numeric_limits<u32>::max()));
+}
+
+std::pair<u32, u32> sliceRow(const TextureCopyInfo& info, u32 line) {
+    const u32 rows = info.height - info.origin.y;
+    return {info.origin.y + line % rows, info.layer + line / rows};
+}
+
+u64 pitchRow(const TextureCopyInfo& info, u32 line) {
+    const u32 rows = info.height - info.origin.y;
+    return u64(line / rows) * info.height + line % rows;
+}
+
 // Copies a sub rectangle between pitch and block linear memory, honouring the
-// origin and layer of the block linear surface
+// origin and initial layer of the block linear surface
 void copySubrect(u8* pitch, u32 pitch_stride, u8* block_linear,
                  const TextureCopyInfo& info, u32 width, u32 bytes_per_pixel,
                  u32 line_length, u32 line_count, bool to_block_linear) {
@@ -22,14 +42,14 @@ void copySubrect(u8* pitch, u32 pitch_stride, u8* block_linear,
         std::max(getBlockSizeLog2(info.block_size.depth), 0));
     const u32 origin_x = info.origin.x * bytes_per_pixel;
     for (u32 line = 0; line < line_count; line++) {
-        const u32 y = info.origin.y + line;
-        u8* pitch_line = pitch + static_cast<usize>(line) * pitch_stride;
+        const auto [y, z] = sliceRow(info, line);
+        u8* pitch_line = pitch + pitchRow(info, line) * pitch_stride;
         for (u32 i = 0; i < line_length;) {
             const u32 x = origin_x + i;
             // Contiguous bytes until the next 16 byte boundary
             const u32 bytes = std::min(16 - x % 16, line_length - i);
             u8* bl = block_linear +
-                     getBlockLinearOffset(x, y, info.layer, width, info.height,
+                     getBlockLinearOffset(x, y, z, width, info.height,
                                           block_height_log2, block_depth_log2);
             if (to_block_linear)
                 std::memcpy(bl, pitch_line + i, bytes);
@@ -56,8 +76,8 @@ void copyBlockLinear(const u8* src, const TextureCopyInfo& src_info,
     const u32 src_origin_x = src_info.origin.x * bytes_per_pixel;
     const u32 dst_origin_x = dst_info.origin.x * bytes_per_pixel;
     for (u32 line = 0; line < line_count; line++) {
-        const u32 src_y = src_info.origin.y + line;
-        const u32 dst_y = dst_info.origin.y + line;
+        const auto [src_y, src_z] = sliceRow(src_info, line);
+        const auto [dst_y, dst_z] = sliceRow(dst_info, line);
         for (u32 i = 0; i < line_length;) {
             const u32 src_x = src_origin_x + i;
             const u32 dst_x = dst_origin_x + i;
@@ -66,11 +86,11 @@ void copyBlockLinear(const u8* src, const TextureCopyInfo& src_info,
             const u32 bytes = std::min(
                 {16 - src_x % 16, 16 - dst_x % 16, line_length - i});
             std::memcpy(dst + getBlockLinearOffset(
-                                  dst_x, dst_y, dst_info.layer, dst_width,
+                                  dst_x, dst_y, dst_z, dst_width,
                                   dst_info.height, dst_height_log2,
                                   dst_depth_log2),
                         src + getBlockLinearOffset(
-                                  src_x, src_y, src_info.layer, src_width,
+                                  src_x, src_y, src_z, src_width,
                                   src_info.height, src_height_log2,
                                   src_depth_log2),
                         bytes);
@@ -289,29 +309,77 @@ void Copy::executeCopy(const LaunchDMAData data) {
                      static_cast<u32>(regs.src.origin.y));
     }
 
-    const auto src_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_in);
-    const auto dst_ptr = tls_crnt_gmmu->unmapAddr(regs.offset_out);
+    // Bound the rectangle to the valid Z slices before calculating host
+    // pointers. A line that would cross the X edge is invalid, not a wrap.
+    u32 copy_lines = data.multi_line_enable ? regs.line_count : 1;
+    const auto valid_surface = [&](const TextureCopyInfo& info, u32 width) {
+        if (getBlockSizeLog2(info.block_size.height) < 0 ||
+            getBlockSizeLog2(info.block_size.depth) < 0 ||
+            static_cast<u32>(info.block_size.height) > 5 ||
+            static_cast<u32>(info.block_size.depth) > 5 ||
+            info.height > std::numeric_limits<u32>::max() - 255 ||
+            width > std::numeric_limits<u32>::max() - 63 ||
+            info.depth > std::numeric_limits<u32>::max() - 31)
+            return false;
+        const u64 aligned_width = align(width, GOB_WIDTH);
+        const u64 aligned_rows = align(
+            info.height, GOB_HEIGHT << getBlockSizeLog2(info.block_size.height));
+        const u64 aligned_depth = align(
+            info.depth, 1u << getBlockSizeLog2(info.block_size.depth));
+        if (aligned_depth != 0 && aligned_width * aligned_rows >
+                                      std::numeric_limits<u64>::max() / aligned_depth)
+            return false;
+        copy_lines = std::min(copy_lines, availableLines(info));
+        return u64(info.origin.x) * bytes_per_pixel +
+                   u64(regs.line_length_in) * bytes_per_pixel <= width;
+    };
+    if ((data.src_memory_layout == MemoryLayout::BlockLinear &&
+         !valid_surface(regs.src, src_stride)) ||
+        (data.dst_memory_layout == MemoryLayout::BlockLinear &&
+         !valid_surface(regs.dst, dst_stride))) {
+        ONCE(LOG_WARN(Engines, "DMA rectangle outside block-linear surface"));
+        return;
+    }
+    if (copy_lines == 0 || regs.line_length_in == 0)
+        return;
+
+    const auto mapped_base = [](uptr address) -> std::optional<uptr> {
+        uptr base;
+        const auto as = tls_crnt_gmmu->findAddr(address, base);
+        if (!as || as->ptr == 0)
+            return std::nullopt;
+        return as->ptr + (address - base);
+    };
+    const auto src_host = mapped_base(regs.offset_in);
+    const auto dst_host = mapped_base(regs.offset_out);
+    if (!src_host || !dst_host) {
+        ONCE(LOG_WARN(Engines, "DMA copy has an unmapped base address"));
+        return;
+    }
+    const auto src_ptr = *src_host;
+    const auto dst_ptr = *dst_host;
     // Bytes a pitch destination spans: LINE_COUNT and PITCH_OUT only apply to
     // multi-line copies
-    const u32 copy_lines = data.multi_line_enable ? regs.line_count : 1;
     const u64 dst_line_bytes =
         data.src_memory_layout == MemoryLayout::Pitch
             ? regs.line_length_in
             : static_cast<u64>(regs.line_length_in) * bytes_per_pixel;
-    const u64 pitch_dst_size =
-        copy_lines == 0 ? 0
-                        : static_cast<u64>(regs.stride_out) * (copy_lines - 1) +
-                              dst_line_bytes;
+    const u64 pitch_dst_rows =
+        data.src_memory_layout == MemoryLayout::BlockLinear
+            ? pitchRow(regs.src, copy_lines - 1)
+            : copy_lines - 1;
+    const u64 pitch_dst_size = u64(regs.stride_out) * pitch_dst_rows + dst_line_bytes;
 
     // The source can be a texture rendered by the GPU (readbacks)
     {
         u64 src_size;
         if (data.src_memory_layout == MemoryLayout::Pitch) {
-            src_size = copy_lines == 0
-                           ? 0
-                           : static_cast<u64>(regs.stride_in) *
-                                     (copy_lines - 1) +
-                                 regs.line_length_in;
+            const u64 last_row =
+                data.dst_memory_layout == MemoryLayout::BlockLinear
+                    ? pitchRow(regs.dst, copy_lines - 1)
+                    : copy_lines - 1;
+            src_size = u64(regs.stride_in) * last_row +
+                       u64(regs.line_length_in) * bytes_per_pixel;
         } else {
             const u32 stride = align(src_stride, GOB_WIDTH);
             const u32 rows = align(
@@ -339,6 +407,24 @@ void Copy::executeCopy(const LaunchDMAData data) {
                 regs.dst.depth, 1u << static_cast<u32>(getBlockSizeLog2(
                                     regs.dst.block_size.depth)));
             dst_size = static_cast<u64>(slices) * rows * stride;
+        }
+        // The swizzle routines use a contiguous host span. Reject split or
+        // missing mappings rather than treating adjacent guest mappings as
+        // adjacent host allocations. Pitch-to-pitch already resolves chunks.
+        if (data.src_memory_layout == MemoryLayout::BlockLinear ||
+            data.dst_memory_layout == MemoryLayout::BlockLinear) {
+            const auto mapped = [](uptr address, u64 size) {
+                uptr base;
+                const auto as = tls_crnt_gmmu->findAddr(address, base);
+                return as && as->ptr != 0 && address - base <= as->size &&
+                       size <= as->size - (address - base);
+            };
+            if (!mapped(regs.offset_in, src_size) ||
+                !mapped(regs.offset_out, dst_size)) {
+                ONCE(LOG_WARN(Engines,
+                              "DMA tiled copy requires mapped host spans"));
+                return;
+            }
         }
         // DEBUG: summary of the copies per 2 s (to correlate with readbacks)
         {
@@ -397,25 +483,23 @@ void Copy::executeCopy(const LaunchDMAData data) {
             }
             return;
         } else {
-            // TODO: can this copy to multiple slices at once?
             copySubrect(reinterpret_cast<u8*>(src_ptr), regs.stride_in,
                         reinterpret_cast<u8*>(dst_ptr), regs.dst, dst_stride,
                         bytes_per_pixel, regs.line_length_in * bytes_per_pixel,
-                        data.multi_line_enable ? regs.line_count : 1, true);
+                        copy_lines, true);
         }
     } else {
         if (data.dst_memory_layout == MemoryLayout::Pitch) {
-            // TODO: can this copy from multiple slices at once?
             copySubrect(reinterpret_cast<u8*>(dst_ptr), regs.stride_out,
                         reinterpret_cast<u8*>(src_ptr), regs.src, src_stride,
                         bytes_per_pixel, regs.line_length_in * bytes_per_pixel,
-                        data.multi_line_enable ? regs.line_count : 1, false);
+                        copy_lines, false);
         } else {
             copyBlockLinear(reinterpret_cast<const u8*>(src_ptr), regs.src,
                             src_stride, reinterpret_cast<u8*>(dst_ptr),
                             regs.dst, dst_stride, bytes_per_pixel,
                             regs.line_length_in * bytes_per_pixel,
-                            data.multi_line_enable ? regs.line_count : 1);
+                            copy_lines);
         }
     }
 

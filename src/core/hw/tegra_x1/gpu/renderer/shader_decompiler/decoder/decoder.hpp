@@ -17,6 +17,7 @@ struct Block {
     std::stack<label_t> sync_point_stack;
     std::stack<label_t> break_point_stack;
     std::stack<label_t> continue_point_stack;
+    std::stack<label_t> exit_point_stack;
 };
 
 class Decoder {
@@ -88,6 +89,7 @@ class Decoder {
         block.sync_point_stack = crnt_block->sync_point_stack;
         block.break_point_stack = crnt_block->break_point_stack;
         block.continue_point_stack = crnt_block->continue_point_stack;
+        block.exit_point_stack = crnt_block->exit_point_stack;
     }
 };
 

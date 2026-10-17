@@ -46,6 +46,9 @@ struct State {
     std::array<std::array<BufferView, CONST_BUFFER_BINDING_COUNT>,
                static_cast<usize>(ShaderType::Count)>
         uniform_buffers{};
+    std::array<std::array<BufferView, CONST_BUFFER_BINDING_COUNT>,
+               static_cast<usize>(ShaderType::Count)>
+        storage_buffers{};
     std::array<std::array<CombinedTextureSampler, TEXTURE_BINDING_COUNT>,
                static_cast<usize>(ShaderType::Count)>
         textures{};
@@ -137,14 +140,24 @@ class Renderer : public IRenderer {
                          engines::IndexType index_type) override;
     void bindUniformBuffer(const BufferView& buffer, ShaderType shader_type,
                            u32 index) override;
+    BufferView getGuestMemoryBuffer(ztd::Range<uptr> range) override;
+    void bindStorageBuffer(const BufferView& buffer, ShaderType shader_type,
+                           u32 index) override;
     void bindTexture(ITextureView* texture, SamplerBase* sampler,
                      ShaderType shader_type, u32 index) override;
 
     // Resource unbinding
     void unbindUniformBuffers(ShaderType shader_type) override;
+    void unbindStorageBuffers(ShaderType shader_type) override;
     void unbindTextures(ShaderType shader_type) override;
 
     f64 debugSyncCommandBuffer(ICommandBuffer* command_buffer) override;
+    bool synchronize(ICommandBuffer* command_buffer) override;
+    void setOcclusionCounterEnabled(bool enabled) override {
+        occlusion_enabled = enabled;
+    }
+    void resetOcclusionCounter() override;
+    std::optional<u64> getOcclusionCounter(ICommandBuffer* command_buffer) override;
 
     // Compute
     void dispatchCompute(ICommandBuffer* command_buffer,
@@ -177,6 +190,8 @@ class Renderer : public IRenderer {
                           u32 index);
     void setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
                     u32 index);
+    void setStorageBuffer(CommandBuffer* command_buffer, ShaderType shader_type,
+                          u32 index);
 
   protected:
     // Capture
@@ -187,6 +202,26 @@ class Renderer : public IRenderer {
     MTL::Device* device;
     MTL::CommandQueue* command_queue;
     std::shared_ptr<UploadBufferPool> upload_buffer_pool;
+
+    // Buffers wrapping guest memory pages, by first page
+    struct GuestMemoryBuffer {
+        std::shared_ptr<BufferBase> buffer;
+        uptr end;
+    };
+    std::mutex guest_memory_buffers_mutex;
+    std::map<uptr, GuestMemoryBuffer> guest_memory_buffers;
+
+    static constexpr u32 OCCLUSION_PAGE_SIZE = 4096;
+    static constexpr usize MAX_OCCLUSION_PAGES = 128;
+    struct OcclusionPage {
+        std::shared_ptr<MTL::Buffer> buffer;
+        u32 count{0};
+    };
+    std::vector<OcclusionPage> occlusion_pages;
+    u64 occlusion_count{0};
+    bool occlusion_enabled{false};
+    bool occlusion_valid{true};
+    std::optional<u64> prepareOcclusionQuery(CommandBuffer* command_buffer);
 
     // Caches
     BinaryArchiveCache binary_archive_cache;

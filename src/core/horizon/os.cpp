@@ -125,7 +125,7 @@ uint2 roundUpToNearestStandardResolution(uint2 surface_resolution) {
 
 OS::OS(System& system_)
     : system{system_}, kernel(system), nvservices_server(system),
-      others_server(system), display_driver(system),
+      others_server(system), display_server(system), display_driver(system),
       hid_resource_manager(system), shared_font_manager(system),
       time_manager(system), ir_sensor_manager(system) {
     // Sysmodules
@@ -229,7 +229,7 @@ OS::OS(System& system_)
     REGISTER_SERVICE(others, lbl::ILblController, "lbl");
 
     // Nvnflinger
-    REGISTER_SERVICE(others, hosbinder::IHOSBinderDriver, "dispdrv");
+    REGISTER_SERVICE(display, hosbinder::IHOSBinderDriver, "dispdrv");
 
     // PTM
     REGISTER_SERVICE(others, psm::IPsmServer, "psm");
@@ -312,6 +312,8 @@ OS::OS(System& system_)
     REGISTER_SERVICE(others, lm::ILogService, "lm");
 
     others_server.start();
+    display_server.start();
+    display_driver.startVSync();
 
     // Sysmodules
     if (std::filesystem::exists(sysmodules_path)) {

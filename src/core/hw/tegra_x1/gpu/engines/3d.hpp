@@ -3,6 +3,7 @@
 #include "core/hw/tegra_x1/gpu/engines/inline_base.hpp"
 #include "core/hw/tegra_x1/gpu/macro/driver_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 class ITextureView;
@@ -147,7 +148,18 @@ struct TextureSamplerControl {
     u32 border_color_a;
 };
 
-renderer::SamplerDescriptor decodeSampler(const TextureSamplerControl& tsc);
+// The texture format selects the border color interpretation (integer bits,
+// sRGB border); Invalid for none
+renderer::SamplerDescriptor
+decodeSampler(const TextureSamplerControl& tsc,
+              renderer::TextureFormat texture_format =
+                  renderer::TextureFormat::Invalid);
+
+// Records the guest sampler state the shader must be specialized for (LOD
+// bias, border emulation) in the shader state of a texture binding
+void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
+                             const TextureSamplerControl& tsc,
+                             renderer::TextureFormat texture_format);
 
 struct RenderTarget {
     Iova addr;
@@ -448,7 +460,10 @@ struct Regs3D {
 
     u32 padding_0x587[0x9];
 
-    u32 padding_0x590[0x62];
+    u32 padding_0x590;
+    u32 primitive_restart_enabled;
+    u32 primitive_restart_index;
+    u32 padding_0x593[0x5f];
 
     // 0x5f2 indexed draws
     Iova index_buffer_addr;
@@ -569,6 +584,9 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     // Getters
     const Regs3D& getRegs() const { return regs; }
+    // Conditional rendering applies to draws and clears.
+    bool shouldExecute() const;
+    const std::vector<u32>& getInlineIndices() const { return inline_indices; }
 
     // Macros
     u32 readMacroRegister(u32 reg) override { return getReg(reg); }
@@ -582,16 +600,18 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     getTexture(const TextureImageControl& tic,
                std::optional<renderer::TextureType> shader_type = std::nullopt,
                renderer::TextureUsage usage = renderer::TextureUsage::Read) const;
-    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc,
-                                      bool force_nearest = false) const;
+    renderer::SamplerBase*
+    getSampler(const TextureSamplerControl& tsc,
+               renderer::TextureFormat texture_format =
+                   renderer::TextureFormat::Invalid) const;
     // Samplers are immutable and never evicted, so they are memoized by the
     // raw TSC words instead of hashing a descriptor for every binding
     struct SamplerMemo {
         std::array<u64, 4> key{};
         renderer::SamplerBase* sampler{nullptr};
     };
-    mutable std::array<SamplerMemo, 256> sampler_memo{};
-    mutable std::array<SamplerMemo, 256> sampler_nearest_memo{};
+    // Indexed by integer texture | sRGB border << 1
+    mutable std::array<std::array<SamplerMemo, 256>, 4> sampler_memos{};
     // Texture lookups of the previous draws, reused while the texture cache
     // epoch only changed by this draw's own render target lookups
     struct TextureMemo {
@@ -639,18 +659,19 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     // Instance of the current draw
     u32 instance_index{0};
-    // Approximate samples passed counter for occlusion queries
-    // TODO: count the actual samples
-    u64 zpass_pixel_count{0};
+    std::vector<u32> inline_indices;
     void beginDraw(const u32 index, const u32 arg);
+    void endDraw(const u32 index, const u32 arg);
+    void inlineIndex32(const u32 index, const u32 arg);
+    void inlineIndex16(const u32 index, const u32 arg);
+    void inlineIndex8(const u32 index, const u32 arg);
+    void drawVertexElementsImpl(u32 count,
+                               std::optional<ztd::Range<uptr>> inline_range);
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
     // Draws with their topology, first vertex or index and count in the
     // argument. The first draw of an instance group restarts the instances.
     void drawVertexArrayCompact(const u32 index, const u32 arg);
-    // Conditional rendering: draws and clears are skipped while rendering is
-    // disabled
-    bool shouldExecute() const;
     void drawVertexElementsCompact(const u32 index, const u32 arg);
 
     struct ClearBufferData {

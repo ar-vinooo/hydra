@@ -604,7 +604,7 @@ void emitTexelFetchSwizzled(DecoderContext& context, InstTlds inst) {
         b.opEndIf();
 }
 
-// TODO: ndv, nodep, dst_pred, aoffi, lc, LOD bias
+// TODO: ndv, nodep, dst_pred, lc
 void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
                         bool int_coords, TextureDimension dim, reg_t dst,
                         u8 component_mask, reg_t src_a, reg_t src_b,
@@ -967,19 +967,22 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
         }
         binding = *tracked;
     }
+    const bool cube = inst.dim == TextureDimension::Cube ||
+                      inst.dim == TextureDimension::CubeArray;
     const bool array = inst.dim == TextureDimension::_2DArray ||
-                       inst.dim == TextureDimension::_1DArray;
+                       inst.dim == TextureDimension::_1DArray ||
+                       inst.dim == TextureDimension::CubeArray;
     const bool is_1d = inst.dim == TextureDimension::_1D ||
                        inst.dim == TextureDimension::_1DArray;
-    if (!is_1d && inst.dim != TextureDimension::_2D &&
-        inst.dim != TextureDimension::_2DArray) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TXD texture dimension {}",
+    if (inst.dim == TextureDimension::_3DArray || (cube && inst.aoffi)) {
+        // Metal has neither 3D arrays nor cubemap texel offsets.
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TXD texture dimension/offset {}",
                             static_cast<u32>(inst.dim.get()));
         if (conditional)
             b.opEndIf();
         return;
     }
-    const u32 axes = is_1d ? 1 : 2;
+    const u32 axes = is_1d ? 1 : (cube || inst.dim == TextureDimension::_3D ? 3 : 2);
     std::vector<ir::Value> coordinate_values;
     for (u32 axis = 0; axis < axes; axis++)
         coordinate_values.push_back(
@@ -1028,8 +1031,7 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
             ir::Value::createConstantF(1.0f / 256.0f));
         flags |= TextureSampleFlags::Lod;
     }
-    const auto type = is_1d ? (array ? TextureType::_1DArray : TextureType::_1D)
-                            : (array ? TextureType::_2DArray : TextureType::_2D);
+    const auto type = static_cast<TextureType>(inst.dim.get());
     const auto result =
         b.opTextureSample(binding, type, flags, layer, coords,
                           ir::Value::createUndefined(), clamp, dx, dy, offset);
@@ -1104,6 +1106,103 @@ void emitTld4s(DecoderContext& context, InstTld4s inst) {
     emitTextureGather2(context, inst.pred, inst.pred_inv, inst.component,
                        inst.dst0, inst.dst1, inst.src_a, inst.src_b,
                        inst.cbuf_index, inst.aoffi, inst.dc, inst.f16);
+}
+
+namespace {
+
+struct StorageCandidates {
+    std::vector<CbufWord> words;
+    u32 budget{64};
+};
+
+// Collects the constant buffer words that feed the low half of a global
+// address. Addresses are built as base (from the NVN descriptor) plus an
+// index, so every term of the additions is followed.
+void collectStorageCandidates(ztd::io::IStream& stream, reg_t reg, u64 pc,
+                              u32 depth, StorageCandidates& out) {
+    if (reg == RZ || depth > MAX_HANDLE_TRACK_DEPTH + 2 || out.budget == 0)
+        return;
+    out.budget--;
+
+    const auto def = findDefinition(stream, reg, pc);
+    if (!def)
+        return;
+    const auto [def_pc, inst] = *def;
+    const auto reg_at = [&](u32 pos) {
+        return static_cast<reg_t>(extractBits(inst, pos, 8));
+    };
+    const auto cbuf = [&] {
+        out.words.push_back({static_cast<u32>(extractBits(inst, 34, 5)),
+                             static_cast<u32>(extractBits(inst, 20, 14))});
+    };
+    const auto follow = [&](reg_t src) {
+        collectStorageCandidates(stream, src, def_pc, depth + 1, out);
+    };
+    const auto op8 = inst & 0xfff8000000000000;
+    const auto op12 = inst & 0xfff0000000000000;
+    const auto op_imm = inst & 0xfef8000000000000;
+
+    if (isLdc(inst)) {
+        const auto ldc = std::bit_cast<InstLdc>(inst);
+        if (ldc.src.get() == RZ) {
+            const auto dst = static_cast<reg_t>(inst & 0xff);
+            out.words.push_back(
+                {ldc.cbuf_slot.get(),
+                 ldc.cbuf_offset.get() / 4 + static_cast<u32>(reg) -
+                     static_cast<u32>(dst)});
+        }
+    } else if (op8 == 0x4c98000000000000) { // MOV Rd, c[][]
+        cbuf();
+    } else if (op8 == 0x5c98000000000000) { // MOV Rd, Rb
+        follow(reg_at(20));
+    } else if (op8 == 0x4c10000000000000 || op8 == 0x4c18000000000000 ||
+               op8 == 0x4bd0000000000000) { // IADD/ISCADD/LEA Rd, Ra, c[][]
+        cbuf();
+        follow(reg_at(8));
+    } else if (op8 == 0x5c10000000000000 || op8 == 0x5c18000000000000 ||
+               op8 == 0x5bd0000000000000) { // IADD/ISCADD/LEA Rd, Ra, Rb
+        follow(reg_at(8));
+        follow(reg_at(20));
+    } else if (op_imm == 0x3810000000000000 || op_imm == 0x3818000000000000 ||
+               op_imm == 0x36d0000000000000 ||
+               (inst & 0xfe00000000000000) == 0x1c00000000000000) {
+        follow(reg_at(8)); // IADD/ISCADD/LEA/IADD32I Rd, Ra, imm
+    } else if (op12 == 0x4cc0000000000000) { // IADD3 Rd, Ra, c[][], Rc
+        cbuf();
+        follow(reg_at(8));
+        follow(reg_at(39));
+    } else if (op12 == 0x5cc0000000000000) { // IADD3 Rd, Ra, Rb, Rc
+        follow(reg_at(8));
+        follow(reg_at(20));
+        follow(reg_at(39));
+    } else if ((inst & 0xfef0000000000000) == 0x38c0000000000000) {
+        follow(reg_at(8)); // IADD3 Rd, Ra, imm, Rc
+        follow(reg_at(39));
+    }
+}
+
+} // namespace
+
+std::optional<StorageBufferWord> trackStorageBuffer(DecoderContext& context,
+                                                    reg_t reg) {
+    auto& stream = *context.code_stream;
+    const u64 saved_seek = stream.getSeek();
+    const u64 crnt_pc = saved_seek / sizeof(instruction_t) - 1;
+
+    StorageCandidates candidates;
+    collectStorageCandidates(stream, reg, crnt_pc, 0, candidates);
+    stream.seekTo(saved_seek);
+
+    // NVN keeps its storage buffer descriptors, 16 bytes each, in c0[0x110,
+    // 0x700). Prefer those, then any 8 byte aligned word
+    for (const auto& word : candidates.words)
+        if (word.slot == 0 && word.word >= 0x110 / 4 && word.word < 0x700 / 4 &&
+            word.word % 4 == 0)
+            return StorageBufferWord{word.slot, word.word};
+    for (const auto& word : candidates.words)
+        if (word.word % 2 == 0)
+            return StorageBufferWord{word.slot, word.word};
+    return std::nullopt;
 }
 
 std::optional<u32> trackBindlessResource(DecoderContext& context, reg_t reg) {

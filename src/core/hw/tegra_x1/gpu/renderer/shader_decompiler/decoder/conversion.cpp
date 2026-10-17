@@ -107,8 +107,17 @@ void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
         rounding = 0;
 
     if (src_fmt == FloatFormat::F64 && dst_fmt == FloatFormat::F64) {
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2F.F64.F64"));
-        writePair(b, inst.dst, src.lo, src.hi);
+        const auto word = [&](bool high) {
+            return callIntrinsic(
+                b, ir::Intrinsic::F64Round,
+                {src.lo, src.hi,
+                 ir::Value::createConstantU(rounding | (inst.abs ? 8u : 0u) |
+                                            (inst.neg ? 0x10u : 0u) |
+                                            (high ? 0x20u : 0u))});
+        };
+        const auto lo = word(false);
+        const auto hi = word(true);
+        writePair(b, inst.dst, lo, hi);
     } else if (src_fmt == FloatFormat::F64) {
         const u32 control = (inst.abs ? 1u : 0u) | (inst.neg ? 2u : 0u) |
                             (inst.sat ? 4u : 0u) | (getFloatCode(dst_fmt) << 3);
@@ -154,16 +163,7 @@ void emitFloatToInt(DecoderContext& context, InstF2iBase inst,
 
     auto value = src.lo;
     bool is_f16 = inst.src_fmt == FloatFormat::F16;
-    if (inst.src_fmt == FloatFormat::F64) {
-        // TODO: exact conversion of doubles beyond the float mantissa
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2I from F64"));
-        value = callIntrinsic(b, ir::Intrinsic::F64ToF32,
-                              {src.lo, src.hi, ir::Value::createConstantU(
-                                                   getFloatCode(
-                                                       FloatFormat::F32)
-                                                   << 3)});
-        is_f16 = false;
-    }
+    const bool is_f64 = inst.src_fmt == FloatFormat::F64;
 
     auto width = inst.dst_width.get();
     if (width == IntegerWidth::Invalid) {
@@ -176,7 +176,25 @@ void emitFloatToInt(DecoderContext& context, InstF2iBase inst,
         (width == IntegerWidth::_16 ? 8u : 0u) | (is_f16 ? 0x10u : 0u) |
         (inst.sh ? 0x20u : 0u) | (inst.abs ? 0x40u : 0u) |
         (inst.neg ? 0x80u : 0u) | (inst.ftz ? 0x100u : 0u);
-    if (width == IntegerWidth::_64) {
+    if (is_f64) {
+        // Exact conversion of the double, results as in the 32-bit helper
+        const u32 f64_control =
+            static_cast<u32>(inst.round_mode.get()) |
+            (inst.dst_signed ? 4u : 0u) |
+            (width == IntegerWidth::_16 ? 8u : 0u) |
+            (inst.abs ? 0x40u : 0u) | (inst.neg ? 0x80u : 0u) |
+            (width == IntegerWidth::_64 ? 0x400u : 0u);
+        const auto word = [&](bool high) {
+            return callIntrinsic(
+                b, ir::Intrinsic::F64ToInt,
+                {src.lo, src.hi,
+                 ir::Value::createConstantU(f64_control | (high ? 0x200u : 0u))});
+        };
+        if (width == IntegerWidth::_64)
+            writePair(b, inst.dst, word(false), word(true));
+        else
+            writeWord(b, inst.dst, word(false));
+    } else if (width == IntegerWidth::_64) {
         const auto lo = callIntrinsic(b, ir::Intrinsic::FloatToInt64,
                                       {value, ir::Value::createConstantU(control)});
         const auto hi = callIntrinsic(
@@ -251,24 +269,21 @@ void emitIntToFloat(DecoderContext& context, InstI2fBase inst,
                          << 3) |
                         (is_64 ? 0u : inst.byte_sel.get() << 5) |
                         (inst.abs ? 0x80u : 0u) | (inst.neg ? 0x100u : 0u);
-    const auto res =
-        is_64 ? callIntrinsic(b, ir::Intrinsic::Int64ToFloat,
-                              {src.lo, src.hi, ir::Value::createConstantU(control)})
-              : callIntrinsic(b, ir::Intrinsic::IntToFloat,
-                              {src.lo, ir::Value::createConstantU(control)});
     if (dst_fmt == FloatFormat::F64) {
-        // TODO: exact conversion of integers beyond the float mantissa
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "I2F to F64"));
-        const auto convert = [&](bool high) {
+        const auto word = [&](bool high) {
             return callIntrinsic(
-                b, ir::Intrinsic::F32ToF64,
-                {res, ir::Value::createConstantU(
-                          getFloatCode(FloatFormat::F32) | (high ? 0x20u : 0u))});
+                b, ir::Intrinsic::F64FromInt,
+                {src.lo, src.hi,
+                 ir::Value::createConstantU(control | (high ? 0x200u : 0u))});
         };
-        const auto lo = convert(false);
-        const auto hi = convert(true);
-        writePair(b, inst.dst, lo, hi);
+        writePair(b, inst.dst, word(false), word(true));
     } else {
+        const auto res =
+            is_64 ? callIntrinsic(
+                        b, ir::Intrinsic::Int64ToFloat,
+                        {src.lo, src.hi, ir::Value::createConstantU(control)})
+                  : callIntrinsic(b, ir::Intrinsic::IntToFloat,
+                                  {src.lo, ir::Value::createConstantU(control)});
         writeWord(b, inst.dst, res);
     }
 

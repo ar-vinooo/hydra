@@ -390,6 +390,420 @@ inline uint hydra_bit_reverse(uint a) { return reverse_bits(a); }
 
 } // namespace
 
+
+// FP64 soft float. Metal has no doubles, so operations work on the bit
+// patterns. All three helpers share this block (guarded against repeated
+// inclusion). The fused multiply-add is exact: the product and the addend are
+// aligned in 128 bits with a sticky bit before the single rounding.
+constexpr std::string_view F64_SOURCE = R"(
+#ifndef HYDRA_F64_HELPERS
+#define HYDRA_F64_HELPERS
+struct hydra_u128 { ulong hi; ulong lo; };
+
+inline hydra_u128 hydra_u128_shl(hydra_u128 v, uint n) {
+    if (n == 0u) return v;
+    if (n >= 64u) return {v.lo << (n - 64u), 0ul};
+    return {(v.hi << n) | (v.lo >> (64u - n)), v.lo << n};
+}
+
+// Shift right, folding the bits shifted out into bit 0
+inline hydra_u128 hydra_u128_shr_jam(hydra_u128 v, uint n) {
+    if (n == 0u) return v;
+    if (n >= 128u) return {0ul, (v.hi | v.lo) != 0ul ? 1ul : 0ul};
+    hydra_u128 out;
+    bool lost;
+    if (n < 64u) {
+        out.hi = v.hi >> n;
+        out.lo = (v.lo >> n) | (v.hi << (64u - n));
+        lost = (v.lo << (64u - n)) != 0ul;
+    } else if (n == 64u) {
+        out.hi = 0ul;
+        out.lo = v.hi;
+        lost = v.lo != 0ul;
+    } else {
+        const uint s = n - 64u;
+        out.hi = 0ul;
+        out.lo = v.hi >> s;
+        lost = v.lo != 0ul || (v.hi << (64u - s)) != 0ul;
+    }
+    if (lost) out.lo |= 1ul;
+    return out;
+}
+
+inline hydra_u128 hydra_u128_add(hydra_u128 a, hydra_u128 b) {
+    hydra_u128 r;
+    r.lo = a.lo + b.lo;
+    r.hi = a.hi + b.hi + (r.lo < a.lo ? 1ul : 0ul);
+    return r;
+}
+
+inline hydra_u128 hydra_u128_sub(hydra_u128 a, hydra_u128 b) {
+    hydra_u128 r;
+    r.lo = a.lo - b.lo;
+    r.hi = a.hi - b.hi - (a.lo < b.lo ? 1ul : 0ul);
+    return r;
+}
+
+inline bool hydra_u128_ge(hydra_u128 a, hydra_u128 b) {
+    return a.hi > b.hi || (a.hi == b.hi && a.lo >= b.lo);
+}
+
+inline uint hydra_u128_clz(hydra_u128 v) {
+    return v.hi != 0ul ? uint(clz(v.hi)) : (v.lo != 0ul ? 64u + uint(clz(v.lo)) : 128u);
+}
+
+inline bool hydra_u128_bit(hydra_u128 v, uint n) {
+    return n >= 64u ? ((v.hi >> (n - 64u)) & 1ul) != 0ul : ((v.lo >> n) & 1ul) != 0ul;
+}
+
+// Any of the n lowest bits set
+inline bool hydra_u128_low_any(hydra_u128 v, uint n) {
+    if (n == 0u) return false;
+    if (n >= 128u) return (v.hi | v.lo) != 0ul;
+    if (n >= 64u)
+        return v.lo != 0ul || (n > 64u && (v.hi & ((1ul << (n - 64u)) - 1ul)) != 0ul);
+    return (v.lo & ((1ul << n) - 1ul)) != 0ul;
+}
+
+constant ulong HYDRA_F64_SIGN = 0x8000000000000000ul;
+constant ulong HYDRA_F64_FRAC = 0x000ffffffffffffful;
+constant ulong HYDRA_F64_QNAN = 0x7ff8000000000000ul;
+constant ulong HYDRA_F64_INF = 0x7ff0000000000000ul;
+
+inline bool hydra_f64_is_nan(ulong x) { return (x & ~HYDRA_F64_SIGN) > HYDRA_F64_INF; }
+
+// Unpacks a finite non-zero value into a 53 bit significand (bit 52 set) and
+// the exponent of that bit
+inline void hydra_f64_unpack(ulong x, thread int& e, thread ulong& m) {
+    const uint ex = uint(x >> 52) & 0x7ffu;
+    const ulong f = x & HYDRA_F64_FRAC;
+    if (ex == 0u) {
+        const uint shift = uint(clz(f)) - 11u;
+        m = f << shift;
+        e = -1022 - int(shift);
+    } else {
+        m = f | (1ul << 52);
+        e = int(ex) - 1023;
+    }
+}
+
+// Rounding: 0 nearest even, 1 toward -inf, 2 toward +inf, 3 toward zero
+inline ulong hydra_f64_fma(ulong a, ulong b, ulong c, uint mode) {
+    const uint sa = uint(a >> 63), sb = uint(b >> 63), sc = uint(c >> 63);
+    const uint sp = sa ^ sb;
+    if (hydra_f64_is_nan(a) || hydra_f64_is_nan(b) || hydra_f64_is_nan(c))
+        return HYDRA_F64_QNAN;
+    const bool a_inf = (a & ~HYDRA_F64_SIGN) == HYDRA_F64_INF;
+    const bool b_inf = (b & ~HYDRA_F64_SIGN) == HYDRA_F64_INF;
+    const bool c_inf = (c & ~HYDRA_F64_SIGN) == HYDRA_F64_INF;
+    const bool a_zero = (a & ~HYDRA_F64_SIGN) == 0ul;
+    const bool b_zero = (b & ~HYDRA_F64_SIGN) == 0ul;
+    const bool c_zero = (c & ~HYDRA_F64_SIGN) == 0ul;
+    if ((a_inf && b_zero) || (b_inf && a_zero)) return HYDRA_F64_QNAN;
+    if (a_inf || b_inf) {
+        if (c_inf && sc != sp) return HYDRA_F64_QNAN;
+        return (ulong(sp) << 63) | HYDRA_F64_INF;
+    }
+    if (c_inf) return c;
+    if (a_zero || b_zero) {
+        if (!c_zero) return c;
+        const uint s = sp == sc ? sp : (mode == 1u ? 1u : 0u);
+        return ulong(s) << 63;
+    }
+
+    int ea, eb, ec = 0;
+    ulong ma, mb, mc = 0ul;
+    hydra_f64_unpack(a, ea, ma);
+    hydra_f64_unpack(b, eb, mb);
+    hydra_u128 p;
+    p.lo = ma * mb;
+    p.hi = mulhi(ma, mb);
+    p = hydra_u128_shl(p, 21u);
+    const int Ep = ea + eb - 125;
+
+    int E = Ep;
+    hydra_u128 X = p;
+    hydra_u128 Y = {0ul, 0ul};
+    uint sX = sp, sY = sp;
+    if (!c_zero) {
+        hydra_f64_unpack(c, ec, mc);
+        const hydra_u128 cc = {mc << 10, 0ul};
+        const int Ec = ec - 126;
+        if (Ep >= Ec) {
+            Y = hydra_u128_shr_jam(cc, uint(Ep - Ec));
+            sY = sc;
+        } else {
+            E = Ec;
+            X = cc;
+            sX = sc;
+            Y = hydra_u128_shr_jam(p, uint(Ec - Ep));
+            sY = sp;
+        }
+    }
+
+    hydra_u128 S;
+    uint rs;
+    if (sX == sY) {
+        S = hydra_u128_add(X, Y);
+        rs = sX;
+    } else if (hydra_u128_ge(X, Y)) {
+        S = hydra_u128_sub(X, Y);
+        rs = sX;
+    } else {
+        S = hydra_u128_sub(Y, X);
+        rs = sY;
+    }
+    if ((S.hi | S.lo) == 0ul)
+        return mode == 1u ? HYDRA_F64_SIGN : 0ul;
+
+    const int msb = 127 - int(hydra_u128_clz(S));
+    const int e_res = E + msb;
+    int q = max(e_res - 52, -1074);
+    const int s = q - E;
+    ulong r;
+    bool guard = false, sticky = false;
+    if (s <= 0) {
+        r = S.lo << uint(-s);
+    } else if (s >= 129) {
+        r = 0ul;
+        sticky = true;
+    } else {
+        if (s >= 128)
+            r = 0ul;
+        else if (s >= 64)
+            r = S.hi >> uint(s - 64);
+        else
+            r = (S.lo >> uint(s)) | (S.hi << uint(64 - s));
+        guard = hydra_u128_bit(S, uint(s - 1));
+        sticky = hydra_u128_low_any(S, uint(s - 1));
+    }
+    const bool inexact = guard || sticky;
+    bool up;
+    if (mode == 0u) up = guard && (sticky || (r & 1ul) != 0ul);
+    else if (mode == 1u) up = rs != 0u && inexact;
+    else if (mode == 2u) up = rs == 0u && inexact;
+    else up = false;
+    if (up) r += 1ul;
+    if (r == (1ul << 53)) {
+        r = 1ul << 52;
+        q += 1;
+    }
+    if (r < (1ul << 52))
+        return (ulong(rs) << 63) | r;
+    const int field = q + 52 + 1023;
+    if (field >= 0x7ff) {
+        const bool to_inf = mode == 0u || (mode == 1u && rs != 0u) || (mode == 2u && rs == 0u);
+        return (ulong(rs) << 63) | (to_inf ? HYDRA_F64_INF : 0x7fefffffffffffffull);
+    }
+    return (ulong(rs) << 63) | (ulong(field) << 52) | (r & HYDRA_F64_FRAC);
+}
+
+// Rounds to an integral value. Modes: 0 none, 1 nearest even, 2 floor, 3 ceil,
+// 4 truncate. NaN and infinity pass through
+inline ulong hydra_f64_round_int(ulong x, uint mode) {
+    if (mode == 0u || (x & ~HYDRA_F64_SIGN) >= HYDRA_F64_INF) return x;
+    const ulong sign = x & HYDRA_F64_SIGN;
+    const int e = int((x >> 52) & 0x7ffu) - 1023;
+    if (e >= 52) return x;
+    if (e < 0) {
+        const bool nonzero = (x & ~HYDRA_F64_SIGN) != 0ul;
+        bool one = false;
+        if (mode == 1u) one = e == -1 && (x & HYDRA_F64_FRAC) != 0ul;
+        else if (mode == 2u) one = sign != 0ul && nonzero;
+        else if (mode == 3u) one = sign == 0ul && nonzero;
+        return one ? (sign | 0x3ff0000000000000ul) : sign;
+    }
+    const ulong mask = (1ul << uint(52 - e)) - 1ul;
+    const ulong frac = x & mask;
+    if (frac == 0ul) return x;
+    ulong result = x & ~mask;
+    const ulong halfway = 1ul << uint(51 - e);
+    bool up;
+    if (mode == 1u) up = frac > halfway || (frac == halfway && ((x >> uint(52 - e)) & 1ul) != 0ul);
+    else if (mode == 2u) up = sign != 0ul;
+    else if (mode == 3u) up = sign == 0ul;
+    else up = false;
+    if (up) result += 1ul << uint(52 - e);
+    return result;
+}
+
+// Order key: unsigned comparison of keys is the numeric order, with -0 below +0
+inline ulong hydra_f64_key(ulong x) {
+    return (x & HYDRA_F64_SIGN) != 0ul ? ~x : (x | HYDRA_F64_SIGN);
+}
+
+inline uint hydra_f64_word(ulong v, uint high) {
+    return high != 0u ? uint(v >> 32) : uint(v);
+}
+#endif
+)";
+
+constexpr std::string_view F64_TO_INT_SOURCE = R"(
+inline uint hydra_f64_to_int(uint lo, uint hi, uint control) {
+    ulong x = ulong(lo) | (ulong(hi) << 32);
+    if ((control & 0x40u) != 0u) x &= ~HYDRA_F64_SIGN;
+    if ((control & 0x80u) != 0u) x ^= HYDRA_F64_SIGN;
+    ulong result = 0ul;
+    if (hydra_f64_is_nan(x)) {
+        // 64-bit results of a NaN are the most negative integer
+        if ((control & 0x400u) != 0u) result = 1ul << 63;
+    } else {
+        const ulong r = hydra_f64_round_int(x, (control & 3u) + 1u);
+        const bool negative = (r & HYDRA_F64_SIGN) != 0ul;
+        const int e = int((r >> 52) & 0x7ffu) - 1023;
+        ulong magnitude;
+        bool overflow = false;
+        if ((r & ~HYDRA_F64_SIGN) == HYDRA_F64_INF || e >= 64) {
+            overflow = true;
+            magnitude = ~0ul;
+        } else if (e < 0) {
+            magnitude = 0ul;
+        } else {
+            const ulong mantissa = (r & HYDRA_F64_FRAC) | (1ul << 52);
+            magnitude = e >= 52 ? mantissa << uint(e - 52) : mantissa >> uint(52 - e);
+        }
+        const bool is_signed = (control & 4u) != 0u;
+        const uint bits = (control & 0x400u) != 0u ? 64u : ((control & 8u) != 0u ? 16u : 32u);
+        if (is_signed) {
+            const ulong limit = 1ul << (bits - 1u);
+            if (negative)
+                result = (overflow || magnitude >= limit) ? 0ul - limit : 0ul - magnitude;
+            else
+                result = (overflow || magnitude >= limit) ? limit - 1ul : magnitude;
+        } else if (!negative) {
+            const ulong maximum = bits == 64u ? ~0ul : ((1ul << bits) - 1ul);
+            result = (overflow || magnitude > maximum) ? maximum : magnitude;
+        }
+    }
+    if ((control & 0x400u) != 0u)
+        return (control & 0x200u) != 0u ? uint(result >> 32) : uint(result);
+    return uint(result);
+}
+)";
+
+constexpr std::string_view F64_FROM_INT_SOURCE = R"(
+inline uint hydra_f64_from_int(uint lo, uint hi, uint control) {
+    const uint width = control & 3u;
+    const bool is_signed = (control & 4u) != 0u;
+    const bool absolute = (control & 0x80u) != 0u;
+    ulong value;
+    uint bits = 64u;
+    if (width == 3u) {
+        value = ulong(lo) | (ulong(hi) << 32);
+    } else {
+        bits = 8u << min(width, 2u);
+        const uint offset = min(((control >> 5) & 3u) * 8u, 32u - bits);
+        const uint field = is_signed
+                               ? as_type<uint>(extract_bits(as_type<int>(lo), offset, bits))
+                               : extract_bits(lo, offset, bits);
+        value = is_signed ? ulong(long(as_type<int>(field))) : ulong(field);
+    }
+    long signed_value = as_type<long>(value);
+    const long least = bits == 64u ? as_type<long>(0x8000000000000000ul) : -(1l << (bits - 1u));
+    const bool is_least = is_signed && signed_value == least;
+    bool negative = false;
+    ulong magnitude = value;
+    if (is_signed) {
+        negative = signed_value < 0;
+        magnitude = negative ? 0ul - value : value;
+        if (absolute && !is_least) negative = false;
+    }
+    if ((control & 0x100u) != 0u && (absolute || !is_least))
+        negative = !negative;
+    ulong result = negative ? HYDRA_F64_SIGN : 0ul;
+    if (magnitude != 0ul) {
+        const int msb = 63 - int(clz(magnitude));
+        ulong mantissa;
+        int exponent = msb;
+        if (msb <= 52) {
+            mantissa = magnitude << uint(52 - msb);
+        } else {
+            const uint shift = uint(msb - 52);
+            mantissa = magnitude >> shift;
+            const ulong rest = magnitude & ((1ul << shift) - 1ul);
+            const ulong halfway = 1ul << (shift - 1u);
+            if (rest > halfway || (rest == halfway && (mantissa & 1ul) != 0ul)) mantissa += 1ul;
+            if (mantissa == (1ul << 53)) {
+                mantissa >>= 1;
+                exponent += 1;
+            }
+        }
+        result |= (ulong(exponent + 1023) << 52) | (mantissa & HYDRA_F64_FRAC);
+    }
+    return hydra_f64_word(result, (control >> 9) & 1u);
+}
+)";
+
+constexpr std::string_view F64_ROUND_SOURCE = R"(
+inline uint hydra_f64_round(uint lo, uint hi, uint control) {
+    ulong x = ulong(lo) | (ulong(hi) << 32);
+    if ((control & 8u) != 0u) x &= ~HYDRA_F64_SIGN;
+    if ((control & 0x10u) != 0u) x ^= HYDRA_F64_SIGN;
+    return hydra_f64_word(hydra_f64_round_int(x, control & 7u), (control >> 5) & 1u);
+}
+)";
+
+constexpr std::string_view F64_FMA_SOURCE = R"(
+inline uint hydra_f64_fma_word(uint alo, uint ahi, uint blo, uint bhi,
+                               uint clo, uint chi, uint control) {
+    const ulong r = hydra_f64_fma(ulong(alo) | (ulong(ahi) << 32),
+                                  ulong(blo) | (ulong(bhi) << 32),
+                                  ulong(clo) | (ulong(chi) << 32), control & 3u);
+    return hydra_f64_word(r, (control >> 2) & 1u);
+}
+)";
+
+// op is a FloatCmpOp: 0 F, 1 LT, 2 EQ, 3 LE, 4 GT, 5 NE, 6 GE, 7 NUM, 8 NAN,
+// 9 LTU, 10 EQU, 11 LEU, 12 GTU, 13 NEU, 14 GEU, 15 T
+constexpr std::string_view F64_COMPARE_SOURCE = R"(
+inline uint hydra_f64_compare(uint alo, uint ahi, uint blo, uint bhi, uint op) {
+    const ulong a = ulong(alo) | (ulong(ahi) << 32);
+    const ulong b = ulong(blo) | (ulong(bhi) << 32);
+    const bool unordered = hydra_f64_is_nan(a) || hydra_f64_is_nan(b);
+    const ulong ka = hydra_f64_key(a), kb = hydra_f64_key(b);
+    const bool zeros = ((a | b) & ~HYDRA_F64_SIGN) == 0ul;
+    const bool eq = !unordered && (zeros || ka == kb);
+    const bool lt = !unordered && !zeros && ka < kb;
+    const bool gt = !unordered && !zeros && ka > kb;
+    bool result;
+    switch (op) {
+    case 0u: result = false; break;
+    case 1u: result = lt; break;
+    case 2u: result = eq; break;
+    case 3u: result = lt || eq; break;
+    case 4u: result = gt; break;
+    case 5u: result = !unordered && !eq; break;
+    case 6u: result = gt || eq; break;
+    case 7u: result = !unordered; break;
+    case 8u: result = unordered; break;
+    case 9u: result = lt || unordered; break;
+    case 10u: result = eq || unordered; break;
+    case 11u: result = lt || eq || unordered; break;
+    case 12u: result = gt || unordered; break;
+    case 13u: result = !eq; break;
+    case 14u: result = gt || eq || unordered; break;
+    default: result = true; break;
+    }
+    return result ? 1u : 0u;
+}
+)";
+
+constexpr std::string_view F64_MINMAX_SOURCE = R"(
+inline uint hydra_f64_minmax(uint alo, uint ahi, uint blo, uint bhi, uint control) {
+    const ulong a = ulong(alo) | (ulong(ahi) << 32);
+    const ulong b = ulong(blo) | (ulong(bhi) << 32);
+    ulong r;
+    if (hydra_f64_is_nan(a) && hydra_f64_is_nan(b)) r = HYDRA_F64_QNAN;
+    else if (hydra_f64_is_nan(a)) r = b;
+    else if (hydra_f64_is_nan(b)) r = a;
+    else {
+        const bool a_less = hydra_f64_key(a) < hydra_f64_key(b);
+        r = ((control & 1u) != 0u) ? (a_less ? b : a) : (a_less ? a : b);
+    }
+    return hydra_f64_word(r, (control >> 1) & 1u);
+}
+)";
+
 std::string_view getIntrinsicSource(ir::Intrinsic intrinsic) {
     switch (intrinsic) {
     case ir::Intrinsic::Prmt:
@@ -418,6 +832,36 @@ std::string_view getIntrinsicSource(ir::Intrinsic intrinsic) {
         return RSQ64H_SOURCE;
     case ir::Intrinsic::BitReverse:
         return BIT_REVERSE_SOURCE;
+    case ir::Intrinsic::F64Fma: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_FMA_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64Compare: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_COMPARE_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64MinMax: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_MINMAX_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64ToInt: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_TO_INT_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64FromInt: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_FROM_INT_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64Round: {
+        static const std::string source =
+            std::string(F64_SOURCE) + std::string(F64_ROUND_SOURCE);
+        return source;
+    }
     }
     unreachable();
 }
@@ -450,6 +894,18 @@ std::string_view getIntrinsicFunctionName(ir::Intrinsic intrinsic) {
         return "hydra_rsq64h";
     case ir::Intrinsic::BitReverse:
         return "hydra_bit_reverse";
+    case ir::Intrinsic::F64Fma:
+        return "hydra_f64_fma_word";
+    case ir::Intrinsic::F64Compare:
+        return "hydra_f64_compare";
+    case ir::Intrinsic::F64MinMax:
+        return "hydra_f64_minmax";
+    case ir::Intrinsic::F64ToInt:
+        return "hydra_f64_to_int";
+    case ir::Intrinsic::F64FromInt:
+        return "hydra_f64_from_int";
+    case ir::Intrinsic::F64Round:
+        return "hydra_f64_round";
     }
     unreachable();
 }

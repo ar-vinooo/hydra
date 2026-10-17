@@ -17,6 +17,10 @@ struct ImageInfo {
     bool is_read{false};
 };
 
+struct StorageInfo {
+    bool written{false};
+};
+
 class MemoryAnalyzer {
   public:
     void analyze(const ir::Module& modul);
@@ -29,6 +33,8 @@ class MemoryAnalyzer {
     std::unordered_set<u32> const_buffers;
     std::map<u32, TextureInfo> textures;
     std::map<u32, ImageInfo> images;
+    // Storage buffers by binding (constant buffer slot << 16 | word)
+    std::map<u32, StorageInfo> storage_buffers;
     bool uses_local_memory{false};
     bool uses_call_stack{false};
     // Bit per clip distance the shader writes
@@ -52,6 +58,7 @@ class MemoryAnalyzer {
     CONST_REF_GETTER(const_buffers, getConstBuffers);
     CONST_REF_GETTER(textures, getTextures);
     CONST_REF_GETTER(images, getImages);
+    CONST_REF_GETTER(storage_buffers, getStorageBuffers);
     CONST_REF_GETTER(uses_local_memory, getUsesLocalMemory);
     CONST_REF_GETTER(uses_call_stack, getUsesCallStack);
     GETTER(clip_distance_outputs, getClipDistanceOutputs);

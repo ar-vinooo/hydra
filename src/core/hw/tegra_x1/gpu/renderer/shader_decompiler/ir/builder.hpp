@@ -510,6 +510,39 @@ class Builder {
         return addInstruction(Opcode::AtomicSharedCas, ScalarType::U32,
                               {addr, compare, value});
     }
+    // Storage buffers (global memory). `binding` is the constant buffer word
+    // that holds the NVN descriptor (slot << 16 | word), offsets are in bytes
+    // from the buffer start and `size` is the descriptor's byte size. Access
+    // sizes: 0 U8, 1 S8, 2 U16, 3 S16, 4 B32
+    Value opLoadStorage(u32 binding, const Value& offset, const Value& size,
+                        u32 access) {
+        return addInstruction(Opcode::LoadStorage, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               Value::createRawValue(access)});
+    }
+    void opStoreStorage(u32 binding, const Value& offset, const Value& size,
+                        const Value& value, u32 access) {
+        addInstructionWithDst(Opcode::StoreStorage, std::nullopt,
+                              {Value::createRawValue(binding), offset, size,
+                               value, Value::createRawValue(access)});
+    }
+    // Returns the previous value. Operations as in ATOM (0 add ... 8 exchange)
+    // plus 9 for a floating point add
+    Value opAtomicStorage(u32 binding, const Value& offset, const Value& size,
+                          const Value& value, u32 op, bool is_signed) {
+        return addInstruction(Opcode::AtomicStorage, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               value, Value::createRawValue(op),
+                               Value::createRawValue(is_signed)});
+    }
+    // Compare and swap, returns the previous value
+    Value opAtomicStorageCas(u32 binding, const Value& offset,
+                             const Value& size, const Value& compare,
+                             const Value& value) {
+        return addInstruction(Opcode::AtomicStorageCas, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               compare, value});
+    }
     // Per-thread local memory, addressed in bytes and accessed in words
     Value opLoadLocal(const Value& addr) {
         return addInstruction(Opcode::LoadLocal, ScalarType::U32, {addr});

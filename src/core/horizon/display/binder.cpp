@@ -4,129 +4,162 @@
 
 namespace hydra::horizon::display {
 
-void Binder::addBuffer(i32 slot, const GraphicBuffer& buff) {
-    std::scoped_lock lock(queue_mutex);
-    // Replacing the buffer of a slot does not add a slot
-    if (!buffers[slot].initialized)
-        buffer_count++;
-    buffers[slot].initialized = true;
-    buffers[slot].buffer = buff;
+bool Binder::hasFreeSlot(const QueueState& state) {
+    return std::any_of(state.buffers.begin(), state.buffers.end(), [](const Buffer& b) {
+        return b.initialized && b.state == Buffer::State::Free;
+    });
+}
+
+void Binder::updateEventLocked() {
+    if (hasFreeSlot(*queue))
+        event->signal();
+    else
+        event->clear();
+}
+
+bool Binder::addBuffer(i32 slot, const GraphicBuffer& buff) {
+    if (!validSlot(slot))
+        return false;
+    std::scoped_lock lock(queue->mutex);
+    auto& buffer = queue->buffers[static_cast<usize>(slot)];
+    if (buffer.initialized && buffer.state != Buffer::State::Free)
+        return false;
+    if (!buffer.initialized)
+        queue->buffer_count++;
+    buffer.initialized = true;
+    buffer.state = Buffer::State::Free;
+    buffer.generation = ++queue->generation;
+    buffer.buffer = buff;
+    updateEventLocked();
+    queue->cv.notify_all();
+    return true;
 }
 
 i32 Binder::getAvailableSlot() {
-    // Wait for a slot to become available
-    std::unique_lock<std::mutex> lock(queue_mutex);
-    queue_cv.wait(lock, [&] { return queued_buffers.size() != buffer_count; });
-
-    // Find an available slot
-    i32 slot = -1;
-    for (usize i = 0; i < MAX_BINDER_BUFFER_COUNT; i++) {
-        if (buffers[i].initialized && !buffers[i].queued) {
-            if (slot == -1) {
-                // Consume the first slot
-                slot = static_cast<i32>(i);
-            } else {
-                // We know that there is another available slot, so we can
-                // keep the event signalled
-                return slot;
-            }
+    std::unique_lock lock(queue->mutex);
+    queue->cv.wait(lock, [&] {
+        return queue->buffer_count == 0 || hasFreeSlot(*queue);
+    });
+    for (usize i = 0; i < queue->buffers.size(); ++i) {
+        auto& buffer = queue->buffers[i];
+        if (buffer.initialized && buffer.state == Buffer::State::Free) {
+            buffer.state = Buffer::State::Dequeued;
+            updateEventLocked();
+            return static_cast<i32>(i);
         }
     }
-
-    // If we reach here, it means that there won't be a slot available the
-    // next time, so clear the event
-    event->clear();
-
-    // TODO: remove this?
-    if (slot == -1)
-        LOG_ERROR(Horizon, "No available slots");
-
-    return slot;
+    return -1;
 }
 
-void Binder::queueBuffer(System& system, i32 slot, const BqBufferInput& input) {
-    // Fences are not implemented, so remember how much GPU work has been
-    // submitted to wait for it before presenting
+bool Binder::queueBuffer(System& system, i32 slot, const BqBufferInput& input) {
     const auto gpu_fence = system.getGpu().getPfifo().getSubmittedCount();
-    {
-        std::scoped_lock lock(queue_mutex);
-        queued_buffers.emplace(slot, input, gpu_fence);
-        buffers[slot].queued = true;
-    }
-
-    // Time
-    const auto now = clock_t::now();
-    accumulated_dt += now - last_queue_time;
-    last_queue_time = now;
-
-    queue_cv.notify_all();
-
-    // Debug
-    // TODO: only do this for the main process
+    if (!queueBuffer(slot, input, gpu_fence))
+        return false;
     system.getGpu().getRenderer().notifyDebugFrameBoundary();
+    return true;
+}
+
+bool Binder::queueBuffer(i32 slot, const BqBufferInput& input, u64 gpu_fence) {
+    if (!validSlot(slot))
+        return false;
+    std::scoped_lock lock(queue->mutex);
+    auto& buffer = queue->buffers[static_cast<usize>(slot)];
+    if (!buffer.initialized || buffer.state != Buffer::State::Dequeued)
+        return false;
+    queue->queued_buffers.emplace(slot, input, gpu_fence);
+    buffer.state = Buffer::State::Queued;
+    const auto now = clock_t::now();
+    queue->accumulated_dt += now - queue->last_queue_time;
+    queue->last_queue_time = now;
+    return true;
+}
+
+bool Binder::cancelBuffer(i32 slot) {
+    if (!validSlot(slot))
+        return false;
+    std::scoped_lock lock(queue->mutex);
+    auto& buffer = queue->buffers[static_cast<usize>(slot)];
+    if (!buffer.initialized || buffer.state != Buffer::State::Dequeued)
+        return false;
+    buffer.state = Buffer::State::Free;
+    updateEventLocked();
+    queue->cv.notify_all();
+    return true;
 }
 
 i32 Binder::consumeBuffer(BqBufferInput& out_input, u64& out_gpu_fence) {
-    i32 slot;
-    {
-        // Wait for a buffer to become available
-        std::scoped_lock lock(queue_mutex);
-        // TODO: should we wait?
-        // queue_cv.wait_for(lock, std::chrono::milliseconds(67),
-        //                  [&] { return !queued_buffers.empty(); });
-
-        if (queued_buffers.empty())
-            return -1;
-
-        // Get the first queued buffer
-        const auto [tmp_slot, tmp_input, tmp_gpu_fence] =
-            queued_buffers.front();
-        slot = tmp_slot;
-        out_input = tmp_input;
-        out_gpu_fence = tmp_gpu_fence;
-
-        queued_buffers.pop();
-        buffers[slot].queued = false;
-    }
-
-    queue_cv.notify_all();
-
-    // Signal event
-    event->signal();
-
+    std::scoped_lock lock(queue->mutex);
+    if (queue->queued_buffers.empty())
+        return -1;
+    const auto [slot, input, fence] = queue->queued_buffers.front();
+    queue->queued_buffers.pop();
+    queue->buffers[static_cast<usize>(slot)].state = Buffer::State::Acquired;
+    out_input = input;
+    out_gpu_fence = fence;
     return slot;
 }
 
+std::function<void()> Binder::releaseCallback(i32 slot) {
+    std::scoped_lock lock(queue->mutex);
+    if (!validSlot(slot) || !queue->buffers[static_cast<usize>(slot)].initialized ||
+        queue->buffers[static_cast<usize>(slot)].state != Buffer::State::Acquired)
+        return [] {};
+    const auto generation = queue->buffers[static_cast<usize>(slot)].generation;
+    // Keep the queue state alive independently of the layer/binder pool. A
+    // late host completion must not free a newly connected producer's slot.
+    return [state = queue, release_event = event, slot, generation] {
+        std::scoped_lock release_lock(state->mutex);
+        auto& buffer = state->buffers[static_cast<usize>(slot)];
+        if (buffer.initialized && buffer.generation == generation &&
+            buffer.state == Buffer::State::Acquired) {
+            buffer.state = Buffer::State::Free;
+            release_event->signal();
+            state->cv.notify_all();
+        }
+    };
+}
+
+std::optional<GraphicBuffer> Binder::getBuffer(i32 slot) {
+    std::scoped_lock lock(queue->mutex);
+    if (!validSlot(slot) || !queue->buffers[static_cast<usize>(slot)].initialized)
+        return std::nullopt;
+    return queue->buffers[static_cast<usize>(slot)].buffer;
+}
+
+u32 Binder::getPendingBufferCount() {
+    std::scoped_lock lock(queue->mutex);
+    return static_cast<u32>(queue->queued_buffers.size());
+}
+
+AccumulatedTime Binder::getAccumulatedDt() {
+    std::scoped_lock lock(queue->mutex);
+    const auto result = queue->accumulated_dt;
+    queue->accumulated_dt = {};
+    return result;
+}
+
 void Binder::removeBuffer(i32 slot) {
-    {
-        std::scoped_lock lock(queue_mutex);
-        auto& buffer = buffers[slot];
-        if (!buffer.initialized)
-            return;
-        buffer.initialized = false;
-        buffer.queued = false;
-        buffer_count--;
-    }
-    queue_cv.notify_all();
+    if (!validSlot(slot))
+        return;
+    std::scoped_lock lock(queue->mutex);
+    auto& buffer = queue->buffers[static_cast<usize>(slot)];
+    if (!buffer.initialized || buffer.state != Buffer::State::Free)
+        return;
+    buffer = {};
+    queue->buffer_count--;
+    updateEventLocked();
+    queue->cv.notify_all();
 }
 
 void Binder::unqueueAllBuffers() {
-    {
-        // Wait for a buffer to become available
-        std::scoped_lock lock(queue_mutex);
-
-        // Unqueue all
-        while (!queued_buffers.empty()) {
-            const auto [slot, input, gpu_fence] = queued_buffers.front();
-            queued_buffers.pop();
-            buffers[slot].queued = false;
-        }
-    }
-
-    queue_cv.notify_all();
-
-    // Signal event
-    event->signal();
+    std::scoped_lock lock(queue->mutex);
+    queue->queued_buffers = {};
+    queue->buffers = {};
+    queue->buffer_count = 0;
+    queue->accumulated_dt = {};
+    queue->last_queue_time = clock_t::now();
+    updateEventLocked();
+    queue->cv.notify_all();
 }
 
 } // namespace hydra::horizon::display

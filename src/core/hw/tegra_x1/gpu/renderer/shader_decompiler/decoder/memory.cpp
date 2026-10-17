@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/memory.hpp"
 
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.hpp"
+
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
@@ -163,53 +165,156 @@ void emitLoadConstant(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: cache_op, extended
-void emitLoadGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
-                    LsSize3 size, reg_t dst, reg_t src, i32 offset) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+// Offset into the storage buffer an address [Ra.64 + imm] points into. The
+// buffer is found by following the low half of the address back to the
+// constant buffer word with its NVN descriptor (u64 address, u32 size)
+struct StorageAccess {
+    u32 binding;
+    ir::Value offset;
+    ir::Value size;
+};
 
-    u32 count;
-    switch (size) {
-    case LsSize3::U8:
-    case LsSize3::S8:
-    case LsSize3::U16:
-    case LsSize3::S16:
-    case LsSize3::B32:
-        count = 1;
-        break;
-    case LsSize3::B64:
-        count = 2;
-        break;
-    case LsSize3::B128:
-    case LsSize3::UB128:
-        count = 4;
-        break;
-    default:
-        unreachable();
+std::optional<StorageAccess> makeStorageAccess(DecoderContext& context, bool e,
+                                               reg_t addr, i32 imm) {
+    // 32-bit and absolute addresses have no descriptor
+    if (!e || addr == RZ)
+        return std::nullopt;
+    const auto word = trackStorageBuffer(context, addr);
+    if (!word) {
+        LOG_WARN(ShaderDecompiler,
+                 "Failed to track the storage buffer of global address {}",
+                 addr);
+        return std::nullopt;
     }
 
-    // TODO: handle small ints
-    if (size == LsSize3::U8 || size == LsSize3::S8 || size == LsSize3::U16 ||
-        size == LsSize3::S16)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Small integer loading");
+    auto& b = context.builder;
+    auto low = b.opCopy(ir::Value::createRegister(addr));
+    if (imm != 0)
+        low = b.opAdd(low, ir::Value::createConstantU(std::bit_cast<u32>(imm)));
+    const auto descriptor = [&](u32 byte_offset) {
+        return b.opCopy(ir::Value::createConstMemory(
+            CMem(word->slot, RZ, u64(word->word) * 4 + byte_offset)));
+    };
+    // The descriptor holds the base address, so what is left of the guest
+    // address is the offset into the buffer
+    return StorageAccess{word->slot << 16 | word->word,
+                         b.opAdd(low, b.opNeg(descriptor(0))), descriptor(8)};
+}
 
-    LOG_FUNC_WITH_ARGS_NOT_IMPLEMENTED(
-        ShaderDecompiler, "size: {}, src: {}, offset: {}", size, src, offset);
+u32 getAccessWordCount(LsSize3 size) {
+    switch (size) {
+    case LsSize3::B64:
+        return 2;
+    case LsSize3::B128:
+    case LsSize3::UB128:
+        return 4;
+    default:
+        return 1;
+    }
+}
+
+// Word offset of a component of a multi-word access
+ir::Value offsetWord(DecoderContext& context, const ir::Value& offset,
+                     u32 index) {
+    if (index == 0)
+        return offset;
+    return context.builder.opAdd(offset, ir::Value::createConstantU(index * 4));
+}
+
+// TODO: cache_op
+void emitLoadGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
+                    LsSize3 size, reg_t dst, reg_t src, i32 offset, bool e) {
+    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+    const u32 count = getAccessWordCount(size);
+
+    const auto access = makeStorageAccess(context, e, src, offset);
+    if (!access)
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                            "Global load without a storage buffer (size: {}, "
+                            "src: {}, offset: {})",
+                            size, src, offset);
 
     std::vector<ir::Value> values;
     values.reserve(count);
     for (u32 i = 0; i < count; i++) {
-        // TODO: global memory
-        values.push_back(ir::Value::createConstantU(0));
+        values.push_back(
+            access ? context.builder.opLoadStorage(
+                         access->binding, offsetWord(context, access->offset, i),
+                         access->size, static_cast<u32>(size) <= 4
+                                           ? static_cast<u32>(size)
+                                           : 4)
+                   : ir::Value::createConstantU(0));
     }
 
-    for (u32 i = 0; i < count; i++) {
-        context.builder.opCopy(
-            ir::Value::createRegister(dst + static_cast<u8>(i)), values[i]);
+    if (dst != RZ)
+        for (u32 i = 0; i < count; i++)
+            context.builder.opCopy(
+                ir::Value::createRegister(dst + static_cast<u8>(i)), values[i]);
+
+    if (conditional)
+        context.builder.opEndIf();
+}
+
+void emitStoreGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
+                     LsSize3 size, reg_t src, reg_t addr, i32 offset, bool e) {
+    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+    const u32 count = getAccessWordCount(size);
+
+    const auto access = makeStorageAccess(context, e, addr, offset);
+    if (!access) {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                            "Global store without a storage buffer (size: {}, "
+                            "addr: {}, offset: {})",
+                            size, addr, offset);
+    } else {
+        for (u32 i = 0; i < count; i++)
+            context.builder.opStoreStorage(
+                access->binding, offsetWord(context, access->offset, i),
+                access->size,
+                context.builder.opCopy(
+                    ir::Value::createRegister(src + static_cast<u8>(i))),
+                static_cast<u32>(size) <= 4 ? static_cast<u32>(size) : 4);
     }
 
     if (conditional)
         context.builder.opEndIf();
+}
+
+// ATOM and RED: Eden's AtomOp/AtomSize encodings
+void emitAtomicGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
+                      reg_t dst, reg_t addr, reg_t operand, i32 offset, bool e,
+                      u32 size, u32 op) {
+    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+    auto& b = context.builder;
+
+    // U32, S32 and F32 additions
+    const bool is_float = size == 3;
+    const bool supported = (size <= 1 && op <= 8) || (is_float && op == 0);
+    const auto access = supported ? makeStorageAccess(context, e, addr, offset)
+                                  : std::nullopt;
+    ir::Value result = ir::Value::createConstantU(0);
+    if (access) {
+        const auto value = b.opCopy(ir::Value::createRegister(operand));
+        if ((op == 3 || op == 4) && !is_float) {
+            // Eden: increment and decrement leave 32-bit memory unchanged
+            result = b.opLoadStorage(access->binding, access->offset,
+                                     access->size, 4);
+        } else {
+            result = b.opAtomicStorage(access->binding, access->offset,
+                                       access->size, value,
+                                       is_float ? 9 : op, size == 1);
+        }
+    } else {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                            "Global atomic (size: {}, op: {}, addr: {}, "
+                            "offset: {})",
+                            size, op, addr, offset);
+    }
+    if (dst != RZ)
+        b.opCopy(ir::Value::createRegister(dst), result);
+
+    if (conditional)
+        b.opEndIf();
 }
 
 // TODO: msi
@@ -292,7 +397,60 @@ void emitLdc(DecoderContext& context, InstLdc inst) {
 
 void emitLdg(DecoderContext& context, InstLdg inst) {
     emitLoadGlobal(context, inst.pred, inst.pred_inv, inst.size, inst.dst,
-                   inst.src, signExtend<i32, 24>(static_cast<i32>(inst.imm24)));
+                   inst.src, signExtend<i32, 24>(static_cast<i32>(inst.imm24)),
+                   inst.e);
+}
+
+void emitStg(DecoderContext& context, InstStg inst) {
+    emitStoreGlobal(context, inst.pred, inst.pred_inv, inst.size, inst.dst,
+                    inst.src, signExtend<i32, 24>(static_cast<i32>(inst.imm24)),
+                    inst.e);
+}
+
+void emitAtom(DecoderContext& context, InstAtom inst) {
+    emitAtomicGlobal(context, inst.pred, inst.pred_inv, inst.dst, inst.src,
+                     inst.operand,
+                     signExtend<i32, 20>(static_cast<i32>(inst.imm20)), inst.e,
+                     inst.size, inst.op);
+}
+
+void emitAtomCas(DecoderContext& context, InstAtomCas inst) {
+    const auto conditional =
+        handlePredCond(context.builder, inst.pred, inst.pred_inv);
+    auto& b = context.builder;
+    const reg_t dst = inst.dst;
+    const reg_t addr = inst.src;
+    const reg_t operand = inst.operand;
+    const bool is_64 = inst.is_64;
+    const auto access =
+        is_64 ? std::nullopt
+              : makeStorageAccess(
+                    context, inst.e, addr,
+                    signExtend<i32, 20>(static_cast<i32>(inst.imm20)));
+    ir::Value result = ir::Value::createConstantU(0);
+    if (access) {
+        const auto compare = b.opCopy(ir::Value::createRegister(operand));
+        const auto value = b.opCopy(
+            ir::Value::createRegister(operand + static_cast<u8>(1)));
+        result = b.opAtomicStorageCas(access->binding, access->offset,
+                                      access->size, compare, value);
+    } else {
+        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                            "Global ATOM.CAS (64-bit: {}, addr: {})", is_64,
+                            addr);
+    }
+    if (dst != RZ)
+        b.opCopy(ir::Value::createRegister(dst), result);
+
+    if (conditional)
+        b.opEndIf();
+}
+
+void emitRed(DecoderContext& context, InstRed inst) {
+    emitAtomicGlobal(context, inst.pred, inst.pred_inv, RZ, inst.src,
+                     inst.operand,
+                     signExtend<i32, 20>(static_cast<i32>(inst.imm20)), inst.e,
+                     inst.size, inst.op);
 }
 
 void emitIpa(DecoderContext& context, InstIpa inst) {

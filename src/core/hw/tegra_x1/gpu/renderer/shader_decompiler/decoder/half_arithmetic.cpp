@@ -69,11 +69,24 @@ void emitHadd2(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: fmz
+ir::Value applyHalfFmz(ir::Builder& builder, ir::Value a, ir::Value b,
+                       ir::Value fallback, ir::Value result) {
+    const auto zero = builder.opCast(ir::Value::createConstantF(0.0f),
+                                     ir::ScalarType::F16);
+    const auto lane = [&](u8 i) {
+        const auto any_zero = builder.opBitwiseOr(
+            builder.opCompareEqual(builder.opVectorExtract(a, i), zero),
+            builder.opCompareEqual(builder.opVectorExtract(b, i), zero));
+        return builder.opSelect(any_zero, builder.opVectorExtract(fallback, i),
+                                builder.opVectorExtract(result, i));
+    };
+    return builder.opVectorConstruct(ir::ScalarType::F16, {lane(0), lane(1)});
+}
+
 void emitHmul2(DecoderContext& context, pred_t pred, bool pred_inv,
                bool saturate, HalfOutputFormat out_format, reg_t dst,
                reg_t src_a, HalfSwizzle swizzle_a, bool abs_a, bool neg_a,
-               ir::Value src_b, bool abs_b, bool neg_b) {
+               ir::Value src_b, bool abs_b, bool neg_b, u32 fmz) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = absNegIf(context.builder,
@@ -82,6 +95,13 @@ void emitHmul2(DecoderContext& context, pred_t pred, bool pred_inv,
     auto src_b_v = absNegIf(context.builder, src_b, abs_b, neg_b);
 
     auto res = context.builder.opMultiply(src_a_v, src_b_v);
+    if (fmz == 2 && !saturate) {
+        const auto zero = context.builder.opCast(
+            ir::Value::createConstantF(0.0f), ir::ScalarType::F16);
+        const auto zeros = context.builder.opVectorConstruct(
+            ir::ScalarType::F16, {zero, zero});
+        res = applyHalfFmz(context.builder, src_a_v, src_b_v, zeros, res);
+    }
     res = saturate2xF16If(context.builder, res, saturate);
     copyHalfOutput(context.builder, out_format, dst, res);
 
@@ -89,11 +109,10 @@ void emitHmul2(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: fmz
 void emitHfma2(DecoderContext& context, pred_t pred, bool pred_inv,
                bool saturate, HalfOutputFormat out_format, reg_t dst,
                reg_t src_a, HalfSwizzle swizzle_a, bool neg_a, ir::Value src_b,
-               bool neg_b, ir::Value src_c, bool neg_c) {
+               bool neg_b, ir::Value src_c, bool neg_c, u32 fmz) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v =
@@ -103,6 +122,8 @@ void emitHfma2(DecoderContext& context, pred_t pred, bool pred_inv,
     auto src_c_v = negIf(context.builder, src_c, neg_c);
 
     auto res = context.builder.opFma(src_a_v, src_b_v, src_c_v);
+    if (fmz == 2 && !saturate)
+        res = applyHalfFmz(context.builder, src_a_v, src_b_v, src_c_v, res);
     res = saturate2xF16If(context.builder, res, saturate);
     copyHalfOutput(context.builder, out_format, dst, res);
 
@@ -151,7 +172,7 @@ void emitHmul2R(DecoderContext& context, InstHmul2R inst) {
               inst.base.out_fmt, inst.base.dst, inst.base.src_a,
               inst.base.swizzle_a, inst.base.abs_a, false,
               getSwizzledHalf(context.builder, inst.swizzle_b, inst.src_b),
-              inst.abs_b, inst.neg_b);
+              inst.abs_b, inst.neg_b, inst.base.fmz);
 }
 
 void emitHmul2C(DecoderContext& context, InstHmul2C inst) {
@@ -160,7 +181,7 @@ void emitHmul2C(DecoderContext& context, InstHmul2C inst) {
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         inst.base.abs_a, inst.neg_a,
         getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
-        inst.abs_b, false);
+        inst.abs_b, false, inst.base.fmz);
 }
 
 void emitHmul2I(DecoderContext& context, InstHmul2I inst) {
@@ -170,14 +191,14 @@ void emitHmul2I(DecoderContext& context, InstHmul2I inst) {
         inst.base.out_fmt, inst.base.dst, inst.base.src_a, inst.base.swizzle_a,
         inst.base.abs_a, inst.neg_a,
         getHalf2Const20(context.builder, inst.h0_imm10, inst.getH1Imm10()),
-        false, false);
+        false, false, inst.base.fmz);
 }
 
 void emitHmul2_32I(DecoderContext& context, InstHmul2_32I inst) {
     emitHmul2(context, inst.pred, inst.pred_inv, inst.sat,
               HalfOutputFormat::F16, inst.dst, inst.src_a, inst.swizzle_a,
               false, false, getHalf2Const32(context.builder, inst.imm), false,
-              false);
+              false, inst.fmz);
 }
 
 void emitHfma2R(DecoderContext& context, InstHfma2R inst) {
@@ -187,7 +208,7 @@ void emitHfma2R(DecoderContext& context, InstHfma2R inst) {
               getSwizzledHalf(context.builder, inst.swizzle_b, inst.src_b),
               inst.neg_b,
               getSwizzledHalf(context.builder, inst.swizzle_c, inst.src_c),
-              inst.neg_c);
+              inst.neg_c, inst.fmz);
 }
 
 void emitHfma2RC(DecoderContext& context, InstHfma2RC inst) {
@@ -197,7 +218,7 @@ void emitHfma2RC(DecoderContext& context, InstHfma2RC inst) {
         false, getSwizzledHalf(context.builder, inst.swizzle_b, inst.src_b),
         inst.neg_b,
         getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
-        inst.neg_c);
+        inst.neg_c, inst.fmz);
 }
 
 void emitHfma2C(DecoderContext& context, InstHfma2C inst) {
@@ -208,7 +229,7 @@ void emitHfma2C(DecoderContext& context, InstHfma2C inst) {
         getHalfConstMemory(context.builder, inst.cbuf_slot, inst.cbuf_offset),
         inst.neg_b,
         getSwizzledHalf(context.builder, inst.swizzle_c, inst.src_c),
-        inst.neg_c);
+        inst.neg_c, inst.fmz);
 }
 
 void emitHfma2I(DecoderContext& context, InstHfma2I inst) {
@@ -219,7 +240,7 @@ void emitHfma2I(DecoderContext& context, InstHfma2I inst) {
         false,
         getHalf2Const20(context.builder, inst.h0_imm10, inst.getH1Imm10()),
         false, getSwizzledHalf(context.builder, inst.swizzle_c, inst.src_c),
-        inst.neg_c);
+        inst.neg_c, inst.fmz);
 }
 
 void emitHfma2_32I(DecoderContext& context, InstHfma2_32I inst) {
@@ -228,7 +249,7 @@ void emitHfma2_32I(DecoderContext& context, InstHfma2_32I inst) {
               getHalf2Const32(context.builder, inst.imm), false,
               ir::Value::createRegister(inst.dst,
                                         ir::VectorType(ir::ScalarType::F16, 2)),
-              inst.neg_c);
+              inst.neg_c, inst.fmz);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

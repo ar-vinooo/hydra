@@ -27,7 +27,9 @@ struct GraphicBuffer {
 
 struct Buffer {
     bool initialized = false;
-    bool queued = false;
+    enum class State { Free, Dequeued, Queued, Acquired };
+    State state{State::Free};
+    u64 generation{0};
     GraphicBuffer buffer;
 };
 
@@ -78,7 +80,7 @@ struct BqBufferOutput {
 };
 #pragma pack(pop)
 
-constexpr usize MAX_BINDER_BUFFER_COUNT = 8; // TODO: what should this be?
+constexpr usize MAX_BINDER_BUFFER_COUNT = 64;
 
 struct AccumulatedTime {
     std::chrono::nanoseconds value{0ns};
@@ -117,37 +119,40 @@ struct Binder {
     Binder() : event{new kernel::Event(true, "Display event")} {}
 
     // Buffers
-    void addBuffer(i32 slot, const GraphicBuffer& buff);
+    bool addBuffer(i32 slot, const GraphicBuffer& buff);
     i32 getAvailableSlot();
-    void queueBuffer(System& system, i32 slot, const BqBufferInput& input);
+    bool queueBuffer(System& system, i32 slot, const BqBufferInput& input);
+    bool queueBuffer(i32 slot, const BqBufferInput& input, u64 gpu_fence);
+    bool cancelBuffer(i32 slot);
+    std::function<void()> releaseCallback(i32 slot);
+    u32 getPendingBufferCount();
     // out_gpu_fence: number of GPU submissions that render the buffer
     i32 consumeBuffer(BqBufferInput& out_input, u64& out_gpu_fence);
     void unqueueAllBuffers();
     void removeBuffer(i32 slot);
 
-    const GraphicBuffer& getBuffer(i32 slot) {
-        std::scoped_lock lock(queue_mutex);
-        return buffers[slot].buffer;
-    }
-
-    AccumulatedTime getAccumulatedDt() {
-        const auto tmp = accumulated_dt;
-        accumulated_dt = {};
-        return tmp;
-    }
+    std::optional<GraphicBuffer> getBuffer(i32 slot);
+    AccumulatedTime getAccumulatedDt();
 
   private:
     kernel::Event* event;
 
-    Buffer buffers[MAX_BINDER_BUFFER_COUNT];
-    u32 buffer_count = 0;
-    std::queue<std::tuple<i32, BqBufferInput, u64>> queued_buffers;
-    std::mutex queue_mutex;
-    std::condition_variable queue_cv;
-
-    // Time
-    clock_t::time_point last_queue_time{clock_t::now()};
-    AccumulatedTime accumulated_dt;
+    struct QueueState {
+        std::array<Buffer, MAX_BINDER_BUFFER_COUNT> buffers{};
+        u32 buffer_count{0};
+        u64 generation{0};
+        std::queue<std::tuple<i32, BqBufferInput, u64>> queued_buffers;
+        std::mutex mutex;
+        std::condition_variable cv;
+        clock_t::time_point last_queue_time{clock_t::now()};
+        AccumulatedTime accumulated_dt;
+    };
+    std::shared_ptr<QueueState> queue{std::make_shared<QueueState>()};
+    static bool validSlot(i32 slot) {
+        return slot >= 0 && slot < static_cast<i32>(MAX_BINDER_BUFFER_COUNT);
+    }
+    static bool hasFreeSlot(const QueueState& state);
+    void updateEventLocked();
 
   public:
     GETTER(event, getEvent);

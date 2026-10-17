@@ -17,6 +17,8 @@ CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_)
 
 CommandBuffer::~CommandBuffer() {
     endEncoding();
+    if (visibility_buffer != nullptr)
+        visibility_buffer->release();
     if (!retired_upload_buffers.empty()) {
         command_buffer->addCompletedHandler(
             [pool = std::move(upload_pool),
@@ -80,6 +82,15 @@ void CommandBuffer::retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> poo
     retired_upload_buffers.push_back(buffer);
 }
 
+void CommandBuffer::setVisibilityResultBuffer(MTL::Buffer* buffer) {
+    if (buffer == visibility_buffer)
+        return;
+    endEncoding();
+    if (visibility_buffer != nullptr)
+        visibility_buffer->release();
+    visibility_buffer = buffer != nullptr ? buffer->retain() : nullptr;
+}
+
 MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     if (render_pass_descriptor == encoder_state.render_pass)
@@ -94,8 +105,14 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
-    command_encoder =
-        command_buffer->renderCommandEncoder(render_pass_descriptor)->retain();
+    auto* descriptor = render_pass_descriptor;
+    if (visibility_buffer != nullptr) {
+        descriptor = render_pass_descriptor->copy();
+        descriptor->setVisibilityResultBuffer(visibility_buffer);
+    }
+    command_encoder = command_buffer->renderCommandEncoder(descriptor)->retain();
+    if (descriptor != render_pass_descriptor)
+        descriptor->release();
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Render;
@@ -142,6 +159,20 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     endEncoding();
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
+    last_submission_succeeded =
+        command_buffer->status() == MTL::CommandBufferStatusCompleted;
+    if (!last_submission_succeeded) {
+        const auto error = command_buffer->error();
+        LOG_ERROR(MetalRenderer, "GPU checkpoint failed: {}",
+                  error ? error->localizedDescription()->utf8String() : "unknown error");
+    }
+    for (auto* buffer : retired_upload_buffers) {
+        if (last_submission_succeeded)
+            upload_pool->recycle(buffer);
+        else
+            buffer->release();
+    }
+    retired_upload_buffers.clear();
     const auto ms =
         (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) *
         1000.0;
@@ -161,6 +192,11 @@ void CommandBuffer::endEncodingHot6() {
     command_encoder = nullptr;
     encoder_type = EncoderType::None;
 
+    // A new render pass resets visibility storage, so it needs a fresh page.
+    if (visibility_buffer != nullptr) {
+        visibility_buffer->release();
+        visibility_buffer = nullptr;
+    }
     // Reset the render pass
     encoder_state.render_pass = nullptr;
 }

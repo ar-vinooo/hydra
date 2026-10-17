@@ -43,6 +43,11 @@ struct ComputeDispatch {
     ShaderBase* shader{nullptr};
     // Indexed by the host binding
     std::array<BufferView, CONST_BUFFER_BINDING_COUNT> uniform_buffers{};
+    struct StorageBufferBinding {
+        u32 index;
+        BufferView buffer;
+    };
+    std::vector<StorageBufferBinding> storage_buffers;
     struct TextureBinding {
         u32 index;
         ITextureView* texture;
@@ -144,6 +149,15 @@ class IRenderer {
 
     // Command buffer
     virtual ICommandBuffer* createCommandBuffer() = 0;
+    virtual bool synchronize([[maybe_unused]] ICommandBuffer* command_buffer) {
+        return true;
+    }
+    virtual void setOcclusionCounterEnabled([[maybe_unused]] bool enabled) {}
+    virtual void resetOcclusionCounter() {}
+    virtual std::optional<u64>
+    getOcclusionCounter([[maybe_unused]] ICommandBuffer* command_buffer) {
+        return 0;
+    }
 
     // Render pass
     virtual RenderPassBase*
@@ -197,13 +211,18 @@ class IRenderer {
                                  engines::IndexType index_type) = 0;
     virtual void bindUniformBuffer(const BufferView& buffer,
                                    ShaderType shader_type, u32 index) = 0;
-    // TODO: storage buffers
+    // Storage buffers alias guest memory: shader writes land in the guest's
+    // pages without a copy. The range is rounded out to host pages
+    virtual BufferView getGuestMemoryBuffer(ztd::Range<uptr> range) = 0;
+    virtual void bindStorageBuffer(const BufferView& buffer,
+                                   ShaderType shader_type, u32 index) = 0;
     virtual void bindTexture(ITextureView* texture, SamplerBase* sampler,
                              ShaderType shader_type, u32 index) = 0;
     // TODO: images
 
     // Resource unbinding
     virtual void unbindUniformBuffers(ShaderType shader_type) = 0;
+    virtual void unbindStorageBuffers(ShaderType shader_type) = 0;
     virtual void unbindTextures(ShaderType shader_type) = 0;
 
     // DEBUG: submit the recorded work, wait for it and return its GPU time in

@@ -5,6 +5,7 @@
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
+#include "core/hw/tegra_x1/gpu/engines/storage_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
@@ -140,6 +141,7 @@ void Compute::launch(const u32 index, const u32 arg) {
         .code_ptr = tls_crnt_gmmu->unmapAddr(program_addr),
         .gpu_addr = program_addr,
     };
+    descriptor.state.program_offset = qmd.programStart();
     descriptor.state.shared_memory_size = qmd.sharedAlloc();
     descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
         const auto range = getConstBuffer(qmd, slot);
@@ -167,16 +169,19 @@ void Compute::launch(const u32 index, const u32 arg) {
                 type_it != resource_mapping.texture_types.end() &&
                 type_it->second == renderer::TextureType::_1D;
             const auto handle = readTextureHandle(qmd, binding_index);
-            if (handle && tsc_pool != nullptr && getSamplerHandle(*handle) <= regs.tsc_limit) {
-                const auto bias = decodeSampler(tsc_pool[getSamplerHandle(*handle)]).lod_bias;
-                if (bias != 0.0f)
-                    descriptor.state.texture_lod_bias.emplace(binding_index, bias);
-            }
             const auto tic = get_tic(binding_index);
             if (!tic)
                 continue;
+            if (tic->hdr_version != TicHdrVersion::_1DBuffer &&
+                !tic->normalized_coords)
+                descriptor.state.unnormalized_textures.push_back(binding_index);
             const auto format =
                 renderer::toSampledTextureFormat(tic->format_word, tic->is_srgb);
+            if (handle && tsc_pool != nullptr && tic->hdr_version != TicHdrVersion::_1DBuffer &&
+                getSamplerHandle(*handle) <= regs.tsc_limit)
+                specializeShaderSampler(descriptor.state, binding_index,
+                                        tsc_pool[getSamplerHandle(*handle)],
+                                        format);
             if (is_1d && tic->hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(binding_index,
                                                                 format);
@@ -194,6 +199,8 @@ void Compute::launch(const u32 index, const u32 arg) {
                                                              tic->is_srgb));
         }
         if (!descriptor.state.texture_lod_bias.empty() ||
+            !descriptor.state.border_samplers.empty() ||
+            !descriptor.state.unnormalized_textures.empty() ||
             !descriptor.state.buffer_texture_formats.empty() ||
             !descriptor.state.integer_texture_formats.empty() ||
             !descriptor.state.image_formats.empty())
@@ -225,6 +232,24 @@ void Compute::launch(const u32 index, const u32 arg) {
             renderer.getBufferCache().get(tls_crnt_command_buffer, range);
     }
 
+    // Storage buffers
+    for (const auto& storage : resource_mapping.storage_buffers) {
+        const auto range = resolveStorageBuffer(
+            getConstBuffer(qmd, storage.cbuf_slot), storage.cbuf_offset);
+        if (!range) {
+            ONCE(LOG_WARN(Engines,
+                          "Storage buffer descriptor c{}[{:#x}] is not valid",
+                          storage.cbuf_slot, storage.cbuf_offset));
+            continue;
+        }
+        dispatch.storage_buffers.push_back(
+            {storage.host_index, renderer.getGuestMemoryBuffer(*range)});
+        if (storage.written) {
+            renderer.getBufferCache().markGpuModified(*range);
+            renderer.getBufferCache().invalidateMemory(*range);
+        }
+    }
+
     // Textures
     struct TracedTexture {
         u32 binding_index;
@@ -248,9 +273,8 @@ void Compute::launch(const u32 index, const u32 arg) {
                       : std::nullopt);
         const auto sampler = three_d.getSampler(
             tsc_pool[getSamplerHandle(*handle)],
-            texture != nullptr && renderer::getIntegerTextureComponentType(
-                                      texture->getDescriptor().format) !=
-                                      nullptr);
+            texture != nullptr ? texture->getDescriptor().format
+                               : renderer::TextureFormat::Invalid);
         if (texture != nullptr && sampler != nullptr) {
             dispatch.textures.push_back({renderer_index, texture, sampler});
             // DEBUG: record and dump the textures in the frame trace
@@ -329,6 +353,9 @@ void Compute::launch(const u32 index, const u32 arg) {
             const auto tic = get_tic(binding_index);
             if (!tic)
                 continue;
+            if (tic->hdr_version != TicHdrVersion::_1DBuffer &&
+                !tic->normalized_coords)
+                descriptor.state.unnormalized_textures.push_back(binding_index);
             str += fmt::format(
                 "    image {:#x}: addr={:#x} fmt={} {}x{}x{} hdr={}\n",
                 binding_index, makeAddr(tic->addr_lo, tic->addr_hi),

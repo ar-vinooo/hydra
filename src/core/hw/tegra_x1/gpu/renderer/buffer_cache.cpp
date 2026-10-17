@@ -48,8 +48,39 @@ std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
 
 BufferCache::~BufferCache() = default;
 
+void BufferCache::markGpuModified(ztd::Range<uptr> range) {
+    uptr begin = range.getBegin();
+    uptr end = range.getEnd();
+    // Merge with overlapping or touching intervals
+    auto it = gpu_modified.upper_bound(begin);
+    if (it != gpu_modified.begin() && std::prev(it)->second >= begin)
+        --it;
+    while (it != gpu_modified.end() && it->first <= end) {
+        begin = std::min(begin, it->first);
+        end = std::max(end, it->second);
+        it = gpu_modified.erase(it);
+    }
+    // Bounded: past this the oldest knowledge is dropped, and those ranges
+    // fall back to snapshots again
+    if (gpu_modified.size() >= 256)
+        gpu_modified.erase(gpu_modified.begin());
+    gpu_modified.emplace(begin, end);
+}
+
+bool BufferCache::intersectsGpuModified(ztd::Range<uptr> range) const {
+    auto it = gpu_modified.upper_bound(range.getBegin());
+    if (it != gpu_modified.begin() && std::prev(it)->second > range.getBegin())
+        return true;
+    return it != gpu_modified.end() && it->first < range.getEnd();
+}
+
 BufferView BufferCache::getHot0(ICommandBuffer* command_buffer,
                             ztd::Range<uptr> range) {
+    if (!gpu_modified.empty() && intersectsGpuModified(range)) {
+        auto view = renderer.getGuestMemoryBuffer(range);
+        if (view.isValid())
+            return view;
+    }
     auto& entry = find(range);
     if (entry.buffer != nullptr) {
         // Check for memory invalidation

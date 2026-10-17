@@ -119,6 +119,13 @@ void Renderer::bindIndexBuffer([[maybe_unused]] const BufferView& index_buffer,
 void Renderer::bindUniformBuffer([[maybe_unused]] const BufferView& buffer,
                                  [[maybe_unused]] ShaderType shader_type,
                                  [[maybe_unused]] u32 index) {}
+BufferView
+Renderer::getGuestMemoryBuffer([[maybe_unused]] ztd::Range<uptr> range) {
+    return {};
+}
+void Renderer::bindStorageBuffer([[maybe_unused]] const BufferView& buffer,
+                                 [[maybe_unused]] ShaderType shader_type,
+                                 [[maybe_unused]] u32 index) {}
 void Renderer::bindTexture([[maybe_unused]] ITextureView* texture,
                            [[maybe_unused]] SamplerBase* sampler,
                            [[maybe_unused]] ShaderType shader_type,
@@ -126,6 +133,7 @@ void Renderer::bindTexture([[maybe_unused]] ITextureView* texture,
 
 // Resource unbinding
 void Renderer::unbindUniformBuffers([[maybe_unused]] ShaderType shader_type) {}
+void Renderer::unbindStorageBuffers([[maybe_unused]] ShaderType shader_type) {}
 void Renderer::unbindTextures([[maybe_unused]] ShaderType shader_type) {}
 
 // Draw

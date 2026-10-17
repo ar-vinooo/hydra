@@ -13,6 +13,8 @@
 #include <bit>
 #include <cmath>
 #include <functional>
+#include <cfenv>
+#include <cmath>
 #include <set>
 #include <iostream>
 #include <stdexcept>
@@ -196,7 +198,8 @@ struct AluState {
 std::vector<AluState> runAlu(MTL::Device* device, const std::vector<u64>& insts,
                              const std::vector<AluState>& inputs,
                              const std::vector<u32>& cbuf, u32 cbuf_slot,
-                             const char* what) {
+                             const char* what, u64 code_offset = 0,
+                             std::vector<u32>* storage = nullptr) {
     std::vector<u64> words;
     for (const auto inst : insts) {
         if (words.size() % 4 == 0)
@@ -211,9 +214,14 @@ std::vector<AluState> runAlu(MTL::Device* device, const std::vector<u64>& insts,
     ztd::io::MemoryStream stream(bytes);
     DecompilerContext context{};
     context.type = ShaderType::Compute;
+    context.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
+        if (slot != cbuf_slot || word >= cbuf.size())
+            return std::nullopt;
+        return cbuf[word];
+    };
     ir::Module module;
     ir::Builder builder(module);
-    decoder::Decoder decoder({context, &stream, builder});
+    decoder::Decoder decoder({context, &stream, builder, code_offset});
     decoder.decode();
     analyzer::MemoryAnalyzer memory;
     memory.analyze(module);
@@ -231,16 +239,21 @@ std::vector<AluState> runAlu(MTL::Device* device, const std::vector<u64>& insts,
         expect(slot == cbuf_slot, "Test program reads one constant buffer");
         cbuf_assignments += fmt::format("state.c{} = cb;", slot);
     }
+    std::string storage_assignments;
+    for (const auto& [binding, info] : memory.getStorageBuffers())
+        storage_assignments += fmt::format("state.ssbo{}_{} = ssbo;",
+                                           binding >> 16, binding & 0xffff);
     source += fmt::format(R"(
 kernel void run_alu(device uint* out [[buffer(0)]], constant uint* in [[buffer(1)]],
-                    constant Reg* cb [[buffer(2)]], uint tid [[thread_position_in_grid]]) {{
+                    constant Reg* cb [[buffer(2)]], device uint* ssbo [[buffer(3)]],
+                    uint tid [[thread_position_in_grid]]) {{
     State state;
     constant uint* src = in + tid * 34u;
     for (uint i = 0; i < 32; i++) state.r[i]._u32 = src[i];
     for (uint i = 0; i < 8; i++) state.p[i] = ((src[32] >> i) & 1u) != 0u;
     state.p[7] = true;
     for (uint i = 0; i < 4; i++) state.cc[i] = ((src[33] >> i) & 1u) != 0u;
-    {}
+    {}{}
     run_program(state);
     device uint* dst = out + tid * 34u;
     for (uint i = 0; i < 32; i++) dst[i] = state.r[i]._u32;
@@ -250,7 +263,7 @@ kernel void run_alu(device uint* out [[buffer(0)]], constant uint* in [[buffer(1
     dst[32] = preds;
     dst[33] = cc;
 }}
-)", cbuf_assignments);
+)", cbuf_assignments, storage_assignments);
     NS_STACK_SCOPED auto library = compileLibrary(device, source, what);
     NS_STACK_SCOPED auto function = library->newFunction(toNsString("run_alu"));
     NS::Error* error = nullptr;
@@ -271,6 +284,11 @@ kernel void run_alu(device uint* out [[buffer(0)]], constant uint* in [[buffer(1
         cbuf_words.data(), cbuf_words.size() * 4, MTL::ResourceStorageModeShared);
     NS_STACK_SCOPED auto out = device->newBuffer(
         input_words.size() * 4, MTL::ResourceStorageModeShared);
+    std::vector<u32> dummy_storage(4);
+    auto& storage_words = storage != nullptr ? *storage : dummy_storage;
+    NS_STACK_SCOPED auto ssbo = device->newBuffer(
+        storage_words.data(), std::max<usize>(storage_words.size(), 1) * 4,
+        MTL::ResourceStorageModeShared);
     NS_STACK_SCOPED auto queue = device->newCommandQueue();
     auto* commands = queue->commandBuffer();
     auto* encoder = commands->computeCommandEncoder();
@@ -278,11 +296,13 @@ kernel void run_alu(device uint* out [[buffer(0)]], constant uint* in [[buffer(1
     encoder->setBuffer(out, 0, 0);
     encoder->setBuffer(in, 0, 1);
     encoder->setBuffer(cb, 0, 2);
+    encoder->setBuffer(ssbo, 0, 3);
     encoder->dispatchThreads(MTL::Size(inputs.size(), 1, 1), MTL::Size(1, 1, 1));
     encoder->endEncoding();
     commands->commit();
     commands->waitUntilCompleted();
     expect(commands->status() == MTL::CommandBufferStatusCompleted, what);
+    std::memcpy(storage_words.data(), ssbo->contents(), storage_words.size() * 4);
     std::vector<AluState> results(inputs.size());
     const auto* words_out = static_cast<const u32*>(out->contents());
     for (usize i = 0; i < inputs.size(); ++i) {
@@ -655,7 +675,7 @@ void testSpecialRegisters(MTL::Device* device) {
         source += R"(
 kernel void check_sr(device uint* out [[buffer(0)]]) {
     State state;
-    run_program(state);
+    func_label0x0(state);
     for (uint i = 0; i < 4; i++) out[i] = state.r[16 + i]._u32;
 }
 )";
@@ -1345,7 +1365,8 @@ struct TextureBinding {
 std::vector<AluState> runTextureProgram(
     MTL::Device* device, const std::vector<u64>& insts,
     const std::vector<AluState>& inputs, const std::vector<u32>& cbuf,
-    const std::vector<TextureBinding>& textures, const char* what) {
+    const std::vector<TextureBinding>& textures, const char* what,
+    const GuestShaderState& state = {}) {
     std::vector<u64> words;
     for (const auto inst : insts) {
         if (words.size() % 4 == 0)
@@ -1366,7 +1387,6 @@ std::vector<AluState> runTextureProgram(
     decoder.decode();
     analyzer::MemoryAnalyzer memory;
     memory.analyze(module);
-    GuestShaderState state{};
     std::vector<u8> generated;
     ResourceMapping mapping;
     codegen::lang::msl::MslEmitter emitter(context, memory, state, generated,
@@ -1398,7 +1418,7 @@ kernel void run_tex(device uint* out [[buffer(0)]], constant uint* in [[buffer(1
     for (uint i = 0; i < 8; i++) state.p[i] = ((src[32] >> i) & 1u) != 0u;
     state.p[7] = true;
     {}
-    run_program(state);
+    func_label0x0(state);
     device uint* dst = out + tid * 34u;
     for (uint i = 0; i < 32; i++) dst[i] = state.r[i]._u32;
 }}
@@ -1512,7 +1532,7 @@ kernel void run_img(device uint* out [[buffer(0)]], constant uint* in [[buffer(1
     for (uint i = 0; i < 8; i++) state.p[i] = ((src[32] >> i) & 1u) != 0u;
     state.p[7] = true;
     {}
-    run_program(state);
+    func_label0x0(state);
     device uint* dst = out + tid * 34u;
     for (uint i = 0; i < 32; i++) dst[i] = state.r[i]._u32;
 }}
@@ -1828,6 +1848,7 @@ void testMipLevelQuery(MTL::Device* device) {
         DecompilerContext context{};
         context.type = ShaderType::Fragment;
         GuestShaderState guest{};
+        guest.unnormalized_textures.push_back(1);
         guest.color_target_data_types[0] = ColorDataType::Float;
         ir::Module module;
         ir::Builder builder(module);
@@ -1960,6 +1981,79 @@ void testTldsEncodings(MTL::Device* device) {
     std::cout << "PASS: TLDS 2D.LZ, 2D.LL and AOFFI encodings\n";
 }
 
+void testTexAoffi(MTL::Device* device) {
+    NS_STACK_SCOPED auto texture = createMippedTexture(device);
+    NS_STACK_SCOPED auto sampler = createSampler(device);
+    // TEX.LZ reads its signed nibbles from R8; TEX.LL consumes R8 as LOD
+    // first, then reads the offsets from R9.
+    for (const bool explicit_lod : {false, true}) {
+        const u64 tex = 0xc038000000000000ull | PT_GUARD | 20 | (4ull << 8) |
+                        (8ull << 20) | (2ull << 28) | (15ull << 31) |
+                        (1ull << 36) | (1ull << 54) |
+                        (u64(explicit_lod ? 3 : 1) << 55);
+        std::vector<AluState> inputs;
+        for (const u32 packed : {0x21u, 0xf1u, 0x8fu, 0x77u}) {
+            AluState input{};
+            input.regs[4] = f32Bits(0.4375f);
+            input.regs[5] = f32Bits(0.5625f);
+            input.regs[8] = explicit_lod ? f32Bits(1.0f) : packed;
+            input.regs[9] = packed;
+            inputs.push_back(input);
+        }
+        const auto results = runTextureProgram(
+            device, {tex}, inputs, {}, {{"texture2d<float>", texture, sampler}},
+            "TEX.AOFFI runs");
+        for (usize i = 0; i < inputs.size(); ++i) {
+            const u32 packed = inputs[i].regs[explicit_lod ? 9 : 8];
+            const auto signed_nibble = [](u32 value) {
+                return value < 8 ? static_cast<i32>(value)
+                                 : static_cast<i32>(value) - 16;
+            };
+            const i32 size = explicit_lod ? 4 : 8;
+            const i32 x = std::clamp((explicit_lod ? 1 : 3) +
+                                         signed_nibble(packed & 15), 0, size - 1);
+            const i32 y = std::clamp((explicit_lod ? 2 : 4) +
+                                         signed_nibble((packed >> 4) & 15), 0, size - 1);
+            expect(results[i].regs[20] == f32Bits(explicit_lod ? 2.0f : 1.0f) &&
+                       results[i].regs[21] == f32Bits(f32(x)) &&
+                       results[i].regs[22] == f32Bits(f32(y)),
+                   "TEX.AOFFI sign extends both offsets at the selected mip");
+        }
+    }
+    std::cout << "PASS: TEX.AOFFI signed offsets, LZ/LL and edge clamping\n";
+}
+
+void testUnnormalizedTextureCoordinates(MTL::Device* device) {
+    NS_STACK_SCOPED auto texture = createMippedTexture(device);
+    NS_STACK_SCOPED auto sampler = createSampler(device);
+    GuestShaderState state{};
+    state.unnormalized_textures.push_back(1);
+    AluState input{};
+    input.regs[4] = f32Bits(2.5f);
+    input.regs[5] = f32Bits(4.5f);
+    // TEX.LZ 2D, RGBA: level 0 contains (1, x, y, 1).
+    const u64 tex = 0xc038000000000000ull | PT_GUARD | 10 | (4ull << 8) |
+                    (2ull << 28) | (15ull << 31) | (1ull << 36) | (1ull << 55);
+    const auto sampled = runTextureProgram(
+        device, {tex}, {input}, {}, {{"texture2d<float>", texture, sampler}},
+        "Unnormalized TEX runs", state)[0];
+    expect(sampled.regs[11] == f32Bits(2.0f) && sampled.regs[12] == f32Bits(4.0f),
+           "Unnormalized TEX converts pixel centers to normalized coordinates");
+    // Derivatives are in texels as well: dx=(2,0), dy=(0,2) selects level 1.
+    input.regs[6] = f32Bits(2.0f);
+    input.regs[7] = f32Bits(0.0f);
+    input.regs[8] = f32Bits(0.0f);
+    input.regs[9] = f32Bits(2.0f);
+    const u64 txd = 0xde38000000000000ull | PT_GUARD | 10 | (4ull << 8) |
+                    (6ull << 20) | (2ull << 28) | (1ull << 31) | (1ull << 36);
+    const auto gradient = runTextureProgram(
+        device, {txd}, {input}, {}, {{"texture2d<float>", texture, sampler}},
+        "Unnormalized TXD runs", state)[0];
+    expect(gradient.regs[10] == f32Bits(2.0f),
+           "Unnormalized TXD scales explicit gradients in texel units");
+    std::cout << "PASS: unnormalized texture coordinates and gradients\n";
+}
+
 // TXD gradients are interleaved per axis (dx.x, dy.x, dx.y, dy.y)
 void testTxdGradientOrder(MTL::Device* device) {
     NS_STACK_SCOPED auto texture = createMippedTexture(device);
@@ -1985,8 +2079,572 @@ void testTxdGradientOrder(MTL::Device* device) {
     std::cout << "PASS: TXD gradient register order\n";
 }
 
+// Third-axis derivatives must select mip levels for volumes. Cubemap
+// coordinates remain directions, with the array index after all three axes.
+void testTxdVolumeAndCube(MTL::Device* device) {
+    NS_STACK_SCOPED auto sampler = createSampler(device);
+    for (const u32 dim : {4u, 6u, 7u}) {
+        NS_STACK_SCOPED auto descriptor = MTL::TextureDescriptor::alloc()->init();
+        descriptor->setPixelFormat(MTL::PixelFormatRGBA32Float);
+        descriptor->setTextureType(dim == 4 ? MTL::TextureType3D
+                                   : dim == 6 ? MTL::TextureTypeCube
+                                              : MTL::TextureTypeCubeArray);
+        descriptor->setWidth(8);
+        descriptor->setHeight(8);
+        descriptor->setDepth(dim == 4 ? 8 : 1);
+        descriptor->setArrayLength(dim == 7 ? 2 : 1);
+        descriptor->setMipmapLevelCount(4);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr, "TXD volume/cube fixture allocates");
+        const u32 slices = dim == 4 ? 1 : dim == 6 ? 6 : 12;
+        for (u32 level = 0; level < 4; ++level) {
+            const u32 size = 8u >> level;
+            const u32 depth = dim == 4 ? size : 1;
+            for (u32 slice = 0; slice < slices; ++slice) {
+                std::vector<f32> pixels(usize(size) * size * depth * 4);
+                for (usize i = 0; i < pixels.size(); i += 4) {
+                    pixels[i] = f32(level + 1);
+                    pixels[i + 1] = f32(slice + 1);
+                    pixels[i + 2] = 0;
+                    pixels[i + 3] = 1;
+                }
+                texture->replaceRegion(MTL::Region::Make3D(0, 0, 0, size, size, depth),
+                                       level, slice, pixels.data(), size * 16,
+                                       size * size * 16);
+            }
+        }
+        // Keep coordinate, derivative and destination registers disjoint.
+        const u64 txd = 0xde38000000000000ull | PT_GUARD | 20 | (4ull << 8) |
+                        (10ull << 20) | (u64(dim) << 28) | (3ull << 31) |
+                        (1ull << 36);
+        AluState input{};
+        input.regs[4] = f32Bits(dim == 4 ? 0.5f : 1.0f);
+        input.regs[5] = f32Bits(dim == 4 ? 0.5f : 0.0f);
+        input.regs[6] = f32Bits(dim == 4 ? 0.5f : 0.0f);
+        input.regs[7] = 1; // cube array 1, face +X = slice 6
+        // Only dPdx.z is nonzero: volume LOD is log2(8 * .25) = 1.
+        input.regs[14] = f32Bits(dim == 4 ? 0.25f : 0.0f);
+        GuestShaderState state{};
+        // Cube directions must not be divided by texture dimensions.
+        state.unnormalized_textures.push_back(1);
+        if (dim == 4) {
+            state.unnormalized_textures.clear();
+        }
+        const char* declaration = dim == 4 ? "texture3d<float>"
+                                 : dim == 6 ? "texturecube<float>"
+                                            : "texturecube_array<float>";
+        const auto result = runTextureProgram(
+            device, {txd}, {input}, {}, {{declaration, texture, sampler}},
+            "TXD volume/cube runs", state)[0];
+        expect(result.regs[20] == f32Bits(dim == 4 ? 2.0f : 1.0f),
+               "TXD volume uses third derivative and cube zero derivatives use base mip");
+        expect(result.regs[21] == f32Bits(dim == 7 ? 7.0f : 1.0f),
+               "TXD cube reads its face and array index after xyz");
+    }
+    std::cout << "PASS: TXD 3D, cube and cube-array coordinates/gradients\n";
+}
+
 // ATOMS.CAS swaps only when the word matches, under contention; byte
 // stores to shared memory keep the other bytes of the word
+// Global memory through the NVN storage buffer descriptor in c0[0x310]:
+// {address, size} of the buffer the shader's 64-bit pointers are based on
+void testGlobalMemory(MTL::Device* device) {
+    constexpr u32 DESCRIPTOR_WORD = 0x310 / 4;
+    constexpr u32 BASE = 0x20000;
+    std::vector<u32> cbuf(DESCRIPTOR_WORD + 4);
+    cbuf[DESCRIPTOR_WORD] = BASE;
+    cbuf[DESCRIPTOR_WORD + 2] = 32;
+    const auto pointer = [&](u32 dst, u32 src) {
+        return 0x4c10000000000000ull | dst | (u64(src) << 8) | PT_GUARD |
+               (u64(DESCRIPTOR_WORD) << 20);
+    };
+    const auto ldg = [](u32 size, u32 dst, u32 addr, u32 imm) {
+        return (0xeed0000000000000ull + (u64(size) << 48)) | dst |
+               (u64(addr) << 8) | PT_GUARD | (u64(imm & 0xffffff) << 20) |
+               (1ull << 45);
+    };
+    const auto stg = [](u32 size, u32 src, u32 addr, u32 imm) {
+        return (0xeed8000000000000ull + (u64(size) << 48)) | src |
+               (u64(addr) << 8) | PT_GUARD | (u64(imm & 0xffffff) << 20) |
+               (1ull << 45);
+    };
+    constexpr u32 U8 = 0, S8 = 1, U16 = 2, S16 = 3, B32 = 4, B64 = 5, B128 = 6;
+
+    {
+        std::vector<u32> storage{0x11111111, 0x22222222, 0xa5b6c7d8, 0x44444444,
+                                 0x55555555, 0x66666666, 0x77777777, 0x88888888};
+        storage.resize(16, 0xdeadbeef);
+        AluState input;
+        input.regs[2] = 8;
+        input.regs[5] = 0x1234abcd;
+        const auto results = runAlu(
+            device,
+            {pointer(12, 2), ldg(B32, 4, 12, 4), ldg(B64, 6, 12, 8),
+             ldg(U8, 8, 12, 1), ldg(S8, 9, 12, 3), ldg(U16, 10, 12, 2),
+             ldg(S16, 11, 12, 0), ldg(B32, 13, 12, 0x100),
+             ldg(B128, 16, 12, 16), stg(B32, 5, 12, 20), stg(U8, 5, 12, 1),
+             stg(B32, 5, 12, 0x100), stg(U16, 5, 12, 0)},
+            {input}, cbuf, 0, "LDG/STG storage buffer", 0, &storage);
+        const auto& r = results[0].regs;
+        expect(r[4] == 0x44444444, "LDG.32 reads the offset from the descriptor base");
+        expect(r[6] == 0x55555555 && r[7] == 0x66666666, "LDG.64 reads two words");
+        expect(r[8] == 0xc7, "LDG.U8 zero extends");
+        expect(r[9] == 0xffffffa5, "LDG.S8 sign extends");
+        expect(r[10] == 0xa5b6, "LDG.U16 zero extends");
+        expect(r[11] == 0xffffc7d8, "LDG.S16 sign extends");
+        expect(r[13] == 0, "LDG beyond the buffer size reads zero");
+        expect(r[16] == 0x77777777 && r[17] == 0x88888888 && r[18] == 0 &&
+                   r[19] == 0,
+               "LDG.128 zeroes the words beyond the buffer size");
+        expect(storage[7] == 0x1234abcd, "STG.32 stores a word");
+        expect(storage[2] == 0xa5b6abcd,
+               "STG.U8 and STG.U16 merge into their word");
+        for (usize i = 8; i < storage.size(); ++i)
+            expect(storage[i] == 0xdeadbeef, "STG beyond the buffer size is dropped");
+    }
+
+    {
+        // Eight threads share one buffer
+        const auto atom = [](u32 size, u32 op, u32 dst, u32 addr, u32 operand,
+                             u32 imm) {
+            return 0xed00000000000000ull | (u64(op) << 52) | (u64(size) << 49) |
+                   (1ull << 48) | (u64(imm & 0xfffff) << 28) |
+                   (u64(operand) << 20) | PT_GUARD | (u64(addr) << 8) | dst;
+        };
+        const auto red = [](u32 size, u32 op, u32 operand, u32 addr, u32 imm) {
+            return 0xebf8000000000000ull | (1ull << 48) |
+                   (u64(imm & 0xfffff) << 28) | (u64(op) << 23) |
+                   (u64(size) << 20) | PT_GUARD | (u64(addr) << 8) | operand;
+        };
+        std::vector<u32> storage{10, 20, 100, 0, std::bit_cast<u32>(2.0f), 7, 0, 0};
+        std::vector<AluState> inputs(8);
+        for (u32 i = 0; i < inputs.size(); ++i) {
+            inputs[i].regs[5] = 1;
+            inputs[i].regs[6] = static_cast<u32>(static_cast<i32>(i) - 3);
+            inputs[i].regs[7] = i + 100;
+            inputs[i].regs[8] = std::bit_cast<u32>(1.5f);
+        }
+        const auto results = runAlu(
+            device,
+            {pointer(12, 2), atom(0, 0, 4, 12, 5, 0), red(0, 0, 5, 12, 4),
+             atom(1, 1, 9, 12, 6, 8), atom(0, 8, 10, 12, 7, 12),
+             atom(3, 0, 11, 12, 8, 16), atom(0, 3, 13, 12, 5, 20)},
+            inputs, cbuf, 0, "ATOM/RED storage buffer", 0, &storage);
+        std::set<u32> previous;
+        for (const auto& result : results)
+            previous.insert(result.regs[4]);
+        expect(previous.size() == 8 && *previous.begin() == 10 &&
+                   *previous.rbegin() == 17,
+               "ATOM.ADD returns a distinct previous value to each thread");
+        expect(storage[0] == 18, "ATOM.ADD accumulates");
+        expect(storage[1] == 28, "RED.ADD accumulates");
+        expect(static_cast<i32>(storage[2]) == -3, "ATOM.MIN.S32 takes the signed minimum");
+        expect(storage[3] >= 100 && storage[3] < 108, "ATOM.EXCH stores one thread's value");
+        expect(std::bit_cast<f32>(storage[4]) == 14.0f, "ATOM.ADD.F32 accumulates");
+        expect(storage[5] == 7 && results[0].regs[13] == 7,
+               "ATOM.INC leaves 32-bit memory unchanged");
+    }
+    {
+        // ATOM.CAS: compare in Rb, new value in Rb + 1
+        const auto cas = [](u32 dst, u32 addr, u32 operand, u32 imm) {
+            return 0xeef0000000000000ull | dst | (u64(addr) << 8) | PT_GUARD |
+                   (u64(operand) << 20) | (u64(imm & 0xfffff) << 28) |
+                   (1ull << 48);
+        };
+        std::vector<u32> storage{5, 7, 0, 0, 0, 0, 0, 0};
+        AluState input;
+        input.regs[6] = 5;
+        input.regs[7] = 9;
+        input.regs[8] = 5;
+        input.regs[9] = 11;
+        const auto results = runAlu(
+            device,
+            {pointer(12, 2), cas(4, 12, 6, 0), cas(5, 12, 8, 0),
+             cas(10, 12, 6, 4)},
+            {input}, cbuf, 0, "ATOM.CAS storage buffer", 0, &storage);
+        expect(results[0].regs[4] == 5 && storage[0] == 9,
+               "ATOM.CAS swaps when the compare value matches");
+        expect(results[0].regs[5] == 9,
+               "ATOM.CAS returns the current value when the compare fails");
+        expect(results[0].regs[10] == 7 && storage[1] == 7,
+               "ATOM.CAS leaves memory alone on a failed compare");
+    }
+    std::cout << "PASS: global memory loads, stores and atomics\n";
+}
+
+// FP64 on bit patterns: DFMA/DADD/DMUL against the host's fused multiply-add
+// in every rounding mode, comparisons, min/max and DSET
+void testDoublePrecision(MTL::Device* device) {
+    struct Rng {
+        u64 state{0x9e3779b97f4a7c15ull};
+        u64 next() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            return state;
+        }
+    } rng;
+    const std::vector<u64> special{
+        0x0000000000000000ull, 0x8000000000000000ull, 0x3ff0000000000000ull,
+        0xbff0000000000000ull, 0x7ff0000000000000ull, 0xfff0000000000000ull,
+        0x7ff8000000000000ull, 0x0000000000000001ull, 0x000fffffffffffffull,
+        0x0010000000000000ull, 0x7fefffffffffffffull, 0xffefffffffffffffull,
+        0x3fe0000000000000ull, 0x4008000000000000ull, 0x3ff0000000000001ull,
+        0x3fefffffffffffffull, 0x8000000000000001ull, 0x4340000000000000ull,
+        0x7fe0000000000000ull, 0x0020000000000000ull};
+    const auto random_value = [&]() -> u64 {
+        const u64 kind = rng.next() % 8;
+        if (kind == 0)
+            return special[rng.next() % special.size()];
+        u64 sign = (rng.next() & 1) << 63;
+        u64 mantissa = rng.next() & 0xfffffffffffffull;
+        u64 exponent;
+        if (kind <= 4)
+            exponent = 0x3f0 + rng.next() % 0x20;
+        else if (kind == 5)
+            exponent = rng.next() % 3; // Subnormal and smallest normals
+        else if (kind == 6)
+            exponent = 0x7fe - rng.next() % 3; // Near overflow
+        else
+            exponent = rng.next() % 0x7ff;
+        return sign | (exponent << 52) | mantissa;
+    };
+    constexpr usize COUNT = 3000;
+    struct Case {
+        u64 a, b, c;
+    };
+    std::vector<Case> cases(COUNT);
+    for (usize i = 0; i < COUNT; ++i) {
+        cases[i] = {random_value(), random_value(), random_value()};
+        // Make cancellation likely: the addend nearly negates the product
+        if (i % 4 == 0) {
+            const double p = std::bit_cast<double>(cases[i].a) *
+                             std::bit_cast<double>(cases[i].b);
+            u64 bits = std::bit_cast<u64>(-p);
+            if (std::isfinite(p))
+                bits += rng.next() % 4;
+            cases[i].c = bits;
+        }
+    }
+    const auto input_for = [&](const Case& c) {
+        AluState input;
+        input.regs[2] = static_cast<u32>(c.a);
+        input.regs[3] = static_cast<u32>(c.a >> 32);
+        input.regs[4] = static_cast<u32>(c.b);
+        input.regs[5] = static_cast<u32>(c.b >> 32);
+        input.regs[6] = static_cast<u32>(c.c);
+        input.regs[7] = static_cast<u32>(c.c >> 32);
+        return input;
+    };
+    std::vector<AluState> inputs;
+    for (const auto& c : cases)
+        inputs.push_back(input_for(c));
+    const auto result_of = [](const AluState& state, u32 reg) {
+        return static_cast<u64>(state.regs[reg]) |
+               (static_cast<u64>(state.regs[reg + 1]) << 32);
+    };
+    const auto same = [](u64 got, u64 want) {
+        const auto is_nan = [](u64 x) {
+            return (x & 0x7fffffffffffffffull) > 0x7ff0000000000000ull;
+        };
+        return got == want || (is_nan(got) && is_nan(want));
+    };
+    const int host_modes[4] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD,
+                               FE_TOWARDZERO};
+    // dfma R10, R2, R4, R6
+    const auto dfma = [](u32 rounding) {
+        return 0x5b70000000000000ull | 10 | (2ull << 8) | PT_GUARD |
+               (4ull << 20) | (6ull << 39) | (u64(rounding) << 50);
+    };
+    const auto dadd = [](u32 rounding) {
+        return 0x5c70000000000000ull | 10 | (2ull << 8) | PT_GUARD |
+               (4ull << 20) | (u64(rounding) << 39);
+    };
+    const auto dmul = [](u32 rounding) {
+        return 0x5c80000000000000ull | 10 | (2ull << 8) | PT_GUARD |
+               (4ull << 20) | (u64(rounding) << 39);
+    };
+    for (u32 mode = 0; mode < 4; ++mode) {
+        const auto fma_results = runAlu(device, {dfma(mode)}, inputs, {}, 0, "DFMA");
+        const auto add_results = runAlu(device, {dadd(mode)}, inputs, {}, 0, "DADD");
+        const auto mul_results = runAlu(device, {dmul(mode)}, inputs, {}, 0, "DMUL");
+        u32 fma_failures = 0, add_failures = 0, mul_failures = 0;
+        for (usize i = 0; i < COUNT; ++i) {
+            volatile double a = std::bit_cast<double>(cases[i].a);
+            volatile double b = std::bit_cast<double>(cases[i].b);
+            volatile double c = std::bit_cast<double>(cases[i].c);
+            std::fesetround(host_modes[mode]);
+            volatile double fma_want = std::fma(a, b, c);
+            volatile double add_want = a + c;
+            volatile double mul_want = a * b;
+            std::fesetround(FE_TONEAREST);
+            const auto check_one = [&](u64 got, double want, u32& failures,
+                                       const char* name) {
+                if (!same(got, std::bit_cast<u64>(want)) && failures++ < 4)
+                    std::cerr << name << " mode " << mode << " a=" << std::hex
+                              << cases[i].a << " b=" << cases[i].b
+                              << " c=" << cases[i].c << " got=" << got
+                              << " want=" << std::bit_cast<u64>(want)
+                              << std::dec << '\n';
+            };
+            check_one(result_of(fma_results[i], 10), fma_want, fma_failures, "DFMA");
+            // DADD adds its two operands: a and b (R4:R5)
+            volatile double add_b = std::bit_cast<double>(cases[i].b);
+            std::fesetround(host_modes[mode]);
+            volatile double add_want_ab = a + add_b;
+            std::fesetround(FE_TONEAREST);
+            (void)add_want;
+            check_one(result_of(add_results[i], 10), add_want_ab, add_failures, "DADD");
+            check_one(result_of(mul_results[i], 10), mul_want, mul_failures, "DMUL");
+        }
+        expect(fma_failures == 0, "DFMA matches the host fused multiply-add");
+        expect(add_failures == 0, "DADD matches the host addition");
+        expect(mul_failures == 0, "DMUL matches the host multiplication");
+    }
+
+    // Comparisons: DSETP P1 = a OP b with dest2 = !, then DSET
+    const auto dsetp = [](u32 cmp, u32 bool_op) {
+        return 0x5b80000000000000ull | 2 | (1ull << 3) | (2ull << 8) |
+               PT_GUARD | (4ull << 20) | (7ull << 39) | (u64(bool_op) << 45) |
+               (u64(cmp) << 48);
+    };
+    const auto dset = [](u32 cmp, bool bf) {
+        return 0x5900000000000000ull | 10 | (2ull << 8) | PT_GUARD |
+               (4ull << 20) | (7ull << 39) | (u64(cmp) << 48) |
+               (bf ? 1ull << 52 : 0ull);
+    };
+    for (u32 cmp = 0; cmp < 16; ++cmp) {
+        const auto predicates = runAlu(device, {dsetp(cmp, 0)}, inputs, {}, 0, "DSETP");
+        const auto masks = runAlu(device, {dset(cmp, false)}, inputs, {}, 0, "DSET");
+        const auto floats = runAlu(device, {dset(cmp, true)}, inputs, {}, 0, "DSET.BF");
+        u32 failures = 0;
+        for (usize i = 0; i < COUNT; ++i) {
+            const double a = std::bit_cast<double>(cases[i].a);
+            const double b = std::bit_cast<double>(cases[i].b);
+            const bool unordered = std::isnan(a) || std::isnan(b);
+            bool want;
+            switch (cmp) {
+            case 0: want = false; break;
+            case 1: want = a < b; break;
+            case 2: want = a == b; break;
+            case 3: want = a <= b; break;
+            case 4: want = a > b; break;
+            case 5: want = !unordered && a != b; break;
+            case 6: want = a >= b; break;
+            case 7: want = !unordered; break;
+            case 8: want = unordered; break;
+            case 9: want = a < b || unordered; break;
+            case 10: want = a == b || unordered; break;
+            case 11: want = a <= b || unordered; break;
+            case 12: want = a > b || unordered; break;
+            case 13: want = a != b; break;
+            case 14: want = a >= b || unordered; break;
+            default: want = true; break;
+            }
+            const bool got = (predicates[i].preds & 2) != 0;
+            const bool got_inverse = (predicates[i].preds & 4) != 0;
+            if (got != want || got_inverse != !want ||
+                masks[i].regs[10] != (want ? 0xffffffffu : 0u) ||
+                floats[i].regs[10] != (want ? 0x3f800000u : 0u))
+                failures++;
+        }
+        expect(failures == 0, "DSETP and DSET implement every comparison");
+    }
+
+    // DMNMX R10, R2, R4, PT (minimum) and !PT (maximum)
+    const auto dmnmx = [](bool maximum) {
+        return 0x5c50000000000000ull | 10 | (2ull << 8) | PT_GUARD |
+               (4ull << 20) | (7ull << 39) | (maximum ? 1ull << 42 : 0ull);
+    };
+    const auto minimums = runAlu(device, {dmnmx(false)}, inputs, {}, 0, "DMNMX min");
+    const auto maximums = runAlu(device, {dmnmx(true)}, inputs, {}, 0, "DMNMX max");
+    u32 minmax_failures = 0;
+    for (usize i = 0; i < COUNT; ++i) {
+        const double a = std::bit_cast<double>(cases[i].a);
+        const double b = std::bit_cast<double>(cases[i].b);
+        const auto expected = [&](bool maximum) -> double {
+            if (std::isnan(a) && std::isnan(b))
+                return std::numeric_limits<double>::quiet_NaN();
+            if (std::isnan(a))
+                return b;
+            if (std::isnan(b))
+                return a;
+            if (a == b)
+                // -0 orders below +0
+                return maximum ? (std::signbit(a) ? b : a)
+                               : (std::signbit(a) ? a : b);
+            return maximum ? std::max(a, b) : std::min(a, b);
+        };
+        if (!same(result_of(minimums[i], 10), std::bit_cast<u64>(expected(false))) ||
+            !same(result_of(maximums[i], 10), std::bit_cast<u64>(expected(true))))
+            minmax_failures++;
+    }
+    expect(minmax_failures == 0, "DMNMX picks the minimum and maximum like the host");
+    std::cout << "PASS: FP64 fused multiply-add, add, multiply, compare and min/max\n";
+}
+
+// Exact conversions between doubles and integers
+void testDoubleConversions(MTL::Device* device) {
+    const auto f2i = [](u32 dst, u32 src, u32 width, bool is_signed, u32 round,
+                        bool abs_ = false, bool neg = false) -> u64 {
+        return 0x5cb0000000000000ull | dst | (u64(width) << 8) |
+               (3ull << 10) | (u64(is_signed) << 12) | PT_GUARD |
+               (u64(src) << 20) | (u64(round) << 39) | (u64(neg) << 45) |
+               (u64(abs_) << 49);
+    };
+    const auto f2f = [](u32 dst, u32 src, u32 round_mode) -> u64 {
+        return 0x5ca8000000000000ull | dst | (3ull << 8) | (3ull << 10) |
+               PT_GUARD | (u64(src) << 20) | (u64(round_mode & 3) << 39) |
+               (u64(round_mode >> 2) << 42);
+    };
+    const auto i2f = [](u32 dst, u32 src, u32 src_width, bool src_signed,
+                        bool abs_ = false, bool neg = false) -> u64 {
+        return 0x5cb8000000000000ull | dst | (3ull << 8) |
+               (u64(src_width) << 10) | (u64(src_signed) << 13) | PT_GUARD |
+               (u64(src) << 20) | (u64(neg) << 45) | (u64(abs_) << 49);
+    };
+    const std::vector<double> doubles{
+        0.0,         -0.0,        0.5,         -0.5,         1.5,
+        2.5,         -2.5,        0.49999999999999994, 0.5000000000000001,
+        1e10,        -1e10,       2147483647.5, -2147483648.5, 4294967295.5,
+        65535.5,     -40000.7,    9.3e18,      -9.3e18,      1.8446744073709552e19,
+        1e300,       -1e300,      4503599627370495.5, 4503599627370496.0,
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN(), 123456.789, -123456.789,
+        32767.5,     -32768.5,    0.1,         -0.1};
+    const std::vector<u64> integers{
+        0ull, 1ull, 0xffffffffffffffffull, 0x8000000000000000ull,
+        0x7fffffffffffffffull, 0x0020000000000001ull, 0x0020000000000003ull,
+        0x00ffffffffffffffull, 0x123456789abcdef0ull, 0xfffffffffffff800ull,
+        0x0000000080000000ull, 0x00000000ffffffffull};
+    std::vector<AluState> inputs;
+    for (usize i = 0; i < doubles.size(); ++i) {
+        AluState input{};
+        const u64 d = std::bit_cast<u64>(doubles[i]);
+        input.regs[4] = u32(d);
+        input.regs[5] = u32(d >> 32);
+        const u64 n = integers[i % integers.size()];
+        input.regs[6] = u32(n);
+        input.regs[7] = u32(n >> 32);
+        input.regs[2] = u32(n);
+        inputs.push_back(input);
+    }
+    const auto results = runAlu(
+        device,
+        {f2i(10, 4, 2, true, 0), f2i(11, 4, 2, false, 3), f2i(12, 4, 1, true, 1),
+         f2i(13, 4, 1, false, 2), f2i(14, 4, 3, true, 3),
+         f2i(16, 4, 3, false, 0), f2i(18, 4, 2, true, 3, true, false),
+         f2i(19, 4, 2, true, 3, false, true), f2f(20, 4, 4), f2f(22, 4, 5),
+         f2f(24, 4, 6), f2f(26, 4, 7), i2f(28, 6, 3, true),
+         i2f(30, 6, 3, false)},
+        inputs, {}, 2, "double conversions");
+    const auto integer_results = runAlu(
+        device,
+        {i2f(10, 2, 2, true), i2f(12, 2, 2, false),
+         i2f(14, 6, 3, true, true, false), i2f(16, 6, 3, true, false, true)},
+        inputs, {}, 2, "integer to double conversions");
+    const auto same = [](u64 bits, double expected) {
+        const double got = std::bit_cast<double>(bits);
+        return std::isnan(expected) ? std::isnan(got)
+                                    : bits == std::bit_cast<u64>(expected);
+    };
+    const auto pair = [](const AluState& state, u32 reg) {
+        return u64(state.regs[reg]) | (u64(state.regs[reg + 1]) << 32);
+    };
+    for (usize i = 0; i < inputs.size(); ++i) {
+        const double x = doubles[i];
+        const auto& r = results[i].regs;
+        const auto reference = [&](double v, u32 bits, bool is_signed) -> u64 {
+            if (std::isnan(v))
+                return bits == 64 ? 1ull << 63 : 0ull;
+            if (is_signed) {
+                const double low = -std::ldexp(1.0, int(bits) - 1);
+                const double high = std::ldexp(1.0, int(bits) - 1);
+                if (v >= high)
+                    return bits == 64 ? u64(INT64_MAX) : u64(i64(high) - 1);
+                if (v <= low)
+                    return u64(bits == 64 ? INT64_MIN : i64(low));
+                return u64(i64(v));
+            }
+            if (v <= 0.0)
+                return 0ull;
+            const double high = std::ldexp(1.0, int(bits));
+            if (v >= high)
+                return bits == 64 ? ~0ull : u64(high) - 1;
+            return u64(v);
+        };
+        expect(r[10] == u32(reference(std::nearbyint(x), 32, true)),
+               "F2I.S32 from a double rounds to even and saturates");
+        expect(r[11] == u32(reference(std::trunc(x), 32, false)),
+               "F2I.U32 from a double truncates and saturates");
+        expect(r[12] == u32(i32(reference(std::floor(x), 16, true))),
+               "F2I.S16 from a double sign extends");
+        expect(r[13] == u32(reference(std::ceil(x), 16, false)),
+               "F2I.U16 from a double saturates to 16 bits");
+        expect(pair(results[i], 14) == reference(std::trunc(x), 64, true),
+               "F2I.S64 from a double");
+        expect(pair(results[i], 16) == reference(std::nearbyint(x), 64, false),
+               "F2I.U64 from a double");
+        expect(r[18] == u32(reference(std::trunc(std::fabs(x)), 32, true)) &&
+                   r[19] == u32(reference(std::trunc(-x), 32, true)),
+               "F2I from a double honours abs and neg");
+        expect(same(pair(results[i], 20), std::nearbyint(x)) &&
+                   same(pair(results[i], 22), std::floor(x)) &&
+                   same(pair(results[i], 24), std::ceil(x)) &&
+                   same(pair(results[i], 26), std::trunc(x)),
+               "F2F.F64 integer rounding is exact");
+        const u64 n = integers[i % integers.size()];
+        expect(same(pair(results[i], 28), static_cast<double>(i64(n))) &&
+                   same(pair(results[i], 30), static_cast<double>(n)),
+               "I2F.F64 converts 64-bit integers with a single rounding");
+        expect(same(pair(integer_results[i], 10), static_cast<double>(i32(u32(n)))) &&
+                   same(pair(integer_results[i], 12), static_cast<double>(u32(n))),
+               "I2F.F64 converts 32-bit integers exactly");
+        const double signed_n = static_cast<double>(i64(n));
+        expect(same(pair(integer_results[i], 14),
+                    i64(n) == INT64_MIN ? signed_n : std::fabs(signed_n)) &&
+                   same(pair(integer_results[i], 16),
+                        i64(n) == INT64_MIN ? signed_n : -signed_n),
+               "I2F.F64 abs and neg keep the most negative value");
+    }
+    std::cout << "PASS: exact double to integer and integer to double conversions\n";
+}
+
+// BRX through a table in a constant buffer, bounded by an IMNMX clamp (the
+// shape of the ones in UE4 material shaders)
+void testIndirectBranch(MTL::Device* device) {
+    const auto word = [](u32 i) { return i + 1 + i / 3; };
+    const auto mov = [](u32 dst, u32 value) {
+        return 0x0100000000000000ull | PT_GUARD | dst |
+               (static_cast<u64>(value) << 20);
+    };
+    const u64 exit = 0xe30000000007000full;
+    const u64 imnmx = 0x3820038000370000ull; // IMNMX.U32 R0, R0, 3, PT
+    const u64 shl = 0x3848000000270000ull;   // SHL R0, R0, 2
+    // LDC R0, c[1][R0 + 0]
+    const u64 ldc = 0xef94000000070000ull | (1ull << 36);
+    const u64 brx = 0xe250000000070000ull | 0xf; // BRX R0
+    const std::vector<u64> program{imnmx, shl, ldc, brx,
+                                   mov(10, 100), exit, mov(10, 101), exit,
+                                   mov(10, 102), exit, mov(10, 103), exit};
+    // Offsets from the instruction after the BRX
+    const u32 base = (word(3) + 1) * 8;
+    std::vector<u32> cbuf{(word(4) * 8) - base, (word(6) * 8) - base,
+                          (word(8) * 8) - base, (word(10) * 8) - base};
+    std::vector<AluState> inputs(6);
+    for (u32 i = 0; i < inputs.size(); ++i)
+        inputs[i].regs[0] = i;
+    const auto results = runAlu(device, program, inputs, cbuf, 1, "BRX table");
+    const u32 expected[] = {100, 101, 102, 103, 103, 103};
+    for (usize i = 0; i < inputs.size(); ++i)
+        expect(results[i].regs[10] == expected[i],
+               "BRX jumps to the table entry and clamps the index to the bound");
+    std::cout << "PASS: BRX through a bounded constant buffer table\n";
+}
+
 void testSharedCompareExchange(MTL::Device* device) {
     std::vector<u64> words;
     const auto append = [&](u64 x) {
@@ -2036,7 +2694,7 @@ kernel void check_cas(device uint* out [[buffer(0)]],
         state.r[3]._u32 = tid + 1;
         state.r[4]._u32 = 4 + (tid & 3);
         state.r[5]._u32 = 0x10 + (tid & 3);
-        run_program(state);
+        func_label0x0(state);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     out[1 + tid] = state.r[10]._u32;
@@ -2425,6 +3083,76 @@ void testBitfieldExtractReverse(MTL::Device* device) {
     std::cout << "PASS: BFE.BREV signed and unsigned\n";
 }
 
+void testAluEdgeCases(MTL::Device* device) {
+    AluState input{};
+    input.regs[1] = 0;
+    input.regs[2] = std::bit_cast<u32>(std::numeric_limits<f32>::infinity());
+    input.regs[3] = std::bit_cast<u32>(0.75f);
+    input.regs[4] = 0x80000001u;
+    input.regs[5] = 32u | (8u << 8);
+    input.regs[6] = 0xffffffffu;
+    input.regs[7] = 0x7c007e00u; // infinity / NaN halves
+    input.regs[8] = halfBits(0.25f) | (halfBits(-0.5f) << 16);
+    const auto reg = [](u64 op, u32 dst, u32 a, u32 b) {
+        return op | PT_GUARD | dst | (static_cast<u64>(a) << 8) |
+               (static_cast<u64>(b) << 20);
+    };
+    const std::vector<u64> program = {
+        reg(0x5c68000000000000ull, 10, 1, 2) | (2ull << 44),
+        reg(0x5980000000000000ull, 11, 1, 2) | (3ull << 39) | (2ull << 53),
+        reg(0x5d08000000000000ull, 12, 1, 7) | (2ull << 39),
+        reg(0x5d00000000000000ull, 13, 1, 7) | (8ull << 39) | (2ull << 37),
+        reg(0x5c00000000000000ull, 14, 4, 5) | (1ull << 48),
+        0x1d80000000000000ull | PT_GUARD | 15 | (6ull << 8) | (1ull << 20),
+        reg(0x5cc0000000000000ull, 16, 6, 6) | (6ull << 39),
+        reg(0x5c18000000000000ull, 17, 6, 6) | (1ull << 39),
+        reg(0x5bd0000000000000ull, 18, 6, 6) | (1ull << 39),
+    };
+    const auto result = runAlu(device, program, {input}, {}, 2, "ALU edges run")[0];
+    expect(result.regs[10] == 0, "FMUL.FMZ zero times infinity is positive zero");
+    expect(result.regs[11] == input.regs[3], "FFMA.FMZ zero product keeps addend");
+    expect(result.regs[12] == 0, "HMUL2.FMZ suppresses infinity and NaN per lane");
+    expect(result.regs[13] == input.regs[8], "HFMA2.FMZ keeps both addend lanes");
+    expect(result.regs[14] == 0xffffffffu, "Signed BFE beyond the word replicates sign");
+    expect(result.regs[15] == 1, "IADD32I.PO decodes and adds one");
+    expect(result.regs[16] == 0xfffffffdu, "IADD3 wraps three unsigned inputs");
+    expect(result.regs[17] == 0xfffffffdu, "ISCADD wraps shifted addition");
+    expect(result.regs[18] == 0xfffffffdu, "LEA wraps shifted addition");
+    std::vector<AluState> fields;
+    for (const u32 base : {0u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+        for (const u32 offset : {0u, 1u, 31u, 32u, 33u, 255u}) {
+            for (const u32 width : {0u, 1u, 8u, 32u, 255u}) {
+                AluState field{};
+                field.regs[1] = base;
+                field.regs[2] = offset | (width << 8);
+                fields.push_back(field);
+            }
+        }
+    }
+    const auto extracted = runAlu(
+        device, {reg(0x5c00000000000000ull, 10, 1, 2) | (1ull << 48) |
+                 (1ull << 47)}, fields, {}, 2, "BFE edge fields run");
+    for (usize i = 0; i < fields.size(); i++) {
+        const u32 base = fields[i].regs[1];
+        const u32 offset = fields[i].regs[2] & 255;
+        const u32 width = (fields[i].regs[2] >> 8) & 255;
+        u32 expected = 0;
+        if (width != 0) {
+            const u32 shift = std::min(offset, 31u);
+            const u32 bits = std::min(width, 32u - shift);
+            const u32 low = base >> shift;
+            const u32 mask = bits == 32 ? 0xffffffffu : (1u << bits) - 1;
+            expected = low & mask;
+            if ((expected & (1u << (bits - 1))) != 0)
+                expected |= ~mask;
+        }
+        expect(extracted[i].regs[10] == expected, "Signed BFE clamps and sign replicates");
+        const u32 cc = (expected == 0 ? 1u : 0u) | ((expected >> 31) << 1);
+        expect(extracted[i].cc == cc, "BFE.CC sets Z/S and clears C/O");
+    }
+    std::cout << "PASS: FMZ, signed BFE edges, IADD32I.PO and wrapping ALU\n";
+}
+
 // The fixed function alpha test discards fragments whose render target 0
 // alpha fails the comparison
 void testAlphaTest(MTL::Device* device) {
@@ -2626,6 +3354,92 @@ void testSubroutines(MTL::Device* device) {
                  "call stacks\n";
 }
 
+void testExitTargetsAndAbsoluteJump(MTL::Device* device) {
+    const auto word = [](u32 i) { return i + 1 + i / 3; };
+    const auto mov = [](u32 dst, u32 value) {
+        return 0x0100000000000000ull | PT_GUARD | dst |
+               (static_cast<u64>(value) << 20);
+    };
+    const u64 exit = 0xe30000000007000full;
+    const auto pexit = [&](u32 from, u32 to) {
+        return 0xe230000000000000ull |
+               (static_cast<u64>((word(to) - word(from) - 1) * 8) << 20);
+    };
+    const auto jmp = [&](u32 to, u32 pred) {
+        return 0xe21000000000000full | (static_cast<u64>(pred) << 16) |
+               (static_cast<u64>(word(to) * 8) << 20);
+    };
+    // Nested exit targets unwind once each. The conditional exit keeps its
+    // target pending on the untaken path.
+    const std::vector<u64> program = {
+        pexit(0, 9), pexit(1, 6), mov(10, 1),
+        0xe30000000000000full, mov(11, 2), exit,
+        mov(12, 3), exit, mov(13, 4),
+        mov(14, 5), jmp(13, 0), mov(15, 6),
+        jmp(14, 7), mov(16, 7), exit,
+    };
+    AluState off{};
+    AluState on{};
+    on.preds = 1;
+    const auto results = runAlu(device, program, {off, on}, {}, 2,
+                                "Exit targets and absolute jumps run");
+    for (usize i = 0; i < results.size(); i++) {
+        const auto& r = results[i].regs;
+        expect(r[10] == 1 && r[11] == (i == 0 ? 2u : 0u) && r[12] == 3 &&
+                   r[13] == 0 && r[14] == 5,
+               "PEXIT handles nested and conditional exits");
+        expect(r[15] == (i == 0 ? 6u : 0u) && r[16] == (i == 0 ? 0u : 7u),
+               "JMP uses absolute byte addresses and instruction predicates");
+    }
+    for (const u32 base : {0x50u, 0x40050u}) {
+        auto relocated = program;
+        for (auto& instruction : relocated) {
+            if ((instruction & 0xfff0000000000000ull) == 0xe210000000000000ull)
+                instruction += static_cast<u64>(base) << 20;
+        }
+        const auto moved = runAlu(device, relocated, {off, on}, {}, 2,
+                                   "Relocated JMP runs", base);
+        expect(moved[0].regs == results[0].regs &&
+                   moved[1].regs == results[1].regs,
+               "Absolute JMP accounts for the program offset and graphics header");
+    }
+    // A constant-buffer address participates in shader cache specialization.
+    for (const u32 base : {0u, 0x40050u}) {
+        const u64 jump_cbuf = 0xe21000000000002full | PT_GUARD |
+                              (2ull << 36) | (16ull << 20);
+        std::vector<u32> table(8);
+        table[4] = base + word(3) * 8;
+        const auto taken = runAlu(device,
+            {jump_cbuf, mov(10, 1), exit, mov(11, 2), exit},
+            {off}, table, 2, "Constant-buffer JMP runs", base)[0];
+        expect(taken.regs[10] == 0 && taken.regs[11] == 2,
+               "JMP resolves signed byte offset and slot from constant buffer");
+        // JMX gets an absolute address from a bounded LDC jump table.
+        const std::vector<u64> indirect{
+            0x3820000000000000ull | PT_GUARD | 1 | (1ull << 8) |
+                (1ull << 20) | (7ull << 39), // IMNMX R1, R1, 1, PT
+            0x3848000000000000ull | PT_GUARD | 2 | (1ull << 8) |
+                (2ull << 20),              // SHL R2, R1, 2
+            0xef90000000000000ull | PT_GUARD | 3 | (2ull << 8) |
+                (2ull << 36) | (4ull << 48), // LDC R3, c2[R2]
+            0xe20000000000000full | PT_GUARD | (3ull << 8),
+            mov(10, 3), exit, mov(11, 4), exit,
+        };
+        table[0] = base + word(4) * 8;
+        table[1] = base + word(6) * 8;
+        AluState first{}, second{}, clamped{};
+        second.regs[1] = 1;
+        clamped.regs[1] = 99;
+        const auto branches = runAlu(device, indirect, {first, second, clamped},
+                                     table, 2, "Bounded JMX runs", base);
+        expect(branches[0].regs[10] == 3 && branches[0].regs[11] == 0 &&
+                   branches[1].regs[10] == 0 && branches[1].regs[11] == 4 &&
+                   branches[2].regs[11] == 4,
+               "JMX uses absolute bounded table targets, relocation and clamping");
+    }
+    std::cout << "PASS: PEXIT targets and absolute JMP predicates\n";
+}
+
 void runShaderCoverageTests(MTL::Device* device) {
     testFrontFacing(device);
     testPointSizeAndCoord(device);
@@ -2646,12 +3460,21 @@ void runShaderCoverageTests(MTL::Device* device) {
     testSurfaceAccess(device);
     testTexsVariants(device);
     testTldsEncodings(device);
+    testTexAoffi(device);
     testTxdGradientOrder(device);
+    testTxdVolumeAndCube(device);
+    testUnnormalizedTextureCoordinates(device);
     testSharedCompareExchange(device);
+    testGlobalMemory(device);
+    testDoublePrecision(device);
+    testDoubleConversions(device);
+    testIndirectBranch(device);
     testConversions(device);
     testHalfOperands(device);
     testBitfieldExtractReverse(device);
+    testAluEdgeCases(device);
     testAlphaTest(device);
     testDualSourceBlending(device);
     testSubroutines(device);
+    testExitTargetsAndAbsoluteJump(device);
 }

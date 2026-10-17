@@ -97,6 +97,10 @@ enum class Opcode {
     StoreShared,
     AtomicShared,
     AtomicSharedCas,
+    LoadStorage,
+    StoreStorage,
+    AtomicStorage,
+    AtomicStorageCas,
     LoadLocal,
     StoreLocal,
     Barrier,
@@ -164,7 +168,9 @@ ENABLE_ENUM_FORMATTING(
     "quad_shuffle_xor", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
     "find_msb", ReadSystemRegister, "read_sysreg", LoadShared, "load_shared",
     StoreShared, "store_shared", AtomicShared, "atomic_shared",
-    AtomicSharedCas, "atomic_shared_cas", LoadLocal, "load_local", StoreLocal, "store_local", Barrier, "barrier", ImageStore, "image_store", ImageLoad, "image_load",
+    AtomicSharedCas, "atomic_shared_cas", LoadStorage, "load_storage",
+    StoreStorage, "store_storage", AtomicStorage, "atomic_storage",
+    AtomicStorageCas, "atomic_storage_cas", LoadLocal, "load_local", StoreLocal, "store_local", Barrier, "barrier", ImageStore, "image_store", ImageLoad, "image_load",
     ImageAtomic, "image_atomic", Vote, "vote", Ballot, "ballot", Shuffle,
     "shuffle", Intrinsic, "intrinsic")
 
