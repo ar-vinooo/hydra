@@ -148,18 +148,30 @@ struct TextureSamplerControl {
     u32 border_color_a;
 };
 
+// Levels of detail the resource view of a TIC allows. They are absolute mip
+// levels of the texture (the TIC address is always level 0), so they clamp the
+// sampler's LOD range instead of shifting it
+struct TicLodRange {
+    u32 min = 0;
+    u32 max = 15;
+};
+
+TicLodRange getTicLodRange(const TextureImageControl& tic);
+
 // The texture format selects the border color interpretation (integer bits,
 // sRGB border); Invalid for none
 renderer::SamplerDescriptor
 decodeSampler(const TextureSamplerControl& tsc,
               renderer::TextureFormat texture_format =
-                  renderer::TextureFormat::Invalid);
+                  renderer::TextureFormat::Invalid,
+              TicLodRange view_lods = {});
 
 // Records the guest sampler state the shader must be specialized for (LOD
 // bias, border emulation) in the shader state of a texture binding
 void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
                              const TextureSamplerControl& tsc,
-                             renderer::TextureFormat texture_format);
+                             renderer::TextureFormat texture_format,
+                             TicLodRange view_lods);
 
 struct RenderTarget {
     Iova addr;
@@ -603,11 +615,13 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     renderer::SamplerBase*
     getSampler(const TextureSamplerControl& tsc,
                renderer::TextureFormat texture_format =
-                   renderer::TextureFormat::Invalid) const;
+                   renderer::TextureFormat::Invalid,
+               TicLodRange view_lods = {}) const;
     // Samplers are immutable and never evicted, so they are memoized by the
     // raw TSC words instead of hashing a descriptor for every binding
     struct SamplerMemo {
         std::array<u64, 4> key{};
+        u32 view_lods{0};
         renderer::SamplerBase* sampler{nullptr};
     };
     // Indexed by integer texture | sRGB border << 1

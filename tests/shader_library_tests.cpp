@@ -1910,6 +1910,164 @@ void testTextureLodSelection() {
                  "sampler cache keys\n";
 }
 
+// A solid red 2x2 texture sampled with a custom border color: the filter
+// weight that falls outside the texture must blend the guest border color.
+void testTextureBorderEmulation() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    metal::Renderer border_renderer;
+    auto* device = border_renderer.getDevice();
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 2, 2, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageShaderRead);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    const std::array<u8, 16> red = {255, 0, 0, 255, 255, 0, 0, 255,
+                                    255, 0, 0, 255, 255, 0, 0, 255};
+    texture->replaceRegion(MTL::Region::Make2D(0, 0, 2, 2), 0, red.data(), 8);
+    const std::array<float, 4> border_color = {0.25f, 0.5f, 0.75f, 1.0f};
+
+    for (const bool linear : {true, false}) {
+        const auto filter = linear ? SamplerFilter::Linear : SamplerFilter::Nearest;
+        const SamplerDescriptor sampler_descriptor{
+            .min_filter = filter,
+            .mag_filter = filter,
+            .mip_filter = SamplerMipFilter::NotMipmapped,
+            .address_mode_s = SamplerAddressMode::ClampToBorder,
+            .address_mode_t = SamplerAddressMode::ClampToBorder,
+            .address_mode_r = SamplerAddressMode::ClampToBorder,
+            .depth_compare_op =
+                hydra::hw::tegra_x1::gpu::engines::CompareOp::Invalid,
+            .border_color_u = std::bit_cast<uint4>(border_color),
+        };
+        check(samplerNeedsBorderEmulation(sampler_descriptor),
+              "A custom border color is emulated");
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        GuestShaderState guest{};
+        guest.color_target_data_types[0] = ColorDataType::Float;
+        guest.border_samplers.emplace(7, sampler_descriptor);
+        ir::Module module;
+        ir::Builder builder(module);
+        // Texel coordinates -0.5, 0, 0.5, 1 (in units of the 2 texel size)
+        for (u32 axis = 0; axis < 2; ++axis) {
+            const auto position = ir::Value::createAttrMemory(
+                {RZ, SV_POSITION_BASE + axis * 4, true}, ir::ScalarType::F32);
+            builder.opCopy(
+                ir::Value::createRegister(static_cast<reg_t>(axis),
+                                          ir::ScalarType::F32),
+                builder.opAdd(builder.opMultiply(
+                                  position, ir::Value::createConstantF(0.5f)),
+                              ir::Value::createConstantF(-0.75f)));
+        }
+        builder.opCopy(ir::Value::createRegister(2, ir::ScalarType::F32),
+                       ir::Value::createConstantF(0.0f));
+        decoder::DecoderContext dc{context, nullptr, builder};
+        decoder::emitTex(dc, std::bit_cast<decoder::InstTex>(
+                                 0xc038000000000000ull | 4ull | (7ull << 16) |
+                                 (2ull << 20) | (2ull << 28) | (15ull << 31) |
+                                 (7ull << 36) |
+                                 (static_cast<u64>(decoder::Lod::Lz) << 55)));
+        for (u32 channel = 0; channel < 4; ++channel)
+            builder.opCopy(
+                ir::Value::createRegister(static_cast<reg_t>(channel),
+                                          ir::ScalarType::F32),
+                ir::Value::createRegister(static_cast<reg_t>(4 + channel),
+                                          ir::ScalarType::F32));
+        builder.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter emitter(context, memory, guest,
+                                               generated, mapping);
+        emitter.emit(module);
+        std::string source(generated.begin(), generated.end());
+        check(source.find("hydra_bs7_pw") != std::string::npos,
+              "The border samplers are declared");
+        source += "\nvertex float4 border_vertex(uint id [[vertex_id]]) { "
+                  "return float4(id==1?3.0:-1.0,id==2?3.0:-1.0,0,1); }\n";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << '\n';
+        check(library != nullptr, "Border emulated texture sample compiles");
+        NS_STACK_SCOPED auto vertex =
+            library->newFunction(toNsString("border_vertex"));
+        NS_STACK_SCOPED auto fragment =
+            library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto pipeline_descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        pipeline_descriptor->setVertexFunction(vertex);
+        pipeline_descriptor->setFragmentFunction(fragment);
+        pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS_STACK_SCOPED auto pipeline =
+            device->newRenderPipelineState(pipeline_descriptor, &error);
+        check(pipeline != nullptr, "Border pipeline compiles");
+        auto* output_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA8Unorm, 4, 4, false);
+        output_descriptor->setStorageMode(MTL::StorageModeShared);
+        output_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+        NS_STACK_SCOPED auto output_texture =
+            device->newTexture(output_descriptor);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(output_texture);
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setStoreAction(MTL::StoreActionStore);
+        NS_STACK_SCOPED auto queue = device->newCommandQueue();
+        auto* commands = queue->commandBuffer();
+        auto* encoder = commands->renderCommandEncoder(pass);
+        encoder->setRenderPipelineState(pipeline);
+        const auto slot = mapping.textures.at(7);
+        encoder->setFragmentTexture(texture, slot);
+        // The shader samples with its own samplers; any bound one is unused
+        NS_STACK_SCOPED auto bound_descriptor =
+            MTL::SamplerDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto bound_sampler =
+            device->newSamplerState(bound_descriptor);
+        encoder->setFragmentSamplerState(bound_sampler, slot);
+        encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                                NS::UInteger(3));
+        encoder->endEncoding();
+        commands->commit();
+        commands->waitUntilCompleted();
+        check(commands->status() == MTL::CommandBufferStatusCompleted,
+              "Border render completes");
+        std::array<u8, 64> colors{};
+        output_texture->getBytes(colors.data(), 16,
+                                 MTL::Region::Make2D(0, 0, 4, 4), 0);
+        // Coordinates -0.5, 0, 0.5 and 1: the filter footprint of 0 and 1
+        // straddles the edge; with nearest sampling [0, 1) is inside
+        const std::array<float, 4> linear_coverage = {0.0f, 0.5f, 1.0f, 0.5f};
+        const std::array<float, 4> nearest_coverage = {0.0f, 1.0f, 1.0f, 0.0f};
+        const auto& axis_coverage = linear ? linear_coverage : nearest_coverage;
+        for (u32 y = 0; y < 4; ++y) {
+            for (u32 x = 0; x < 4; ++x) {
+                const float coverage = axis_coverage[x] * axis_coverage[y];
+                const std::array<float, 4> inside = {1.0f, 0.0f, 0.0f, 1.0f};
+                for (u32 channel = 0; channel < 4; ++channel) {
+                    const float value = inside[channel] * coverage +
+                                        border_color[channel] * (1.0f - coverage);
+                    const int expected = static_cast<int>(value * 255.0f + 0.5f);
+                    const int got = colors[(y * 4 + x) * 4 + channel];
+                    if (std::abs(got - expected) > 3)
+                        std::cerr << "border linear=" << linear << " x=" << x
+                                  << " y=" << y << " channel=" << channel
+                                  << " got=" << got
+                                  << " expected=" << expected << '\n';
+                    check(std::abs(got - expected) <= 3,
+                          "The guest border color is blended by the filter "
+                          "weight outside the texture");
+                }
+            }
+        }
+    }
+    std::cout << "PASS: emulated custom sampler border colors\n";
+}
+
 void testTextureOffsetAndGather(MTL::Device* device) {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
     using namespace shader_decomp;
@@ -2180,6 +2338,7 @@ int main() {
         testFragmentDepth(device);
         testQuadDerivatives(device);
         testTextureLodSelection();
+        testTextureBorderEmulation();
         testTextureOffsetAndGather(device);
         testGeometryLayerForwarding(device);
         testLea(device);

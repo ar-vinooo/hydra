@@ -152,6 +152,8 @@ constexpr u32 D3D11_BLEND_FACTOR_INV_DST_ALPHA = 8;
 constexpr u32 D3D11_BLEND_FACTOR_DST_COLOR = 9;
 constexpr u32 D3D11_BLEND_FACTOR_INV_DST_COLOR = 10;
 constexpr u32 D3D11_BLEND_FACTOR_SRC_ALPHA_SATURATE = 11;
+constexpr u32 D3D11_BLEND_FACTOR_BOTH_SRC_ALPHA = 12;
+constexpr u32 D3D11_BLEND_FACTOR_BOTH_INV_SRC_ALPHA = 13;
 constexpr u32 D3D11_BLEND_FACTOR_SRC1_COLOR = 16;
 constexpr u32 D3D11_BLEND_FACTOR_INV_SRC1_COLOR = 17;
 constexpr u32 D3D11_BLEND_FACTOR_SRC1_ALPHA = 18;
@@ -221,8 +223,12 @@ renderer::BlendFactor getBlendFactor(u32 blend_factor) {
             return renderer::BlendFactor::InvDstColor;
         case D3D11_BLEND_FACTOR_SRC_ALPHA_SATURATE:
             return renderer::BlendFactor::SrcAlphaSaturate;
-        case 12: return renderer::BlendFactor::ConstAlpha;
-        case 13: return renderer::BlendFactor::InvConstAlpha;
+        // BOTHSRCALPHA / BOTHINVSRCALPHA, the destination is set by the
+        // caller (see applyBlendState)
+        case D3D11_BLEND_FACTOR_BOTH_SRC_ALPHA:
+            return renderer::BlendFactor::SrcAlpha;
+        case D3D11_BLEND_FACTOR_BOTH_INV_SRC_ALPHA:
+            return renderer::BlendFactor::InvSrcAlpha;
         case 14: return renderer::BlendFactor::ConstColor;
         case 15: return renderer::BlendFactor::InvConstColor;
         case D3D11_BLEND_FACTOR_SRC1_COLOR:
@@ -239,6 +245,15 @@ renderer::BlendFactor getBlendFactor(u32 blend_factor) {
             return renderer::BlendFactor::One;
         }
     }
+}
+
+// The "both" source factors (D3D9 BOTHSRCALPHA, BOTHINVSRCALPHA) set the
+// destination factor too: (SrcAlpha, InvSrcAlpha) and (InvSrcAlpha, SrcAlpha)
+void applyBothFactors(u32 raw_source, renderer::BlendFactor& destination) {
+    if (raw_source == D3D11_BLEND_FACTOR_BOTH_SRC_ALPHA)
+        destination = renderer::BlendFactor::InvSrcAlpha;
+    else if (raw_source == D3D11_BLEND_FACTOR_BOTH_INV_SRC_ALPHA)
+        destination = renderer::BlendFactor::SrcAlpha;
 }
 
 // Render target width is aligned to the stride, lets try to figure out the real
@@ -1550,7 +1565,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
                     TextureSamplerControl tsc{};
                     std::memcpy(&tsc, bytes.data(), sizeof(tsc));
                     specializeShaderSampler(descriptor.state, index, tsc,
-                                            format);
+                                            format, getTicLodRange(tic));
                 }
             }
             // Only 1D accesses can be buffer textures. Games can leave stale
@@ -1730,31 +1745,26 @@ renderer::PipelineBase* ThreeD::getPipeline() {
             !(VisualDiagnostics::instance().selected() &&
               VisualDiagnostics::instance().options().no_blend);
         if (color_target.blend_enabled) {
-            if (regs.independent_blend_enabled != 0u) {
-                const auto& blend_state = regs.independent_blend_state[i];
+            const auto apply = [&](const auto& blend_state) {
                 color_target.rgb_op = getBlendOperation(blend_state.rgb_op);
                 color_target.src_rgb_factor =
                     getBlendFactor(blend_state.src_rgb_factor);
                 color_target.dst_rgb_factor =
                     getBlendFactor(blend_state.dst_rgb_factor);
+                applyBothFactors(blend_state.src_rgb_factor,
+                                 color_target.dst_rgb_factor);
                 color_target.alpha_op = getBlendOperation(blend_state.alpha_op);
                 color_target.src_alpha_factor =
                     getBlendFactor(blend_state.src_alpha_factor);
                 color_target.dst_alpha_factor =
                     getBlendFactor(blend_state.dst_alpha_factor);
-            } else {
-                const auto& blend_state = regs.blend_state;
-                color_target.rgb_op = getBlendOperation(blend_state.rgb_op);
-                color_target.src_rgb_factor =
-                    getBlendFactor(blend_state.src_rgb_factor);
-                color_target.dst_rgb_factor =
-                    getBlendFactor(blend_state.dst_rgb_factor);
-                color_target.alpha_op = getBlendOperation(blend_state.alpha_op);
-                color_target.src_alpha_factor =
-                    getBlendFactor(blend_state.src_alpha_factor);
-                color_target.dst_alpha_factor =
-                    getBlendFactor(blend_state.dst_alpha_factor);
-            }
+                applyBothFactors(blend_state.src_alpha_factor,
+                                 color_target.dst_alpha_factor);
+            };
+            if (regs.independent_blend_enabled != 0u)
+                apply(regs.independent_blend_state[i]);
+            else
+                apply(regs.blend_state);
         }
     }
 
@@ -2020,9 +2030,19 @@ f32 srgbToLinear(u32 value) {
 
 } // namespace
 
+TicLodRange getTicLodRange(const TextureImageControl& tic) {
+    // The color key headers use these bits for the key
+    if (tic.hdr_version != TicHdrVersion::Pitch &&
+        tic.hdr_version != TicHdrVersion::BlockLinear)
+        return {};
+    if (tic.view_mip_max_level < tic.view_mip_min_level)
+        return {};
+    return {tic.view_mip_min_level, tic.view_mip_max_level};
+}
+
 renderer::SamplerDescriptor
 decodeSampler(const TextureSamplerControl& tsc,
-              renderer::TextureFormat texture_format) {
+              renderer::TextureFormat texture_format, TicLodRange view_lods) {
     constexpr u32 anisotropy[] = {1, 2, 4, 6, 8, 10, 12, 16};
     const auto address = [&](u32 mode) {
         if (mode == static_cast<u32>(renderer::SamplerAddressMode::Clamp))
@@ -2061,7 +2081,15 @@ decodeSampler(const TextureSamplerControl& tsc,
              tsc.border_color_a});
     }
 
-    // Integer textures cannot be filtered (Eden uses a nearest variant too)
+    // The sampler clamps the LOD to its own range, then to the view's
+    descriptor.min_lod =
+        std::clamp(descriptor.min_lod, static_cast<f32>(view_lods.min),
+                   static_cast<f32>(view_lods.max));
+    descriptor.max_lod =
+        std::clamp(descriptor.max_lod, static_cast<f32>(view_lods.min),
+                   static_cast<f32>(view_lods.max));
+
+    // Integer textures cannot be filtered
     if (descriptor.integer_texture) {
         descriptor.min_filter = renderer::SamplerFilter::Nearest;
         descriptor.mag_filter = renderer::SamplerFilter::Nearest;
@@ -2079,8 +2107,9 @@ decodeSampler(const TextureSamplerControl& tsc,
 
 void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
                              const TextureSamplerControl& tsc,
-                             renderer::TextureFormat texture_format) {
-    auto descriptor = decodeSampler(tsc, texture_format);
+                             renderer::TextureFormat texture_format,
+                             TicLodRange view_lods) {
+    auto descriptor = decodeSampler(tsc, texture_format, view_lods);
     if (descriptor.lod_bias != 0.0f)
         state.texture_lod_bias.emplace(index, descriptor.lod_bias);
     if (renderer::samplerNeedsBorderEmulation(descriptor)) {
@@ -2092,7 +2121,8 @@ void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
 
 renderer::SamplerBase*
 ThreeD::getSampler(const TextureSamplerControl& tsc,
-                   renderer::TextureFormat texture_format) const {
+                   renderer::TextureFormat texture_format,
+                   TicLodRange view_lods) const {
     static_assert(sizeof(TextureSamplerControl) == 32);
     std::array<u64, 4> key;
     std::memcpy(key.data(), &tsc, sizeof(key));
@@ -2107,11 +2137,14 @@ ThreeD::getSampler(const TextureSamplerControl& tsc,
         tsc.srgb_conversion && renderer::isSrgbTextureFormat(texture_format);
     auto& memo = sampler_memos[(force_nearest ? 1u : 0u) |
                                (srgb_border ? 2u : 0u)][mixed >> 56];
-    if (memo.sampler != nullptr && memo.key == key)
+    const u32 packed_lods = view_lods.min | (view_lods.max << 8);
+    if (memo.sampler != nullptr && memo.key == key &&
+        memo.view_lods == packed_lods)
         return memo.sampler;
 
-    memo = {key, gpu.getRenderer().getSamplerCache().find(
-                     decodeSampler(tsc, texture_format))};
+    memo = {key, packed_lods,
+            gpu.getRenderer().getSamplerCache().find(
+                decodeSampler(tsc, texture_format, view_lods))};
     return memo.sampler;
 }
 
@@ -2255,8 +2288,10 @@ void ThreeD::configureShaderStage(
             // Sampler
             const auto& tsc = tex_sampler_pool[sampler_handle];
             const auto sampler = getSampler(
-                tsc, texture != nullptr ? texture->getDescriptor().format
-                                        : renderer::TextureFormat::Invalid);
+                tsc,
+                texture != nullptr ? texture->getDescriptor().format
+                                   : renderer::TextureFormat::Invalid,
+                getTicLodRange(tic));
 
             if ((texture != nullptr) && (sampler != nullptr))
                 gpu.getRenderer().bindTexture(texture, sampler, shader_type,

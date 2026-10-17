@@ -427,13 +427,8 @@ MTL::IndexType toMtlIndexType(engines::IndexType index_type) {
 
 MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
                                     engines::VertexAttribSize size, bool bgra) {
-    ASSERT_DEBUG(!bgra || (type == engines::VertexAttribType::Unorm &&
-                           size == engines::VertexAttribSize::_4x8),
-                 MetalRenderer,
-                 "BGRA vertex formats are only supported for uchar4 normalized "
-                 "types (type: {}, size: {})",
-                 type, size);
-
+    // Only uchar4 normalized has a BGRA host format; other attributes swap
+    // R and B in the vertex shader (engines::hostVertexFormatSwapsRb)
     switch (type) {
     case engines::VertexAttribType::Snorm:
         switch (size) {

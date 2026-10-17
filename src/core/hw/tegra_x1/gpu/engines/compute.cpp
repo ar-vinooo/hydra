@@ -181,7 +181,7 @@ void Compute::launch(const u32 index, const u32 arg) {
                 getSamplerHandle(*handle) <= regs.tsc_limit)
                 specializeShaderSampler(descriptor.state, binding_index,
                                         tsc_pool[getSamplerHandle(*handle)],
-                                        format);
+                                        format, getTicLodRange(*tic));
             if (is_1d && tic->hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(binding_index,
                                                                 format);
@@ -274,7 +274,8 @@ void Compute::launch(const u32 index, const u32 arg) {
         const auto sampler = three_d.getSampler(
             tsc_pool[getSamplerHandle(*handle)],
             texture != nullptr ? texture->getDescriptor().format
-                               : renderer::TextureFormat::Invalid);
+                               : renderer::TextureFormat::Invalid,
+            getTicLodRange(*tic));
         if (texture != nullptr && sampler != nullptr) {
             dispatch.textures.push_back({renderer_index, texture, sampler});
             // DEBUG: record and dump the textures in the frame trace

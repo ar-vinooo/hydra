@@ -46,6 +46,8 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [x] 2D: signed fixed point, exact du/dx extents, SAMPLE_MODE filter, integer blit pipelines, no source layer from word 0x90
 - [x] Shader corpus tool (`hydra-shader-corpus-tests`)
 
+- [~] Review pass 2026-10-17 (IMPLEMENTED_UNVERIFIED): D3D blend factors 0xC/0xD (BOTHSRCALPHA/BOTHINVSRCALPHA) set both factors; audio voice interpolation reads the next wave/loop start at buffer boundaries; TIC `RES_VIEW_MIN/MAX_MIP_LEVEL` clamp the sampler LOD range (absolute levels, color-key headers excluded; view stays whole); `alignLayerSize` uses block rows for compressed formats; `adjustBlockSizeLog2` no longer shifts by -1. 2D engine registers/maths verified against cl902d.h (no bug); 2D gaps: color key in blit path, BLEND/PREMULT/pattern ROPs, DIRECTION.
+
 ## P0 — crash / UB / gross corruption
 
 ## Known test limitations
@@ -57,7 +59,7 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [ ] Restart topology-change modes, inline alignment controls, DRAW_AUTO (needs transform feedback). Non-indexed restart is a hardware no-op.
 - [x] ALU: FMZ for FMUL/FFMA/HMUL2/HFMA2 operand variants; IADD3/ISCADD/LEA u32 overflow regression tests; BFE signed replicate for offset >= 32 + CC; IADD32I.PO decoder mask. Metal result tests pass. Float rounding/FTZ/CC completeness remains outside this item.
 - [x] Unnormalized TIC coordinates specialized in graphics/compute shaders; TEX/gather coordinates, explicit TXD gradients and TMML LOD coordinates scale by texture dimensions. TEX/TXD result tests and fragment TMML compilation pass. Cube coordinates retain direction semantics.
-- [ ] Exact sampler border colors (shader emulation, TEX D-9)
+- [~] Exact sampler border colors (shader emulation, TEX D-9): custom float/integer/sRGB/depth borders and mirror-to-border via baked samplers; IMPLEMENTED_UNVERIFIED, tests written not run. See `sampler-borders-2026-10-17.md`.
 - [x] Global memory + SSBO: LDG/STG/ATOM/RED/ATOM.CAS via NVN descriptor tracking, guest-memory aliasing, bounds-checked MSL, buffer-cache coherence for GPU-written ranges (`global-memory-2026-10-17.md`, `fp64-reports-2026-10-17.md`). Open: texture-cache invalidation, 64-bit atomics, indirect descriptors. No corpus shader uses it yet.
 - [x] Completion-ordered payload/ZPASS reports and real Metal occlusion counts (0x2/0x15). Register 0x545 gates counting; reset epochs, indexed draws, cross-pass/submission accumulation, page rollover/folding, report sizes/mapping boundaries and conditional comparisons have tests. Reports currently wait for GPU completion.
 - [x] Report semaphore acquire (bounded wait) and reduction (`fp64-reports-2026-10-17.md`).

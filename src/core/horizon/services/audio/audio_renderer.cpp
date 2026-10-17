@@ -433,20 +433,35 @@ bool IAudioRenderer::renderAudio() {
                 }
                 for (u32 channel = 0; channel < voice_in.channel_count;
                      channel++) {
-                    auto sampleAt = [&](u32 offset) {
+                    auto sampleAt = [&](const auto& source, u32 offset) {
                         if (voice_in.sample_format == PcmFormat::Adpcm)
-                            return offset < slot.decoded.size()
-                                       ? slot.decoded[offset]
+                            return offset < source.decoded.size()
+                                       ? source.decoded[offset]
                                        : 0.0f;
-                        return decodePcm(slot.data,
+                        return decodePcm(source.data,
                                          static_cast<usize>(offset) *
                                                  voice_in.channel_count +
                                              channel,
                                          voice_in.sample_format);
                     };
-                    const auto first = sampleAt(state.offset);
-                    const auto second =
-                        sampleAt(std::min(state.offset + 1, slot.end - 1));
+                    const auto first = sampleAt(slot, state.offset);
+                    // The interpolation partner of the last sample is the
+                    // start of the loop or of the next wave; holding the last
+                    // sample makes every wave boundary a discontinuity (click)
+                    f32 second;
+                    if (state.offset + 1 < slot.end) {
+                        second = sampleAt(slot, state.offset + 1);
+                    } else if (slot.is_looping) {
+                        second = sampleAt(slot, slot.start);
+                    } else if (const auto& next =
+                                   state.slots[(state.crnt_slot + 1) % 4];
+                               next.valid &&
+                               voice_in.sample_format != PcmFormat::Adpcm &&
+                               next.start < next.end) {
+                        second = sampleAt(next, next.start);
+                    } else {
+                        second = first;
+                    }
                     const auto sample =
                         (first +
                          (second - first) * static_cast<f32>(state.fraction)) *

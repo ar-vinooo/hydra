@@ -983,6 +983,23 @@ void MslEmitter::emitStateBindings() {
 }
 
 void MslEmitter::emitStateBindingAssignments() {
+    // Vertex attributes with SWAP_R_AND_B whose host format cannot swap
+    // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
+    static const bool no_vertex_swap =
+        std::getenv("HYDRA_NO_VERTEX_SWAP") != nullptr;
+    if (context.type == ShaderType::Vertex && !no_vertex_swap) {
+        for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
+            const auto& vertex_attrib_state = state.vertex_attrib_states[i];
+            if (vertex_attrib_state.type == engines::VertexAttribType::None ||
+                vertex_attrib_state.is_fixed || !vertex_attrib_state.bgra ||
+                engines::hostVertexFormatSwapsRb(vertex_attrib_state))
+                continue;
+            const auto attribute =
+                "__in." + getSvStr(Sv(SvSemantic::UserInOut, i));
+            writeStatement("{0} = {0}.zyxw", attribute);
+        }
+    }
+
     // Storage buffers
     for (const auto& [binding, info] : memory_analyzer.getStorageBuffers())
         writeStatement("state.{0} = {0}", getStorageBufferName(binding));

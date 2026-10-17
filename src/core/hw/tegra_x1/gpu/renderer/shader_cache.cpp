@@ -309,6 +309,7 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
             hash.add(vertex_attrib_state.is_fixed);
             hash.add(static_cast<u32>(vertex_attrib_state.size));
             hash.add(static_cast<u32>(vertex_attrib_state.type));
+            hash.add(vertex_attrib_state.bgra);
         }
         hash.add(descriptor.state.fragment_input_mask);
         hash.add(descriptor.state.depth_zero_to_one);

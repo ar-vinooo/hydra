@@ -12,6 +12,7 @@ Files in this folder:
 - `global-memory-2026-10-17.md`: LDG/STG/ATOM/RED storage buffers (decoder to Metal binding), tests, open coherence work.
 - `queue-vsync-slices-2026-10-17.md`: buffer queue state machine, 60 Hz vsync, DMA/2D slices and ROP.
 - `video-instructions-2026-10-17.md`: VMAD/VMNMX/VSETP.
+- `sampler-borders-2026-10-17.md`: exact sampler border colors (shader emulation), evidence, limits.
 - `implementation-2026-10-17.md`: continuation changes, validation status, remaining scope and failed GPU capture evidence.
 - `README.md`: this document.
 - `backlog.md`: master backlog. `[x]` means done and tested; `[ ]` means open.

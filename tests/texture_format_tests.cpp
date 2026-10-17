@@ -67,6 +67,149 @@ void testSamplerDecoding() {
     std::cout << "PASS: sampler bias, anisotropy, wrap decoding and GL depth functions\n";
 }
 
+void testSamplerBorders() {
+    constexpr u32 one = 0x3f800000u;
+    engines::TextureSamplerControl tsc{};
+    tsc.min_filter = tsc.mag_filter = 2;
+    tsc.mip_filter = 3;
+    tsc.address_u = tsc.address_v = tsc.address_p = 3;
+
+    const auto set_border = [&](u32 r, u32 g, u32 b, u32 a) {
+        tsc.border_color_r = r;
+        tsc.border_color_g = g;
+        tsc.border_color_b = b;
+        tsc.border_color_a = a;
+    };
+    const auto preset = [&](TextureFormat format = TextureFormat::Invalid) {
+        return getSamplerBorderPreset(engines::decodeSampler(tsc, format));
+    };
+    const auto emulated = [&](TextureFormat format = TextureFormat::Invalid) {
+        return samplerNeedsBorderEmulation(engines::decodeSampler(tsc, format));
+    };
+
+    set_border(0, 0, 0, 0);
+    check(preset() == SamplerBorderPreset::TransparentBlack && !emulated(),
+          "Zero border uses the transparent preset");
+    set_border(0, 0, 0, one);
+    check(preset() == SamplerBorderPreset::OpaqueBlack && !emulated(),
+          "Opaque black border uses the preset");
+    set_border(one, one, one, one);
+    check(preset() == SamplerBorderPreset::OpaqueWhite && !emulated(),
+          "Opaque white border uses the preset");
+    set_border(one, 0, 0, one);
+    check(preset() == SamplerBorderPreset::Custom && emulated(),
+          "A red border is not snapped to a preset");
+    set_border(0, 0, std::bit_cast<u32>(0.99f), one);
+    check(emulated(), "Near black borders are emulated exactly");
+
+    // Integer textures hold raw bits: 1.0f is not the integer 1
+    set_border(1, 1, 1, 1);
+    check(emulated(TextureFormat::R32Uint) &&
+              engines::decodeSampler(tsc, TextureFormat::R32Uint)
+                      .border_color_u.x() == 1u,
+          "Integer borders keep their raw bits and are emulated");
+    set_border(0, 0, 0, 0);
+    check(!emulated(TextureFormat::R32Uint),
+          "A zero integer border uses the transparent preset");
+    set_border(0, 0, 0, one);
+    check(emulated(TextureFormat::R32Uint),
+          "Opaque black float bits are not an integer preset");
+    const auto integer = engines::decodeSampler(tsc, TextureFormat::R32Uint);
+    check(integer.min_filter == SamplerFilter::Nearest &&
+              integer.mag_filter == SamplerFilter::Nearest &&
+              integer.mip_filter == SamplerMipFilter::Nearest &&
+              integer.integer_texture,
+          "Integer textures sample with nearest filters");
+
+    // Depth comparisons use the first component as the border depth
+    tsc.depth_compare = true;
+    tsc.depth_compare_op = 3;
+    set_border(one, 0, 0, 0);
+    check(preset() == SamplerBorderPreset::OpaqueWhite && !emulated(),
+          "A border depth of 1 uses the white preset");
+    set_border(std::bit_cast<u32>(0.5f), 0, 0, 0);
+    check(emulated(), "A fractional border depth is emulated");
+    tsc.depth_compare = false;
+
+    // sRGB textures use the separate 8-bit border color
+    tsc.srgb_conversion = 1;
+    tsc.srgb_border_color_r = tsc.srgb_border_color_g =
+        tsc.srgb_border_color_b = 188;
+    set_border(std::bit_cast<u32>(0.5f), std::bit_cast<u32>(0.5f),
+               std::bit_cast<u32>(0.5f), one);
+    const auto srgb = engines::decodeSampler(tsc, TextureFormat::RGBA8Unorm_sRGB);
+    const auto linear_188 = std::pow((188.0f / 255.0f + 0.055f) / 1.055f, 2.4f);
+    check(std::abs(std::bit_cast<f32>(srgb.border_color_u.x()) - linear_188) <
+                  1e-5f &&
+              srgb.border_color_u.w() == one,
+          "sRGB textures use the sRGB border color converted to linear");
+    check(std::bit_cast<f32>(engines::decodeSampler(
+                                 tsc, TextureFormat::RGBA8Unorm)
+                                 .border_color_u.x()) == 0.5f,
+          "Non-sRGB textures use the float border color");
+    tsc.srgb_conversion = 0;
+    check(std::bit_cast<f32>(engines::decodeSampler(
+                                 tsc, TextureFormat::RGBA8Unorm_sRGB)
+                                 .border_color_u.x()) == 0.5f,
+          "Disabled sRGB conversion keeps the float border color");
+
+    // Metal cannot mirror to the border
+    tsc.address_u = 6;
+    set_border(0, 0, 0, 0);
+    check(emulated(), "Mirror to border is emulated");
+    tsc.address_u = tsc.address_v = tsc.address_p = 2;
+    set_border(one, 0, 0, one);
+    check(!emulated() &&
+              engines::decodeSampler(tsc).border_color_u.x() == 0u,
+          "Samplers that never address the border ignore its color");
+    std::cout << "PASS: sampler border presets, integer, depth and sRGB "
+                 "borders\n";
+}
+
+void testTicViewLodRange() {
+    engines::TextureSamplerControl tsc{};
+    tsc.min_filter = tsc.mag_filter = 2;
+    tsc.mip_filter = 3;
+    tsc.min_lod_clamp = 0;
+    tsc.max_lod_clamp = 15 * 256;
+    auto descriptor = engines::decodeSampler(
+        tsc, TextureFormat::Invalid, engines::TicLodRange{2, 4});
+    check(descriptor.min_lod == 2.0f && descriptor.max_lod == 4.0f,
+          "The TIC view range clamps the sampler LOD range");
+    tsc.min_lod_clamp = 3 * 256;
+    tsc.max_lod_clamp = 3 * 256 + 128;
+    descriptor = engines::decodeSampler(
+        tsc, TextureFormat::Invalid, engines::TicLodRange{2, 4});
+    check(descriptor.min_lod == 3.0f && descriptor.max_lod == 3.5f,
+          "A sampler range inside the view range is kept");
+    tsc.min_lod_clamp = 0;
+    tsc.max_lod_clamp = 256;
+    descriptor = engines::decodeSampler(
+        tsc, TextureFormat::Invalid, engines::TicLodRange{2, 4});
+    check(descriptor.min_lod == 2.0f && descriptor.max_lod == 2.0f,
+          "A sampler range below the view range clamps to the view minimum");
+
+    engines::TextureImageControl tic{};
+    tic.view_mip_min_level = 1;
+    tic.view_mip_max_level = 5;
+    tic.hdr_version = engines::TicHdrVersion::BlockLinear;
+    auto range = engines::getTicLodRange(tic);
+    check(range.min == 1 && range.max == 5, "Block linear TICs carry a view range");
+    tic.hdr_version = engines::TicHdrVersion::Pitch;
+    range = engines::getTicLodRange(tic);
+    check(range.min == 1 && range.max == 5, "Pitch TICs carry a view range");
+    tic.hdr_version = engines::TicHdrVersion::BlockLinearColorKey;
+    range = engines::getTicLodRange(tic);
+    check(range.min == 0 && range.max == 15,
+          "Color key TICs hold the key where the view range would be");
+    tic.hdr_version = engines::TicHdrVersion::BlockLinear;
+    tic.view_mip_min_level = 6;
+    tic.view_mip_max_level = 2;
+    range = engines::getTicLodRange(tic);
+    check(range.min == 0 && range.max == 15, "An inverted view range is ignored");
+    std::cout << "PASS: TIC resource view LOD range\n";
+}
+
 ImageFormatWord makeTic(ImageFormat format, ImageComponent r, ImageComponent g,
                         ImageComponent b, ImageComponent a,
                         ImageSwizzle x = ImageSwizzle::R,
@@ -790,6 +933,8 @@ void testCrossFormatCopies() {
 void runTextureFormatTests() {
     testCrossFormatCopies();
     testSamplerDecoding();
+    testSamplerBorders();
+    testTicViewLodRange();
     testTextureShapeLegalization();
     testExpandedFormats();
     testStorageHashCollision();

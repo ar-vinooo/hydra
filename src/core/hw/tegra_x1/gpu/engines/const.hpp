@@ -3,6 +3,7 @@
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
 #include <chrono>
+#include <cstdlib>
 
 namespace hydra::hw::tegra_x1::gpu::engines {
 
@@ -109,7 +110,9 @@ enum class VertexAttribSize : u32 {
     _10_10_10_2 = 0x30,
     _11_11_10 = 0x31,
 
-    // Arrangements fetched like the ones above (Eden does the same)
+    // Arrangements fetched like the ones above (packed forms of the same
+    // byte order)
+    A8B8G8R8 = 0x2f,
     G8R8 = 0x32,
     X8B8G8R8 = 0x33,
     A8 = 0x34,
@@ -117,9 +120,15 @@ enum class VertexAttribSize : u32 {
 
 // The fetch size the arrangement is read as
 inline VertexAttribSize getFetchSize(VertexAttribSize size) {
+    // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
+    static const bool no_a8b8g8r8 =
+        std::getenv("HYDRA_NO_VERTEX_A8B8G8R8") != nullptr;
+    if (no_a8b8g8r8 && size == VertexAttribSize::A8B8G8R8)
+        return size;
     switch (size) {
     case VertexAttribSize::G8R8:
         return VertexAttribSize::_2x8;
+    case VertexAttribSize::A8B8G8R8:
     case VertexAttribSize::X8B8G8R8:
         return VertexAttribSize::_4x8;
     case VertexAttribSize::A8:
@@ -140,6 +149,13 @@ struct VertexAttribState {
     bool bgra : 1; // Bit 31
 };
 static_assert(sizeof(VertexAttribState) == sizeof(u32));
+
+// SWAP_R_AND_B applies to every attribute format. Metal only has a BGRA
+// variant of uchar4 normalized, the shader swaps the others.
+inline bool hostVertexFormatSwapsRb(const VertexAttribState& state) {
+    return state.type == VertexAttribType::Unorm &&
+           state.size == VertexAttribSize::_4x8;
+}
 
 enum class ShaderStage : u32 {
     VertexA,

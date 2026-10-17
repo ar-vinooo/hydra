@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -250,16 +251,34 @@ TextureFormat toTextureFormat(NvColorFormat color_format) {
     case NvColorFormat::color_format:                                          \
         return TextureFormat::texture_format;
 
-    // TODO: check
+    // Formats of presented buffers. The names list the components from the
+    // most significant bits, like the render target and TIC names, so each
+    // entry matches the mapping of its counterpart there
     switch (color_format) {
         NV_COLOR_FORMAT_CASE(A8B8G8R8, RGBA8Unorm)
+        NV_COLOR_FORMAT_CASE(A8B8G8R8_sRGB, RGBA8Unorm_sRGB)
         NV_COLOR_FORMAT_CASE(X8B8G8R8, RGBX8Unorm)
+        NV_COLOR_FORMAT_CASE(X8B8G8R8_sRGB, RGBX8Unorm_sRGB)
+        NV_COLOR_FORMAT_CASE(X8R8G8B8, BGRX8Unorm)
         NV_COLOR_FORMAT_CASE(R8G8B8, Invalid) // Doesn't work
         NV_COLOR_FORMAT_CASE(R5G6B5, B5G6R5Unorm)
-        // NV_COLOR_FORMAT_CASE(B5G6R5, R5G6B5Unorm)
+        NV_COLOR_FORMAT_CASE(B5G6R5, R5G6B5Unorm)
         NV_COLOR_FORMAT_CASE(A8R8G8B8, BGRA8Unorm)
         NV_COLOR_FORMAT_CASE(R5G5B5A1, A1BGR5Unorm) // Doesn't work
         NV_COLOR_FORMAT_CASE(A4B4G4R4, RGBA4Unorm)
+        NV_COLOR_FORMAT_CASE(A1B5G5R5, RGB5A1Unorm)
+        NV_COLOR_FORMAT_CASE(A5B5G5R1, R1G5B5A5Unorm)
+        NV_COLOR_FORMAT_CASE(A2B10G10R10, RGB10A2Unorm)
+        NV_COLOR_FORMAT_CASE(A2R10G10B10, BGR10A2Unorm)
+        NV_COLOR_FORMAT_CASE(A16B16G16R16, RGBA16Unorm)
+        NV_COLOR_FORMAT_CASE(Float_A16B16G16R16, RGBA16Float)
+        NV_COLOR_FORMAT_CASE(Float_B10G11R11, RG11B10Float)
+        NV_COLOR_FORMAT_CASE(R8, R8Unorm)
+        NV_COLOR_FORMAT_CASE(R8G8, RG8Unorm)
+        NV_COLOR_FORMAT_CASE(R16, R16Unorm)
+        NV_COLOR_FORMAT_CASE(R16G16, RG16Unorm)
+        NV_COLOR_FORMAT_CASE(Float_R16, R16Float)
+        NV_COLOR_FORMAT_CASE(Float_R16G16, RG16Float)
     default:
         LOG_NOT_IMPLEMENTED(Gpu, "NV color format {}", color_format);
         return TextureFormat::Invalid;
@@ -382,10 +401,18 @@ TextureFormat toTextureFormatUncached(const ImageFormatWord image_format_word,
     if (image_format_word.image_format == ImageFormat::Invalid) {
         return TextureFormat::Invalid;
     }
+    // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
+    static const bool no_xbgr8 = std::getenv("HYDRA_NO_XBGR8") != nullptr;
+    if (no_xbgr8 && image_format_word.image_format == ImageFormat::XBGR8)
+        return TextureFormat::Invalid;
     IMAGE_FORMAT_CASE(R16, Float, Float, Float, Float, R16Float)
     IMAGE_FORMAT_CASE(R32, Float, Float, Float, Float, R32Float)
     IMAGE_FORMAT_CASE(ARGB8, Unorm, Unorm, Unorm, Unorm, RGBA8Unorm)
     IMAGE_FORMAT_CASE_SRGB(ARGB8, Unorm, Unorm, Unorm, Unorm, RGBA8Unorm_sRGB)
+    // X8B8G8R8: ARGB8 above is NVIDIA's A8B8G8R8 (red in the low byte)
+    IMAGE_FORMAT_CASE(XBGR8, Unorm, Unorm, Unorm, Unorm, RGBX8Unorm)
+    IMAGE_FORMAT_CASE_SRGB(XBGR8, Unorm, Unorm, Unorm, Unorm,
+                           RGBX8Unorm_sRGB)
     IMAGE_FORMAT_CASE(R8, Unorm, Unorm, Unorm, Unorm, R8Unorm)
     IMAGE_FORMAT_CASE(R16, Unorm, Unorm, Unorm, Unorm, R16Unorm)
     IMAGE_FORMAT_CASE(GR8, Unorm, Unorm, Unorm, Unorm, RG8Unorm)
@@ -828,7 +855,7 @@ uint3 TextureDescriptor::getLevelDimensions(u32 level) const {
 namespace {
 
 u32 adjustBlockSizeLog2(u32 size_log2, u32 gob_dim, u32 dim) {
-    while (dim <= (gob_dim << (size_log2 - 1)) && size_log2 != 0)
+    while (size_log2 != 0 && dim <= (gob_dim << (size_log2 - 1)))
         size_log2--;
 
     return size_log2;
@@ -877,7 +904,9 @@ namespace {
 
 u32 alignLayerSize(u32 layer_size, u32 height, u32 depth, u32 block_height,
                    u32 block_height_gobs_log2, u32 block_depth_gobs_log2) {
-    height = align(height, block_height);
+    // Block rows, like getLevelBlockSizeLog2 (compressed formats have rows of
+    // block_height texels)
+    height = (height + block_height - 1) / block_height;
     while (block_height_gobs_log2 != 0 &&
            height <= 8U << (block_height_gobs_log2 - 1))
         --block_height_gobs_log2;
