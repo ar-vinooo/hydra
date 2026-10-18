@@ -310,6 +310,7 @@ void Process::supervisorResume() {
 
 void Process::cleanUp() {
     joinThreads();
+    system.getGpu().getPfifo().cancel(gmmu);
     executable_mems.clear();
     main_thread_stack_mem = nullptr;
     heap_mem = nullptr;

@@ -157,6 +157,18 @@ void TextureCache::invalidateMemory(ztd::Range<uptr> range) {
     HYDRA_HOT_CALL(*this, texture_cache_invalidate_memory)(range);
 }
 
+void TextureCache::synchronizeStorageWrites(
+    ICommandBuffer* command_buffer,
+    const std::vector<ztd::Range<uptr>>& ranges) {
+    if (ranges.empty())
+        return;
+    // Texture uploads decode guest bytes on the CPU. Finish the shader's
+    // writes before a later lookup can snapshot those bytes.
+    renderer.debugSyncCommandBuffer(command_buffer);
+    for (const auto& range : ranges)
+        invalidateMemory(range);
+}
+
 void TextureCache::markGpuWritesInGuest(ztd::Range<uptr> range) {
     epoch++;
     ::hydra::hot::Scope hot_scope;

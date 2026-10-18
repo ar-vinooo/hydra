@@ -47,6 +47,16 @@ u32 getSamplerHandle(u32 handle) { return extractBits(handle, 20, 12); }
 
 DEFINE_METHOD_TABLE(Compute, INLINE_ENGINE_TABLE, 0xaf, 1, launch, u32)
 
+std::optional<ComputeQmd> ComputeQmd::read(GMmu& gmmu, uptr address) {
+    // GPU-contiguous descriptors can have separate host allocations.
+    const auto bytes = gmmu.readMappedBytes(address, sizeof(ComputeQmd));
+    if (bytes.size() != sizeof(ComputeQmd))
+        return std::nullopt;
+    ComputeQmd qmd;
+    std::memcpy(&qmd, bytes.data(), sizeof(qmd));
+    return qmd;
+}
+
 ztd::Range<uptr> Compute::getConstBuffer(const ComputeQmd& qmd,
                                          u32 index) const {
     if (index >= COMPUTE_CONST_BUFFER_COUNT ||
@@ -107,11 +117,12 @@ void Compute::launch(const u32 index, const u32 arg) {
     tls_crnt_gmmu->getMmu()->flushTrackedPages();
 
     const auto qmd_addr = static_cast<u64>(regs.launch_desc_loc) << 8;
-    ComputeQmd qmd;
-    std::memcpy(&qmd,
-                reinterpret_cast<const void*>(
-                    tls_crnt_gmmu->unmapAddr(qmd_addr)),
-                sizeof(qmd));
+    const auto descriptor_data = ComputeQmd::read(*tls_crnt_gmmu, qmd_addr);
+    if (!descriptor_data) {
+        LOG_ERROR(Engines, "Compute QMD at {:#x} is not fully mapped", qmd_addr);
+        return;
+    }
+    const auto& qmd = *descriptor_data;
 
     const auto code_base =
         (static_cast<u64>(regs.code_addr_hi) << 32) | regs.code_addr_lo;
@@ -268,6 +279,7 @@ void Compute::launch(const u32 index, const u32 arg) {
             renderer.getBufferCache().get(tls_crnt_command_buffer, range);
     }
 
+    std::vector<ztd::Range<uptr>> storage_writes;
     // Storage buffers
     for (const auto& storage : resource_mapping.storage_buffers) {
         const auto range = resolveStorageBuffer(
@@ -280,7 +292,11 @@ void Compute::launch(const u32 index, const u32 arg) {
         }
         dispatch.storage_buffers.push_back(
             {storage.host_index, renderer.getGuestMemoryBuffer(*range)});
+        if (renderer.getTextureCache().hasUnflushedGpuWrites(*range))
+            renderer.getTextureCache().flushMemory(tls_crnt_command_buffer,
+                                                   *range);
         if (storage.written) {
+            storage_writes.push_back(*range);
             renderer.getBufferCache().markGpuModified(*range);
             renderer.getBufferCache().invalidateMemory(*range);
         }
@@ -431,6 +447,8 @@ void Compute::launch(const u32 index, const u32 arg) {
     }
 
     renderer.dispatchCompute(tls_crnt_command_buffer, dispatch);
+    renderer.getTextureCache().synchronizeStorageWrites(
+        tls_crnt_command_buffer, storage_writes);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

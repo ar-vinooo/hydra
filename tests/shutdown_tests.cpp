@@ -13,10 +13,13 @@
 #include "core/horizon/services/nvdrv/ioctl/nvhost_nvdec.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_vic.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_gpu.hpp"
 #include <filesystem>
 #include <fstream>
 #include "core/horizon/ui/handler_base.hpp"
 #include "core/system.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include <future>
 #include <iostream>
 #include <stdexcept>
@@ -679,9 +682,680 @@ void testVideoEvents(System& system, kernel::Process* process) {
     std::cout << "PASS: asynchronous video event completion, rearm and cancellation\n";
 }
 
+void testGpfifoInput(System& system, kernel::Process* process) {
+    namespace nv = services::nvdrv;
+    namespace gpu = hw::tegra_x1::gpu;
+    class CaptureChannel final : public nv::ioctl::NvHostGpu {
+      public:
+        u32 calls{0};
+        std::vector<gpu::GpfifoEntry> captured;
+        nv::NvResult submitGpfifo(System*, kernel::Process*, u64, u32 count,
+            nv::ioctl::InOut<gpu::GpfifoFlags, u32> flags,
+            nv::ioctl::InOutSingle<gpu::Fence> fence,
+            const gpu::GpfifoEntry* entries) override {
+            ++calls;
+            captured.clear();
+            if (count)
+                captured.assign(entries, entries + count);
+            flags = 0;
+            fence = {7, 9};
+            return nv::NvResult::Success;
+        }
+    } channel;
+    for (u32 mode = 0; mode < 3; ++mode) {
+        std::array<u8, 48> input{}, output{}, inline_data{};
+        const std::array<u64, 2> entry_words{0x1234567800000100ull,
+                                            0x8765432100000200ull};
+        const auto call = [&](u32 count, usize input_size, usize output_size,
+                              std::optional<usize> inline_size) {
+            input.fill(0);
+            output.fill(0xa5);
+            std::memcpy(input.data() + 9, &count, 4);
+            std::memcpy(input.data() + 25, entry_words.data(), 16);
+            std::memcpy(inline_data.data() + 1, entry_words.data(), 16);
+            nv::ioctl::IoctlContext context{
+                .system = system, .process = process,
+                .in_stream = ztd::io::MemoryStream(std::span(input).first(input_size + 1)),
+                .out_stream = ztd::io::MemoryStream(std::span(output).first(output_size + 1))};
+            context.in_stream->seekBy(1);
+            context.out_stream->seekBy(1);
+            if (inline_size) {
+                context.in_buffer_stream.emplace(std::span(inline_data).first(*inline_size + 1));
+                context.in_buffer_stream->seekBy(1);
+            }
+            const u32 calls_before = channel.calls;
+            const auto result = mode == 2
+                ? channel.ioctl2(context, 0x48, 0x1b)
+                : channel.ioctl(context, 0x48, mode == 0 ? 0x08 : 0x1b);
+            if (result != nv::NvResult::Success) {
+                check(channel.calls == calls_before, "Invalid GPFIFO input is not submitted");
+                check(std::all_of(output.begin(), output.end(),
+                    [](u8 value) { return value == 0xa5; }),
+                    "Invalid GPFIFO input leaves output untouched");
+            }
+            return result;
+        };
+        for (usize size = 0; size < 24; ++size) {
+            check(call(2, size, 24, 16) == nv::NvResult::InvalidSize,
+                  "Truncated GPFIFO header is rejected");
+            check(call(2, 40, size, 16) == nv::NvResult::InvalidSize,
+                  "Truncated GPFIFO output is rejected");
+        }
+        for (usize size = 0; size < 16; ++size)
+            check(call(2, mode == 2 ? 24 : 24 + size, 24, size) ==
+                      nv::NvResult::InvalidSize,
+                  "Truncated GPFIFO entry arrays are rejected");
+        check(call(0xffffffffu, 40, 24, 16) == nv::NvResult::InvalidSize,
+              "Large GPFIFO counts do not overflow validation");
+        if (mode == 2)
+            check(call(2, 24, 24, std::nullopt) == nv::NvResult::BadParameter,
+                  "Missing inline GPFIFO buffer is rejected");
+        check(call(2, mode == 2 ? 24 : 40, 24, 16) == nv::NvResult::Success,
+              "Valid GPFIFO submission is accepted");
+        check(channel.captured.size() == 2 &&
+                  std::memcmp(channel.captured.data(), entry_words.data(), 16) == 0,
+              "Unaligned GPFIFO entries are copied exactly");
+        gpu::Fence fence{};
+        std::memcpy(&fence, output.data() + 17, 8);
+        check(output[13] == 0 && fence.id == 7 && fence.value == 9 &&
+                  output[0] == 0xa5 && output[25] == 0xa5,
+              "GPFIFO response writes only its header and returns the fence");
+        check(call(0, 24, 24, std::nullopt) == nv::NvResult::Success &&
+                  channel.captured.empty(),
+              "Empty GPFIFO submission needs no entry bytes");
+    }
+    vaddr_t guest;
+    const auto host = process->createMemory(kernel::HEAP_REGION, 0x2000,
+        kernel::MemoryType::Normal_4_0_0, kernel::MemoryPermission::ReadWrite, guest);
+    const std::array<u64, 2> pointed_entries{0x1234567800000100ull,
+                                             0x8765432100000200ull};
+    std::memcpy(reinterpret_cast<void*>(host + 0xffc), pointed_entries.data(), 16);
+    const auto pointer_call = [&](u64 address, u32 nr) {
+        std::array<u8, 24> request{};
+        std::array<u8, 24> response{};
+        const u32 count = 2;
+        std::memcpy(request.data(), &address, 8);
+        std::memcpy(request.data() + 8, &count, 4);
+        nv::ioctl::IoctlContext context{
+            .system = system, .process = process,
+            .in_stream = ztd::io::MemoryStream(request),
+            .out_stream = ztd::io::MemoryStream(response)};
+        return channel.ioctl(context, 0x48, nr);
+    };
+    for (u32 nr : {0x08u, 0x1bu}) {
+        check(pointer_call(guest + 0xffc, nr) == nv::NvResult::Success &&
+                  channel.captured.size() == 2 &&
+                  std::memcmp(channel.captured.data(), pointed_entries.data(), 16) == 0,
+              "Ioctl1 reads the guest pointer array across a CPU page boundary");
+        const auto before = channel.calls;
+        check(pointer_call(guest + 0x1ffc, nr) == nv::NvResult::InvalidAddress &&
+                  channel.calls == before,
+              "Unmapped guest-pointer array tail is rejected before submission");
+        check(pointer_call(0xfffffffffffffff8ull, nr) == nv::NvResult::InvalidAddress,
+              "Guest pointer arithmetic cannot wrap into mapped memory");
+    }
+    nv::ioctl::NvHostGpu real_channel;
+    u32 channel_id = 0;
+    for (u32 nr : {0x18u, 0x1au}) {
+        std::array<u32, 8> allocation{64, 1, 0, 0, 0, 0, 0, 0};
+        std::array<u32, 8> allocated{};
+        nv::ioctl::IoctlContext allocation_context{
+            .system = system, .process = process,
+            .in_stream = ztd::io::MemoryStream(std::span(
+                reinterpret_cast<u8*>(allocation.data()), sizeof(allocation))),
+            .out_stream = ztd::io::MemoryStream(std::span(
+                reinterpret_cast<u8*>(allocated.data()), sizeof(allocated)))};
+        check(real_channel.ioctl(allocation_context, 0x48, nr) == nv::NvResult::Success &&
+                  allocated[3] != 0 && allocated[4] == 0 &&
+                  (channel_id == 0 || channel_id == allocated[3]),
+              "GPFIFO allocation returns the channel's stable initial fence without incrementing it");
+        channel_id = allocated[3];
+    }
+    std::array<u32, 6> empty_request{0, 0, 0,
+        static_cast<u32>(gpu::GpfifoFlags::FenceGet), 0, 0};
+    std::array<u32, 6> response{};
+    nv::ioctl::IoctlContext real_context{
+        .system = system, .process = process,
+        .in_stream = ztd::io::MemoryStream(std::span(
+            reinterpret_cast<u8*>(empty_request.data()), sizeof(empty_request))),
+        .out_stream = ztd::io::MemoryStream(std::span(
+            reinterpret_cast<u8*>(response.data()), sizeof(response)))};
+    const auto submitted = system.getGpu().getPfifo().getSubmittedCount();
+    auto invalid_request = empty_request;
+    invalid_request[3] = static_cast<u32>(gpu::GpfifoFlags::FenceGet |
+                                        gpu::GpfifoFlags::FenceWait);
+    invalid_request[4] = 191;
+    response.fill(0xa5a5a5a5);
+    auto invalid_context = real_context;
+    invalid_context.in_stream.emplace(std::span(
+        reinterpret_cast<u8*>(invalid_request.data()), sizeof(invalid_request)));
+    check(real_channel.ioctl(invalid_context, 0x48, 0x1b) == nv::NvResult::BadValue &&
+              system.getGpu().getPfifo().getSubmittedCount() == submitted &&
+              response[0] == 0xa5a5a5a5,
+          "Invalid wait fence is rejected before queuing or writing output");
+    check(real_channel.ioctl(real_context, 0x48, 0x1b) == nv::NvResult::Success &&
+              system.getGpu().getPfifo().getSubmittedCount() == submitted + 1,
+          "Validated empty submission reaches the real PFIFO queue");
+    check(response[4] == channel_id && response[5] == 1 &&
+              system.getGpu().getVideoSyncpoints().waitFor(
+              response[4], response[5], std::chrono::milliseconds(1000)),
+          "Validated submission returns a completion fence");
+    std::cout << "PASS: GPFIFO ioctl/ioctl2 sizes, entries, output and empty submissions\n";
+}
+
+void testPfifoDecode(System& system, kernel::Process* process) {
+    namespace gpu = hw::tegra_x1::gpu;
+    auto& device = system.getGpu();
+    auto& gmmu = process->getGMmu();
+    auto state = std::make_shared<gpu::PfifoDecodeState>();
+    std::vector<std::vector<u8>> allocations;
+    std::vector<uptr> mappings;
+    uptr next_address = 0x2000000;
+    const auto map_bytes = [&](uptr address, std::span<const u8> bytes) {
+        allocations.emplace_back(bytes.begin(), bytes.end());
+        auto& data = allocations.back();
+        gmmu.map(address, {reinterpret_cast<uptr>(data.data()), data.size()});
+        mappings.push_back(address);
+    };
+    const auto map_words = [&](std::span<const u32> words) {
+        const auto address = next_address;
+        next_address += 0x1000;
+        map_bytes(address, {reinterpret_cast<const u8*>(words.data()), words.size_bytes()});
+        return address;
+    };
+    const auto entry = [](uptr address, u32 words) {
+        return std::bit_cast<gpu::GpfifoEntry>(
+            static_cast<u64>(address) | (static_cast<u64>(words) << 42));
+    };
+    const auto header = [](u32 opcode, u32 method, u32 count) {
+        return (opcode << 29) | (count << 16) | method;
+    };
+    const auto run = [&](std::initializer_list<gpu::GpfifoEntry> entries,
+                         const std::shared_ptr<gpu::PfifoDecodeState>& decode,
+                         bool expect_success = true) {
+        std::promise<void> finished;
+        auto done = finished.get_future();
+        device.getPfifo().submitEntries(gmmu, {entries.begin(), entries.size()},
+            gpu::GpfifoFlags::None, [&] { finished.set_value(); }, {}, decode);
+        if (expect_success) {
+            check(done.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+                  "PFIFO decoder submission completes");
+        } else {
+            check(device.getPfifo().waitForCompletion(device.getPfifo().getSubmittedCount()) &&
+                      decode->failed && done.wait_for(std::chrono::milliseconds(0)) !=
+                          std::future_status::ready,
+                  "Faulted packet retires without publishing success");
+        }
+    };
+    const std::array<u32, 2> bind{header(1, 0, 1), 0xb197};
+    run({entry(map_words(bind), 2)}, state);
+    auto& engine = state->context->three_d;
+
+    // Bytes after the first entry are mapped but are not part of its payload.
+    const std::array<u32, 3> first{header(1, 0xd00, 2), 0x1111, 0xdeadbeef};
+    const std::array<u32, 1> last{0x2222};
+    const auto first_address = map_words(first);
+    const auto last_address = map_words(last);
+    run({entry(first_address, 2), entry(last_address, 1)}, state);
+    check(engine.getReg(0xd00) == 0x1111 && engine.getReg(0xd01) == 0x2222,
+          "Packet continues at the next entry without reading past the first");
+
+    // Every byte boundary, including inside a header and inside a payload word.
+    std::array<u32, 3> split{header(1, 0xd02, 2), 0xaabbccdd, 0x12345678};
+    const auto split_bytes = std::span(reinterpret_cast<const u8*>(split.data()), sizeof(split));
+    for (usize cut = 1; cut < sizeof(split); ++cut) {
+        split[1] = 0xaabbcc00u + static_cast<u32>(cut);
+        split[2] = 0x12345600u + static_cast<u32>(cut);
+        const auto address = next_address;
+        next_address += 0x1000;
+        map_bytes(address, split_bytes.first(cut));
+        map_bytes(address + cut, split_bytes.subspan(cut));
+        run({entry(address, 3)}, state);
+        check(engine.getReg(0xd02) == split[1] && engine.getReg(0xd03) == split[2],
+              "Header and payload words span noncontiguous host allocations");
+    }
+
+    // Each decode stream owns its pending method count, including ONE_INC.
+    const std::array<u32, 2> one_inc{header(5, 0xd04, 3), 0x41};
+    run({entry(map_words(one_inc), 2)}, state);
+    check(state->remaining == 2 && engine.getReg(0xd04) == 0x41,
+          "Incomplete packet is retained across submissions");
+    auto other = std::make_shared<gpu::PfifoDecodeState>();
+    run({entry(map_words(bind), 2)}, other);
+    const std::array<u32, 1> immediate{header(4, 0xd06, 0x66)};
+    run({entry(map_words(immediate), 1)}, other);
+    const std::array<u32, 2> rest{0x51, 0x52};
+    run({entry(map_words(rest), 2)}, state);
+    check(state->remaining == 0 && engine.getReg(0xd05) == 0x52 &&
+              other->context->three_d.getReg(0xd06) == 0x66 && engine.getReg(0xd06) == 0,
+          "ONE_INC resumes without consuming another channel's header");
+
+    const std::array<u32, 4> noninc{header(3, 0xd07, 3), 1, 2, 3};
+    run({entry(map_words(noninc), 4)}, state);
+    check(engine.getReg(0xd07) == 3, "Nonincrementing packet retains its method");
+    const std::array<u32, 3> legacy{(2u << 18) | (0x500u << 2), 0x71, 0x72};
+    run({entry(map_words(legacy), 3)}, state);
+    check(engine.getReg(0x500) == 0x71 && engine.getReg(0x501) == 0x72,
+          "Legacy incrementing header uses byte-addressed method fields");
+    const std::array<u32, 3> legacy_noninc{
+        (2u << 29) | (2u << 18) | (0x502u << 2), 0x81, 0x82};
+    run({entry(map_words(legacy_noninc), 3)}, state);
+    check(engine.getReg(0x502) == 0x82,
+          "Legacy nonincrementing header retains its method");
+
+    // A macro must receive the complete burst before it executes.
+    const std::array<u32, 6> macro_program{
+        header(4, 0x45, 0), header(4, 0x47, 0), header(4, 0x48, 0),
+        header(3, 0x46, 2),
+        1u | (6u << 4) | (1u << 7) | (0xd0au << 14),
+        1u | (1u << 4)};
+    run({entry(map_words(macro_program), 6)}, state);
+    const std::array<u32, 2> macro_first{header(5, 0xe00, 2), 0x123};
+    run({entry(map_words(macro_first), 2)}, state);
+    check(engine.getReg(0xd0a) == 0 && state->remaining == 1,
+          "Partial macro burst does not execute");
+    run({entry(map_words(immediate), 1)}, other);
+    const std::array<u32, 1> macro_last{0x456};
+    run({entry(map_words(macro_last), 1)}, state);
+    check(engine.getReg(0xd0a) == 0x456 && state->remaining == 0,
+          "Macro executes with all arguments after the next submission");
+
+    // A mapping hole must not crash the worker or dispatch a partial word.
+    const std::array<u32, 2> hole{header(1, 0xd08, 1), 0xffffffff};
+    const auto address = next_address;
+    next_address += 0x1000;
+    map_bytes(address, {reinterpret_cast<const u8*>(hole.data()), 6});
+    run({entry(address, 2)}, state, false);
+    check(state->remaining == 0 && engine.getReg(0xd08) == 0,
+          "Unmapped tail discards a partial word and resets pending state");
+    auto recovered = std::make_shared<gpu::PfifoDecodeState>();
+    run({entry(map_words(bind), 2)}, recovered);
+    auto& recovered_engine = recovered->context->three_d;
+    const std::array<u32, 1> recovery{header(4, 0xd08, 0x99)};
+    run({entry(map_words(recovery), 1)}, recovered);
+    check(recovered_engine.getReg(0xd08) == 0x99, "New channel remains usable after another channel faults");
+    run({entry(next_address, 1)}, recovered, false);
+    auto ended = std::make_shared<gpu::PfifoDecodeState>();
+    run({entry(map_words(bind), 2)}, ended);
+    run({entry(map_words(recovery), 1)}, ended);
+    const std::array<u32, 2> segment_end{header(7, 0, 0), header(4, 0xd08, 0x55)};
+    run({entry(map_words(segment_end), 2)}, ended);
+    check(ended->context->three_d.getReg(0xd08) == 0x99, "END_PB_SEGMENT skips the remaining entry words");
+    // Exercise the FD-to-PFIFO wiring, with in-place ioctl input/output.
+    namespace nv = services::nvdrv;
+    nv::ioctl::NvHostGpu channel_a, channel_b;
+    const auto submit_channel = [&](nv::ioctl::NvHostGpu& channel,
+                                    std::span<const u32> words) {
+        std::array<u32, 8> request{0, 0, 1,
+            static_cast<u32>(gpu::GpfifoFlags::FenceGet), 0, 0, 0, 0};
+        const auto command = entry(map_words(words), static_cast<u32>(words.size()));
+        std::memcpy(request.data() + 6, &command, sizeof(command));
+        const auto bytes = std::span(reinterpret_cast<u8*>(request.data()), sizeof(request));
+        nv::ioctl::IoctlContext context{
+            .system = system, .process = process,
+            .in_stream = ztd::io::MemoryStream(bytes),
+            .out_stream = ztd::io::MemoryStream(bytes)};
+        check(channel.ioctl(context, 0x48, 0x1b) == nv::NvResult::Success &&
+                  device.getVideoSyncpoints().waitFor(request[4], request[5],
+                                                      std::chrono::milliseconds(1000)),
+              "Channel submission reaches its completion fence");
+    };
+    const std::array<u32, 2> channel_first{header(1, 0xd0b, 2), 0xab};
+    const std::array<u32, 1> channel_other{header(4, 0xd0d, 0xcd)};
+    const std::array<u32, 1> channel_last{0xbc};
+    submit_channel(channel_a, bind);
+    submit_channel(channel_b, bind);
+    submit_channel(channel_a, channel_first);
+    submit_channel(channel_b, channel_other);
+    submit_channel(channel_a, channel_last);
+    const auto& a_engine = channel_a.getChannelState()->context->three_d;
+    const auto& b_engine = channel_b.getChannelState()->context->three_d;
+    check(a_engine.getReg(0xd0b) == 0xab && a_engine.getReg(0xd0c) == 0xbc &&
+              a_engine.getReg(0xd0d) == 0 && b_engine.getReg(0xd0d) == 0xcd &&
+              b_engine.getReg(0xd0b) == 0,
+          "Actual nvdrv channels keep independent pending packet counts");
+    for (const auto base : mappings)
+        gmmu.unmap(base);
+    std::cout << "PASS: PFIFO packet bounds, split mappings, continuation and decoder modes\n";
+}
+
+void testChannelScheduling(System& system, kernel::Process* process) {
+    namespace gpu = hw::tegra_x1::gpu;
+    auto& device = system.getGpu();
+    auto& gmmu = process->getGMmu();
+    auto a = std::make_shared<gpu::PfifoDecodeState>();
+    auto b = std::make_shared<gpu::PfifoDecodeState>();
+    std::vector<std::vector<u32>> commands;
+    std::vector<uptr> mappings;
+    uptr next = 0x5000000;
+    const auto immediate = [](u32 method, u32 value) {
+        return (4u << 29) | (value << 16) | method;
+    };
+    struct Job {
+        std::future<void> done;
+        gpu::Fence fence;
+        u64 serial;
+    };
+    const auto enqueue = [&](const std::shared_ptr<gpu::PfifoDecodeState>& state,
+                             std::vector<u32> words, gpu::Fence wait = {}) {
+        commands.push_back(std::move(words));
+        auto& bytes = commands.back();
+        const auto address = next;
+        next += 0x1000;
+        gmmu.map(address, {reinterpret_cast<uptr>(bytes.data()), bytes.size() * 4});
+        mappings.push_back(address);
+        const auto entry = std::bit_cast<gpu::GpfifoEntry>(
+            static_cast<u64>(address) | (static_cast<u64>(bytes.size()) << 42));
+        gpu::Fence fence{};
+        check(device.reserveFence(fence, state.get()), "Channel reserves its fence");
+        auto finished = std::make_shared<std::promise<void>>();
+        auto done = finished->get_future();
+        device.getPfifo().submitEntries(gmmu, {&entry, 1}, wait.id
+            ? gpu::GpfifoFlags::FenceWait : gpu::GpfifoFlags::None,
+            [finished, signal = device.makeFenceSignal(fence)] {
+                signal();
+                finished->set_value();
+            }, wait, state);
+        return Job{std::move(done), fence, device.getPfifo().getSubmittedCount()};
+    };
+    const auto finish = [&](Job& job) {
+        check(job.done.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+              "Scheduled channel completes");
+    };
+    const auto dependency = device.getVideoSyncpoints().allocate();
+    check(dependency.has_value(), "External dependency allocation");
+    auto first = enqueue(a, {(1u << 29) | (1u << 16), 0xb197, immediate(0xd00, 0x11)},
+                         {*dependency, 1});
+    auto following = enqueue(a, {immediate(0xd00, 0x22)});
+    auto producer = enqueue(b, {(1u << 29) | (1u << 16), 0xb197, immediate(0xd00, 0x33)});
+    finish(producer);
+    check(first.fence.id != producer.fence.id &&
+              !device.getVideoSyncpoints().waitFor(first.fence.id, first.fence.value,
+                                                   std::chrono::milliseconds(10)),
+          "Another channel's completion cannot signal the blocked channel's fence");
+    check(first.done.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+              following.done.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+              !device.getPfifo().waitForCompletion(producer.serial),
+          "Same-channel FIFO and contiguous retirement survive out-of-order execution");
+    device.getVideoSyncpoints().complete(*dependency, 1);
+    finish(first);
+    finish(following);
+    check(device.getPfifo().waitForCompletion(producer.serial) &&
+              a->context->three_d.getReg(0xd00) == 0x22 &&
+              b->context->three_d.getReg(0xd00) == 0x33,
+          "Channels retain independent 3D state and retire only after earlier work");
+
+    alignas(16) std::array<u32, 4> semaphore{};
+    constexpr uptr SEMAPHORE = 0x5100000;
+    gmmu.map(SEMAPHORE, {reinterpret_cast<uptr>(semaphore.data()), sizeof(semaphore)});
+    mappings.push_back(SEMAPHORE);
+    auto waiting = enqueue(a, {
+        (1u << 29) | (3u << 16) | 4u, 0, static_cast<u32>(SEMAPHORE), 1,
+        immediate(7, 1), immediate(0x1b, 0x77), immediate(0xd01, 0x44)});
+    check(waiting.done.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready,
+          "Semaphore acquire yields without completing its submission");
+    auto same_channel = enqueue(a, {immediate(0xd01, 0x55)});
+    auto releasing = enqueue(b, {
+        (1u << 29) | (2u << 16) | 4u, 0, static_cast<u32>(SEMAPHORE + 4),
+        immediate(0x1b, 0x66),
+        (1u << 29) | (1u << 16) | 5u, static_cast<u32>(SEMAPHORE),
+        immediate(0x1b, 1),
+        (1u << 29) | (1u << 16) | 5u, static_cast<u32>(SEMAPHORE + 8)});
+    finish(releasing);
+    finish(waiting);
+    finish(same_channel);
+    check(semaphore[0] == 0x77 && semaphore[1] == 0x66 && semaphore[2] == 0 &&
+              a->context->three_d.getReg(0xd01) == 0x55 &&
+              b->context->three_d.getReg(0xd01) == 0,
+          "Semaphore resumes at the saved word with its own puller registers");
+
+    const auto syncpoint = device.getVideoSyncpoints().allocate();
+    check(syncpoint.has_value(), "Command syncpoint allocation");
+    auto sync_wait = enqueue(a, {immediate(0x1c, 1),
+        immediate(0x1d, (*syncpoint << 8) | 0x10), immediate(0xd03, 0x45)});
+    check(sync_wait.done.wait_for(std::chrono::milliseconds(30)) != std::future_status::ready,
+          "SYNCPOINT_B wait yields until its captured threshold is reached");
+    auto sync_release = enqueue(b, {immediate(0x1c, 9),
+        immediate(0x1d, (*syncpoint << 8) | 1)});
+    finish(sync_release);
+    finish(sync_wait);
+    check(a->context->three_d.getReg(0xd03) == 0x45 &&
+              device.getVideoSyncpoints().read(*syncpoint) == 1,
+          "Another channel can increment the syncpoint without changing the wait payload");
+
+    // Binding a different engine on B must leave A's subchannel untouched.
+    auto copy_binding = enqueue(b, {(1u << 29) | (1u << 16), 0xb0b5, immediate(0x40, 0x12)});
+    finish(copy_binding);
+    auto resume_3d = enqueue(a, {immediate(0xd02, 0x34)});
+    finish(resume_3d);
+    check(a->context->three_d.getReg(0xd02) == 0x34 &&
+              b->context->copy.getReg(0x40) == 0x12,
+          "Subchannel engine bindings are isolated across channel switches");
+    for (const auto address : mappings)
+        gmmu.unmap(address);
+    std::cout << "PASS: cross-channel dependencies, engine state, semaphore resume and fences\n";
+}
+
+void testChannelFaults(System& system, kernel::Process* process) {
+    namespace gpu = hw::tegra_x1::gpu;
+    namespace nv = services::nvdrv;
+    nv::ioctl::NvHostGpu channel;
+    kernel::Event* event = nullptr;
+    check(channel.queryEvent(3, event) == nv::NvResult::Success && event,
+          "Channel exposes its error event");
+    auto notified = std::make_shared<std::promise<void>>();
+    auto notification = notified->get_future();
+    event->addSignalCallback([notified] { notified->set_value(); });
+    constexpr uptr UNMAPPED = 0x6100000;
+    const auto entry = std::bit_cast<gpu::GpfifoEntry>(
+        static_cast<u64>(UNMAPPED) | (1ull << 42));
+    std::array<u32, 8> request{0, 0, 1,
+        static_cast<u32>(gpu::GpfifoFlags::FenceGet), 0, 0, 0, 0};
+    std::memcpy(request.data() + 6, &entry, sizeof(entry));
+    const auto input = std::span(reinterpret_cast<u8*>(request.data()), sizeof(request));
+    nv::ioctl::IoctlContext context{
+        .system = system, .process = process,
+        .in_stream = ztd::io::MemoryStream(input),
+        .out_stream = ztd::io::MemoryStream(input)};
+    check(channel.ioctl(context, 0x48, 0x1b) == nv::NvResult::Success,
+          "Well-formed submission reaches asynchronous validation");
+    check(notification.wait_for(std::chrono::seconds(2)) == std::future_status::ready &&
+              !system.getGpu().getVideoSyncpoints().waitFor(request[4], request[5],
+                                                           std::chrono::milliseconds(20)),
+          "Unmapped command signals an error without signaling successful completion");
+    alignas(8) std::array<u8, 16> report{};
+    nv::ioctl::IoctlContext query{
+        .system = system, .process = process,
+        .out_stream = ztd::io::MemoryStream(report)};
+    check(channel.ioctl(query, 0x48, 0x17) == nv::NvResult::Success,
+          "Channel error notification is readable");
+    for (usize size = 0; size < report.size(); ++size) {
+        std::array<u8, 16> short_output{};
+        short_output.fill(0xa5);
+        nv::ioctl::IoctlContext short_query{
+            .system = system, .process = process,
+            .out_stream = ztd::io::MemoryStream(std::span(short_output).first(size))};
+        check(channel.ioctl(short_query, 0x48, 0x17) == nv::NvResult::InvalidSize &&
+                  std::all_of(short_output.begin(), short_output.end(),
+                              [](u8 value) { return value == 0xa5; }),
+              "Truncated error notification output is rejected without writes");
+    }
+    u64 timestamp;
+    u32 info;
+    u16 status;
+    std::memcpy(&timestamp, report.data(), 8);
+    std::memcpy(&info, report.data() + 8, 4);
+    std::memcpy(&status, report.data() + 14, 2);
+    check(timestamp != 0 && info == 31 && status == 0xffff,
+          "MMU fault reports the documented notifier layout and error code");
+    context.in_stream->seekTo(0);
+    context.out_stream->seekTo(0);
+    check(channel.ioctl(context, 0x48, 0x1b) == nv::NvResult::InvalidState,
+          "Faulted channel rejects further submissions");
+    nv::ioctl::NvHostGpu unsupported;
+    std::array<u32, 6> unsupported_request{0, 0, 0,
+        static_cast<u32>(gpu::GpfifoFlags::SyncFence), 0, 0};
+    const auto unsupported_bytes = std::span(
+        reinterpret_cast<u8*>(unsupported_request.data()), sizeof(unsupported_request));
+    nv::ioctl::IoctlContext unsupported_context{
+        .system = system, .process = process,
+        .in_stream = ztd::io::MemoryStream(unsupported_bytes),
+        .out_stream = ztd::io::MemoryStream(unsupported_bytes)};
+    const auto submitted = system.getGpu().getPfifo().getSubmittedCount();
+    check(unsupported.ioctl(unsupported_context, 0x48, 0x1b) == nv::NvResult::NotSupported &&
+              system.getGpu().getPfifo().getSubmittedCount() == submitted,
+          "Unsupported fence format is rejected before queuing");
+
+    auto state = std::make_shared<gpu::PfifoDecodeState>();
+    auto faulted = std::make_shared<std::promise<void>>();
+    auto fault_ready = faulted->get_future();
+    state->on_fault = [faulted] { faulted->set_value(); };
+    const auto conditional = std::bit_cast<gpu::GpfifoEntry>(
+        static_cast<u64>(UNMAPPED | 1) | (1ull << 42));
+    system.getGpu().getPfifo().submitEntries(process->getGMmu(), {&conditional, 1},
+        gpu::GpfifoFlags::None, {}, {}, state);
+    check(fault_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready &&
+              state->error == 25,
+          "Unsupported conditional entry faults instead of executing unconditionally");
+    while (system.getGpu().getVideoSyncpoints().allocate()) {}
+    nv::ioctl::NvHostGpu exhausted;
+    std::array<u32, 6> exhausted_request{0, 0, 0,
+        static_cast<u32>(gpu::GpfifoFlags::FenceGet), 0, 0};
+    const auto exhausted_bytes = std::span(
+        reinterpret_cast<u8*>(exhausted_request.data()), sizeof(exhausted_request));
+    nv::ioctl::IoctlContext exhausted_context{
+        .system = system, .process = process,
+        .in_stream = ztd::io::MemoryStream(exhausted_bytes),
+        .out_stream = ztd::io::MemoryStream(exhausted_bytes)};
+    const auto before_exhausted = system.getGpu().getPfifo().getSubmittedCount();
+    check(exhausted.ioctl(exhausted_context, 0x48, 0x1b) == nv::NvResult::InsufficientMemory &&
+              system.getGpu().getPfifo().getSubmittedCount() == before_exhausted,
+          "Syncpoint exhaustion cannot return a successful zero fence");
+    std::cout << "PASS: channel fault event, notification and no false success fence\n";
+}
+
+void testGpuProcessCancellation(System& system) {
+    namespace gpu = hw::tegra_x1::gpu;
+    using gpu::renderer::metal::stackAutoRelease;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    auto& device = system.getGpu();
+    auto& processes = system.getOs().getKernel().getProcessManager();
+    auto* process = processes.createProcess("Queued GPU process");
+    auto blocked = std::make_shared<gpu::PfifoDecodeState>();
+    const auto dependency = device.getVideoSyncpoints().allocate();
+    check(dependency.has_value(), "Cancellation fence allocation");
+    std::atomic<bool> executed{false};
+    device.getPfifo().submitEntries(process->getGMmu(), {}, gpu::GpfifoFlags::FenceWait,
+        [&] { executed = true; }, {*dependency, 1}, blocked);
+    const auto serial = device.getPfifo().getSubmittedCount();
+
+    auto& renderer = static_cast<gpu::renderer::metal::Renderer&>(device.getRenderer());
+    NS_STACK_SCOPED auto gate = renderer.getDevice()->newSharedEvent();
+    NS_STACK_SCOPED auto memory = renderer.getDevice()->newBuffer(
+        4096, MTL::ResourceStorageModeShared);
+    check(gate && memory, "Cancellation GPU resources");
+    std::memset(memory->contents(), 0, 4096);
+    std::unique_ptr<gpu::renderer::ICommandBuffer> commands(renderer.createCommandBuffer());
+    auto* native = static_cast<gpu::renderer::metal::CommandBuffer*>(commands.get());
+    native->getCommandBuffer()->encodeWait(gate, 1);
+    native->getBlitCommandEncoder()->fillBuffer(memory, NS::Range(0, 16), 0x7f);
+    commands.reset();
+    auto destroyed = std::async(std::launch::async, [&] { processes.destroyProcess(process); });
+    const bool waited = destroyed.wait_for(std::chrono::milliseconds(100)) !=
+                        std::future_status::ready;
+    gate->setSignaledValue(1);
+    check(destroyed.wait_for(std::chrono::seconds(3)) == std::future_status::ready,
+          "Process destruction resumes after the GPU drain");
+    destroyed.get();
+    check(waited && !executed && device.getPfifo().waitForCompletion(serial) &&
+              static_cast<const u8*>(memory->contents())[0] == 0x7f,
+          "Process cleanup cancels pending jobs and drains committed GPU work before freeing memory");
+    std::cout << "PASS: process lifetime, pending cancellation and actual GPU drain\n";
+}
+
+void testSemaphoreShutdown(System& system, kernel::Process* process) {
+    namespace gpu = hw::tegra_x1::gpu;
+    auto& device = system.getGpu();
+    auto& gmmu = process->getGMmu();
+    alignas(16) std::array<u32, 2> semaphore{};
+    constexpr uptr SEMAPHORE = 0x4000000;
+    constexpr uptr COMMANDS = 0x4001000;
+    const auto immediate = [](u32 method, u32 value) {
+        return (4u << 29) | (value << 16) | method;
+    };
+    const std::array<u32, 11> commands{
+        (1u << 29) | (2u << 16) | 4u, 0, static_cast<u32>(SEMAPHORE + 4),
+        immediate(0x1b, 1),
+        (1u << 29) | (1u << 16) | 5u, static_cast<u32>(SEMAPHORE),
+        immediate(6, 1), immediate(7, 1),
+        immediate(0xd0e, 0x777), immediate(0xd0f, 0x888), immediate(2, 0)};
+    gmmu.map(SEMAPHORE, {reinterpret_cast<uptr>(semaphore.data()), sizeof(semaphore)});
+    gmmu.map(COMMANDS, {reinterpret_cast<uptr>(commands.data()), sizeof(commands)});
+    const auto entry = std::bit_cast<gpu::GpfifoEntry>(
+        static_cast<u64>(COMMANDS) | (static_cast<u64>(commands.size()) << 42));
+    std::atomic<bool> completed{false};
+    device.getPfifo().submitEntries(gmmu, {&entry, 1}, gpu::GpfifoFlags::None,
+                                    [&] { completed = true; });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::atomic_ref<u32>(semaphore[1]).load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    check(semaphore[1] == 1, "PFIFO reached the pending semaphore acquire");
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const auto stopping = std::chrono::steady_clock::now();
+    device.getPfifo().shutdown();
+    check(!completed && device.get3DEngine().getReg(0xd0e) == 0 &&
+              std::chrono::steady_clock::now() - stopping < std::chrono::seconds(1),
+          "Shutdown cancels a pending acquire without executing subsequent methods");
+    gmmu.unmap(SEMAPHORE);
+    gmmu.unmap(COMMANDS);
+    std::cout << "PASS: semaphore acquire cancellation and no execution after shutdown\n";
+}
+
 int main(int argc, char** argv) {
     try {
         Ui ui;
+        if (argc == 2 && std::string_view(argv[1]) == "--check-channel-faults") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("Channel fault test");
+            testChannelFaults(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-gpu-process-cancel") {
+            unsetenv("HYDRA_GPU_SYNC");
+            System system(ui);
+            testGpuProcessCancellation(system);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-channel-scheduling") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("Channel scheduling test");
+            testChannelScheduling(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-semaphore-shutdown") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("Semaphore shutdown test");
+            testSemaphoreShutdown(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-pfifo-decode") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("PFIFO decode test");
+            testPfifoDecode(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-gpfifo-input") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("GPFIFO input test");
+            testGpfifoInput(system, process);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--check-video-events") {
             System system(ui);
             auto* process = system.getOs().getKernel().getProcessManager()

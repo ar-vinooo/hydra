@@ -47,6 +47,8 @@ static_assert(sizeof(RegsCompute) == 0x983 * sizeof(u32));
 struct ComputeQmd {
     u32 words[0x40];
 
+    static std::optional<ComputeQmd> read(GMmu& gmmu, uptr address);
+
     u32 programStart() const { return words[0x8]; }
     u32 gridDimX() const { return words[0xc] & 0x7fffffff; }
     u32 gridDimY() const { return words[0xd] & 0xffff; }

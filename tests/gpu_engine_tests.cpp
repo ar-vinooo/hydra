@@ -4,6 +4,7 @@
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
+#include "core/hw/tegra_x1/gpu/engines/compute.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
@@ -14,6 +15,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
 #include <sys/mman.h>
@@ -1121,6 +1123,116 @@ void testCacheCollisions() {
     std::cout << "PASS: cache entries with colliding hashes stay distinct\n";
 }
 
+void testStorageWritesRefreshTextures() {
+    using namespace renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    const auto page_size = static_cast<usize>(sysconf(_SC_PAGESIZE));
+    auto* memory = static_cast<u8*>(mmap(nullptr, page_size,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    expect(memory != MAP_FAILED, "Storage texture memory allocation");
+    std::unique_ptr<u8, std::function<void(u8*)>> backing(
+        memory, [page_size](u8* ptr) { munmap(ptr, page_size); });
+    metal::Renderer renderer;
+    auto* device = renderer.getDevice();
+    NS::Error* error = nullptr;
+    NS_STACK_SCOPED auto library = device->newLibrary(NS::String::string(R"(
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void fill(device uint* b [[buffer(0)]],
+                         uint t [[thread_position_in_grid]]) {
+            b[t] = 0x44332211u;
+        })", NS::UTF8StringEncoding), nullptr, &error);
+    expect(library != nullptr, "Storage texture kernel compiles");
+    NS_STACK_SCOPED auto function = library->newFunction(
+        NS::String::string("fill", NS::UTF8StringEncoding));
+    NS_STACK_SCOPED auto pipeline = device->newComputePipelineState(function, &error);
+    expect(pipeline != nullptr, "Storage texture pipeline compiles");
+    const auto address = reinterpret_cast<uptr>(memory);
+    // Cached uploads, tiled layouts and partial overwrites of dirty targets.
+    for (u32 variant = 0; variant < 3; ++variant) {
+        std::memset(memory, 0x19, page_size);
+        auto& cache = renderer.getTextureCache();
+        const TextureDescriptor descriptor(address, MTL::TextureType2D,
+            TextureFormat::RGBA8Unorm, variant != 1, variant != 1 ? 64 : 0,
+            16, 16, 1, 1, 1, 0, 0, 0);
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        cache.invalidateMemory(descriptor.getRange());
+        auto* before = cache.find(commands.get(), descriptor, TextureUsage::Read);
+        if (variant == 2)
+            cache.find(commands.get(), descriptor, TextureUsage::Write);
+        const auto written = ztd::Range<uptr>::fromSize(address,
+            variant == 2 ? sizeof(u32) : descriptor.size);
+        if (variant == 2) {
+            auto* source = device->newBuffer(descriptor.size,
+                                             MTL::ResourceStorageModeShared);
+            std::memset(source->contents(), 0x2a, descriptor.size);
+            static_cast<metal::CommandBuffer*>(commands.get())
+                ->getBlitCommandEncoder()->copyFromBuffer(source, 0, 64, 1024,
+                    MTL::Size(16, 16, 1),
+                    static_cast<metal::Texture*>(before->getBase())->getTexture(),
+                    0, 0, MTL::Origin(0, 0, 0));
+            source->release();
+            cache.flushMemory(commands.get(), written);
+            expect(memory[0] == 0x2a && memory[4] == 0x19,
+                   "Storage preparation reads only its range from the target");
+        }
+        const auto buffer = renderer.getGuestMemoryBuffer(written);
+        expect(buffer.isValid(), "Storage texture memory is GPU accessible");
+        auto* encoder = static_cast<metal::CommandBuffer*>(commands.get())
+                            ->getComputeCommandEncoder();
+        encoder->setComputePipelineState(pipeline);
+        encoder->setBuffer(static_cast<metal::Buffer*>(buffer.getBase())->getBuffer(),
+                           buffer.getOffset(), 0);
+        encoder->dispatchThreads(MTL::Size(written.getSize() / 4, 1, 1),
+                                MTL::Size(1, 1, 1));
+        cache.synchronizeStorageWrites(commands.get(), {written});
+        auto* after = cache.find(commands.get(), descriptor,
+            variant == 2 ? TextureUsage::Write : TextureUsage::Read);
+        expect(after == before, "Storage writes refresh the existing texture");
+        commands.reset();
+        const auto pixels = readTexture(device,
+            static_cast<metal::Texture*>(after->getBase())->getTexture(), 4);
+        expect(pixels[0] == 0x11 && pixels[1] == 0x22 &&
+                   pixels[2] == 0x33 && pixels[3] == 0x44,
+               "Texture contains completed GPU storage writes");
+        if (variant == 2)
+            expect(pixels[4] == 0x2a && pixels.back() == 0x2a,
+                   "Partial storage write preserves other target pixels");
+    }
+    std::cout << "PASS: GPU storage writes refresh cached linear/tiled textures\n";
+}
+
+void testComputeQmdRead() {
+    using engines::ComputeQmd;
+    GMmu gmmu(nullptr);
+    constexpr uptr BASE = 0x100000;
+    ComputeQmd expected{};
+    for (u32 i = 0; i < 0x40; i++)
+        expected.words[i] = 0x12340000u + i;
+    constexpr usize SPLIT = 0x83;
+    std::array<u8, SPLIT> first{};
+    std::array<u8, sizeof(ComputeQmd) - SPLIT> second{};
+    const auto* bytes = reinterpret_cast<const u8*>(&expected);
+    std::memcpy(first.data(), bytes, first.size());
+    std::memcpy(second.data(), bytes + SPLIT, second.size());
+
+    expect(!ComputeQmd::read(gmmu, BASE), "Unmapped QMD is rejected");
+    gmmu.map(BASE, {reinterpret_cast<uptr>(first.data()), first.size()});
+    expect(!ComputeQmd::read(gmmu, BASE), "Truncated QMD is rejected");
+    gmmu.map(BASE + SPLIT + 1,
+             {reinterpret_cast<uptr>(second.data()), second.size()});
+    expect(!ComputeQmd::read(gmmu, BASE), "QMD with a mapping hole is rejected");
+    gmmu.unmap(BASE + SPLIT + 1);
+    gmmu.map(BASE + SPLIT,
+             {reinterpret_cast<uptr>(second.data()), second.size()});
+    const auto actual = ComputeQmd::read(gmmu, BASE);
+    expect(actual && std::memcmp(&*actual, &expected, sizeof(expected)) == 0,
+           "QMD spanning separate host mappings preserves every word");
+    gmmu.unmap(BASE + SPLIT);
+    expect(!ComputeQmd::read(gmmu, BASE), "QMD unmap invalidates the read");
+    std::cout << "PASS: compute QMD reads across mappings and rejects holes\n";
+}
+
 // Inline-to-memory: byte exact transfers started by LAUNCH_DMA, pitch lines
 // and block linear destinations
 void testInlineToMemory() {
@@ -1340,28 +1452,88 @@ void testChannelMethodsAndFences() {
     expect(word == 0x7777u && timestamp != 0,
            "A long release writes the payload and a timestamp");
 
-    // Acquire: satisfied at once, or abandoned after a bounded wait
+    // Acquire: satisfied at once, or held beyond the former 100 ms timeout.
     set_address(0x10);
     const auto begin = std::chrono::steady_clock::now();
     method(0x1a, 0xabcd0001u);
     expect(std::chrono::steady_clock::now() - begin <
                std::chrono::milliseconds(50),
            "An acquired semaphore that holds the value does not wait");
+    std::thread delayed_release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(180));
+        const u32 value = 0x12345678u;
+        std::atomic_ref<u32>(*reinterpret_cast<u32*>(memory.data() + 0x10))
+            .store(value, std::memory_order_release);
+    });
     method(0x1a, 0x12345678u);
     const auto waited = std::chrono::steady_clock::now() - begin;
-    expect(waited < std::chrono::seconds(2),
-           "An acquire that is never released stops waiting");
+    delayed_release.join();
+    expect(waited >= std::chrono::milliseconds(150),
+           "An acquire does not bypass a pending dependency after 100 ms");
 
     // Another thread releases an awaited semaphore
     set_address(0x30);
     std::thread releaser([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         const u32 value = 5;
-        std::memcpy(memory.data() + 0x30, &value, 4);
+        std::atomic_ref<u32>(*reinterpret_cast<u32*>(memory.data() + 0x30))
+            .store(value, std::memory_order_release);
     });
     method(0x6, 5);
     method(0x7, 0x1);
     releaser.join();
+
+    // The queued GPU write would overwrite an early CPU semaphore release.
+    NS_STACK_SCOPED auto gpu_memory = static_cast<renderer::metal::Renderer&>(
+        gpu.getRenderer()).getDevice()->newBuffer(
+        4096, MTL::ResourceStorageModeShared);
+    auto* gpu_bytes = static_cast<u8*>(gpu_memory->contents());
+    constexpr uptr GPU_MEMORY = BASE + 0x10000;
+    gmmu.map(GPU_MEMORY, {reinterpret_cast<uptr>(gpu_bytes), 4096});
+    std::unique_ptr<renderer::ICommandBuffer> commands(
+        gpu.getRenderer().createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    const auto queue_fill = [&](u8 value) {
+        static_cast<renderer::metal::CommandBuffer*>(commands.get())
+            ->getBlitCommandEncoder()->fillBuffer(gpu_memory, NS::Range(0, 16), value);
+    };
+    method(0x5, static_cast<u32>(GPU_MEMORY));
+    queue_fill(0x4a);
+    method(0x1b, 0x11223344);
+    gpu.getRenderer().debugSyncCommandBuffer(commands.get());
+    std::memcpy(&word, gpu_bytes, 4);
+    expect(word == 0x11223344 && gpu_bytes[4] == 0x4a,
+           "Legacy release follows prior GPU writes and touches only four bytes");
+    queue_fill(0x6b);
+    method(0x6, 0x55667788);
+    method(0x7, 0x2 | (1u << 24));
+    gpu.getRenderer().debugSyncCommandBuffer(commands.get());
+    std::memcpy(&word, gpu_bytes, 4);
+    expect(word == 0x55667788 && gpu_bytes[4] == 0x6b && gpu_bytes[8] == 0x6b,
+           "Four-byte trigger release waits and leaves timestamp bytes untouched");
+    queue_fill(0x7c);
+    method(0x7, 0x2);
+    gpu.getRenderer().debugSyncCommandBuffer(commands.get());
+    std::memcpy(&word, gpu_bytes, 4);
+    std::memcpy(&timestamp, gpu_bytes + 8, 8);
+    expect(word == 0x55667788 && timestamp != 0x7c7c7c7c7c7c7c7cull,
+           "Long release publishes its payload and timestamp after GPU writes");
+    queue_fill(0x3d);
+    method(0x7, 0x2 | (1u << 20) | (1u << 24));
+    expect(static_cast<renderer::metal::CommandBuffer*>(commands.get())
+               ->getCommandBuffer()->status() == MTL::CommandBufferStatusNotEnqueued,
+           "WFI-disabled release does not submit the current command buffer");
+    method(0x1e, 0);
+    expect(gpu_bytes[0] == 0x3d && gpu_bytes[15] == 0x3d,
+           "WAIT_FOR_IDLE submits and completes prior work");
+    queue_fill(0x05);
+    method(0x1a, 0x05050505);
+    std::memcpy(&word, gpu_bytes, 4);
+    expect(word == 0x05050505,
+           "Acquire submits earlier GPU work that produces its value");
+    tls_crnt_command_buffer = nullptr;
+    commands.reset();
+    gmmu.unmap(GPU_MEMORY);
 
     // Fences: reached once the work of the submission finished
     setenv("HYDRA_GPU_FENCES", "1", 1);
@@ -1401,13 +1573,34 @@ void testChannelMethodsAndFences() {
     gpu.getPfifo().submitEntries(gmmu, {}, GpfifoFlags::FenceWait,
                                  [&] { waited_ran.set_value(); }, awaited);
     auto waited_future = waited_ran.get_future();
-    expect(waited_future.wait_for(std::chrono::milliseconds(300)) !=
+    expect(waited_future.wait_for(std::chrono::milliseconds(1200)) !=
                std::future_status::ready,
            "A submission waits for its fence before it runs");
     syncpoints.complete(awaited.id, 2);
     expect(waited_future.wait_for(std::chrono::seconds(5)) ==
                std::future_status::ready,
            "A submission runs once its fence is reached");
+
+    commands.reset(gpu.getRenderer().createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    queue_fill(0x09);
+    method(0x1d, (awaited.id << 8) | 1);
+    expect(gpu_bytes[0] == 0x09 &&
+               syncpoints.read(awaited.id) == awaited.value + 1,
+           "Emulated syncpoint increment follows prior GPU work");
+    tls_crnt_command_buffer = nullptr;
+    commands.reset();
+
+    // An unresolved fence must remain cancellable when the emulator stops.
+    std::atomic<bool> bypassed{false};
+    gpu.getPfifo().submitEntries(gmmu, {}, GpfifoFlags::FenceWait,
+        [&] { bypassed = true; }, {awaited.id, awaited.value + 2});
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const auto stopping = std::chrono::steady_clock::now();
+    gpu.getPfifo().shutdown();
+    expect(!bypassed && std::chrono::steady_clock::now() - stopping <
+               std::chrono::seconds(1),
+           "Shutdown cancels a pending fence without running its submission");
 
     tls_crnt_gmmu = nullptr;
     std::cout << "PASS: channel semaphores and GPU fences\n";
@@ -1435,6 +1628,8 @@ int main() {
         testInlineIndices();
         testClippedBlitRegions();
         testCacheCollisions();
+        testComputeQmdRead();
+        testStorageWritesRefreshTextures();
         testInlineToMemory();
         testDmaCopies();
         testChannelMethodsAndFences();

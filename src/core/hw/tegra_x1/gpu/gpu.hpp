@@ -38,6 +38,17 @@ constexpr usize SUBCHANNEL_COUNT = 8;
 inline thread_local GMmu* tls_crnt_gmmu = nullptr;
 inline thread_local renderer::ICommandBuffer* tls_crnt_command_buffer = nullptr;
 
+struct GpuChannelContext {
+    explicit GpuChannelContext(Gpu& gpu);
+    engines::ThreeD three_d;
+    engines::Compute compute;
+    engines::Inline inline_engine;
+    engines::TwoD two_d;
+    engines::Copy copy;
+    std::optional<engines::EngineBase*> subchannels[SUBCHANNEL_COUNT] = {};
+    u32 puller_regs[0x40] = {};
+};
+
 class Gpu {
   public:
     Gpu() noexcept;
@@ -159,19 +170,22 @@ class Gpu {
     // the host reaches when the Metal command buffer of the submission
     // completed. On by default; HYDRA_GPU_FENCES=0 turns them off (every fence
     // then reads as reached at once, while PFIFO still runs the work later).
-    bool reserveFence(Fence& out_fence);
+    bool reserveFence(Fence& out_fence, PfifoDecodeState* channel = nullptr,
+                      u32 increments = 1);
     // Reaches the fence of a submission
     std::function<void()> makeFenceSignal(const Fence& fence) const {
         return [syncpoints = video_syncpoints, id = fence.id] {
             syncpoints->complete(id, 1);
         };
     }
-    bool isFenceSyncpoint(u32 id) const {
-        return fence_syncpoint != 0 && id == fence_syncpoint;
+    bool isFenceSyncpoint(u32 id) {
+        std::scoped_lock lock(fence_mutex);
+        return fence_syncpoints.contains(id);
     }
 
     // Engines
     std::optional<engines::EngineBase*> getEngineAtSubchannel(u32 subchannel) {
+        auto& subchannels = channelContext().subchannels;
         if (subchannel >= SUBCHANNEL_COUNT || !subchannels[subchannel] ||
             *subchannels[subchannel] == nullptr)
             return std::nullopt;
@@ -195,7 +209,11 @@ class Gpu {
 
     // Getters
     Pfifo& getPfifo() { return pfifo; }
-    engines::ThreeD& get3DEngine() { return three_d_engine; }
+    engines::ThreeD& get3DEngine() { return channelContext().three_d; }
+    GpuChannelContext& channelContext() {
+        return tls_crnt_decode_state && tls_crnt_decode_state->context
+            ? *tls_crnt_decode_state->context : default_channel;
+    }
     renderer::IRenderer& getRenderer() const { return *renderer; }
 
   private:
@@ -203,12 +221,7 @@ class Gpu {
     Pfifo pfifo;
 
     // Engines
-    engines::ThreeD three_d_engine;
-    engines::Compute compute_engine;
-    engines::Inline inline_engine;
-    engines::TwoD two_d_engine;
-    engines::Copy copy_engine;
-    std::optional<engines::EngineBase*> subchannels[SUBCHANNEL_COUNT] = {};
+    GpuChannelContext default_channel;
 
     // Renderer
     std::unique_ptr<renderer::IRenderer> renderer;
@@ -226,12 +239,12 @@ class Gpu {
     std::shared_ptr<video::Syncpoints> video_syncpoints =
         std::make_shared<video::Syncpoints>();
     std::mutex fence_mutex;
-    std::atomic<u32> fence_syncpoint{0};
+    u32 fence_syncpoint{0};
     u32 fence_target{0};
+    std::set<u32> fence_syncpoints;
 
     // Puller (host) methods of the channel: semaphores and syncpoints
     void pullerMethod(u32 method, u32 arg);
-    u32 puller_regs[0x40] = {};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

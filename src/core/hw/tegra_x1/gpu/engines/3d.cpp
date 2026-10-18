@@ -571,6 +571,7 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
         gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type,
                                       0, count, regs.vertex_array_start,
                                       instance_index, 1);
+        synchronizeStorageWrites();
         profileDraw(count);
         captureVisualDraw(true);
     } else {
@@ -580,9 +581,19 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
         gpu.getRenderer().draw(tls_crnt_command_buffer, primitive_type,
                                regs.vertex_array_start, count, instance_index,
                                1);
+        synchronizeStorageWrites();
         profileDraw(count);
         captureVisualDraw(true);
     }
+}
+
+void ThreeD::synchronizeStorageWrites() {
+    if (storage_writes.empty())
+        return;
+    auto& cache = gpu.getRenderer().getTextureCache();
+    std::scoped_lock lock(cache.getMutex());
+    cache.synchronizeStorageWrites(tls_crnt_command_buffer, storage_writes);
+    storage_writes.clear();
 }
 
 // Names each draw in a GPU capture after its guest shaders, so Metal draws can
@@ -728,6 +739,7 @@ void ThreeD::drawVertexElementsImpl(
     labelCaptureDraw(count);
     gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type, 0,
                                   count, regs.base_vertex, instance_index, 1);
+    synchronizeStorageWrites();
     profileDraw(count);
     captureVisualDraw(true);
 }
@@ -2251,6 +2263,7 @@ void ThreeD::configureShaderStage(
             storage.host_index);
         // The shader may write it: users of the range read the live memory
         if (storage.written) {
+            storage_writes.push_back(*range);
             gpu.getRenderer().getBufferCache().markGpuModified(*range);
             gpu.getRenderer().getBufferCache().invalidateMemory(*range);
         }
@@ -2939,6 +2952,7 @@ void ThreeD::captureVisualDraw(bool after) {
 }
 
 bool ThreeD::drawInternal() {
+    storage_writes.clear();
     auto& visual = VisualDiagnostics::instance();
     const auto shader_address = [&](ShaderStage stage) {
         return static_cast<u64>(regs.shader_program_region) +
@@ -2973,6 +2987,23 @@ bool ThreeD::drawInternal() {
     gpu.getRenderer().setOcclusionCounterEnabled((regs_raw[0x545] & 1) != 0);
 
     auto& texture_cache = gpu.getRenderer().getTextureCache();
+    auto* pipeline = getPipeline();
+    // Resolve previous texture writes before this draw marks its targets as
+    // written. Storage buffers read and modify the guest allocation directly.
+    for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
+        const auto* shader = getShaderUnchecked(stage);
+        if (shader == nullptr)
+            continue;
+        const auto stage_index = static_cast<u32>(stage) - 1;
+        for (const auto& storage :
+             shader->getDescriptor().resource_mapping.storage_buffers) {
+            const auto range = resolveStorageBuffer(
+                bound_const_buffers[stage_index][storage.cbuf_slot],
+                storage.cbuf_offset);
+            if (range && texture_cache.hasUnflushedGpuWrites(*range))
+                texture_cache.flushMemory(tls_crnt_command_buffer, *range);
+        }
+    }
     const u64 epoch_before_targets = texture_cache.getEpoch();
     // Nothing changed in the texture cache since the previous draw: its
     // render target lookups (which only mark the same targets as written
@@ -2994,7 +3025,6 @@ bool ThreeD::drawInternal() {
         for (auto& stage_memo : texture_memo)
             for (auto& memo : stage_memo)
                 memo.view = nullptr;
-    auto* pipeline = getPipeline();
     gpu.getRenderer().bindRenderPass(render_pass);
     gpu.getRenderer().bindPipeline(pipeline);
     selectVisualResources();

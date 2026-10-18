@@ -164,8 +164,9 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
     // the texture is read now (for example through a view of another format
     // of the same memory). What the GPU holds in those parts is stale: write
     // back the parts that are still fresh, then load everything from guest
-    // memory. A render target that is rendered to again keeps its GPU data.
-    if (usage != TextureUsage::Write && !storage.stale_ranges.empty() &&
+    // memory. Render targets also need this reconciliation: a draw can keep
+    // pixels outside its viewport or scissor.
+    if (!storage.stale_ranges.empty() &&
         storage.gpu_written_timestamp > storage.flushed_timestamp) {
         const auto storage_range = storage.base->getDescriptor().getRange();
         bool fresh = false;

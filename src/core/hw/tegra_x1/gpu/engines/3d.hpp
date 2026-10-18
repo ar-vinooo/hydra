@@ -659,6 +659,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
         renderer::ShaderType::Count)] = {nullptr};
 
     // State
+    std::vector<ztd::Range<uptr>> storage_writes;
     ztd::Range<uptr>
         bound_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
                            [CONST_BUFFER_BINDING_COUNT];
@@ -743,6 +744,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
                               const TextureSamplerControl* tex_sampler_pool);
 
     bool drawInternal();
+    void synchronizeStorageWrites();
     void selectVisualResources();
     void captureVisualDraw(bool after);
 };

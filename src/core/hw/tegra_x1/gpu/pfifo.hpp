@@ -2,6 +2,9 @@
 
 #include "core/hw/tegra_x1/gpu/const.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include <atomic>
+#include <deque>
+#include <set>
 
 namespace hydra::hw::tegra_x1::cpu {
 class IMmu;
@@ -10,9 +13,43 @@ class IMmu;
 namespace hydra::hw::tegra_x1::gpu {
 
 class Gpu;
+struct GpuChannelContext;
+
+struct PfifoPacket {
+    u32 method{0};
+    u32 subchannel{0};
+    u32 remaining{0};
+    bool increment{false};
+    bool one_increment{false};
+    std::vector<std::pair<u32, u32>> macro_args;
+};
+
+struct PfifoSemaphoreWait {
+    u64 address;
+    u32 payload;
+    u32 operation;
+};
+
+struct PfifoDecodeState : PfifoPacket {
+    PfifoDecodeState();
+    ~PfifoDecodeState();
+    std::unique_ptr<GpuChannelContext> context;
+    std::optional<PfifoSemaphoreWait> semaphore_wait;
+    std::optional<Fence> syncpoint_wait;
+    std::atomic<bool> failed{false};
+    std::atomic<u32> error{0};
+    std::atomic<u64> fault_time{0};
+    std::function<void()> on_fault;
+    void fail(u32 code);
+    u32 fence_id{0};
+    u32 fence_target{0};
+    void resetPacket() { static_cast<PfifoPacket&>(*this) = {}; }
+};
+
+inline thread_local PfifoDecodeState* tls_crnt_decode_state = nullptr;
 
 struct GpfifoEntryList {
-    GMmu& gmmu;
+    GMmu* gmmu;
     std::vector<GpfifoEntry> entries;
     GpfifoFlags flags;
     uint64_t correlation_id;
@@ -21,6 +58,9 @@ struct GpfifoEntryList {
     // With GpfifoFlags::FenceWait the GPU does not start the entries before
     // this fence is reached
     Fence wait_fence{};
+    std::shared_ptr<PfifoDecodeState> decode_state;
+    usize entry_index{0};
+    u64 word_offset{0};
 };
 
 class Pfifo {
@@ -28,41 +68,47 @@ class Pfifo {
     explicit Pfifo(Gpu& gpu_);
     ~Pfifo();
     void shutdown();
+    void cancel(GMmu& gmmu);
+    bool isStopping() const { return stop.load(std::memory_order_relaxed); }
 
-    void submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
+    bool submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                        GpfifoFlags flags,
                        std::function<void()> on_complete = {},
-                       Fence wait_fence = {});
+                       Fence wait_fence = {},
+                       std::shared_ptr<PfifoDecodeState> decode_state = {});
 
     // Number of entry lists submitted so far
     u64 getSubmittedCount();
     // Waits till the first `count` entry lists have been executed
-    void waitForCompletion(u64 count);
+    bool waitForCompletion(u64 count);
 
   private:
     Gpu& gpu;
+    PfifoDecodeState default_decode_state;
 
     std::mutex mutex;
     std::condition_variable cond_var;
 
-    std::queue<GpfifoEntryList> entry_lists;
-    bool stop{false};
+    std::deque<GpfifoEntryList> entry_lists;
+    std::atomic<bool> stop{false};
+    GMmu* active_gmmu{nullptr};
 
     // Completion tracking
     u64 submitted_count{0};
     u64 completed_count{0};
+    std::set<u64> retired_submissions;
     std::condition_variable completed_cond_var;
 
     std::thread thread; // TODO: jthread
 
     void threadFunc();
 
-    void submitEntry(const GpfifoEntry entry);
-    bool submitCommand(uptr& gpu_addr); // TODO: return void
+    bool ready(GpfifoEntryList& list);
+    bool submitEntry(GpfifoEntry entry, PfifoDecodeState& state, u64& word_offset);
+    bool submitCommand(u32 raw_header, PfifoDecodeState& state);
 
     // Helpers
-    void processMethodArg(u32 subchannel, uptr& gpu_addr, u32& method,
-                          bool increment);
+    void processMethodArg(u32 arg, PfifoDecodeState& state);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

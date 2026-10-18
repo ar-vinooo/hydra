@@ -10,6 +10,12 @@ Implemented end to end and unit tested. **Not seen in a game**: no reachable sha
 - **Binding** (`engines/storage_buffer.hpp`, 3D `configureShaderStage`, `Compute::launch`): reads `{u64 gpu_addr, u32 size}` from the bound cbuf, resolves it through the GMMU (clamped to the mapping) and binds `IRenderer::getGuestMemoryBuffer(range)`.
 - **Metal** (`metal::Renderer::getGuestMemoryBuffer`): `newBuffer(bytesNoCopy)` over the host pages, so GPU writes land in guest memory with no copy. Cached by first page (cleared past 256 entries; views keep theirs alive).
 - Written buffers invalidate the **buffer cache** for the range at bind time.
+- Update 2026-10-18: graphics and compute wait for storage-writing work before
+  invalidating the overlapping texture cache. Storage bindings flush earlier
+  texture writes into guest memory first; graphics does this before marking
+  the current draw's render targets. Partial guest overwrites are reconciled
+  before both texture reads and render-target reuse. This is a synchronous
+  correctness fallback; GPU-only transfers remain a future optimization.
 
 ## Tests
 - `testGlobalMemory` (shader-library): every LDG/STG size, out-of-range reads/writes, 8-thread ATOM/RED, signed MIN, EXCH, F32 ADD, INC no-op.
@@ -17,7 +23,10 @@ Implemented end to end and unit tested. **Not seen in a game**: no reachable sha
 - Corpus: 1634 + 1137 shaders still compile.
 
 ## Open
-- **Coherence**: a draw/dispatch that writes an SSBO invalidates the buffer cache when it is *encoded*; consumers that snapshot the bytes on the CPU before the GPU has run (vertex/uniform buffers of the same frame) can still see old data. The texture cache is not invalidated. The proper fix is GPU-GPU copies from the aliased buffer for ranges marked GPU-modified (audit `compute_memory_sync.md` P1-3, stage 3).
+- **Coherence optimization**: replace the synchronous storage-write checkpoint
+  with ordered GPU transfers where possible. The current checkpoint is used
+  only for shaders with writable storage buffers; read-only bindings do not
+  introduce this wait. Cross-format copy completeness remains separate.
 - The shader checks the descriptor's size, the host only guarantees the mapped part: a descriptor larger than its GMMU mapping can fault the GPU.
 - `ATOM.CAS` (0xeef0), 64-bit and F16x2 atomics, `.E`-less 32-bit addresses, absolute addresses (`RZ` base), constant-buffer SSBO arrays (dynamic descriptor index), generic `LD`/`ST`, `SAFEADD`.
 - Tracking is a linear backward scan: an address built across a branch join is not followed. A failed track logs a warning and the access is dropped (loads read 0).

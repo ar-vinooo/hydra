@@ -20,6 +20,8 @@ struct AddressSpace {
 class GMmu : public GenericMmu<GMmu, AddressSpace> {
   public:
     explicit GMmu(cpu::IMmu* mmu_) : mmu{mmu_} {}
+    void cancelGpuWork() { gpu_cancelled.store(true, std::memory_order_release); }
+    bool gpuWorkCancelled() const { return gpu_cancelled.load(std::memory_order_acquire); }
 
     static u64 implGetSize(const AddressSpace& as) { return as.size; }
 
@@ -71,6 +73,7 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
   private:
     cpu::IMmu* mmu;
+    std::atomic<bool> gpu_cancelled{false};
 
     // TODO: use a better way to allocate new memory
     uptr address_space_base{GPU_PAGE_SIZE};

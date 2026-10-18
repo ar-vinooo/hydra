@@ -31,7 +31,7 @@ class ChannelBase : public FdBase {
     // Ioctls
     // TODO: args
     NvResult submit(IoctlContext* context);
-    NvResult getSyncpoint(IoctlContext* context, u32 module_id, u32* out_value);
+    virtual NvResult getSyncpoint(IoctlContext* context, u32 module_id, u32* out_value);
     NvResult getWaitBase(u32 module_id, u32* out_value);
     NvResult setSubmitTimeout(u32 timeout);
     NvResult mapCmdBuffer(IoctlContext* context);
@@ -84,7 +84,7 @@ class ChannelBase : public FdBase {
         LOG_FATAL(Services, "GetErrorNotification not available");
     }
     virtual NvResult
-    allocGpfifoEx(u32 num_entries, u32 num_jobs, u32 flags,
+    allocGpfifoEx([[maybe_unused]] IoctlContext* context, u32 num_entries, u32 num_jobs, u32 flags,
                   hw::tegra_x1::gpu::Fence* out_fence,
                   [[maybe_unused]] std::array<u32, 3> reserved) {
         (void)out_fence;

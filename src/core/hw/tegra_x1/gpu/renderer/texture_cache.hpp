@@ -192,6 +192,9 @@ class TextureCache {
                        TextureUsage usage);
 
     void invalidateMemory(ztd::Range<uptr> range);
+    void synchronizeStorageWrites(
+        ICommandBuffer* command_buffer,
+        const std::vector<ztd::Range<uptr>>& ranges);
     // The GPU writes to the range are also in guest memory (written there
     // directly), so they must not be written back over it
     void markGpuWritesInGuest(ztd::Range<uptr> range);
