@@ -164,6 +164,18 @@ int main() {
         check(ShaderCache::hash(vertex) != shader_base,
               "Code sample changes shader key");
         code[80] = 0;
+        for (auto stage : {engines::ShaderStage::VertexB, engines::ShaderStage::Fragment,
+                           engines::ShaderStage::Compute}) {
+            auto probe = vertex;
+            probe.stage = stage;
+            const auto original = ShaderCache::hash(probe);
+            for (usize offset : {0u, 71u, 79u, 81u, 255u, 2048u, 4095u}) {
+                code[offset] = 7;
+                check(ShaderCache::hash(probe) != original,
+                      "Every code region, including compute entry and graphics header, affects identity");
+                code[offset] = 0;
+            }
+        }
         auto fragment = vertex;
         fragment.stage = engines::ShaderStage::Fragment;
         const auto fragment_base = ShaderCache::hash(fragment);

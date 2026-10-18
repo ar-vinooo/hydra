@@ -281,7 +281,9 @@ u32 getMinimumWidth(u32 width, renderer::TextureFormat format, u32 width_hint) {
 
 } // namespace
 
-DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0xb2, 1,
+DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x87, 1,
+                    invalidateShaderCaches, u32, 0x369, 1,
+                    invalidateShaderCaches, u32, 0xb2, 1,
                     incrementSyncPoint, u32, 0x485, 2,
                     drawVertexArrayCompact, u32, 0x5f9, 6,
                     drawVertexElementsCompact, u32, 0x45, 1,
@@ -297,6 +299,24 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0xb2, 1,
                     ClearBufferData, 0x6c3, 1, setReportSemaphore, u32, 0x8c4,
                     1, firmwareCall4, u32, 0x8e4, 16, loadConstBuffer, u32,
                     0x900, 5 * 8, bindGroup, u32)
+
+void invalidateShaderInstructions(Gpu& gpu, u32 flags) {
+    // clb197.h / clb1c0.h: INSTRUCTION bit 0. Data/constant cache behavior
+    // remains handled by the buffer/texture coherence paths, not this epoch.
+    if ((flags & 1u) == 0) return;
+    // Translation reads code on the CPU. A conservative checkpoint makes
+    // earlier GPU code writes visible, also for the NO_WFI method variant.
+    if (tls_crnt_command_buffer &&
+        !gpu.getRenderer().synchronize(tls_crnt_command_buffer)) {
+        if (tls_crnt_decode_state) tls_crnt_decode_state->fail(25);
+        return;
+    }
+    gpu.getRenderer().getShaderCache().invalidateInstructions();
+}
+
+void ThreeD::invalidateShaderCaches(u32, u32 flags) {
+    invalidateShaderInstructions(gpu, flags);
+}
 
 void ThreeD::incrementSyncPoint(u32 index, u32 arg) {
     (void)index;
@@ -811,10 +831,21 @@ void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
             respect_stencil_mask ? regs_raw[REG_STENCIL_FRONT_MASK] & 0xff : 0xff,
     });
 
-    if (data.color_mask != 0x0 && data.target_id < COLOR_TARGET_COUNT)
-        gpu.getRenderer().clearColor(tls_crnt_command_buffer, data.target_id,
-                                     data.layer_id, data.color_mask,
-                                     std::bit_cast<simd::uint4>(regs.clear_color));
+    if (data.color_mask != 0x0 && data.target_id < COLOR_TARGET_COUNT) {
+        auto color = std::bit_cast<std::array<u32, 4>>(regs.clear_color);
+        u8 mask = static_cast<u8>(data.color_mask);
+        // Alpha-only/ARGB guest formats keep their channels elsewhere in the
+        // Metal format with the same memory layout
+        renderer::swizzleClearColor(
+            renderer::toColorOutputSwizzle(
+                regs.color_targets[regs.color_target_control.getMap(data.target_id)]
+                    .format),
+            color, mask);
+        if (mask != 0x0)
+            gpu.getRenderer().clearColor(tls_crnt_command_buffer, data.target_id,
+                                         data.layer_id, mask,
+                                         std::bit_cast<simd::uint4>(color));
+    }
 
     if (data.depth)
         gpu.getRenderer().clearDepth(tls_crnt_command_buffer, data.layer_id,
@@ -1535,6 +1566,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
 
         descriptor.state.color_target_data_types[i] =
             renderer::toColorDataType(render_target.format);
+        descriptor.state.color_target_swizzles[i] = static_cast<u8>(
+            renderer::toColorOutputSwizzle(render_target.format));
     }
 
     // Dual-source blending: only render target 0 is bound, the shader exports
@@ -1561,6 +1594,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             descriptor.state.dual_source_blending = true;
             descriptor.state.color_target_data_types[1] =
                 descriptor.state.color_target_data_types[0];
+            descriptor.state.color_target_swizzles[1] =
+                descriptor.state.color_target_swizzles[0];
         }
     }
 
@@ -3106,6 +3141,33 @@ void ThreeD::captureVisualDraw(bool after) {
     }
 }
 
+// clb197.h: SET_ANTI_ALIAS (0x15d0) SAMPLES[3:0], SET_ANTI_ALIAS_ALPHA_CONTROL
+// (0x153c) ALPHA_TO_COVERAGE[0] / ALPHA_TO_ONE[4]. None of these are
+// implemented yet; record how often the guest relies on them.
+void ThreeD::noteUnimplementedMultisample() {
+    constexpr u32 REG_ANTI_ALIAS = 0x15d0 / 4;
+    constexpr u32 REG_ANTI_ALIAS_ALPHA_CONTROL = 0x153c / 4;
+    const u32 samples_mode = regs_raw[REG_ANTI_ALIAS] & 0xf;
+    const u32 alpha_control = regs_raw[REG_ANTI_ALIAS_ALPHA_CONTROL];
+    const bool alpha_to_coverage = (alpha_control & 0x1) != 0;
+    const bool alpha_to_one = (alpha_control & 0x10) != 0;
+    if (samples_mode != 0) {
+        PerfStats::instance().msaa_draws++;
+        ONCE(LOG_WARN(Engines,
+                      "Draw with SET_ANTI_ALIAS mode {}: MSAA is not implemented, "
+                      "drawing without multisampling",
+                      samples_mode));
+    }
+    if (alpha_to_coverage) {
+        PerfStats::instance().alpha_to_coverage_draws++;
+        ONCE(LOG_WARN(Engines, "Draw with alpha-to-coverage: not implemented"));
+    }
+    if (alpha_to_one) {
+        PerfStats::instance().alpha_to_one_draws++;
+        ONCE(LOG_WARN(Engines, "Draw with alpha-to-one: not implemented"));
+    }
+}
+
 bool ThreeD::drawInternal() {
     storage_writes.clear();
     auto& visual = VisualDiagnostics::instance();
@@ -3115,6 +3177,7 @@ bool ThreeD::drawInternal() {
     };
     visual.beginDraw(shader_address(ShaderStage::VertexB), shader_address(ShaderStage::Fragment));
     PerfStats::instance().draws++;
+    noteUnimplementedMultisample();
 
     // State
     if (!regs.shader_programs[static_cast<u32>(ShaderStage::VertexB)]

@@ -101,153 +101,65 @@ struct ShaderOverrides {
     }
 };
 
-} // namespace
+// The same explicit fields form the hash and the exact collision key. Do not
+// hash struct padding or treat a 32-bit hash as proof of descriptor equality.
+struct ShaderKeyBuilder {
+    std::vector<u32> words;
+    ShaderKeyBuilder() { words.reserve(128); }
+    void add(u32 value) { words.push_back(value); }
+    void add(u64 value) { add(u32(value)); add(u32(value >> 32)); }
+    template <typename T> void add(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        for (usize i = 0; i < sizeof(T); ++i) add(u32(bytes[i]));
+    }
+};
 
-ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
-    ShaderOverrides::instance().poll();
-    const auto inspect = [&](const GuestShaderDescriptor& actual, ShaderBase* shader) {
-        auto& visual = VisualDiagnostics::instance();
-        if (!visual.selected()) return shader;
-        const auto key = fmt::format("shader-{:x}-{}-{:x}-r{}", actual.gpu_addr,
-            actual.stage, hash(actual), ::hydra::hot::generation());
-        visual.event("shader_cache", {{"identity", key},
-            {"guest_address", std::to_string(actual.gpu_addr)},
-            {"stage", fmt::format("{}", actual.stage)},
-            {"shader_present", shader ? "1" : "0"}});
-        if (!shader || !visual.wantsShader(key)) return shader;
-        auto code = tls_crnt_gmmu->readMappedBytes(actual.gpu_addr, 0x10000);
-        visual.artifact(key + ".guest.bin", std::span<const uint8_t>(code));
-        visual.artifact(key + ".bound.metal", std::span<const uint8_t>(shader->getDescriptor().code));
-        visual.event("shader_snapshot", {{"identity", key},
-            {"guest_fnv1a64", VisualDiagnostics::contentId(code)},
-            {"bound_source_fnv1a64", VisualDiagnostics::contentId(shader->getDescriptor().code)},
-            {"decoder", "diagnostic_replay_of_current_guest_bytes"}});
-        if (code.size() < (actual.stage == engines::ShaderStage::Compute ? 8u : 88u)) {
-            visual.event("shader_snapshot_incomplete", {{"identity", key}});
-            return shader;
-        }
-        visual.beginShader(key);
-        struct EndShader {
-            VisualDiagnostics& visual;
-            ~EndShader() { visual.endShader(); }
-        } end_shader{visual};
-        try {
-            ztd::io::MemoryStream stream(code);
-            ShaderDescriptor replay{};
-            replay.type = engines::toRendererShaderType(actual.stage);
-            shader_decomp::decompile(stream, replay.type, actual.state,
-                replay.backend, replay.code, replay.resource_mapping, actual.read_const_word);
-            visual.artifact(key + ".replay.metal", std::span<const uint8_t>(replay.code));
-            visual.event("shader_replay", {{"identity", key},
-                {"matches_bound_source", replay.code == shader->getDescriptor().code ? "1" : "0"},
-                {"note", "difference can indicate an MSL override, changed guest code, or changed specialization; compilation is not semantic validation"}});
-        } catch (const std::exception& error) {
-            visual.event("shader_replay_failed", {{"identity", key}, {"error", error.what()}});
-        }
-        return shader;
-    };
-    const auto base_hash = hash(descriptor);
-    // Most shaders have no constant-buffer jump table. Reuse the hash and
-    // avoid copying all resource maps just to perform the same lookup again.
-    const auto dependency = branch_dependencies.find(base_hash);
-    if (dependency == branch_dependencies.end() || dependency->second.empty()) {
-        auto it = cache.find(base_hash);
-        if (it == cache.end())
-            it = cache.emplace(base_hash, create(descriptor)).first;
-        return inspect(descriptor, it->second);
+bool matchesMappedCode(uptr address, const std::vector<u8>& bytes) {
+    usize offset = 0;
+    while (offset < bytes.size()) {
+        uptr base;
+        const auto mapping = tls_crnt_gmmu->findAddr(address + offset, base);
+        if (!mapping || mapping->ptr == 0) return false;
+        const auto within = address + offset - base;
+        const auto count = std::min<usize>(mapping->size - within, bytes.size() - offset);
+        if (std::memcmp(bytes.data() + offset,
+                        reinterpret_cast<const void*>(mapping->ptr + within), count) != 0)
+            return false;
+        offset += count;
     }
-    auto actual = descriptor;
-    if (const auto it = branch_dependencies.find(base_hash);
-        it != branch_dependencies.end()) {
-        for (const auto& [location, previous] : it->second) {
-            const auto value = descriptor.read_const_word
-                                   ? descriptor.read_const_word(location.first,
-                                                                location.second)
-                                   : std::nullopt;
-            (void)previous;
-            if (!value) {
-                LOG_ERROR(ShaderDecompiler, "Missing branch table c{}[{}]",
-                          location.first, location.second);
-                return nullptr;
-            }
-            actual.state.branch_constants[location] = *value;
-        }
-    }
-    return inspect(actual, CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor>::find(actual));
+    if (bytes.size() == 0x10000) return true;
+    // A previously unmapped tail becoming mapped also changes the snapshot.
+    uptr base;
+    const auto tail = tls_crnt_gmmu->findAddr(address + bytes.size(), base);
+    return !tail || tail->ptr == 0;
 }
 
-ShaderBase* ShaderCache::createHot1(const GuestShaderDescriptor& descriptor) {
-    ShaderDescriptor host_descriptor{};
-    host_descriptor.type = engines::toRendererShaderType(descriptor.stage);
-    host_descriptor.writes_layer =
-        descriptor.stage == engines::ShaderStage::VertexB &&
-        descriptor.state.layer_output_addr != 0;
-
-    // Decompile
-    // Gameplay shaders can exceed 4 KiB, and guest-contiguous code may span
-    // physically separate pages. Decode an owned, bounded snapshot.
-    auto code = tls_crnt_gmmu->readMappedBytes(descriptor.gpu_addr, 0x10000);
-    const usize minimum_size =
-        descriptor.stage == engines::ShaderStage::Compute ? 8 : 80 + 8;
-    if (code.size() < minimum_size) {
-        LOG_ERROR(ShaderDecompiler, "Shader at {:#x} has only {} mapped bytes",
-                  descriptor.gpu_addr, code.size());
-        return nullptr;
-    }
-    if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
-        static std::atomic<u32> input_index{0};
-        std::ofstream out(
-            fmt::format("{}/gpu_{:#x}_{}_{:04}.bin", dump_dir,
-                        descriptor.gpu_addr, host_descriptor.type,
-                        input_index++),
-            std::ios::binary);
-        out.write(reinterpret_cast<const char*>(code.data()),
-                  static_cast<std::streamsize>(code.size()));
-    }
-    ztd::io::MemoryStream code_stream(code);
-    shader_decomp::decompile(
-        code_stream, host_descriptor.type, descriptor.state,
-        host_descriptor.backend, host_descriptor.code,
-        host_descriptor.resource_mapping, descriptor.read_const_word);
-    host_descriptor.writes_layer |= host_descriptor.resource_mapping.writes_layer;
-    if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
-        std::ofstream out(fmt::format("{}/gpu_{:#x}_{}.metal", dump_dir,
-                                      descriptor.gpu_addr,
-                                      host_descriptor.type),
-                          std::ios::binary);
-        out.write(reinterpret_cast<const char*>(host_descriptor.code.data()),
-                  static_cast<std::streamsize>(host_descriptor.code.size()));
-    }
-    if (const auto source = ShaderOverrides::instance().read(
-            descriptor.gpu_addr, host_descriptor.type)) {
-        LOG_INFO(ShaderDecompiler, "Overriding shader {:#x}", descriptor.gpu_addr);
-        host_descriptor.code.assign(source->begin(), source->end());
-    }
-    auto base_descriptor = descriptor;
-    base_descriptor.state.branch_constants.clear();
-    branch_dependencies[hash(base_descriptor)] =
-        host_descriptor.resource_mapping.branch_constants;
-    return renderer.createShader(host_descriptor);
-}
-
-u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
+std::vector<u32> makeShaderKey(const GuestShaderDescriptor& descriptor) {
     // Hash enum values as words rather than feeding each byte separately.
     // Keep explicit fields: hashing whole structs would include padding.
-    ztd::hash::XxHash32 hash;
+    ShaderKeyBuilder hash;
+    hash.add(descriptor.gpu_addr);
+    hash.add(reinterpret_cast<uptr>(tls_crnt_gmmu));
+    hash.add(::hydra::hot::generation());
+    hash.add(descriptor.code_revision);
     hash.add(static_cast<u32>(descriptor.stage));
     hash.add(descriptor.code_ptr);
     hash.add(descriptor.state.program_offset);
     hash.add(ShaderOverrides::instance().getGeneration(descriptor.gpu_addr));
+    hash.add(descriptor.state.branch_constants.size());
     for (const auto& [location, value] : descriptor.state.branch_constants) {
         hash.add(location.first);
         hash.add(location.second);
         hash.add(value);
     }
+    hash.add(descriptor.state.buffer_texture_formats.size());
     for (const auto& [index, format] :
          descriptor.state.buffer_texture_formats) {
         hash.add(index);
         hash.add(static_cast<u32>(format));
     }
+    hash.add(descriptor.state.integer_texture_formats.size());
     for (const auto& [index, format] :
          descriptor.state.integer_texture_formats) {
         hash.add(index | 0x80000000u);
@@ -255,38 +167,26 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
     }
     if (descriptor.stage == engines::ShaderStage::Compute) {
         hash.add(descriptor.state.shared_memory_size);
+        hash.add(descriptor.state.image_formats.size());
         for (const auto& [index, format] : descriptor.state.image_formats) {
             hash.add(index);
             hash.add(static_cast<u32>(format));
         }
     }
 
-    // Take a few samples from the code (one mapping lookup when they are all
-    // in the same mapping, which is almost always the case)
-    {
-        uptr base = 0;
-        std::optional<AddressSpace> as;
-        for (usize offset = 80; offset < 224; offset += 18) {
-            const auto addr = descriptor.gpu_addr + offset;
-            if (!as || addr - base >= as->size) {
-                as = tls_crnt_gmmu->findAddr(addr, base);
-                if (!as || as->ptr == 0)
-                    break;
-            }
-            hash.add(*reinterpret_cast<const u8*>(as->ptr + addr - base));
-        }
-    }
-
+    hash.add(descriptor.state.texture_lod_bias.size());
     for (const auto& [index, bias] : descriptor.state.texture_lod_bias) {
         hash.add(index);
         hash.add(bias);
     }
 
+    hash.add(descriptor.state.texture_type_hints.size());
     for (const auto& [index, type] : descriptor.state.texture_type_hints) {
         hash.add(index | 0x40000000u);
         hash.add(static_cast<u32>(type));
     }
 
+    hash.add(descriptor.state.border_samplers.size());
     for (const auto& [index, sampler] : descriptor.state.border_samplers) {
         hash.add(index);
         hash.add(sampler.min_filter);
@@ -351,9 +251,192 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
              descriptor.state.color_target_data_types) {
             hash.add(static_cast<u32>(color_target_data_type));
         }
+        for (const auto swizzle : descriptor.state.color_target_swizzles)
+            hash.add(static_cast<u32>(swizzle));
     }
 
+    return std::move(hash.words);
+}
+
+
+} // namespace
+
+ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
+    ShaderOverrides::instance().poll();
+    const auto inspect = [&](const GuestShaderDescriptor& actual, ShaderBase* shader) {
+        auto& visual = VisualDiagnostics::instance();
+        if (!visual.selected()) return shader;
+        const auto key = fmt::format("shader-{:x}-{}-{:x}-r{}", actual.gpu_addr,
+            actual.stage, hash(actual), ::hydra::hot::generation());
+        visual.event("shader_cache", {{"identity", key},
+            {"guest_address", std::to_string(actual.gpu_addr)},
+            {"stage", fmt::format("{}", actual.stage)},
+            {"shader_present", shader ? "1" : "0"}});
+        if (!shader || !visual.wantsShader(key)) return shader;
+        auto code = actual.code_snapshot ? *actual.code_snapshot
+            : tls_crnt_gmmu->readMappedBytes(actual.gpu_addr, 0x10000);
+        visual.artifact(key + ".guest.bin", std::span<const uint8_t>(code));
+        visual.artifact(key + ".bound.metal", std::span<const uint8_t>(shader->getDescriptor().code));
+        visual.event("shader_snapshot", {{"identity", key},
+            {"guest_fnv1a64", VisualDiagnostics::contentId(code)},
+            {"bound_source_fnv1a64", VisualDiagnostics::contentId(shader->getDescriptor().code)},
+            {"decoder", "diagnostic_replay_of_current_guest_bytes"}});
+        if (code.size() < (actual.stage == engines::ShaderStage::Compute ? 8u : 88u)) {
+            visual.event("shader_snapshot_incomplete", {{"identity", key}});
+            return shader;
+        }
+        visual.beginShader(key);
+        struct EndShader {
+            VisualDiagnostics& visual;
+            ~EndShader() { visual.endShader(); }
+        } end_shader{visual};
+        try {
+            ztd::io::MemoryStream stream(code);
+            ShaderDescriptor replay{};
+            replay.type = engines::toRendererShaderType(actual.stage);
+            shader_decomp::decompile(stream, replay.type, actual.state,
+                replay.backend, replay.code, replay.resource_mapping, actual.read_const_word);
+            visual.artifact(key + ".replay.metal", std::span<const uint8_t>(replay.code));
+            visual.event("shader_replay", {{"identity", key},
+                {"matches_bound_source", replay.code == shader->getDescriptor().code ? "1" : "0"},
+                {"note", "difference can indicate an MSL override, changed guest code, or changed specialization; compilation is not semantic validation"}});
+        } catch (const std::exception& error) {
+            visual.event("shader_replay_failed", {{"identity", key}, {"error", error.what()}});
+        }
+        return shader;
+    };
+    std::scoped_lock lock(lookup_mutex);
+    auto actual = descriptor;
+    auto& source = sources[{reinterpret_cast<uptr>(tls_crnt_gmmu), descriptor.gpu_addr,
+                            descriptor.stage}];
+    const auto epoch = instruction_epoch.load();
+    if (!source.bytes || source.validated_epoch != epoch ||
+        !matchesMappedCode(descriptor.gpu_addr, *source.bytes)) {
+        auto bytes = tls_crnt_gmmu->readMappedBytes(descriptor.gpu_addr, 0x10000);
+        const usize minimum = descriptor.stage == engines::ShaderStage::Compute ? 8 : 88;
+        if (bytes.size() < minimum) return nullptr;
+        // A -> B -> A code uploads should reuse A's immutable artifact rather
+        // than accumulating duplicate shader/pipeline objects every frame.
+        const auto known = std::find_if(source.history.begin(), source.history.end(),
+            [&](const auto& version) { return *version.first == bytes; });
+        if (known != source.history.end()) {
+            source.bytes = known->first;
+            source.revision = known->second;
+        } else {
+            source.bytes = std::make_shared<const std::vector<u8>>(std::move(bytes));
+            source.revision = ++next_code_revision;
+            source.history.emplace_back(source.bytes, source.revision);
+        }
+        source.validated_epoch = epoch;
+    }
+    actual.code_snapshot = source.bytes;
+    actual.code_revision = source.revision;
+    actual.state.branch_constants.clear();
+    actual.cache_key = makeShaderKey(actual);
+    if (const auto it = branch_dependencies.find(actual.cache_key);
+        it != branch_dependencies.end() && !it->second.empty()) {
+        for (const auto& [location, previous] : it->second) {
+            const auto value = descriptor.read_const_word
+                                   ? descriptor.read_const_word(location.first,
+                                                                location.second)
+                                   : std::nullopt;
+            (void)previous;
+            if (!value) {
+                LOG_ERROR(ShaderDecompiler, "Missing branch table c{}[{}]",
+                          location.first, location.second);
+                return nullptr;
+            }
+            actual.state.branch_constants[location] = *value;
+        }
+        actual.cache_key = makeShaderKey(actual);
+    }
+    return inspect(actual, CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true>::find(actual));
+}
+
+ShaderBase* ShaderCache::createHot1(const GuestShaderDescriptor& descriptor) {
+    ShaderDescriptor host_descriptor{};
+    host_descriptor.type = engines::toRendererShaderType(descriptor.stage);
+    host_descriptor.writes_layer =
+        descriptor.stage == engines::ShaderStage::VertexB &&
+        descriptor.state.layer_output_addr != 0;
+
+    // Decompile
+    // Gameplay shaders can exceed 4 KiB, and guest-contiguous code may span
+    // physically separate pages. Decode an owned, bounded snapshot.
+    auto code = descriptor.code_snapshot ? *descriptor.code_snapshot
+        : tls_crnt_gmmu->readMappedBytes(descriptor.gpu_addr, 0x10000);
+    const usize minimum_size =
+        descriptor.stage == engines::ShaderStage::Compute ? 8 : 80 + 8;
+    if (code.size() < minimum_size) {
+        LOG_ERROR(ShaderDecompiler, "Shader at {:#x} has only {} mapped bytes",
+                  descriptor.gpu_addr, code.size());
+        return nullptr;
+    }
+    if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
+        static std::atomic<u32> input_index{0};
+        std::ofstream out(
+            fmt::format("{}/gpu_{:#x}_{}_{:04}.bin", dump_dir,
+                        descriptor.gpu_addr, host_descriptor.type,
+                        input_index++),
+            std::ios::binary);
+        out.write(reinterpret_cast<const char*>(code.data()),
+                  static_cast<std::streamsize>(code.size()));
+    }
+    ztd::io::MemoryStream code_stream(code);
+    shader_decomp::decompile(
+        code_stream, host_descriptor.type, descriptor.state,
+        host_descriptor.backend, host_descriptor.code,
+        host_descriptor.resource_mapping, descriptor.read_const_word);
+    host_descriptor.writes_layer |= host_descriptor.resource_mapping.writes_layer;
+    if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
+        std::ofstream out(fmt::format("{}/gpu_{:#x}_{}.metal", dump_dir,
+                                      descriptor.gpu_addr,
+                                      host_descriptor.type),
+                          std::ios::binary);
+        out.write(reinterpret_cast<const char*>(host_descriptor.code.data()),
+                  static_cast<std::streamsize>(host_descriptor.code.size()));
+    }
+    if (const auto source = ShaderOverrides::instance().read(
+            descriptor.gpu_addr, host_descriptor.type)) {
+        LOG_INFO(ShaderDecompiler, "Overriding shader {:#x}", descriptor.gpu_addr);
+        host_descriptor.code.assign(source->begin(), source->end());
+    }
+    auto base_descriptor = descriptor;
+    base_descriptor.state.branch_constants.clear();
+    branch_dependencies[makeShaderKey(base_descriptor)] =
+        host_descriptor.resource_mapping.branch_constants;
+    return renderer.createShader(host_descriptor);
+}
+
+u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
+    ztd::hash::XxHash32 hash;
+    if (!descriptor.cache_key.empty()) {
+        for (const auto word : descriptor.cache_key) hash.add(word);
+    } else {
+        for (const auto word : makeShaderKey(descriptor)) hash.add(word);
+    }
+    if (descriptor.cache_key.empty()) {
+        // Direct callers of hash() also see every mapped byte, including the
+        // graphics header, compute entry and code beyond the old sample range.
+        auto code = descriptor.code_snapshot ? *descriptor.code_snapshot
+            : tls_crnt_gmmu->readMappedBytes(descriptor.gpu_addr, 0x10000);
+        hash.add(code.size());
+        usize offset = 0;
+        for (; offset + 4 <= code.size(); offset += 4) {
+            u32 word;
+            std::memcpy(&word, code.data() + offset, 4);
+            hash.add(word);
+        }
+        for (; offset < code.size(); ++offset) hash.add(u32(code[offset]));
+    }
     return hash.toHashCode();
+}
+
+bool ShaderCache::equals(const GuestShaderDescriptor& a,
+                         const GuestShaderDescriptor& b) {
+    return a.cache_key == b.cache_key &&
+           (a.code_snapshot == b.code_snapshot ||
+            (a.code_snapshot && b.code_snapshot && *a.code_snapshot == *b.code_snapshot));
 }
 
 void ShaderCache::destroyElement(ShaderBase* shader) { delete shader; }

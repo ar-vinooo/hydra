@@ -38,6 +38,10 @@ struct PerfStats {
     std::atomic<u64> buffer_snapshots{0};
     std::atomic<u64> buffer_snapshot_bytes{0};
     std::atomic<u64> checkpoint_skips{0};
+    // Draws issued with state Hydra does not implement yet (MSAA, alpha-to-coverage)
+    std::atomic<u64> msaa_draws{0};
+    std::atomic<u64> alpha_to_coverage_draws{0};
+    std::atomic<u64> alpha_to_one_draws{0};
 
     static PerfStats& instance() {
         static PerfStats stats;

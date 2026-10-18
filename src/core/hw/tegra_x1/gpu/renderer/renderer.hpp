@@ -97,7 +97,9 @@ class IRenderer {
         }
 
         if (any(scope & MemoryInvalidationScope::ShaderCache)) {
-            // TODO
+            // ShaderCache validates a full mapped code snapshot at every
+            // lookup, including untracked CPU writes and GPU remaps. No
+            // pointer-based eviction is needed for this host-memory range.
         }
     }
 

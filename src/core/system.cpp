@@ -628,6 +628,12 @@ void System::progressFrame(u32 width, u32 height,
             LOG_INFO(Other, "CHECKPOINTS skipped (nothing in flight): {:.1f}/frame",
                      static_cast<f64>(stats.checkpoint_skips.exchange(0)) /
                          std::max(frames, 1.0));
+            LOG_INFO(Other,
+                     "UNIMPLEMENTED draw state: {} MSAA, {} alpha-to-coverage, {} "
+                     "alpha-to-one draws",
+                     stats.msaa_draws.exchange(0),
+                     stats.alpha_to_coverage_draws.exchange(0),
+                     stats.alpha_to_one_draws.exchange(0));
             LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
                      static_cast<f64>(stats.compute_dispatches.exchange(0)) /
                          std::max(frames, 1.0),

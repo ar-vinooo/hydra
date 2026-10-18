@@ -45,7 +45,13 @@ u32 getSamplerHandle(u32 handle) { return extractBits(handle, 20, 12); }
 
 } // namespace
 
-DEFINE_METHOD_TABLE(Compute, INLINE_ENGINE_TABLE, 0xaf, 1, launch, u32)
+DEFINE_METHOD_TABLE(Compute, INLINE_ENGINE_TABLE, 0x87, 1,
+                    invalidateShaderCaches, u32, 0x5a6, 1,
+                    invalidateShaderCaches, u32, 0xaf, 1, launch, u32)
+
+void Compute::invalidateShaderCaches(u32, u32 flags) {
+    invalidateShaderInstructions(gpu, flags);
+}
 
 std::optional<ComputeQmd> ComputeQmd::read(GMmu& gmmu, uptr address) {
     // GPU-contiguous descriptors can have separate host allocations.

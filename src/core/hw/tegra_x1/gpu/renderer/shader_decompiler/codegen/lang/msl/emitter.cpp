@@ -1344,6 +1344,36 @@ void MslEmitter::emitExitReturn() {
         }
     }
 
+    // Alpha-only/ARGB guest render targets use a Metal format with the same
+    // memory layout, so move the channels (after the alpha test above)
+    if (context.type == ShaderType::Fragment) {
+        for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
+            const auto type = state.color_target_data_types[i];
+            const auto swizzle = static_cast<renderer::ColorOutputSwizzle>(
+                state.color_target_swizzles[i]);
+            if (type == MTL::DataTypeNone ||
+                swizzle == renderer::ColorOutputSwizzle::Identity)
+                continue;
+            const auto member = getSvStr(Sv(SvSemantic::UserInOut, i));
+            const char* channels = "";
+            switch (swizzle) {
+            case renderer::ColorOutputSwizzle::AlphaToRed:
+                channels = "c.w, 0, 0, 0";
+                break;
+            case renderer::ColorOutputSwizzle::AlphaToGreen:
+                channels = "c.x, c.w, 0, 0";
+                break;
+            case renderer::ColorOutputSwizzle::Argb:
+                channels = "c.w, c.x, c.y, c.z";
+                break;
+            default:
+                break;
+            }
+            writeStatement("{{ const auto c = __out.{}; __out.{} = vec<{}, 4>({}); }}",
+                           member, member, toType(type), channels);
+        }
+    }
+
     // Return
     writeStatement("return __out");
 }

@@ -13,6 +13,9 @@
 #include <bit>
 #include <cmath>
 #include <functional>
+#include <fstream>
+#include <map>
+#include <sstream>
 #include <cfenv>
 #include <cmath>
 #include <set>
@@ -3483,4 +3486,149 @@ void runShaderCoverageTests(MTL::Device* device) {
     testDualSourceBlending(device);
     testSubroutines(device);
     testExitTargetsAndAbsoluteJump(device);
+}
+
+// Python-driven instruction reference (tests/maxwell_alu_reference.py).
+// Each input line: "<inst hex>[,<inst hex>...] <preds hex> <cc hex> <R0..R7 hex>".
+// Output line: "<R0..R7 hex> <preds hex> <cc hex>". Programs are decoded from the
+// guest encoding, emitted as MSL and executed on Metal, one thread per case.
+void runMaxwellAluCaseFile(MTL::Device* device, const char* in_path,
+                           const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "ALU case files open");
+    std::map<std::vector<u64>, std::vector<std::pair<AluState, usize>>> groups;
+    std::vector<std::vector<u64>> programs;
+    std::vector<AluState> states;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        std::istringstream row(line);
+        std::string insts_text;
+        row >> insts_text;
+        std::vector<u64> insts;
+        std::istringstream split(insts_text);
+        for (std::string item; std::getline(split, item, ',');)
+            insts.push_back(std::stoull(item, nullptr, 16));
+        AluState state{};
+        row >> std::hex >> state.preds >> state.cc;
+        for (u32 i = 0; i < 8; ++i) row >> std::hex >> state.regs[i];
+        expect(bool(row), "Malformed ALU case");
+        groups[insts].emplace_back(state, programs.size());
+        programs.push_back(insts);
+        states.push_back(state);
+    }
+    std::vector<AluState> results(states.size());
+    for (const auto& [insts, cases] : groups) {
+        std::vector<AluState> inputs;
+        for (const auto& item : cases) inputs.push_back(item.first);
+        const auto out = runAlu(device, insts, inputs, {}, 2, "Maxwell ALU reference");
+        for (usize i = 0; i < cases.size(); ++i) results[cases[i].second] = out[i];
+    }
+    for (const auto& r : results) {
+        for (u32 i = 0; i < 8; ++i) output << std::hex << r.regs[i] << ' ';
+        output << std::hex << r.preds << ' ' << r.cc << '\n';
+    }
+}
+
+// Python-driven texture reference (tests/maxwell_texture_reference.py).
+// Grammar, one record per line:
+//   CONFIG <color|depth> <w> <h> <min n|l> <mag n|l> <addr_s> <addr_t> <compare>
+//          addr: edge|repeat|mirror|zero; compare: MTL::CompareFunction value
+//   DATA   <w*h*4 (color) or w*h (depth) hex words>
+//   CASE   <x hex> <y hex> <ref hex>
+// Output: one line "<R10..R13 hex>" per CASE. The guest instruction is TEXS
+// 2D.LZ (color) or 2D.LL.DC (depth compare), decoded and run through MSL/Metal.
+void runMaxwellTextureCaseFile(MTL::Device* device, const char* in_path,
+                               const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "Texture case files open");
+    struct Config {
+        std::string kind, min, mag, addr_s, addr_t;
+        u32 width{}, height{}, compare{};
+        std::vector<u32> data;
+        std::vector<std::array<u32, 3>> cases;
+    };
+    std::vector<Config> configs;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string tag;
+        row >> tag;
+        if (tag == "CONFIG") {
+            Config config;
+            row >> config.kind >> config.width >> config.height >> config.min >>
+                config.mag >> config.addr_s >> config.addr_t >> config.compare;
+            expect(bool(row), "Malformed texture CONFIG");
+            configs.push_back(std::move(config));
+        } else if (tag == "DATA") {
+            expect(!configs.empty(), "DATA before CONFIG");
+            for (u32 word; row >> std::hex >> word;) configs.back().data.push_back(word);
+        } else if (tag == "CASE") {
+            expect(!configs.empty(), "CASE before CONFIG");
+            std::array<u32, 3> values{};
+            for (auto& value : values) row >> std::hex >> value;
+            expect(bool(row), "Malformed texture CASE");
+            configs.back().cases.push_back(values);
+        }
+    }
+    const auto address = [](const std::string& name) {
+        if (name == "repeat") return MTL::SamplerAddressModeRepeat;
+        if (name == "mirror") return MTL::SamplerAddressModeMirrorRepeat;
+        if (name == "zero") return MTL::SamplerAddressModeClampToZero;
+        expect(name == "edge", "Unknown address mode");
+        return MTL::SamplerAddressModeClampToEdge;
+    };
+    const auto filter = [](const std::string& name) {
+        return name == "l" ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
+    };
+    const auto texs = [](u32 encoding, u32 dst0, u32 dst1, u32 a, u32 b, u32 mask) {
+        return 0xd000000000000000ull | dst0 | (u64(a) << 8) | PT_GUARD |
+               (u64(b) << 20) | (u64(dst1) << 28) | (1ull << 36) |
+               (u64(mask) << 50) | (u64(encoding) << 53) | (1ull << 59);
+    };
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    for (const auto& config : configs) {
+        const bool depth = config.kind == "depth";
+        expect(config.data.size() == config.width * config.height * (depth ? 1u : 4u),
+               "Texture DATA size");
+        auto* descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+            depth ? MTL::PixelFormatDepth32Float : MTL::PixelFormatRGBA32Float,
+            config.width, config.height, false);
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr, "Texture creation");
+        texture->replaceRegion(MTL::Region::Make2D(0, 0, config.width, config.height), 0,
+                               config.data.data(), config.width * (depth ? 4 : 16));
+        NS_STACK_SCOPED auto sampler_descriptor = MTL::SamplerDescriptor::alloc()->init();
+        sampler_descriptor->setMinFilter(filter(config.min));
+        sampler_descriptor->setMagFilter(filter(config.mag));
+        sampler_descriptor->setMipFilter(MTL::SamplerMipFilterNotMipmapped);
+        sampler_descriptor->setSAddressMode(address(config.addr_s));
+        sampler_descriptor->setTAddressMode(address(config.addr_t));
+        if (depth)
+            sampler_descriptor->setCompareFunction(static_cast<MTL::CompareFunction>(config.compare));
+        NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_descriptor);
+        std::vector<AluState> inputs;
+        for (const auto& values : config.cases) {
+            AluState state{};
+            state.regs[4] = values[0];
+            state.regs[5] = values[1];
+            state.regs[6] = 0; // LOD 0
+            state.regs[7] = values[2];
+            inputs.push_back(state);
+        }
+        // 2D.LZ: coords R4,R5; 2D.LL.DC: coords R4,R5, LOD R6, reference R7
+        const u64 instruction = depth ? texs(5, 10, 12, 4, 6, 4) : texs(2, 10, 12, 4, 5, 4);
+        const auto results = runTextureProgram(
+            device, {instruction}, inputs, {},
+            {{depth ? "depth2d<float>" : "texture2d<float>", texture, sampler}},
+            "Maxwell texture reference");
+        for (const auto& result : results) {
+            for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+            output << '\n';
+        }
+    }
 }

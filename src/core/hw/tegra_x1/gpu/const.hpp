@@ -603,6 +603,16 @@ enum class ColorSurfaceFormat : u32 {
 
     Bitmap = 0x1C,
     Unknown1D = 0x1D,
+    // NVIDIA names list components from the most significant bits down, so
+    // the bytes in memory are in the reverse order of the name.
+    A16 = 0x40,
+    AF16 = 0x41,
+    AF32 = 0x42,
+    A8R8 = 0x43,
+    R16_A16 = 0x44,
+    RF16_AF16 = 0x45,
+    RF32_AF32 = 0x46,
+    B8G8R8A8 = 0x47,
     RGBA32Float = 0xC0,
     RGBA32Sint = 0xC1,
     RGBA32Uint = 0xC2,
@@ -1031,7 +1041,9 @@ ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::ImageSwizzle, Zero, "zero", R,
 
 ENABLE_ENUM_FORMATTING(
     hydra::hw::tegra_x1::gpu::ColorSurfaceFormat, Invalid, "invalid", Bitmap,
-    "bitmap", RGBA32Float, "rgba32float", RGBA32Sint, "rgba32sint", RGBA32Uint,
+    "bitmap", A16, "a16", AF16, "af16", AF32, "af32", A8R8, "a8r8", R16_A16,
+    "r16_a16", RF16_AF16, "rf16_af16", RF32_AF32, "rf32_af32", B8G8R8A8,
+    "b8g8r8a8", RGBA32Float, "rgba32float", RGBA32Sint, "rgba32sint", RGBA32Uint,
     "rgba32uint", RGBX32Float, "rgbx32float", RGBX32Sint, "rgbx32sint",
     RGBX32Uint, "rgbx32uint", RGBA16Unorm, "rgba16unorm", RGBA16Snorm,
     "rgba16snorm", RGBA16Sint, "rgba16sint", RGBA16Uint, "rgba16uint",

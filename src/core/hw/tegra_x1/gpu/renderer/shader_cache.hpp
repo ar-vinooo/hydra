@@ -2,6 +2,10 @@
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <tuple>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -60,6 +64,8 @@ struct GuestShaderState {
     engines::VertexAttribState vertex_attrib_states[VERTEX_ATTRIB_COUNT];
     MTL::DataType color_target_data_types[COLOR_TARGET_COUNT] = {
         MTL::DataTypeNone};
+    // Channel rearrangement for alpha-only/ARGB guest formats (ColorOutputSwizzle)
+    u8 color_target_swizzles[COLOR_TARGET_COUNT] = {};
     // Compute
     u32 shared_memory_size{0};
     std::map<u32, TextureFormat> image_formats;
@@ -71,10 +77,14 @@ struct GuestShaderDescriptor {
     uptr gpu_addr;
     GuestShaderState state;
     std::function<std::optional<u32>(u32, u32)> read_const_word;
+    // Filled by ShaderCache::find: compilation and identity use one snapshot.
+    std::shared_ptr<const std::vector<u8>> code_snapshot;
+    std::vector<u32> cache_key;
+    u64 code_revision{0};
 };
 
 class ShaderCache
-    : public CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor> {
+    : public CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true> {
   public:
     explicit ShaderCache(IRenderer& renderer_) : renderer{renderer_} {}
 
@@ -84,12 +94,27 @@ class ShaderCache
     ShaderBase* create(const GuestShaderDescriptor& descriptor);
     void update([[maybe_unused]] ShaderBase* shader) {}
     static u32 hash(const GuestShaderDescriptor& descriptor);
+    static bool equals(const GuestShaderDescriptor& a,
+                       const GuestShaderDescriptor& b);
+    // Force a new owned code read on next use. Identical immutable compiled
+    // artifacts remain reusable; queued pipelines keep their shader lifetime.
+    void invalidateInstructions() { instruction_epoch.fetch_add(1); }
 
     static void destroyElement(ShaderBase* shader);
 
   private:
     IRenderer& renderer;
-    std::map<u32, std::map<std::pair<u32, u32>, u32>> branch_dependencies;
+    std::map<std::vector<u32>, std::map<std::pair<u32, u32>, u32>> branch_dependencies;
+    struct SourceVersion {
+        std::shared_ptr<const std::vector<u8>> bytes;
+        u64 revision{0};
+        u64 validated_epoch{0};
+        std::vector<std::pair<std::shared_ptr<const std::vector<u8>>, u64>> history;
+    };
+    std::map<std::tuple<uptr, uptr, engines::ShaderStage>, SourceVersion> sources;
+    u64 next_code_revision{0};
+    std::atomic<u64> instruction_epoch{0};
+    std::mutex lookup_mutex;
 
   public:
     // ABI-stable implementations selected by the live module.

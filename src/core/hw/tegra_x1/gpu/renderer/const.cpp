@@ -577,6 +577,14 @@ TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
         COLOR_SURFACE_FORMAT_CASE(Invalid, Invalid)
         COLOR_SURFACE_FORMAT_CASE(Bitmap, Invalid)
         COLOR_SURFACE_FORMAT_CASE(Unknown1D, Invalid)
+        COLOR_SURFACE_FORMAT_CASE(A16, R16Unorm)
+        COLOR_SURFACE_FORMAT_CASE(AF16, R16Float)
+        COLOR_SURFACE_FORMAT_CASE(AF32, R32Float)
+        COLOR_SURFACE_FORMAT_CASE(A8R8, RG8Unorm)
+        COLOR_SURFACE_FORMAT_CASE(R16_A16, RG16Unorm)
+        COLOR_SURFACE_FORMAT_CASE(RF16_AF16, RG16Float)
+        COLOR_SURFACE_FORMAT_CASE(RF32_AF32, RG32Float)
+        COLOR_SURFACE_FORMAT_CASE(B8G8R8A8, RGBA8Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Float, RGBA32Float)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Sint, RGBA32Sint)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Uint, RGBA32Uint)
@@ -628,7 +636,7 @@ TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
         COLOR_SURFACE_FORMAT_CASE(R8Snorm, R8Snorm)
         COLOR_SURFACE_FORMAT_CASE(R8Sint, R8Sint)
         COLOR_SURFACE_FORMAT_CASE(R8Uint, R8Uint)
-        COLOR_SURFACE_FORMAT_CASE(A8Unorm, Invalid) // TODO
+        COLOR_SURFACE_FORMAT_CASE(A8Unorm, R8Unorm) // alpha written to red
         COLOR_SURFACE_FORMAT_CASE(BGR5X1Unorm, BGR5Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBX8Unorm, RGBX8Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBX8Unorm_sRGB, RGBX8Unorm_sRGB)
@@ -712,8 +720,56 @@ bool isTextureFormatDepthOrStencil(const TextureFormat format) {
     return info.is_depth_stencil;
 }
 
+ColorOutputSwizzle toColorOutputSwizzle(ColorSurfaceFormat format) {
+    switch (format) {
+    case ColorSurfaceFormat::A16:
+    case ColorSurfaceFormat::AF16:
+    case ColorSurfaceFormat::AF32:
+    case ColorSurfaceFormat::A8Unorm:
+        return ColorOutputSwizzle::AlphaToRed;
+    case ColorSurfaceFormat::A8R8:
+    case ColorSurfaceFormat::R16_A16:
+    case ColorSurfaceFormat::RF16_AF16:
+    case ColorSurfaceFormat::RF32_AF32:
+        return ColorOutputSwizzle::AlphaToGreen;
+    case ColorSurfaceFormat::B8G8R8A8:
+        return ColorOutputSwizzle::Argb;
+    default:
+        return ColorOutputSwizzle::Identity;
+    }
+}
+
+void swizzleClearColor(ColorOutputSwizzle swizzle, std::array<u32, 4>& color,
+                       u8& mask) {
+    const auto c = color;
+    switch (swizzle) {
+    case ColorOutputSwizzle::AlphaToRed:
+        color = {c[3], 0, 0, 0};
+        mask = (mask & 0x8) != 0 ? 0x1 : 0x0;
+        break;
+    case ColorOutputSwizzle::AlphaToGreen:
+        color = {c[0], c[3], 0, 0};
+        mask = static_cast<u8>((mask & 0x1) | ((mask & 0x8) >> 2));
+        break;
+    case ColorOutputSwizzle::Argb:
+        color = {c[3], c[0], c[1], c[2]};
+        mask = static_cast<u8>(((mask & 0x8) >> 3) | ((mask & 0x7) << 1));
+        break;
+    default:
+        break;
+    }
+}
+
 MTL::DataType toColorDataType(ColorSurfaceFormat format) {
     switch (format) {
+    case ColorSurfaceFormat::A16:
+    case ColorSurfaceFormat::AF16:
+    case ColorSurfaceFormat::AF32:
+    case ColorSurfaceFormat::A8R8:
+    case ColorSurfaceFormat::R16_A16:
+    case ColorSurfaceFormat::RF16_AF16:
+    case ColorSurfaceFormat::RF32_AF32:
+    case ColorSurfaceFormat::B8G8R8A8:
     case ColorSurfaceFormat::RGBA32Float:
     case ColorSurfaceFormat::RGBX32Float:
     case ColorSurfaceFormat::RGBA16Unorm:

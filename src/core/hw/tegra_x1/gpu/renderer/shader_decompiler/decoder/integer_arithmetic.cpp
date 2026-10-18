@@ -4,10 +4,9 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: saturating mode
 void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
               AvgMode avg_mode, reg_t dst, reg_t src_a, ir::Value src_b,
-              bool write_cc, bool extended) {
+              bool write_cc, bool extended, bool saturate) {
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, pred, pred_inv);
     auto a = b.opCopy(ir::Value::createRegister(src_a));
@@ -18,15 +17,24 @@ void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
     auto result = sum;
     if (extended) result = b.opAdd(sum, b.opSelect(ir::Value::createConditionFlag(2), ir::Value::createConstantU(1), ir::Value::createConstantU(0)));
     if (avg_mode == AvgMode::PlusOne) result = b.opAdd(result, ir::Value::createConstantU(1));
+    const auto zero = ir::Value::createConstantU(0);
+    const auto sign = [&](ir::Value v) { return b.opCompareNotEqual(b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero); };
+    // Signed overflow of the unsaturated sum, shared by SAT and the CC flags.
+    std::optional<ir::Value> overflow;
+    if (saturate || write_cc)
+        overflow = sign(b.opBitwiseAnd(b.opBitwiseNot(b.opBitwiseXor(a, other)), b.opBitwiseXor(a, result)));
+    if (saturate) {
+        // IADD.SAT clamps the signed sum; overflow has the sign of the operands.
+        const auto clamp = b.opSelect(sign(a), ir::Value::createConstantU(0x80000000u),
+                                      ir::Value::createConstantU(0x7fffffffu));
+        result = b.opSelect(*overflow, clamp, result);
+    }
     if (write_cc) {
-        const auto zero = ir::Value::createConstantU(0);
-        const auto sign = [&](ir::Value v) { return b.opCompareNotEqual(b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero); };
-        const auto overflow = sign(b.opBitwiseAnd(b.opBitwiseNot(b.opBitwiseXor(a, other)), b.opBitwiseXor(a, result)));
         const auto carry = b.opBitwiseOr(b.opCompareLess(sum, a), b.opCompareLess(result, sum));
         b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(result, zero));
         b.opCopy(ir::Value::createConditionFlag(1), sign(result));
         b.opCopy(ir::Value::createConditionFlag(2), carry);
-        b.opCopy(ir::Value::createConditionFlag(3), overflow);
+        b.opCopy(ir::Value::createConditionFlag(3), *overflow);
     }
     b.opCopy(ir::Value::createRegister(dst), result);
     if (conditional) b.opEndIf();
@@ -298,7 +306,7 @@ void emitIadd3I(DecoderContext& context, InstIadd3I inst) {
 void emitIaddR(DecoderContext& context, InstIaddR inst) {
     emitIadd(context, inst.base.pred, inst.base.pred_inv, inst.base.avg_mode,
              inst.base.dst, inst.base.src_a,
-             ir::Value::createRegister(inst.src_b, ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
+             ir::Value::createRegister(inst.src_b, ir::ScalarType::I32), inst.base.write_cc, inst.base.x, inst.base.sat);
 }
 
 void emitIaddC(DecoderContext& context, InstIaddC inst) {
@@ -307,7 +315,7 @@ void emitIaddC(DecoderContext& context, InstIaddC inst) {
         inst.base.dst, inst.base.src_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
+            ir::ScalarType::I32), inst.base.write_cc, inst.base.x, inst.base.sat);
 }
 
 void emitIaddI(DecoderContext& context, InstIaddI inst) {
@@ -315,13 +323,13 @@ void emitIaddI(DecoderContext& context, InstIaddI inst) {
              inst.base.dst, inst.base.src_a,
              ir::Value::createConstant(
                  getIntImm20(inst.imm20_0, inst.imm20_19, true),
-                 ir::ScalarType::I32), inst.base.write_cc, inst.base.x);
+                 ir::ScalarType::I32), inst.base.write_cc, inst.base.x, inst.base.sat);
 }
 
 void emitIadd32I(DecoderContext& context, InstIadd32I inst) {
     emitIadd(context, inst.pred, inst.pred_inv, inst.avg_mode, inst.dst,
              inst.src_a,
-             ir::Value::createConstant(inst.imm, ir::ScalarType::I32), inst.write_cc, inst.x);
+             ir::Value::createConstant(inst.imm, ir::ScalarType::I32), inst.write_cc, inst.x, inst.sat);
 }
 
 void emitIscaddR(DecoderContext& context, InstIscaddR inst) {

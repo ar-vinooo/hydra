@@ -285,10 +285,31 @@ void testSurfaceFormatConversions() {
     check(toTextureFormat(ColorSurfaceFormat::BGRX8UnormUnknownFE) ==
               TextureFormat::BGRX8Unorm,
           "O8R8G8B8 render targets are BGRX8");
-    for (u32 value = 0x40; value <= 0x47; value++) {
-        check(toTextureFormat(static_cast<ColorSurfaceFormat>(value)) ==
-                  TextureFormat::Invalid,
-              "Alpha render target formats are reported as unsupported");
+    // Alpha-only/ARGB targets use the Metal format with the same memory layout
+    // (values and byte order are checked against clb197.h by
+    // tests/color_target_format_reference.py)
+    const struct {
+        ColorSurfaceFormat format;
+        TextureFormat texture;
+        ColorOutputSwizzle swizzle;
+    } alpha_formats[] = {
+        {ColorSurfaceFormat::A16, TextureFormat::R16Unorm, ColorOutputSwizzle::AlphaToRed},
+        {ColorSurfaceFormat::AF16, TextureFormat::R16Float, ColorOutputSwizzle::AlphaToRed},
+        {ColorSurfaceFormat::AF32, TextureFormat::R32Float, ColorOutputSwizzle::AlphaToRed},
+        {ColorSurfaceFormat::A8R8, TextureFormat::RG8Unorm, ColorOutputSwizzle::AlphaToGreen},
+        {ColorSurfaceFormat::R16_A16, TextureFormat::RG16Unorm, ColorOutputSwizzle::AlphaToGreen},
+        {ColorSurfaceFormat::RF16_AF16, TextureFormat::RG16Float, ColorOutputSwizzle::AlphaToGreen},
+        {ColorSurfaceFormat::RF32_AF32, TextureFormat::RG32Float, ColorOutputSwizzle::AlphaToGreen},
+        {ColorSurfaceFormat::B8G8R8A8, TextureFormat::RGBA8Unorm, ColorOutputSwizzle::Argb},
+        {ColorSurfaceFormat::A8Unorm, TextureFormat::R8Unorm, ColorOutputSwizzle::AlphaToRed},
+    };
+    for (const auto& entry : alpha_formats) {
+        check(toTextureFormat(entry.format) == entry.texture,
+              "Alpha render target formats map to the same-layout Metal format");
+        check(toColorOutputSwizzle(entry.format) == entry.swizzle,
+              "Alpha render target formats rearrange the shader output");
+        check(toColorDataType(entry.format) == MTL::DataTypeFloat,
+              "Alpha render targets are float outputs");
     }
 
     check(toTextureFormat(DepthSurfaceFormat::S8Z24Unorm) ==

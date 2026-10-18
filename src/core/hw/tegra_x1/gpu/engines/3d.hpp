@@ -601,6 +601,7 @@ struct BlendEquation {
 
 MTL::BlendOperation getBlendOperation(u32 blend_op);
 MTL::BlendFactor getBlendFactor(u32 blend_factor);
+void invalidateShaderInstructions(Gpu& gpu, u32 flags);
 
 template <typename Blend>
 inline BlendEquation getBlendEquation(const Blend& blend) {
@@ -707,6 +708,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     DEFINE_INLINE_ENGINE_METHODS;
 
     void incrementSyncPoint(u32 index, u32 arg);
+    void noteUnimplementedMultisample();
+    void invalidateShaderCaches(u32 index, u32 flags);
 
     void loadMmeInstructionRamPointer(const u32 index, const u32 ptr);
     void loadMmeInstructionRam(const u32 index, const u32 data);

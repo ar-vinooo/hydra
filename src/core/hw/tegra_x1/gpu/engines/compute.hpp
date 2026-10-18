@@ -85,6 +85,7 @@ class Compute : public EngineWithRegsBase<RegsCompute>, public InlineBase {
     // Methods
     DEFINE_INLINE_ENGINE_METHODS;
     void launch(const u32 index, const u32 arg);
+    void invalidateShaderCaches(u32 index, u32 flags);
 
     // Helpers
     ztd::Range<uptr> getConstBuffer(const ComputeQmd& qmd, u32 index) const;

@@ -3,6 +3,7 @@
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/metal_cpp.hpp"
 
+#include <array>
 #include <set>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -196,6 +197,21 @@ bool isTextureFormatDepthOrStencil(const TextureFormat format);
 
 // MTL::DataTypeNone for formats without a color data type
 MTL::DataType toColorDataType(ColorSurfaceFormat format);
+
+// Metal has no alpha-only or ARGB render targets. These guest formats use the
+// Metal format with the same memory layout; the fragment output (and clear
+// color) is rearranged so the alpha lands in the right channel.
+enum class ColorOutputSwizzle : u8 {
+    Identity,
+    AlphaToRed,   // A16, AF16, AF32, A8: (r, g, b, a) -> (a, 0, 0, 0)
+    AlphaToGreen, // A8R8, R16_A16, RF16_AF16, RF32_AF32: -> (r, a, 0, 0)
+    Argb,         // B8G8R8A8 (bytes A, R, G, B): -> (a, r, g, b)
+};
+ColorOutputSwizzle toColorOutputSwizzle(ColorSurfaceFormat format);
+// Rearranges a clear color (r, g, b, a) and write mask (R=1 G=2 B=4 A=8) for
+// the channels the Metal format actually stores.
+void swizzleClearColor(ColorOutputSwizzle swizzle, std::array<u32, 4>& color,
+                       u8& mask);
 
 struct SwizzleChannels {
     ImageSwizzle r : 3;
