@@ -59,29 +59,29 @@ CompareOp decodeCompareOp(u32 value) {
 }
 u32 getSamplerHandle(u32 handle) { return extractBits(handle, 20, 12); }
 
-renderer::TextureType toTextureType(TextureType type) {
+MTL::TextureType toTextureType(TextureType type) {
     switch (type) {
     case TextureType::_1D:
-        return renderer::TextureType::_1D;
+        return MTL::TextureType1D;
     case TextureType::_1DArray:
-        return renderer::TextureType::_1DArray;
+        return MTL::TextureType1DArray;
     case TextureType::_1DBuffer:
-        return renderer::TextureType::_1DBuffer;
+        return MTL::TextureTypeTextureBuffer;
     case TextureType::_2D:
     case TextureType::_2DNoMipmap:
-        return renderer::TextureType::_2D;
+        return MTL::TextureType2D;
     case TextureType::_2DArray:
-        return renderer::TextureType::_2DArray;
+        return MTL::TextureType2DArray;
     case TextureType::_3D:
-        return renderer::TextureType::_3D;
+        return MTL::TextureType3D;
     case TextureType::Cubemap:
-        return renderer::TextureType::Cube;
+        return MTL::TextureTypeCube;
     case TextureType::CubeArray:
-        return renderer::TextureType::CubeArray;
+        return MTL::TextureTypeCubeArray;
     default:
         ONCE(LOG_WARN(Engines, "Invalid TIC texture type {}",
                       static_cast<u32>(type)));
-        return renderer::TextureType::_2D;
+        return MTL::TextureType2D;
     }
 }
 
@@ -97,34 +97,34 @@ constexpr u32 D3D11_BLEND_OP_REV_SUB = 3;
 constexpr u32 D3D11_BLEND_OP_MIN = 4;
 constexpr u32 D3D11_BLEND_OP_MAX = 5;
 
-renderer::BlendOperation getBlendOperation(u32 blend_op) {
+MTL::BlendOperation getBlendOperation(u32 blend_op) {
     switch (blend_op) {
     // GL
     case GL_MIN:
-        return renderer::BlendOperation::Min;
+        return MTL::BlendOperationMin;
     case GL_MAX:
-        return renderer::BlendOperation::Max;
+        return MTL::BlendOperationMax;
     case GL_FUNC_ADD:
-        return renderer::BlendOperation::Add;
+        return MTL::BlendOperationAdd;
     case GL_FUNC_SUBTRACT:
-        return renderer::BlendOperation::Sub;
+        return MTL::BlendOperationSubtract;
     case GL_FUNC_REVERSE_SUBTRACT:
-        return renderer::BlendOperation::RevSub;
+        return MTL::BlendOperationReverseSubtract;
 
     // DX11
     case D3D11_BLEND_OP_ADD:
-        return renderer::BlendOperation::Add;
+        return MTL::BlendOperationAdd;
     case D3D11_BLEND_OP_SUB:
-        return renderer::BlendOperation::Sub;
+        return MTL::BlendOperationSubtract;
     case D3D11_BLEND_OP_REV_SUB:
-        return renderer::BlendOperation::RevSub;
+        return MTL::BlendOperationReverseSubtract;
     case D3D11_BLEND_OP_MIN:
-        return renderer::BlendOperation::Min;
+        return MTL::BlendOperationMin;
     case D3D11_BLEND_OP_MAX:
-        return renderer::BlendOperation::Max;
+        return MTL::BlendOperationMax;
     default:
         ONCE(LOG_ERROR(Engines, "Unknown blend operation 0x{:04x}", blend_op));
-        return renderer::BlendOperation::Add;
+        return MTL::BlendOperationAdd;
     }
 }
 
@@ -160,100 +160,100 @@ constexpr u32 D3D11_BLEND_FACTOR_SRC1_ALPHA = 18;
 constexpr u32 D3D11_BLEND_FACTOR_INV_SRC1_ALPHA = 19;
 constexpr u32 GL_BLEND_FACTOR_BIT = 0x4000;
 
-renderer::BlendFactor getBlendFactor(u32 blend_factor) {
+MTL::BlendFactor getBlendFactor(u32 blend_factor) {
     if ((blend_factor & GL_BLEND_FACTOR_BIT) != 0u) { // GL
         u32 gl_blend_factor = blend_factor & ~GL_BLEND_FACTOR_BIT;
         switch (gl_blend_factor) {
         case GL_ZERO:
-            return renderer::BlendFactor::Zero;
+            return MTL::BlendFactorZero;
         case GL_ONE:
-            return renderer::BlendFactor::One;
+            return MTL::BlendFactorOne;
         case GL_SRC_COLOR:
-            return renderer::BlendFactor::SrcColor;
+            return MTL::BlendFactorSourceColor;
         case GL_ONE_MINUS_SRC_COLOR:
-            return renderer::BlendFactor::InvSrcColor;
+            return MTL::BlendFactorOneMinusSourceColor;
         case GL_SRC_ALPHA:
-            return renderer::BlendFactor::SrcAlpha;
+            return MTL::BlendFactorSourceAlpha;
         case GL_ONE_MINUS_SRC_ALPHA:
-            return renderer::BlendFactor::InvSrcAlpha;
+            return MTL::BlendFactorOneMinusSourceAlpha;
         case GL_DST_ALPHA:
-            return renderer::BlendFactor::DstAlpha;
+            return MTL::BlendFactorDestinationAlpha;
         case GL_ONE_MINUS_DST_ALPHA:
-            return renderer::BlendFactor::InvDstAlpha;
+            return MTL::BlendFactorOneMinusDestinationAlpha;
         case GL_DST_COLOR:
-            return renderer::BlendFactor::DstColor;
+            return MTL::BlendFactorDestinationColor;
         case GL_ONE_MINUS_DST_COLOR:
-            return renderer::BlendFactor::InvDstColor;
-        case 0x8001: return renderer::BlendFactor::ConstColor;
-        case 0x8002: return renderer::BlendFactor::InvConstColor;
-        case 0x8003: return renderer::BlendFactor::ConstAlpha;
-        case 0x8004: return renderer::BlendFactor::InvConstAlpha;
-        case 0x8900: return renderer::BlendFactor::Src1Color;
-        case 0x8901: return renderer::BlendFactor::InvSrc1Color;
-        case 0x8902: return renderer::BlendFactor::Src1Alpha;
-        case 0x8903: return renderer::BlendFactor::InvSrc1Alpha;
+            return MTL::BlendFactorOneMinusDestinationColor;
+        case 0x8001: return MTL::BlendFactorBlendColor;
+        case 0x8002: return MTL::BlendFactorOneMinusBlendColor;
+        case 0x8003: return MTL::BlendFactorBlendAlpha;
+        case 0x8004: return MTL::BlendFactorOneMinusBlendAlpha;
+        case 0x8900: return MTL::BlendFactorSource1Color;
+        case 0x8901: return MTL::BlendFactorOneMinusSource1Color;
+        case 0x8902: return MTL::BlendFactorSource1Alpha;
+        case 0x8903: return MTL::BlendFactorOneMinusSource1Alpha;
         case GL_SRC_ALPHA_SATURATE:
-            return renderer::BlendFactor::SrcAlphaSaturate;
+            return MTL::BlendFactorSourceAlphaSaturated;
         default:
             ONCE(LOG_ERROR(Engines, "Unknown GL blend factor 0x{:04x}",
                            gl_blend_factor));
-            return renderer::BlendFactor::One;
+            return MTL::BlendFactorOne;
         }
     } else { // D3D11
         switch (blend_factor) {
         case D3D11_BLEND_FACTOR_ZERO:
-            return renderer::BlendFactor::Zero;
+            return MTL::BlendFactorZero;
         case D3D11_BLEND_FACTOR_ONE:
-            return renderer::BlendFactor::One;
+            return MTL::BlendFactorOne;
         case D3D11_BLEND_FACTOR_SRC_COLOR:
-            return renderer::BlendFactor::SrcColor;
+            return MTL::BlendFactorSourceColor;
         case D3D11_BLEND_FACTOR_INV_SRC_COLOR:
-            return renderer::BlendFactor::InvSrcColor;
+            return MTL::BlendFactorOneMinusSourceColor;
         case D3D11_BLEND_FACTOR_SRC_ALPHA:
-            return renderer::BlendFactor::SrcAlpha;
+            return MTL::BlendFactorSourceAlpha;
         case D3D11_BLEND_FACTOR_INV_SRC_ALPHA:
-            return renderer::BlendFactor::InvSrcAlpha;
+            return MTL::BlendFactorOneMinusSourceAlpha;
         case D3D11_BLEND_FACTOR_DST_ALPHA:
-            return renderer::BlendFactor::DstAlpha;
+            return MTL::BlendFactorDestinationAlpha;
         case D3D11_BLEND_FACTOR_INV_DST_ALPHA:
-            return renderer::BlendFactor::InvDstAlpha;
+            return MTL::BlendFactorOneMinusDestinationAlpha;
         case D3D11_BLEND_FACTOR_DST_COLOR:
-            return renderer::BlendFactor::DstColor;
+            return MTL::BlendFactorDestinationColor;
         case D3D11_BLEND_FACTOR_INV_DST_COLOR:
-            return renderer::BlendFactor::InvDstColor;
+            return MTL::BlendFactorOneMinusDestinationColor;
         case D3D11_BLEND_FACTOR_SRC_ALPHA_SATURATE:
-            return renderer::BlendFactor::SrcAlphaSaturate;
+            return MTL::BlendFactorSourceAlphaSaturated;
         // BOTHSRCALPHA / BOTHINVSRCALPHA, the destination is set by the
         // caller (see applyBlendState)
         case D3D11_BLEND_FACTOR_BOTH_SRC_ALPHA:
-            return renderer::BlendFactor::SrcAlpha;
+            return MTL::BlendFactorSourceAlpha;
         case D3D11_BLEND_FACTOR_BOTH_INV_SRC_ALPHA:
-            return renderer::BlendFactor::InvSrcAlpha;
-        case 14: return renderer::BlendFactor::ConstColor;
-        case 15: return renderer::BlendFactor::InvConstColor;
+            return MTL::BlendFactorOneMinusSourceAlpha;
+        case 14: return MTL::BlendFactorBlendColor;
+        case 15: return MTL::BlendFactorOneMinusBlendColor;
         case D3D11_BLEND_FACTOR_SRC1_COLOR:
-            return renderer::BlendFactor::Src1Color;
+            return MTL::BlendFactorSource1Color;
         case D3D11_BLEND_FACTOR_INV_SRC1_COLOR:
-            return renderer::BlendFactor::InvSrc1Color;
+            return MTL::BlendFactorOneMinusSource1Color;
         case D3D11_BLEND_FACTOR_SRC1_ALPHA:
-            return renderer::BlendFactor::Src1Alpha;
+            return MTL::BlendFactorSource1Alpha;
         case D3D11_BLEND_FACTOR_INV_SRC1_ALPHA:
-            return renderer::BlendFactor::InvSrc1Alpha;
+            return MTL::BlendFactorOneMinusSource1Alpha;
         default:
             ONCE(LOG_ERROR(Engines, "Unknown D3D11 blend factor 0x{:04x}",
                            blend_factor));
-            return renderer::BlendFactor::One;
+            return MTL::BlendFactorOne;
         }
     }
 }
 
 // The "both" source factors (D3D9 BOTHSRCALPHA, BOTHINVSRCALPHA) set the
 // destination factor too: (SrcAlpha, InvSrcAlpha) and (InvSrcAlpha, SrcAlpha)
-void applyBothFactors(u32 raw_source, renderer::BlendFactor& destination) {
+void applyBothFactors(u32 raw_source, MTL::BlendFactor& destination) {
     if (raw_source == D3D11_BLEND_FACTOR_BOTH_SRC_ALPHA)
-        destination = renderer::BlendFactor::InvSrcAlpha;
+        destination = MTL::BlendFactorOneMinusSourceAlpha;
     else if (raw_source == D3D11_BLEND_FACTOR_BOTH_INV_SRC_ALPHA)
-        destination = renderer::BlendFactor::SrcAlpha;
+        destination = MTL::BlendFactorSourceAlpha;
 }
 
 // Render target width is aligned to the stride, lets try to figure out the real
@@ -284,6 +284,7 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x485, 2,
                     loadMmeInstructionRam, u32, 0x47, 1,
                     loadMmeStartAddressRamPointer, u32, 0x48, 1,
                     loadMmeStartAddressRam, u32, 0x35e, 1, drawVertexArray, u32,
+                    0x48f, 1, drawAuto, u32,
                     0x54c, 1, resetCounter, u32, 0x586, 1, beginDraw, u32,
                     0x585, 1, endDraw, u32, 0x57a, 1, inlineIndex32, u32,
                     0x57c, 1, inlineIndex16, u32, 0x4c1, 1, inlineIndex8, u32,
@@ -458,6 +459,21 @@ void ThreeD::drawVertexElementsCompact(const u32 index, const u32 arg) {
     regs.vertex_elements_start = first;
     regs.index_type = index_type;
     regs.begin.primitive_type = primitive_type;
+}
+
+void ThreeD::drawAuto(const u32, const u32 byte_count) {
+    // NVIDIA defines DRAW_AUTO as a byte count and its stride as 12 bits.
+    // Metal needs a vertex count; transform feedback itself is not emulated.
+    const u32 stride = regs_raw[0x4c6] & 0xfff;
+    if (stride == 0) {
+        ONCE(LOG_WARN(Engines, "Ignoring DRAW_AUTO with zero stride"));
+        return;
+    }
+
+    const u32 start = regs.vertex_array_start;
+    regs.vertex_array_start = 0;
+    drawVertexArray(0, byte_count / stride);
+    regs.vertex_array_start = start;
 }
 
 void ThreeD::beginDraw(const u32 index, const u32 arg) {
@@ -759,7 +775,7 @@ void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
     if (data.color_mask != 0x0 && data.target_id < COLOR_TARGET_COUNT)
         gpu.getRenderer().clearColor(tls_crnt_command_buffer, data.target_id,
                                      data.layer_id, data.color_mask,
-                                     regs.clear_color);
+                                     std::bit_cast<simd::uint4>(regs.clear_color));
 
     if (data.depth)
         gpu.getRenderer().clearDepth(tls_crnt_command_buffer, data.layer_id,
@@ -1044,16 +1060,16 @@ ThreeD::getColorTargetTexture(u32 render_target_index) const {
         return nullptr;
 
     // Depth and layer count
-    auto type = renderer::TextureType::_2D;
+    auto type = MTL::TextureType2D;
     u32 depth = 1;
     u32 layer_count = 1;
     if (render_target.tile_mode.is_3d) {
-        type = renderer::TextureType::_3D;
+        type = MTL::TextureType3D;
         depth = render_target.array_mode.layers;
     } else {
         layer_count = render_target.array_mode.layers;
         if (layer_count > 1)
-            type = renderer::TextureType::_2DArray;
+            type = MTL::TextureType2DArray;
     }
 
     // Width and stride
@@ -1097,8 +1113,8 @@ renderer::ITextureView* ThreeD::getDepthStencilTargetTexture() const {
         return nullptr;
 
     const auto type = regs.depth_target_array_mode.layers > 1
-                          ? renderer::TextureType::_2DArray
-                          : renderer::TextureType::_2D;
+                          ? MTL::TextureType2DArray
+                          : MTL::TextureType2D;
 
     const renderer::TextureDescriptor descriptor(
         tls_crnt_gmmu->unmapAddr(gpu_addr), type, format, false, 0,
@@ -1153,8 +1169,8 @@ renderer::RenderPassBase* ThreeD::getRenderPass() const {
     return gpu.getRenderer().getRenderPassCache().find(descriptor);
 }
 
-renderer::Viewport ThreeD::getViewport(u32 index) {
-    renderer::Viewport res;
+MTL::Viewport ThreeD::getViewport(u32 index) {
+    MTL::Viewport res{};
 
     const auto& extent = regs.viewports[index];
     const auto& transform = regs.viewport_transforms[index];
@@ -1197,46 +1213,46 @@ renderer::Viewport ThreeD::getViewport(u32 index) {
                      Engines, "Unsupported W viewport swizzle {}",
                      transform.swizzle.w);
 
-        res.rect.origin.x() = transform.offset_x - scale_x;
-        res.rect.origin.y() = offset_y - scale_y;
-        res.rect.size.x() = scale_x * 2.0f;
-        res.rect.size.y() = scale_y * 2.0f;
+        res.originX = static_cast<f64>(transform.offset_x - scale_x);
+        res.originY = static_cast<f64>(offset_y - scale_y);
+        res.width = static_cast<f64>(scale_x * 2.0f);
+        res.height = static_cast<f64>(scale_y * 2.0f);
         // Depth range from the Z scale and offset
         const bool zero_to_one =
             regs.viewport_z_clip == ViewportZClip::ZeroToOne;
         ONCE(LOG_INFO(Engines, "Depth mode: {}",
                       zero_to_one ? "zero to one" : "minus one to one"));
-        res.depth_near =
-            transform.offset_z - (zero_to_one ? 0.0f : transform.scale_z);
-        res.depth_far = transform.offset_z + transform.scale_z;
+        res.znear = static_cast<f64>(
+            transform.offset_z - (zero_to_one ? 0.0f : transform.scale_z));
+        res.zfar = static_cast<f64>(transform.offset_z + transform.scale_z);
     } else {
         // The shader outputs window coordinates (see the vertex shader
         // state): the viewport is the surface clip
         window_space = true;
         const auto& screen_scissor = regs.screen_scissor;
-        res.rect.origin.x() = screen_scissor.horizontal.x;
-        res.rect.origin.y() = screen_scissor.vertical.y;
-        res.rect.size.x() = screen_scissor.horizontal.width;
-        res.rect.size.y() = screen_scissor.vertical.height;
-        res.depth_near = extent.near;
-        res.depth_far = extent.far;
+        res.originX = static_cast<f64>(screen_scissor.horizontal.x);
+        res.originY = static_cast<f64>(screen_scissor.vertical.y);
+        res.width = static_cast<f64>(screen_scissor.horizontal.width);
+        res.height = static_cast<f64>(screen_scissor.vertical.height);
+        res.znear = static_cast<f64>(extent.near);
+        res.zfar = static_cast<f64>(extent.far);
     }
 
     // Flip Y (window space positions are already converted to Metal's
     // orientation)
     if (!window_space) {
-        res.rect.origin.y() += res.rect.size.y();
-        res.rect.size.y() = -res.rect.size.y();
+        res.originY += res.height;
+        res.height = -res.height;
     }
 
     // Metal takes depth ranges within 0..1
-    res.depth_near = std::clamp(res.depth_near, 0.0f, 1.0f);
-    res.depth_far = std::clamp(res.depth_far, 0.0f, 1.0f);
+    res.znear = std::clamp(res.znear, 0.0, 1.0);
+    res.zfar = std::clamp(res.zfar, 0.0, 1.0);
 
     return res;
 }
 
-renderer::Scissor ThreeD::getClearRect() const {
+MTL::ScissorRect ThreeD::getClearRect() const {
     // Register offsets from NVIDIA's clb197.h
     constexpr u32 REG_CLEAR_RECT_HORIZONTAL = 0x35b;
     constexpr u32 REG_CLEAR_RECT_VERTICAL = 0x35c;
@@ -1269,12 +1285,11 @@ renderer::Scissor ThreeD::getClearRect() const {
                   static_cast<u16>(viewport.vertical.y) +
                       static_cast<u16>(viewport.vertical.height));
     }
-    return renderer::Scissor(uint2({min_x, min_y}),
-                             uint2({max_x > min_x ? max_x - min_x : 0,
-                                    max_y > min_y ? max_y - min_y : 0}));
+    return MTL::ScissorRect(min_x, min_y, max_x > min_x ? max_x - min_x : 0,
+                            max_y > min_y ? max_y - min_y : 0);
 }
 
-renderer::Scissor ThreeD::getScissor(u32 index) {
+MTL::ScissorRect ThreeD::getScissor(u32 index) {
     const auto& scissor = regs.scissors[index];
     if (scissor.enabled != 0u) {
         u32 min_y = scissor.vertical.min;
@@ -1288,13 +1303,12 @@ renderer::Scissor ThreeD::getScissor(u32 index) {
             min_y = flipped_min;
             max_y = flipped_max;
         }
-        return renderer::Scissor(
-            uint2({scissor.horizontal.min, min_y}),
-            uint2({static_cast<u32>(scissor.horizontal.max -
-                                    scissor.horizontal.min),
-                   max_y > min_y ? max_y - min_y : 0u}));
+        return MTL::ScissorRect(
+            scissor.horizontal.min, min_y,
+            static_cast<u32>(scissor.horizontal.max - scissor.horizontal.min),
+            max_y > min_y ? max_y - min_y : 0u);
     } else {
-        return renderer::Scissor(uint2({0, 0}), uint2({0xffff, 0xffff}));
+        return MTL::ScissorRect(0, 0, 0xffff, 0xffff);
     }
 }
 
@@ -1492,10 +1506,10 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
         regs.color_blend_enabled[0] != 0u) {
         const auto is_src1 = [](u32 factor) {
             const auto mapped = getBlendFactor(factor);
-            return mapped == renderer::BlendFactor::Src1Color ||
-                   mapped == renderer::BlendFactor::InvSrc1Color ||
-                   mapped == renderer::BlendFactor::Src1Alpha ||
-                   mapped == renderer::BlendFactor::InvSrc1Alpha;
+            return mapped == MTL::BlendFactorSource1Color ||
+                   mapped == MTL::BlendFactorOneMinusSource1Color ||
+                   mapped == MTL::BlendFactorSource1Alpha ||
+                   mapped == MTL::BlendFactorOneMinusSource1Alpha;
         };
         const auto uses_src1 = [&](const auto& blend) {
             return is_src1(blend.src_rgb_factor) ||
@@ -1573,7 +1587,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             const auto type_it = resource_mapping.texture_types.find(index);
             const bool is_1d =
                 type_it != resource_mapping.texture_types.end() &&
-                type_it->second == renderer::TextureType::_1D;
+                type_it->second == MTL::TextureType1D;
             if (is_1d && tic.hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(index, format);
             else if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
@@ -1666,18 +1680,17 @@ renderer::PipelineBase* ThreeD::getPipeline() {
         vertex_shader != nullptr && vertex_shader->getDescriptor().writes_layer) {
         switch (regs.begin.primitive_type) {
         case PrimitiveType::Points:
-            descriptor.topology_class = renderer::PrimitiveTopologyClass::Point;
+            descriptor.topology_class = MTL::PrimitiveTopologyClassPoint;
             break;
         case PrimitiveType::Lines:
         case PrimitiveType::LineLoop:
         case PrimitiveType::LineStrip:
         case PrimitiveType::LinesAdjacency:
         case PrimitiveType::LineStripAdjacency:
-            descriptor.topology_class = renderer::PrimitiveTopologyClass::Line;
+            descriptor.topology_class = MTL::PrimitiveTopologyClassLine;
             break;
         default:
-            descriptor.topology_class =
-                renderer::PrimitiveTopologyClass::Triangle;
+            descriptor.topology_class = MTL::PrimitiveTopologyClassTriangle;
             break;
         }
     }
@@ -1818,14 +1831,14 @@ bool ThreeD::isVertexArrayInstanced(u32 vertex_array_index) const {
 
 renderer::ITextureView*
 ThreeD::getTexture(const TextureImageControl& tic,
-                   std::optional<renderer::TextureType> shader_type,
+                   std::optional<MTL::TextureType> shader_type,
                    renderer::TextureUsage usage) const {
     // Storage images are written without a swizzle
     const bool is_image = usage == renderer::TextureUsage::Write;
     if (tic.hdr_version == TicHdrVersion::_1DBuffer) {
         // The shader was not specialized for a buffer texture
-        if (shader_type && *shader_type != renderer::TextureType::_1D &&
-            *shader_type != renderer::TextureType::_1DBuffer) {
+        if (shader_type && *shader_type != MTL::TextureType1D &&
+            *shader_type != MTL::TextureTypeTextureBuffer) {
             ONCE(LOG_WARN(Engines,
                           "Buffer texture bound to a {} texture binding, "
                           "ignoring",
@@ -1850,11 +1863,11 @@ ThreeD::getTexture(const TextureImageControl& tic,
         }
         const renderer::TextureDescriptor descriptor(
             tls_crnt_gmmu->unmapAddr(gpu_addr),
-            renderer::TextureType::_1DBuffer, format, true,
+            MTL::TextureTypeTextureBuffer, format, true,
             static_cast<u32>(bytes), static_cast<u32>(width), 1, 1, 1, 1, 0, 0,
             0);
         const renderer::TextureViewDescriptor view(
-            renderer::TextureType::_1DBuffer, format, ztd::Range<u32>(0, 1),
+            MTL::TextureTypeTextureBuffer, format, ztd::Range<u32>(0, 1),
             ztd::Range<u32>(0, 1),
             is_image ? renderer::SwizzleChannels()
                      : renderer::SwizzleChannels(format,
@@ -1893,11 +1906,11 @@ ThreeD::getTexture(const TextureImageControl& tic,
     auto type = toTextureType(tic.texture_type);
     u32 depth = tic.depth_minus_one + 1;
     u32 layer_count = 1;
-    if (type != renderer::TextureType::_3D) {
+    if (type != MTL::TextureType3D) {
         layer_count = depth;
         depth = 1;
-        if (type == renderer::TextureType::Cube ||
-            type == renderer::TextureType::CubeArray)
+        if (type == MTL::TextureTypeCube ||
+            type == MTL::TextureTypeCubeArray)
             layer_count *= 6;
     }
     const u32 width = tic.width_minus_one + 1;
@@ -1926,49 +1939,49 @@ ThreeD::getTexture(const TextureImageControl& tic,
         target_type = *shader_type;
     } else {
         // Demote array types to non-array types if possible
-        if (type == renderer::TextureType::_1DArray && layer_count == 1)
-            target_type = renderer::TextureType::_1D;
-        else if (type == renderer::TextureType::_2DArray && layer_count == 1)
-            target_type = renderer::TextureType::_2D;
-        else if (type == renderer::TextureType::CubeArray && layer_count == 6)
-            target_type = renderer::TextureType::Cube;
+        if (type == MTL::TextureType1DArray && layer_count == 1)
+            target_type = MTL::TextureType1D;
+        else if (type == MTL::TextureType2DArray && layer_count == 1)
+            target_type = MTL::TextureType2D;
+        else if (type == MTL::TextureTypeCubeArray && layer_count == 6)
+            target_type = MTL::TextureTypeCube;
     }
     switch (target_type) {
-    case renderer::TextureType::_1D:
-        if (type == renderer::TextureType::_1DArray) {
+    case MTL::TextureType1D:
+        if (type == MTL::TextureType1DArray) {
             view_type = target_type;
             view_layer_count = 1;
         }
         break;
-    case renderer::TextureType::_1DArray:
-        if (type == renderer::TextureType::_1D)
+    case MTL::TextureType1DArray:
+        if (type == MTL::TextureType1D)
             view_type = target_type;
         break;
-    case renderer::TextureType::_2D:
-        if (type == renderer::TextureType::_2DArray ||
-            type == renderer::TextureType::Cube ||
-            type == renderer::TextureType::CubeArray) {
+    case MTL::TextureType2D:
+        if (type == MTL::TextureType2DArray ||
+            type == MTL::TextureTypeCube ||
+            type == MTL::TextureTypeCubeArray) {
             view_type = target_type;
             view_layer_count = 1;
         }
         break;
-    case renderer::TextureType::_2DArray:
-        if (type == renderer::TextureType::_2D ||
-            type == renderer::TextureType::Cube ||
-            type == renderer::TextureType::CubeArray)
+    case MTL::TextureType2DArray:
+        if (type == MTL::TextureType2D ||
+            type == MTL::TextureTypeCube ||
+            type == MTL::TextureTypeCubeArray)
             view_type = target_type;
         break;
-    case renderer::TextureType::Cube:
-        if ((type == renderer::TextureType::CubeArray ||
-             type == renderer::TextureType::_2DArray) &&
+    case MTL::TextureTypeCube:
+        if ((type == MTL::TextureTypeCubeArray ||
+             type == MTL::TextureType2DArray) &&
             layer_count >= 6) {
             view_type = target_type;
             view_layer_count = 6;
         }
         break;
-    case renderer::TextureType::CubeArray:
-        if ((type == renderer::TextureType::Cube ||
-             type == renderer::TextureType::_2DArray) &&
+    case MTL::TextureTypeCubeArray:
+        if ((type == MTL::TextureTypeCube ||
+             type == MTL::TextureType2DArray) &&
             layer_count >= 6) {
             view_type = target_type;
             view_layer_count = layer_count / 6 * 6;
@@ -2054,15 +2067,17 @@ decodeSampler(const TextureSamplerControl& tsc,
     renderer::SamplerDescriptor descriptor{
         .min_filter = static_cast<renderer::SamplerFilter>(tsc.min_filter),
         .mag_filter = static_cast<renderer::SamplerFilter>(tsc.mag_filter),
-        .mip_filter = static_cast<renderer::SamplerMipFilter>(tsc.mip_filter),
+        .mip_filter = tsc.mip_filter == 2   ? MTL::SamplerMipFilterNearest
+                      : tsc.mip_filter == 3 ? MTL::SamplerMipFilterLinear
+                                            : MTL::SamplerMipFilterNotMipmapped,
         .address_mode_s = address(tsc.address_u),
         .address_mode_t = address(tsc.address_v),
         .address_mode_r = address(tsc.address_p),
         .depth_compare_op = (tsc.depth_compare ? static_cast<CompareOp>(
                                                      tsc.depth_compare_op + 1)
                                                : CompareOp::Invalid),
-        .border_color_u = uint4({tsc.border_color_r, tsc.border_color_g,
-                                 tsc.border_color_b, tsc.border_color_a}),
+        .border_color_u = simd::uint4{tsc.border_color_r, tsc.border_color_g,
+                                      tsc.border_color_b, tsc.border_color_a},
         .min_lod = static_cast<f32>(tsc.min_lod_clamp) / 256.0f,
         .max_lod = static_cast<f32>(tsc.max_lod_clamp) / 256.0f,
         .lod_bias = static_cast<f32>(signExtend<i32, 13>(static_cast<i32>(tsc.mip_lod_bias))) / 256.0f,
@@ -2074,11 +2089,11 @@ decodeSampler(const TextureSamplerControl& tsc,
     // sRGB textures use the separate 8-bit border color, converted to linear
     // (alpha is shared). It is only distinct when sRGB conversion is enabled.
     if (tsc.srgb_conversion && renderer::isSrgbTextureFormat(texture_format)) {
-        descriptor.border_color_u = uint4(
-            {std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_r)),
-             std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_g)),
-             std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_b)),
-             tsc.border_color_a});
+        descriptor.border_color_u = simd::uint4{
+            std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_r)),
+            std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_g)),
+            std::bit_cast<u32>(srgbToLinear(tsc.srgb_border_color_b)),
+            tsc.border_color_a};
     }
 
     // The sampler clamps the LOD to its own range, then to the view's
@@ -2093,15 +2108,15 @@ decodeSampler(const TextureSamplerControl& tsc,
     if (descriptor.integer_texture) {
         descriptor.min_filter = renderer::SamplerFilter::Nearest;
         descriptor.mag_filter = renderer::SamplerFilter::Nearest;
-        if (descriptor.mip_filter == renderer::SamplerMipFilter::Linear)
-            descriptor.mip_filter = renderer::SamplerMipFilter::Nearest;
+        if (descriptor.mip_filter == MTL::SamplerMipFilterLinear)
+            descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;
     }
 
     // The color only matters to samplers addressing the border; clearing it
     // keeps equivalent samplers and shader variants shared
     if (!renderer::samplerUsesBorder(descriptor))
-        descriptor.border_color_u = uint4({0u, 0u, 0u, 0u});
+        descriptor.border_color_u = simd::uint4{0u, 0u, 0u, 0u};
     return descriptor;
 }
 
@@ -2430,11 +2445,9 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
     const auto scissor = getScissor(0);
     str += fmt::format("    viewport=({}, {}, {}x{}, z {}..{}) scissor=({}, {}, "
                        "{}x{})\n",
-                       viewport.rect.origin.x(), viewport.rect.origin.y(),
-                       viewport.rect.size.x(), viewport.rect.size.y(),
-                       viewport.depth_near, viewport.depth_far,
-                       scissor.origin.x(), scissor.origin.y(),
-                       scissor.size.x(), scissor.size.y());
+                       viewport.originX, viewport.originY, viewport.width,
+                       viewport.height, viewport.znear, viewport.zfar,
+                       scissor.x, scissor.y, scissor.width, scissor.height);
 
     // Uniform buffers used by the shaders
     for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
@@ -2757,11 +2770,11 @@ void ThreeD::captureVisualDraw(bool after) {
         const auto viewport = getViewport(0);
         const auto scissor = getScissor(0);
         visual.event("viewport_scissor", {
-            {"viewport", fmt::format("{},{} {}x{} z={}..{}", viewport.rect.origin.x(),
-                viewport.rect.origin.y(), viewport.rect.size.x(), viewport.rect.size.y(),
-                viewport.depth_near, viewport.depth_far)},
-            {"scissor", fmt::format("{},{} {}x{}", scissor.origin.x(), scissor.origin.y(),
-                scissor.size.x(), scissor.size.y())}});
+            {"viewport", fmt::format("{},{} {}x{} z={}..{}", viewport.originX,
+                viewport.originY, viewport.width, viewport.height,
+                viewport.znear, viewport.zfar)},
+            {"scissor", fmt::format("{},{} {}x{}", scissor.x, scissor.y,
+                scissor.width, scissor.height)}});
     }
     for (u32 i = 0; i < std::min<u32>(static_cast<u32>(regs.color_target_control.count), COLOR_TARGET_COUNT); ++i) {
         const auto index = regs.color_target_control.getMap(i);
@@ -2959,7 +2972,8 @@ bool ThreeD::drawInternal() {
     gpu.getRenderer().setDepthWriteEnabled(regs.depth_write_enabled != 0u &&
         !(visual.selected() && visual.options().no_depth));
     gpu.getRenderer().setDepthCompareOp(regs.depth_compare_op);
-    gpu.getRenderer().setBlendConstant(regs.blend_constant);
+    gpu.getRenderer().setBlendConstant(
+        std::bit_cast<simd::float4>(regs.blend_constant));
 
     // Stencil, register offsets from NVIDIA's clb197.h
     {
@@ -2967,30 +2981,30 @@ bool ThreeD::drawInternal() {
             switch (value) {
             case 0x1e00: // OGL_KEEP
             case 1:      // D3D_KEEP
-                return renderer::StencilOp::Keep;
+                return MTL::StencilOperationKeep;
             case 0x0: // OGL_ZERO
             case 2:   // D3D_ZERO
-                return renderer::StencilOp::Zero;
+                return MTL::StencilOperationZero;
             case 0x1e01: // OGL_REPLACE
             case 3:      // D3D_REPLACE
-                return renderer::StencilOp::Replace;
+                return MTL::StencilOperationReplace;
             case 0x1e02: // OGL_INCRSAT
             case 4:      // D3D_INCRSAT
-                return renderer::StencilOp::IncrSat;
+                return MTL::StencilOperationIncrementClamp;
             case 0x1e03: // OGL_DECRSAT
             case 5:      // D3D_DECRSAT
-                return renderer::StencilOp::DecrSat;
+                return MTL::StencilOperationDecrementClamp;
             case 0x150a: // OGL_INVERT
             case 6:      // D3D_INVERT
-                return renderer::StencilOp::Invert;
+                return MTL::StencilOperationInvert;
             case 0x8507: // OGL_INCR
             case 7:      // D3D_INCR
-                return renderer::StencilOp::Incr;
+                return MTL::StencilOperationIncrementWrap;
             case 0x8508: // OGL_DECR
             case 8:      // D3D_DECR
-                return renderer::StencilOp::Decr;
+                return MTL::StencilOperationDecrementWrap;
             default:
-                return renderer::StencilOp::Keep;
+                return MTL::StencilOperationKeep;
             }
         };
         const auto decode_func = decodeCompareOp;

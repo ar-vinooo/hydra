@@ -1,5 +1,10 @@
 # Hydra Maxwell (SM 5.3 / GM20B) shader translation audit: ALU and non-memory instructions
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Read-only audit of `src/core/hw/tegra_x1/gpu/renderer/shader_decompiler/` (decoder, IR, MSL codegen) and `tests/shader_library_tests.cpp`.
 Nothing in the repository was modified, built or run. Real-game evidence comes from guest shader words that Hydra had already dumped under `build/` (see Appendix A).
 

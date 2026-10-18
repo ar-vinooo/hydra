@@ -29,7 +29,7 @@ struct State {
     bool depth_test_enabled;
     bool depth_write_enabled;
     engines::CompareOp depth_compare_op;
-    float4 blend_constant{};
+    simd::float4 blend_constant{};
     f32 depth_bias_constant{0.0f};
     f32 depth_bias_slope{0.0f};
     f32 depth_bias_clamp{0.0f};
@@ -38,8 +38,8 @@ struct State {
     MTL::CullMode cull_mode{MTL::CullModeNone};
     MTL::Winding front_face_winding{MTL::WindingClockwise};
     MTL::DepthClipMode depth_clip_mode{MTL::DepthClipModeClip};
-    Viewport viewports[VIEWPORT_COUNT];
-    Scissor scissors[VIEWPORT_COUNT];
+    MTL::Viewport viewports[VIEWPORT_COUNT];
+    MTL::ScissorRect scissors[VIEWPORT_COUNT];
     BufferView index_buffer;
     engines::IndexType index_type{engines::IndexType::None};
     std::array<BufferView, VERTEX_ARRAY_COUNT> vertex_buffers{};
@@ -76,9 +76,9 @@ class Renderer : public IRenderer {
     // Texture
     ITexture* createTexture(const TextureDescriptor& descriptor) override;
     void blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
-                     float3 src_origin, uint3 src_size, u32 src_level,
-                     u32 src_layer, ITextureView* dst, float3 dst_origin,
-                     uint3 dst_size, u32 dst_level, u32 dst_layer,
+                     simd::float3 src_origin, MTL::Size src_size, u32 src_level,
+                     u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
+                     MTL::Size dst_size, u32 dst_level, u32 dst_layer,
                      u32 level_count, u32 layer_count, const BlitOptions& options) override;
 
     // Sampler
@@ -97,7 +97,7 @@ class Renderer : public IRenderer {
         state.clear = clear_state;
     }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
-                    u32 layer, u8 mask, const uint4 color) override;
+                    u32 layer, u8 mask, const simd::uint4 color) override;
     void clearDepth(ICommandBuffer* command_buffer, u32 layer,
                     const float value) override;
     void clearStencil(ICommandBuffer* command_buffer, u32 layer,
@@ -115,7 +115,7 @@ class Renderer : public IRenderer {
     void setDepthTestEnabled(bool enabled) override;
     void setDepthWriteEnabled(bool enabled) override;
     void setDepthCompareOp(engines::CompareOp op) override;
-    void setBlendConstant(const float4 color) override;
+    void setBlendConstant(const simd::float4 color) override;
     void setDepthBias(f32 constant, f32 slope, f32 clamp) override;
     void setStencilState(const StencilState& stencil) override;
     void setCullState(bool enabled, engines::CullFaceMode mode,
@@ -131,8 +131,8 @@ class Renderer : public IRenderer {
                                const std::string& path);
 
     // Viewport and scissor
-    void setViewport(u32 index, const Viewport& viewport) override;
-    void setScissor(u32 index, const Scissor& scissor) override;
+    void setViewport(u32 index, const MTL::Viewport& viewport) override;
+    void setScissor(u32 index, const MTL::ScissorRect& scissor) override;
 
     // Resource binding
     void bindVertexBuffer(const BufferView& buffer, u32 index) override;
@@ -280,9 +280,9 @@ class Renderer : public IRenderer {
     void freeTemporaryBufferHot7(BufferBase* buffer);
     ITexture* createTextureHot8(const TextureDescriptor& descriptor);
     void blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src,
-                         float3 src_origin, uint3 src_size, u32 src_level,
-                         u32 src_layer, ITextureView* dst, float3 dst_origin,
-                         uint3 dst_size, u32 dst_level, u32 dst_layer,
+                         simd::float3 src_origin, MTL::Size src_size, u32 src_level,
+                         u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
+                         MTL::Size dst_size, u32 dst_level, u32 dst_layer,
                          u32 level_count, u32 layer_count, const BlitOptions& options);
     SamplerBase* createSamplerHot10(const SamplerDescriptor& descriptor);
     ICommandBuffer* createCommandBufferHot11();
@@ -290,7 +290,7 @@ class Renderer : public IRenderer {
     createRenderPassHot12(const RenderPassDescriptor& descriptor);
     void bindRenderPassHot13(const RenderPassBase* render_pass);
     void clearColorHot14(ICommandBuffer* command_buffer, u32 render_target_id,
-                         u32 layer, u8 mask, const uint4 color);
+                         u32 layer, u8 mask, const simd::uint4 color);
     void clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
                          const float value);
     void clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
@@ -310,10 +310,10 @@ class Renderer : public IRenderer {
     void setCullStateHot26(bool enabled, engines::CullFaceMode mode,
                            engines::Winding front_face);
     void setDepthBiasHot27(f32 constant, f32 slope, f32 clamp);
-    void setBlendConstantHot28(const float4 color);
+    void setBlendConstantHot28(const simd::float4 color);
     void setDepthCompareOpHot29(engines::CompareOp op);
-    void setViewportHot30(u32 index, const Viewport& viewport);
-    void setScissorHot31(u32 index, const Scissor& scissor);
+    void setViewportHot30(u32 index, const MTL::Viewport& viewport);
+    void setScissorHot31(u32 index, const MTL::ScissorRect& scissor);
     void bindVertexBufferHot32(const BufferView& buffer, u32 index);
     void bindIndexBufferHot33(const BufferView& index_buffer,
                               engines::IndexType index_type);

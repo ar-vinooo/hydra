@@ -43,7 +43,7 @@ int main() {
         auto& cache = renderer.getTextureCache();
         const auto ptr = reinterpret_cast<uptr>(guest_memory.data());
         const auto descriptor = [ptr](TextureFormat format) {
-            return TextureDescriptor(ptr, TextureType::_2D, format, false, 0,
+            return TextureDescriptor(ptr, MTL::TextureType2D, format, false, 0,
                                      64, 64, 1, 4, 1, 0, 0, 0);
         };
 
@@ -66,7 +66,7 @@ int main() {
         }
 
         auto mip = TextureDescriptor(
-            ptr + bc5.getLevelOffset(1), TextureType::_2D,
+            ptr + bc5.getLevelOffset(1), MTL::TextureType2D,
             TextureFormat::BC5_RGUnorm, false, 0, 32, 32, 1, 2, 1, 0, 0, 0);
         auto* mip_view = cache.find(commands.get(), mip, TextureUsage::Read);
         check(mip_view->getBase() == bc5_view->getBase(),
@@ -89,10 +89,10 @@ int main() {
             auto& layouts = layout_renderer.getTextureCache();
             std::unique_ptr<ICommandBuffer> cb(layout_renderer.createCommandBuffer());
             const auto address = reinterpret_cast<uptr>(layout_memory.data());
-            const TextureDescriptor first(address, TextureType::_2D,
+            const TextureDescriptor first(address, MTL::TextureType2D,
                 TextureFormat::RGBA8Unorm, variant == 1, variant == 1 ? 256 : 0,
                 32, 32, 1, 1, 1, 0, 0, 0);
-            const TextureDescriptor second(address, TextureType::_2D,
+            const TextureDescriptor second(address, MTL::TextureType2D,
                 TextureFormat::RGBA8Unorm, variant != 0, variant != 0 ? 128 : 0,
                 32, 32, 1, 1, 1, 0, variant == 0 ? 2 : 0, 0);
             auto* a = layouts.find(cb.get(), first, TextureUsage::Read);
@@ -133,7 +133,7 @@ int main() {
             const auto cube_ptr = reinterpret_cast<uptr>(cube_memory.data());
             std::unique_ptr<ICommandBuffer> cube_commands(
                 renderer.createCommandBuffer());
-            const TextureDescriptor cube(cube_ptr, TextureType::_2DArray,
+            const TextureDescriptor cube(cube_ptr, MTL::TextureType2DArray,
                                          TextureFormat::RGBA16Float, false, 0,
                                          128, 128, 1, 1, 6, 0, 4, 0, 0x2c000);
             auto* cube_view =
@@ -153,7 +153,7 @@ int main() {
                     ->getRenderCommandEncoder(pass);
             }
             const TextureDescriptor level1(
-                cube_ptr + 0x20000, TextureType::_2DArray,
+                cube_ptr + 0x20000, MTL::TextureType2DArray,
                 TextureFormat::RGBA16Float, false, 0, 64, 64, 1, 1, 6, 0, 3, 0,
                 0x2c000);
             auto* level1_view =
@@ -164,7 +164,7 @@ int main() {
                   "Cubemap storage grows to hold the rendered level");
             check(level1_view->getDescriptor().levels.getBegin() == 1,
                   "Rendered level is a view of level 1");
-            const TextureDescriptor full(cube_ptr, TextureType::_2DArray,
+            const TextureDescriptor full(cube_ptr, MTL::TextureType2DArray,
                                          TextureFormat::RGBA16Float, false, 0,
                                          128, 128, 1, 2, 6, 0, 4, 0, 0x2c000);
             auto* full_view =
@@ -192,14 +192,14 @@ int main() {
             // e.g. level 5 (4x4) of face 4 as an 8x4 render target
             std::unique_ptr<ICommandBuffer> sky_commands(
                 renderer.createCommandBuffer());
-            const TextureDescriptor sky(cube_ptr, TextureType::_2DArray,
+            const TextureDescriptor sky(cube_ptr, MTL::TextureType2DArray,
                                         TextureFormat::RGBA16Float, false, 0,
                                         128, 128, 1, 8, 6, 0, 4, 0, 0x2c000);
             auto* sky_view =
                 cache.find(sky_commands.get(), sky, TextureUsage::Read);
             const TextureDescriptor padded(
                 cube_ptr + 4 * 0x2c000 + sky.getLevelOffset(5),
-                TextureType::_2D, TextureFormat::RGBA16Float, false, 0, 8, 4,
+                MTL::TextureType2D, TextureFormat::RGBA16Float, false, 0, 8, 4,
                 1, 1, 1, 0, 0, 0);
             auto* padded_view =
                 cache.find(sky_commands.get(), padded, TextureUsage::Write);
@@ -221,11 +221,11 @@ int main() {
             std::unique_ptr<ICommandBuffer> alias_commands(
                 alias_renderer.createCommandBuffer());
             const TextureDescriptor source(
-                alias_ptr, TextureType::_2DArray, TextureFormat::RGBA8Unorm,
+                alias_ptr, MTL::TextureType2DArray, TextureFormat::RGBA8Unorm,
                 false, 0, 32, 32, 1, 3, 2, 0, 0, 0, 0x2000);
             const TextureDescriptor destination(
                 alias_ptr + source.layer_size + source.getLevelOffset(1),
-                TextureType::_2DArray, TextureFormat::RGBA8Unorm, false, 0,
+                MTL::TextureType2DArray, TextureFormat::RGBA8Unorm, false, 0,
                 16, 16, 1, 2, 2, 0, 0, 0, 0x2000);
             auto* source_view = alias_cache.find(
                 alias_commands.get(), source, TextureUsage::Read);
@@ -278,12 +278,12 @@ int main() {
         auto& range_cache = range_renderer.getTextureCache();
         commands.reset(range_renderer.createCommandBuffer());
         auto target_desc =
-            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+            TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
                               false, 0, 16, 16, 1, 1, 1, 0, 0, 0);
         auto alias_desc =
-            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+            TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
                               false, 0, 8, 16, 1, 1, 1, 0, 0, 0);
-        auto separate_desc = TextureDescriptor(ptr + 4096, TextureType::_2D,
+        auto separate_desc = TextureDescriptor(ptr + 4096, MTL::TextureType2D,
                                                TextureFormat::RGBA8Unorm, false,
                                                0, 16, 16, 1, 1, 1, 0, 0, 0);
         auto* target_view =
@@ -305,7 +305,7 @@ int main() {
         static_cast<metal::CommandBuffer*>(commands.get())
             ->getRenderCommandEncoder(pass);
         auto bridge =
-            TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+            TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
                               true, 256, 64, 64, 1, 1, 1, 0, 0, 0);
         range_cache.find(commands.get(), bridge, TextureUsage::Read);
         check(range_cache.getMemoryCount() == 1,
@@ -413,10 +413,10 @@ int main() {
             metal::Renderer aliases_renderer;
             auto& aliases = aliases_renderer.getTextureCache();
             std::unique_ptr<ICommandBuffer> cb(aliases_renderer.createCommandBuffer());
-            const TextureDescriptor raw_desc(address, TextureType::_1DBuffer,
+            const TextureDescriptor raw_desc(address, MTL::TextureTypeTextureBuffer,
                 TextureFormat::R32Uint, true, 8192, 2048, 1, 1, 1, 1, 0, 0, 0);
             const u32 height = linear_surface ? 3 : 16;
-            const TextureDescriptor surface_desc(address + 512, TextureType::_2D,
+            const TextureDescriptor surface_desc(address + 512, MTL::TextureType2D,
                 TextureFormat::RG32Float, linear_surface, linear_surface ? 160 : 0,
                 16, height, 1, 1, 1, 0, 1, 0);
             auto* surface = aliases.find(cb.get(), surface_desc, TextureUsage::Read);
@@ -436,7 +436,7 @@ int main() {
             const auto guest_offset = [&](u32 x, u32 y) -> u64 {
                 if (linear_surface) return u64(y) * 160 + x;
                 const auto blocks = surface_desc.getLevelBlockSizeLog2(0);
-                return hydra::hw::tegra_x1::gpu::getBlockLinearOffset(x, y, 0, 128, height, blocks.y(), blocks.z());
+                return hydra::hw::tegra_x1::gpu::getBlockLinearOffset(x, y, 0, 128, height, static_cast<u32>(blocks.height), static_cast<u32>(blocks.depth));
             };
             const auto read_surface = [&] {
                 commands_impl()->getBlitCommandEncoder()->copyFromTexture(surface_native, 0, 0,
@@ -488,11 +488,11 @@ int main() {
         metal::Renderer buffer_renderer;
         auto& buffer_cache = buffer_renderer.getTextureCache();
         commands.reset(buffer_renderer.createCommandBuffer());
-        auto buffer_full = TextureDescriptor(buffer_ptr, TextureType::_1DBuffer,
+        auto buffer_full = TextureDescriptor(buffer_ptr, MTL::TextureTypeTextureBuffer,
                                              TextureFormat::R32Uint, true, 256,
                                              64, 1, 1, 1, 1, 0, 0, 0);
         auto buffer_sub = TextureDescriptor(
-            buffer_ptr + 64, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            buffer_ptr + 64, MTL::TextureTypeTextureBuffer, TextureFormat::R32Uint,
             true, 128, 32, 1, 1, 1, 1, 0, 0, 0);
         auto* full_view =
             buffer_cache.find(commands.get(), buffer_full, TextureUsage::Read);
@@ -541,7 +541,7 @@ int main() {
         // contents and must recover the written data rather than stale CPU
         // zeros.
         auto late_descriptor = TextureDescriptor(
-            buffer_ptr + 80, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            buffer_ptr + 80, MTL::TextureTypeTextureBuffer, TextureFormat::R32Uint,
             true, 64, 16, 1, 1, 1, 1, 0, 0, 0);
         auto* late_view = buffer_cache.find(commands.get(), late_descriptor,
                                             TextureUsage::Read);
@@ -573,7 +573,7 @@ int main() {
         // boundary. Copying texel indices or requiring equal formats loses
         // data.
         auto half_descriptor = TextureDescriptor(
-            buffer_ptr + 82, TextureType::_1DBuffer, TextureFormat::R16Uint,
+            buffer_ptr + 82, MTL::TextureTypeTextureBuffer, TextureFormat::R16Uint,
             true, 62, 31, 1, 1, 1, 1, 0, 0, 0);
         auto* half_view = buffer_cache.find(commands.get(), half_descriptor,
                                             TextureUsage::Read);
@@ -628,7 +628,7 @@ int main() {
         buffer_encoder->dispatchThreads(MTL::Size(31, 1, 1),
                                         MTL::Size(31, 1, 1));
         auto mixed_descriptor = TextureDescriptor(
-            buffer_ptr + 80, TextureType::_1DBuffer, TextureFormat::R32Uint,
+            buffer_ptr + 80, MTL::TextureTypeTextureBuffer, TextureFormat::R32Uint,
             true, 80, 20, 1, 1, 1, 1, 0, 0, 0);
         auto* mixed_view = buffer_cache.find(commands.get(), mixed_descriptor,
                                              TextureUsage::Read);
@@ -677,7 +677,7 @@ int main() {
         check(sampled_format == toTextureFormat(DepthSurfaceFormat::S8Z24Unorm),
               "G24R8 sampling aliases Z24S8 render target format");
         auto depth_desc =
-            TextureDescriptor(ptr + 16384, TextureType::_2D, sampled_format,
+            TextureDescriptor(ptr + 16384, MTL::TextureType2D, sampled_format,
                               false, 0, 16, 16, 1, 1, 1, 0, 0, 0);
         commands.reset(range_renderer.createCommandBuffer());
         auto* depth_target =
@@ -696,7 +696,7 @@ int main() {
                                       ImageSwizzle::OneFloat);
         auto* sampled_depth = range_cache.find(
             commands.get(), depth_desc,
-            TextureViewDescriptor(TextureType::_2D, sampled_format,
+            TextureViewDescriptor(MTL::TextureType2D, sampled_format,
                                   ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1),
                                   depth_swizzle),
             TextureUsage::Read);
@@ -787,7 +787,7 @@ int main() {
         auto* sampled_stencil = range_cache.find(
             commands.get(), depth_desc,
             TextureViewDescriptor(
-                TextureType::_2D, stencil_format, ztd::Range<u32>(0, 1),
+                MTL::TextureType2D, stencil_format, ztd::Range<u32>(0, 1),
                 ztd::Range<u32>(0, 1),
                 SwizzleChannels(stencil_format, ImageSwizzle::R,
                                 ImageSwizzle::R, ImageSwizzle::R,
@@ -846,7 +846,7 @@ int main() {
             auto& copy_cache = copy_renderer.getTextureCache();
             const auto address = reinterpret_cast<uptr>(copy_memory.data());
             const auto make_copy_desc = [](uptr ptr_) {
-                return TextureDescriptor(ptr_, TextureType::_2D,
+                return TextureDescriptor(ptr_, MTL::TextureType2D,
                     TextureFormat::RGBA8Unorm, true, 16, 4, 4, 1, 1, 1, 0, 0, 0);
             };
             commands.reset(copy_renderer.createCommandBuffer());
@@ -900,11 +900,11 @@ int main() {
             commands.reset(copy_renderer.createCommandBuffer());
             auto& copy_cache = copy_renderer.getTextureCache();
             auto* source = copy_cache.find(commands.get(), TextureDescriptor(
-                address, TextureType::_2D, TextureFormat::RGBA8Unorm,
+                address, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
                 true, 4, 1, 1, 1, 1, 1, 0, 0, 0), TextureUsage::Read);
             const u32 bpp = format == TextureFormat::RGBA8Unorm ? 4 : 8;
             auto* destination = copy_cache.find(commands.get(), TextureDescriptor(
-                address + 256, TextureType::_2D, format,
+                address + 256, MTL::TextureType2D, format,
                 true, 4 * bpp, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Read);
             copy_renderer.blitTexture(commands.get(), source, {0, 0, 0},
                 {1, 1, 1}, 0, 0, destination, {1, 1, 0}, {2, 2, 1},
@@ -946,10 +946,10 @@ int main() {
             commands.reset(int_renderer.createCommandBuffer());
             auto& int_cache = int_renderer.getTextureCache();
             auto* source = int_cache.find(commands.get(), TextureDescriptor(
-                address, TextureType::_2D, TextureFormat::RGBA8Uint,
+                address, MTL::TextureType2D, TextureFormat::RGBA8Uint,
                 true, 8, 2, 2, 1, 1, 1, 0, 0, 0), TextureUsage::Read);
             auto* destination = int_cache.find(commands.get(), TextureDescriptor(
-                address + 256, TextureType::_2D, TextureFormat::RGBA8Uint,
+                address + 256, MTL::TextureType2D, TextureFormat::RGBA8Uint,
                 true, 16, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Read);
             BlitOptions options;
             options.nearest = true;
@@ -986,7 +986,7 @@ int main() {
             auto& tiled_cache = tiled_renderer.getTextureCache();
             const auto tiled_address =
                 reinterpret_cast<uptr>(tiled_memory.data());
-            const TextureDescriptor tiled_desc(tiled_address, TextureType::_2D,
+            const TextureDescriptor tiled_desc(tiled_address, MTL::TextureType2D,
                                                TextureFormat::RGBA8Unorm, false,
                                                0, 8, 8, 1, 1, 1, 0, 0, 0);
             commands.reset(tiled_renderer.createCommandBuffer());
@@ -1038,7 +1038,7 @@ int main() {
             const auto readback_ptr =
                 reinterpret_cast<uptr>(readback_memory.data());
             auto readback_desc = TextureDescriptor(
-                readback_ptr, TextureType::_2D, TextureFormat::RGBA32Float,
+                readback_ptr, MTL::TextureType2D, TextureFormat::RGBA32Float,
                 false, 0, 1, 1, 1, 1, 1, 0, 0, 0);
             commands.reset(range_renderer.createCommandBuffer());
             auto* readback_target = range_cache.find(commands.get(), readback_desc,
@@ -1065,6 +1065,60 @@ int main() {
             std::cout << "PASS: rendered texture flushes to guest memory\n";
         }
 
+        // Packed depth/stencil targets use separate Metal planes, but guest
+        // memory expects one Z24S8 word per pixel.
+        {
+            std::vector<u8> memory(1024, 0);
+            const auto address = reinterpret_cast<uptr>(memory.data());
+            const TextureDescriptor desc(
+                address, MTL::TextureType2D, TextureFormat::Z24Unorm_S8Uint,
+                false, 0, 4, 4, 1, 1, 1, 0, 0, 0);
+            metal::Renderer depth_renderer;
+            auto& depth_cache = depth_renderer.getTextureCache();
+            auto cb = std::unique_ptr<ICommandBuffer>(
+                depth_renderer.createCommandBuffer());
+            auto* depth_target_view =
+                depth_cache.find(cb.get(), desc, TextureUsage::Write);
+            auto* packed_depth_native = static_cast<metal::Texture*>(
+                                            depth_target_view->getBase())
+                                            ->getTexture();
+            auto* packed_depth_pass =
+                MTL::RenderPassDescriptor::renderPassDescriptor();
+            packed_depth_pass->depthAttachment()->setTexture(
+                packed_depth_native);
+            packed_depth_pass->depthAttachment()->setLoadAction(
+                MTL::LoadActionClear);
+            packed_depth_pass->depthAttachment()->setStoreAction(
+                MTL::StoreActionStore);
+            packed_depth_pass->depthAttachment()->setClearDepth(0.5);
+            packed_depth_pass->stencilAttachment()->setTexture(
+                packed_depth_native);
+            packed_depth_pass->stencilAttachment()->setLoadAction(
+                MTL::LoadActionClear);
+            packed_depth_pass->stencilAttachment()->setStoreAction(
+                MTL::StoreActionStore);
+            packed_depth_pass->stencilAttachment()->setClearStencil(0x5a);
+            static_cast<metal::CommandBuffer*>(cb.get())
+                ->getRenderCommandEncoder(packed_depth_pass);
+            depth_cache.flushMemory(cb.get(), desc.getRange());
+            bool match = true;
+            for (u32 y = 0; y < 4 && match; y++) {
+                for (u32 x = 0; x < 4; x++) {
+                    const usize offset =
+                        hydra::hw::tegra_x1::gpu::getBlockLinearOffset(
+                            x * 4, y, 0, 64, 4, 0, 0);
+                    u32 word;
+                    std::memcpy(&word, memory.data() + offset, sizeof(word));
+                    const u32 depth = word & 0xffffffu;
+                    match &= (depth == 0x7fffffu || depth == 0x800000u) &&
+                             word >> 24 == 0x5a;
+                }
+            }
+            check(match, "Depth/stencil clear flushes in packed guest layout");
+            cb.reset();
+            std::cout << "PASS: packed depth/stencil target flush\n";
+        }
+
         // Guest readback must replay aliases by GPU write time, rather than
         // the cache's insertion/hash order. The first storage is deliberately
         // newer so an unordered flush overwrites it with the older alias.
@@ -1075,7 +1129,7 @@ int main() {
             auto& aliases = alias_renderer.getTextureCache();
             std::unique_ptr<ICommandBuffer> cb(alias_renderer.createCommandBuffer());
             for (auto format : {TextureFormat::RGBA32Float, TextureFormat::RGBA8Unorm}) {
-                const TextureDescriptor desc(address, TextureType::_2D, format,
+                const TextureDescriptor desc(address, MTL::TextureType2D, format,
                                              false, 0, 1, 1, 1, 1, 1, 0, 0, 0);
                 aliases.find(cb.get(), desc, TextureUsage::Read);
             }
@@ -1182,6 +1236,55 @@ int main() {
             check(match, "3D block linear layout matches the hardware order");
         }
         std::cout << "PASS: 3D block linear slices within a block\n";
+
+        // GPU-written 3D textures must read back every slice and retile the
+        // packed Metal data into the guest block-linear layout.
+        {
+            std::vector<u8> memory(4096, 0);
+            const auto address = reinterpret_cast<uptr>(memory.data());
+            const TextureDescriptor desc(
+                address, MTL::TextureType3D, TextureFormat::RGBA8Unorm, false, 0,
+                4, 4, 3, 1, 1, 0, 0, 2);
+            metal::Renderer readback_renderer;
+            auto& readback_cache = readback_renderer.getTextureCache();
+            auto cb = std::unique_ptr<ICommandBuffer>(
+                readback_renderer.createCommandBuffer());
+            auto* volume_target =
+                readback_cache.find(cb.get(), desc, TextureUsage::Write);
+            std::vector<u8> linear(4 * 4 * 4 * 3);
+            for (usize i = 0; i < linear.size(); i++)
+                linear[i] = static_cast<u8>(i * 17 + i / 13);
+            auto* upload = readback_renderer.getDevice()->newBuffer(
+                linear.data(), linear.size(), MTL::ResourceStorageModeShared);
+            static_cast<metal::CommandBuffer*>(cb.get())
+                ->getBlitCommandEncoder()
+                ->copyFromBuffer(
+                    upload, 0, 16, 64, MTL::Size(4, 4, 3),
+                    static_cast<metal::Texture*>(volume_target->getBase())
+                        ->getTexture(),
+                    0, 0, MTL::Origin(0, 0, 0));
+            upload->release();
+            readback_cache.flushMemory(cb.get(), desc.getRange());
+            bool match = true;
+            for (u32 z = 0; z < 3 && match; z++) {
+                for (u32 y = 0; y < 4 && match; y++) {
+                    for (u32 x = 0; x < 16; x++) {
+                        const usize guest =
+                            hydra::hw::tegra_x1::gpu::getBlockLinearOffset(
+                                x, y, z, 64, 4, 0, 2);
+                        const usize packed =
+                            static_cast<usize>(z) * 64 + y * 16 + x;
+                        if (memory[guest] != linear[packed]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            check(match, "3D GPU readback restores every guest slice");
+            cb.reset();
+            std::cout << "PASS: 3D texture readback and block-linear retile\n";
+        }
 
 
         metal::Renderer upload_renderer;

@@ -325,7 +325,7 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
                 const u32 stride = width * 4;
                 const u32 size = height * stride;
                 const hw::tegra_x1::gpu::renderer::TextureDescriptor descriptor(
-                    0x0, hw::tegra_x1::gpu::renderer::TextureType::_2D,
+                    0x0, MTL::TextureType2D,
                     hw::tegra_x1::gpu::renderer::TextureFormat::RGBA8Unorm,
                     true, stride, width, height, 1, 1, 1, 0x0, 0x0, 0x0);
                 const auto texture =
@@ -361,7 +361,7 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
                 const u32 stride = width * 4;
                 const u32 size = height * stride;
                 hw::tegra_x1::gpu::renderer::TextureDescriptor descriptor(
-                    0x0, hw::tegra_x1::gpu::renderer::TextureType::_2D,
+                    0x0, MTL::TextureType2D,
                     hw::tegra_x1::gpu::renderer::TextureFormat::RGBA8Unorm,
                     true, stride, width, height, 1, 1, 1, 0x0, 0x0, 0x0);
                 const auto view_descriptor =
@@ -783,7 +783,12 @@ void System::takeScreenshot() {
         auto command_buffer = gpu.getRenderer().createCommandBuffer();
         auto buffer = gpu.getRenderer().allocateTemporaryBuffer(
             static_cast<u32>(rect.size.y() * rect.size.x() * 4));
-        buffer->copyFrom(command_buffer, texture, rect.origin, rect.size,
+        buffer->copyFrom(command_buffer, texture,
+                         MTL::Origin(static_cast<NS::UInteger>(rect.origin.x()),
+                                     static_cast<NS::UInteger>(rect.origin.y()),
+                                     0),
+                         MTL::Size(static_cast<NS::UInteger>(rect.size.x()),
+                                   static_cast<NS::UInteger>(rect.size.y()), 1),
                          ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1));
         // Wait for the copy to finish
         gpu.getRenderer().debugSyncCommandBuffer(command_buffer);

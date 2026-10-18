@@ -169,7 +169,7 @@ int main() {
         const auto fragment_base = ShaderCache::hash(fragment);
         for (u32 i = 0; i < COLOR_TARGET_COUNT; ++i) {
             changed = fragment;
-            changed.state.color_target_data_types[i] = ColorDataType::Float;
+            changed.state.color_target_data_types[i] = MTL::DataTypeFloat;
             check(ShaderCache::hash(changed) != fragment_base,
                   "Color type remains in fragment key");
         }

@@ -1,6 +1,6 @@
 # Hydra graphics work: handoff
 
-Status as of 2026-10-17. This covers the graphics-compatibility work done on branch `arvino`: what changed, how it was verified, what is still open, and the rules for continuing. Nothing here is committed.
+Status as of 2026-10-18. This covers the graphics-compatibility work done on branch `arvino`: what changed, how it was verified, what is still open, and the rules for continuing. Nothing here is committed.
 
 Read sections 1–3 before touching code. Section 5 lists the design decisions that will bite you if you don't know them.
 
@@ -14,9 +14,11 @@ Files in this folder:
 - `video-instructions-2026-10-17.md`: VMAD/VMNMX/VSETP.
 - `sampler-borders-2026-10-17.md`: exact sampler border colors (shader emulation), evidence, limits.
 - `implementation-2026-10-17.md`: continuation changes, validation status, remaining scope and failed GPU capture evidence.
+- `continuation-2026-10-18.md`: RZ register boundaries, DRAW_AUTO fallback,
+  compressed alias copies and depth/3D readback.
 - `README.md`: this document.
 - `backlog.md`: master backlog. `[x]` means done and tested; `[ ]` means open.
-- `audit/*.md`: eight subsystem audits written at the start of the work, with capability tables, code quotes, Eden/NVIDIA references and per-subsystem backlogs. They describe the code **before** the fixes below, so their line numbers are stale and many of their bugs are now fixed. Section 7 maps which ones.
+- `audit/*.md`: eight subsystem audits written at the start of the work, with capability tables, code quotes, NVIDIA references and secondary implementation comparisons. They describe the code **before** the fixes below, so their line numbers are stale and many of their bugs are now fixed. Section 7 maps which ones.
 
 ---
 
@@ -27,21 +29,32 @@ Files in this folder:
 Do not:
 - add enum values or Metal features without confirmed guest semantics;
 - treat one game rendering correctly as proof that a subsystem is complete.
+- treat another emulator's implementation as proof of NVIDIA semantics.
 
 **Rules from the user (follow them):**
 - **Never commit** unless the user asks. Don't stage files either; the user's tree has many unrelated uncommitted changes.
 - **Don't launch or drive games or the GUI.** The user runs the games and reports what they see. Ask them to test.
 - **Gather evidence first.** Use logs, captures, dumped shaders and reference code. Fix root causes, not symptoms.
+- **Use primary authorities.** NVIDIA documentation/headers define guest state;
+  Apple Metal documentation, SDK headers and validation define host behavior.
+  Reproducible hardware traces may fill gaps. Emulator code, including Eden,
+  is only a hypothesis generator and must be corroborated before a feature is
+  marked guest-semantics verified.
 - **Make engine-level, generic fixes.** Main titles: Crash Bandicoot 4 and Jump Force (both UE4). Regression titles: Crash Team Racing and Mario Kart 8. A fix for one UE4 title should carry over to the other.
 - **The user writes casual Indonesian** ("bg", "bro"); reply in Indonesian.
 - **Strip debug code before any commit** (section 9).
 - **Match the existing code style.** Comments are sparse, short and explain why. Don't write long comment blocks.
 
-**References used** (cite them in code reviews or commit messages):
-- **Eden** (yuzu fork): `src/video_core`, `src/shader_recompiler/frontend/maxwell/translate/impl/*`, `texture_cache/format_lookup_table.cpp`, `surface.cpp`, `macro/macro_interpreter.cpp`, `engines/engine_upload.cpp`.
-- **NVIDIA open-gpu-doc**: `classes/3d/clb197.h` (3D class), `clb097tex.h` (TIC/TSC), `clb0b5.h` (DMA), `cla140.h`.
-- **Mesa**: NAK `sm50.rs` (SASS encodings), nouveau `nv50_defs.xml.h` (zeta format names).
-- **envytools**: `envydis/gm107.c`.
+**Evidence hierarchy** (cite primary sources in code reviews or commit messages):
+1. **NVIDIA open-gpu-doc**: `classes/3d/clb197.h` (3D class),
+   `clb097tex.h` (TIC/TSC), `clb0b5.h` (DMA), `cla140.h`.
+2. **Apple Metal** documentation, SDK headers and validation-layer results.
+3. Reproducible NVIDIA hardware/NVN traces and focused output comparisons.
+
+Mesa/NAK, nouveau, envytools and other emulators may help locate an encoding
+or formulate a test. They are secondary comparators, not authorities. Eden in
+particular must never be the sole reason for an implementation or `[x]` status;
+agreement with it is not confirmation that its behavior is correct.
 
 A local copy of these sources was at `/private/tmp/claude-501/-Users-arvino-Documents-Project-hydra/0e906531-f45a-4e9b-b0bc-dcb303edaa1b/scratchpad/refs/`. It is session-scoped and may be gone; fetch upstream if so.
 
@@ -96,6 +109,13 @@ New `.cpp`/`.hpp` files under `src/core` must be added to the explicit source li
 - the 2D batch: signed 32.32 `FixedPoint`, exact du/dx source extents (no truncation, mirrored copies keep their sign), SAMPLE_MODE filter (POINT uses the nearest sampler; origin CORNER is **not** modeled, shifting by du/2 would blur 1:1 copies if the driver uses it differently), integer uint/int blit pipeline variants (point read, `BlitOptions` in `blitTexture`), word 0x90 no longer used as a source layer;
 - tooling: `hydra-shader-corpus-tests <dir> [limit]` decompiles and Metal-compiles every dumped guest shader (`HYDRA_CORPUS_VERBOSE=1` prints names); all 2771 dumped Crash 4/Jump Force shaders pass.
 
+**Continuation (2026-10-18):** Sequential shader operands now stop at RZ
+instead of wrapping into R0, `DRAW_AUTO` has the verified byte-count/stride
+fallback, raw compressed-block alias copies work in both directions, and
+packed depth/stencil plus 3D GPU texture writes can be flushed back to guest
+memory. The focused shader, engine and texture suites pass with Metal
+validation. See `continuation-2026-10-18.md`.
+
 See `backlog.md` for what is left. The raster, viewport and compact draw changes have no engine-level test (they need a `ThreeD` with a GMMU, like `testInlineToMemory`); only the window-space shader path is tested. Verify them in gameplay, or add such a test.
 
 Performance and stability are part of the job, not an afterthought: new code on per-draw paths must not allocate, hash or copy more than the code it replaces (see section 5, items 6 and 9, for the existing cost-saving designs).
@@ -111,7 +131,8 @@ Confirmed in Crash 4 shader `0x1b56830`: `FSET.EQ.FTZ.AND.CC RZ, R16, R17, PT` i
 References:
 - `audit/shader_alu.md` §B2;
 - `audit/shader_mem_tex_flow.md` C16;
-- Eden `floating_point_compare_and_set.cpp` (CC writes) and `ir_emitter.cpp` (flow-test evaluation).
+- A secondary-emulator comparison identified the same CC/flow behavior, but
+  does not count as guest-semantics evidence.
 
 Notes for the work:
 - Hydra represents the flags as `ir::Value::createConditionFlag(i)`: 0 = Z, 1 = S, 2 = C, 3 = O. See the I2I CC code in `decoder/conversion.cpp`.
@@ -153,11 +174,11 @@ Grouped by area. Each line gives the fix, the main files and the test that cover
 - **XMAD cbuf form** (`decoder/integer_arithmetic.*`): decodes `.PSL` (bit 55) and `.MRG` (bit 56). This was wrong in 520+ dumped Crash 4 shaders. Test: `testXmadConstantMultiply`.
 - **LDC** (`decoder/memory.cpp`): U8/S8/U16/S16 extraction, signed 16-bit register offset. Test: `testLdcSmallIntegers`.
 
-**Conversions (rewritten to Eden semantics)** (`decoder/conversion.{hpp,cpp}`)
+**Conversions (implemented; NVIDIA/hardware validation incomplete)** (`decoder/conversion.{hpp,cpp}`)
 - Each conversion is now a backend helper; see the intrinsics bullet below.
 - **F2I**: round-half-to-even, saturation to the destination range, NaN → 0, F16 source half (H1), 16-bit results sign-extended into the full register, 64-bit destinations as a register pair.
 - **F2F**: H1 source, F16 result in the low half (high half 0), SAT, integer rounding only for equal sizes, exact F64↔F32 conversions.
-- **I2I**: SAT is bit 50 (was 51); source sign is bit 13 only; 3-bit byte selector; non-saturating narrow results are truncated and zero-extended (Eden).
+- **I2I**: SAT is bit 50 (was 51); source sign is bit 13 only; 3-bit byte selector; non-saturating narrow results are truncated and zero-extended. The result tests validate the Metal path, not these guest semantics on NVIDIA hardware.
 - **I2F**: selector, 64-bit source pair, abs/neg keep the most negative value.
 - **MUFU.RCP64H/RSQ64H** (`decoder/multifunction.cpp`): now produce approximate double seeds. Before, they aborted the host via `LOG_FATAL` on an undefined value.
 - **Removed debug code**: the old `HYDRA_NO_BYTESEL` "DEBUG byte select" logging is gone.
@@ -189,7 +210,7 @@ Grouped by area. Each line gives the fix, the main files and the test that cover
 ### 4.2 MME macros and engine registers
 
 - **MME interpreter rewrite** (`macro/driver_base.*`, `macro/interpreter/driver.*`):
-  - Eden semantics: per-call state reset, u64 carry (subtract carry = no borrow), signed 18-bit immediates, delay slots, annul, exit after the delay slot.
+  - Current behavior: per-call state reset, u64 carry (subtract carry = no borrow), signed 18-bit immediates, delay slots, annul, exit after the delay slot. Parts originally came from a secondary emulator and still need NVIDIA/hardware confirmation.
   - Correct ExtractShiftLeft operand order.
   - All arguments after the first are parameters.
   - Nested macro calls execute immediately.
@@ -223,7 +244,8 @@ Grouped by area. Each line gives the fix, the main files and the test that cover
 - **Crash fixes**: no `LOG_FATAL` remains in format conversion.
   - Unknown color, depth and TIC formats return `Invalid`. Engines skip invalid render targets (`getColorTargetTexture`/`getDepthStencilTargetTexture` return null) and 2D copies.
   - Added: RGBA32Sint in the Metal table; ZT X8Z24 (0x15) → `Z24Unorm_X8Uint`; A2R10G10B10 → new `BGR10A2Unorm`; X1R5G5B5 and the Z/O 1555/8888 variants.
-- **TIC table**: +26 Eden encodings:
+- **TIC table**: +26 encodings originally collected from a secondary emulator;
+  NVIDIA `clb097tex.h` is the required authority for revalidation:
   - BC6H S/U, BC7 sRGB, BC4 SNORM;
   - RG8 UINT/SINT, RGB10A2 UINT, E5B9G9R9;
   - ETC2/EAC ×10, now mapped to native Metal `ETC2_*`/`EAC_*`;
@@ -338,7 +360,8 @@ All GPU suites pass (2026-10-17). The buffer-snapshot and thread-wait failures l
 - `3d_backend.md`: B1, B6, B9, B10, B15.
 - `3d_frontend.md`: B1–B8, B10–B14, B26, B27.
 - `shader_alu.md`: B1, B3–B9, B13–B16.
-- `shader_mem_tex_flow.md`: C1–C5, C8, C10–C13.
+- `shader_mem_tex_flow.md`: C1–C5, C8, C10–C13, C22 (`reg_t`
+  sequential operands stop at RZ).
 - `compute_memory_sync.md`: B4–B8, B18.
 - `2d_dma_inline.md`: B1–B4.
 - `services_presentation.md`: B1, B2.
@@ -365,7 +388,6 @@ All GPU suites pass (2026-10-17). The buffer-snapshot and thread-wait failures l
    - PSETP second destination (B10), MOV immediate sign extension (B11), LEA.HI.X cbuf and IADD32I.PO decode masks (B12);
    - `fmin`/`fmax` for FMNMX NaN, `!` instead of `~` on bools, unsigned arithmetic in IADD3/ISCADD/LEA, `extract_bits` guards (§c).
 6. **Decoder bugs** (`shader_mem_tex_flow.md`):
-   - `reg_t` wrap: `dst + 1` when dst is RZ clobbers R0 (C22);
    - shuffles outside compute (C23);
    - mixed texture declaration types (C24).
 7. **Cross-format texture copies** violate Metal's blit rule (`textures.md` D-5): views for same-size formats, buffers for compressed, compute for depth↔colour.
@@ -391,7 +413,7 @@ If the user reports a visual regression after these changes, check these first:
 3. **Index FIRST/limit and decode changes.** Watch for missing geometry or draws dropped by the limit clamp. A one-time warning is logged.
 4. **Texture cache keys** (`servesRequest` probing, exact group keys, Z32F group split). Watch for textures that now upload from stale guest memory instead of reusing a render target.
 5. **GMMU lookup cache and locks**: performance, and any stale mapping after remaps.
-6. **Conversions now per Eden.** F2I maps NaN to 0 even for unsigned results; non-saturating I2I narrow results zero-extend.
+6. **Conversion semantics need NVIDIA/hardware revalidation.** The current F2I maps NaN to 0 even for unsigned results, and non-saturating I2I narrow results zero-extend. Metal result tests only confirm that Hydra implements those choices consistently.
 7. **2D block-alias path restricted**: NVN texture streaming that copies BC blocks through RG32/RGBA32.
 8. **Formats now unbound instead of aborting**: A8, 0x40–0x47, 0xFF, V8Z24 and the coverage depth formats log `NOT_IMPLEMENTED` once.
 

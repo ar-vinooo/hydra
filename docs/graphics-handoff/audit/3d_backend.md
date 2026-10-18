@@ -1,5 +1,10 @@
 # Hydra audit: Maxwell B (0xB197) 3D back end, output merger and framebuffer
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Read-only audit of the Hydra working tree (HEAD `3e8c4cc2` plus uncommitted changes), 2026-10-17 at about 10:20 WIB. Nothing in the repo was modified, built or run.
 
 **Concurrency note:** other agents edited files during the audit (`engines/3d.cpp`, `renderer/metal/pipeline.cpp`, `renderer/pipeline_cache.cpp`, `renderer/shader_cache.hpp`, `shader_decompiler/const.hpp`, `codegen/lang/msl/emitter.cpp`). Those edits were vertex, topology, clip-distance and point-size work, outside this scope. Every line number below was re-checked at write time. The MSL emitter kept moving while I worked, so citations into it name the function and give an approximate line (`≈`).

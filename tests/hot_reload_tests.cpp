@@ -46,7 +46,7 @@ u8 draw(MTL::Device* device) {
     std::memcpy(bytes.data(), words.data(), bytes.size());
     ztd::io::MemoryStream stream(bytes);
     GuestShaderState guest{};
-    guest.color_target_data_types[0] = ColorDataType::Float;
+    guest.color_target_data_types[0] = MTL::DataTypeFloat;
     ShaderBackend backend;
     std::vector<u8> code;
     ResourceMapping mapping;

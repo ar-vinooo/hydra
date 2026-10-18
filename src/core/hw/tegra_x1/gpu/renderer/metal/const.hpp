@@ -1,15 +1,7 @@
 #pragma once
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#pragma GCC diagnostic ignored "-Wold-style-cast"
-
-#include <Metal/Metal.hpp>
-#include <QuartzCore/QuartzCore.hpp>
-
-#pragma GCC diagnostic pop
-
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/metal_cpp.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 

@@ -24,13 +24,13 @@ void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const u32 layer_count) {}
 void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const ITexture* src,
-                       [[maybe_unused]] const uint3 src_origin,
+                       [[maybe_unused]] const MTL::Origin src_origin,
                        [[maybe_unused]] const u32 src_level,
                        [[maybe_unused]] const u32 src_layer,
-                       [[maybe_unused]] const uint3 dst_origin,
+                       [[maybe_unused]] const MTL::Origin dst_origin,
                        [[maybe_unused]] const u32 dst_level,
                        [[maybe_unused]] const u32 dst_layer,
-                       [[maybe_unused]] const uint3 size,
+                       [[maybe_unused]] const MTL::Size size,
                        [[maybe_unused]] const u32 layer_count) {}
 
 void Texture::copyBufferBytes([[maybe_unused]] ICommandBuffer* command_buffer,

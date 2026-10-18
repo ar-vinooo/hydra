@@ -210,9 +210,9 @@ ITexture* Renderer::createTextureHot8(const TextureDescriptor& descriptor) {
 }
 
 void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src,
-                           float3 src_origin, uint3 src_size, u32 src_level,
-                           u32 src_layer, ITextureView* dst, float3 dst_origin,
-                           uint3 dst_size, u32 dst_level, u32 dst_layer,
+                           simd::float3 src_origin, MTL::Size src_size, u32 src_level,
+                           u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
+                           MTL::Size dst_size, u32 dst_level, u32 dst_layer,
                            u32 level_count, u32 layer_count, const BlitOptions& options) {
     // TODO: what about 3D textures?
 
@@ -244,22 +244,22 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
                 MetalRenderer, "Depth stencil blit between different formats"));
             return;
         }
-        if (src_size.x() != dst_size.x() || src_size.y() != dst_size.y())
+        if (src_size.width != dst_size.width || src_size.height != dst_size.height)
             ONCE(
                 LOG_WARN(MetalRenderer,
                          "Scaled depth stencil blit, copying without scaling"));
 
         // Clamp the region to both textures
-        const auto src_x = static_cast<u32>(src_origin.x());
-        const auto src_y = static_cast<u32>(src_origin.y());
-        const auto dst_x = static_cast<u32>(dst_origin.x());
-        const auto dst_y = static_cast<u32>(dst_origin.y());
+        const auto src_x = static_cast<u32>(src_origin.x);
+        const auto src_y = static_cast<u32>(src_origin.y);
+        const auto dst_x = static_cast<u32>(dst_origin.x);
+        const auto dst_y = static_cast<u32>(dst_origin.y);
         const auto width = static_cast<u32>(std::min<u64>(
-            {dst_size.x(),
+            {dst_size.width,
              src_mtl->width() - std::min<u64>(src_x, src_mtl->width()),
              dst_mtl->width() - std::min<u64>(dst_x, dst_mtl->width())}));
         const auto height = static_cast<u32>(std::min<u64>(
-            {dst_size.y(),
+            {dst_size.height,
              src_mtl->height() - std::min<u64>(src_y, src_mtl->height()),
              dst_mtl->height() - std::min<u64>(dst_y, dst_mtl->height())}));
         if (width == 0 || height == 0)
@@ -276,11 +276,11 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
     const auto is_2d = [](MTL::TextureType type) {
         return type == MTL::TextureType2D || type == MTL::TextureType2DArray;
     };
-    const auto integral_origin = [](float3 origin) {
-        return std::isfinite(origin.x()) && std::isfinite(origin.y()) &&
-               origin.x() >= 0 && origin.y() >= 0 && origin.z() == 0 &&
-               std::floor(origin.x()) == origin.x() &&
-               std::floor(origin.y()) == origin.y();
+    const auto integral_origin = [](simd::float3 origin) {
+        return std::isfinite(origin.x) && std::isfinite(origin.y) &&
+               origin.x >= 0 && origin.y >= 0 && origin.z == 0 &&
+               std::floor(origin.x) == origin.x &&
+               std::floor(origin.y) == origin.y;
     };
     if (src_mtl != dst_mtl && src_mtl->pixelFormat() == dst_mtl->pixelFormat() &&
         !isTextureFormatCompressed(src->getBase()->getDescriptor().format) &&
@@ -291,36 +291,36 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
         src_level < src_mtl->mipmapLevelCount() &&
         dst_level < dst_mtl->mipmapLevelCount() &&
         src_layer < src_mtl->arrayLength() && dst_layer < dst_mtl->arrayLength() &&
-        src_size.x() == dst_size.x() && src_size.y() == dst_size.y() &&
-        src_size.z() == 1 && dst_size.z() == 1 &&
+        src_size.width == dst_size.width && src_size.height == dst_size.height &&
+        src_size.depth == 1 && dst_size.depth == 1 &&
         (options.src_width == 0.0f ||
-         options.src_width == static_cast<f32>(src_size.x())) &&
+         options.src_width == static_cast<f32>(src_size.width)) &&
         (options.src_height == 0.0f ||
-         options.src_height == static_cast<f32>(src_size.y())) &&
+         options.src_height == static_cast<f32>(src_size.height)) &&
         integral_origin(src_origin) && integral_origin(dst_origin)) {
         const auto src_width = std::max<u64>(src_mtl->width() >> src_level, 1);
         const auto src_height = std::max<u64>(src_mtl->height() >> src_level, 1);
         const auto dst_width = std::max<u64>(dst_mtl->width() >> dst_level, 1);
         const auto dst_height = std::max<u64>(dst_mtl->height() >> dst_level, 1);
-        if (static_cast<f64>(src_origin.x()) <= static_cast<f64>(src_width) &&
-            static_cast<f64>(src_origin.y()) <= static_cast<f64>(src_height) &&
-            static_cast<f64>(dst_origin.x()) <= static_cast<f64>(dst_width) &&
-            static_cast<f64>(dst_origin.y()) <= static_cast<f64>(dst_height)) {
-            const auto sx = static_cast<u64>(src_origin.x());
-            const auto sy = static_cast<u64>(src_origin.y());
-            const auto dx = static_cast<u64>(dst_origin.x());
-            const auto dy = static_cast<u64>(dst_origin.y());
-            if (src_size.x() <= src_width - sx && src_size.y() <= src_height - sy &&
-                dst_size.x() <= dst_width - dx && dst_size.y() <= dst_height - dy) {
-                if (src_size.x() == 0 || src_size.y() == 0) return;
+        if (static_cast<f64>(src_origin.x) <= static_cast<f64>(src_width) &&
+            static_cast<f64>(src_origin.y) <= static_cast<f64>(src_height) &&
+            static_cast<f64>(dst_origin.x) <= static_cast<f64>(dst_width) &&
+            static_cast<f64>(dst_origin.y) <= static_cast<f64>(dst_height)) {
+            const auto sx = static_cast<u64>(src_origin.x);
+            const auto sy = static_cast<u64>(src_origin.y);
+            const auto dx = static_cast<u64>(dst_origin.x);
+            const auto dy = static_cast<u64>(dst_origin.y);
+            if (src_size.width <= src_width - sx && src_size.height <= src_height - sy &&
+                dst_size.width <= dst_width - dx && dst_size.height <= dst_height - dy) {
+                if (src_size.width == 0 || src_size.height == 0) return;
                 auto encoder = command_buffer_impl->getBlitCommandEncoder();
                 encoder->copyFromTexture(src_mtl, src_layer, src_level,
-                    MTL::Origin(sx, sy, 0), MTL::Size(src_size.x(), src_size.y(), 1),
+                    MTL::Origin(sx, sy, 0), MTL::Size(src_size.width, src_size.height, 1),
                     dst_mtl, dst_layer, dst_level, MTL::Origin(dx, dy, 0));
                 if (auto& visual = VisualDiagnostics::instance(); visual.active())
                     visual.event("native_texture_copy", {
-                        {"width", std::to_string(src_size.x())},
-                        {"height", std::to_string(src_size.y())},
+                        {"width", std::to_string(src_size.width)},
+                        {"height", std::to_string(src_size.height)},
                         {"components", "all_raw_bits_including_alpha"}});
                 return;
             }
@@ -344,10 +344,12 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
         command_buffer_impl->createRenderCommandEncoder(render_pass_descriptor);
 
     // Draw
-    const auto data_type = [](ITextureView* view) -> u8 {
+    const auto data_type = [](ITextureView* view) {
         const auto type = getIntegerTextureComponentType(
             view->getBase()->getDescriptor().format);
-        return type == nullptr ? 0 : (type[0] == 'u' ? 1 : 2);
+        return type == nullptr   ? MTL::DataTypeFloat
+               : type[0] == 'u' ? MTL::DataTypeUInt
+                                : MTL::DataTypeInt;
     };
     const auto src_type = data_type(src);
     const auto dst_type = data_type(dst);
@@ -358,21 +360,21 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
          .src_type = src_type,
          .dst_type = dst_type}));
     encoder->setViewport(MTL::Viewport(
-        static_cast<f64>(dst_origin.x()), static_cast<f64>(dst_origin.y()),
-        static_cast<f64>(dst_size.x()), static_cast<f64>(dst_size.y()), 0.0,
+        static_cast<f64>(dst_origin.x), static_cast<f64>(dst_origin.y),
+        static_cast<f64>(dst_size.width), static_cast<f64>(dst_size.height), 0.0,
         1.0));
     encoder->setVertexBytes(&dst_layer, sizeof(dst_layer), 0);
     const auto src_width = static_cast<f32>(src_impl->getTexture()->width());
     const auto src_height = static_cast<f32>(src_impl->getTexture()->height());
     const auto extent_x =
         options.src_width != 0.0f ? options.src_width
-                                  : static_cast<f32>(src_size.x());
+                                  : static_cast<f32>(src_size.width);
     const auto extent_y =
         options.src_height != 0.0f ? options.src_height
-                                   : static_cast<f32>(src_size.y());
+                                   : static_cast<f32>(src_size.height);
     BlitParams params = {
-        .src_offset = {static_cast<f32>(src_origin.x()) / src_width,
-                       static_cast<f32>(src_origin.y()) / src_height},
+        .src_offset = {static_cast<f32>(src_origin.x) / src_width,
+                       static_cast<f32>(src_origin.y) / src_height},
         .src_scale = {extent_x / src_width, extent_y / src_height},
         .opacity = 1.0f,
     };
@@ -412,10 +414,11 @@ void Renderer::beginClear(CommandBuffer* command_buffer,
     const MTL::Viewport viewport(0.0, 0.0, static_cast<f64>(width),
                                  static_cast<f64>(height), 0.0, 1.0);
     const auto& rect = state.clear.rect;
-    const u32 x = std::min(rect.origin.x(), width);
-    const u32 y = std::min(rect.origin.y(), height);
-    const MTL::ScissorRect scissor(x, y, std::min(rect.size.x(), width - x),
-                                   std::min(rect.size.y(), height - y));
+    const NS::UInteger x = std::min<NS::UInteger>(rect.x, width);
+    const NS::UInteger y = std::min<NS::UInteger>(rect.y, height);
+    const MTL::ScissorRect scissor(x, y,
+                                   std::min<NS::UInteger>(rect.width, width - x),
+                                   std::min<NS::UInteger>(rect.height, height - y));
     command_buffer->setViewports(std::span(&viewport, 1));
     command_buffer->setScissors(std::span(&scissor, 1));
     command_buffer->setDepthBias(0.0f, 0.0f, 0.0f);
@@ -424,7 +427,7 @@ void Renderer::beginClear(CommandBuffer* command_buffer,
 }
 
 void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target_id,
-                          u32 layer, u8 mask, const uint4 color) {
+                          u32 layer, u8 mask, const simd::uint4 color) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
     auto texture =
@@ -440,7 +443,7 @@ void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target
     }
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
-    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0)
+    if (state.clear.rect.width == 0 || state.clear.rect.height == 0)
         return;
 
     ClearColorPipelineDescriptor pipeline_descriptor{
@@ -480,7 +483,7 @@ void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
     }
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
-    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0)
+    if (state.clear.rect.width == 0 || state.clear.rect.height == 0)
         return;
 
     ClearDepthPipelineDescriptor pipeline_descriptor{
@@ -510,7 +513,7 @@ void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
         return;
 
     auto encoder = getRenderCommandEncoder(command_buffer_impl);
-    if (state.clear.rect.size.x() == 0 || state.clear.rect.size.y() == 0 ||
+    if (state.clear.rect.width == 0 || state.clear.rect.height == 0 ||
         (state.clear.stencil_write_mask & 0xff) == 0)
         return;
 
@@ -524,9 +527,9 @@ void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
         clear_depth_pipeline_cache.find(pipeline_descriptor));
     const StencilFaceState replace{
         .func = engines::CompareOp::Always,
-        .fail_op = StencilOp::Replace,
-        .depth_fail_op = StencilOp::Replace,
-        .pass_op = StencilOp::Replace,
+        .fail_op = MTL::StencilOperationReplace,
+        .depth_fail_op = MTL::StencilOperationReplace,
+        .pass_op = MTL::StencilOperationReplace,
         .ref = value,
         .func_mask = 0xff,
         .write_mask = state.clear.stencil_write_mask & 0xff,
@@ -952,7 +955,7 @@ void Renderer::setDepthBiasHot27(f32 constant, f32 slope, f32 clamp) {
     state.depth_bias_clamp = clamp;
 }
 
-void Renderer::setBlendConstantHot28(const float4 color) {
+void Renderer::setBlendConstantHot28(const simd::float4 color) {
     state.blend_constant = color;
 }
 
@@ -960,11 +963,11 @@ void Renderer::setDepthCompareOpHot29(engines::CompareOp op) {
     state.depth_compare_op = op;
 }
 
-void Renderer::setViewportHot30(u32 index, const Viewport& viewport) {
+void Renderer::setViewportHot30(u32 index, const MTL::Viewport& viewport) {
     state.viewports[index] = viewport;
 }
 
-void Renderer::setScissorHot31(u32 index, const Scissor& scissor) {
+void Renderer::setScissorHot31(u32 index, const MTL::ScissorRect& scissor) {
     state.scissors[index] = scissor;
 }
 
@@ -1036,7 +1039,7 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
         getIntegerTextureComponentType(texture->getDescriptor().format) != nullptr) {
         auto descriptor = sampler->getDescriptor();
         descriptor.min_filter = descriptor.mag_filter = SamplerFilter::Nearest;
-        descriptor.mip_filter = SamplerMipFilter::Nearest;
+        descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;
         sampler = getSamplerCache().find(descriptor);
     }
@@ -1242,15 +1245,15 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
 
     const auto& block = dispatch.block_size;
     const auto& grid = dispatch.grid_size;
-    if (block.x() * block.y() * block.z() == 0 ||
-        grid.x() * grid.y() * grid.z() == 0)
+    if (block.width * block.height * block.depth == 0 ||
+        grid.width * grid.height * grid.depth == 0)
         return;
-    if (block.x() * block.y() * block.z() >
+    if (block.width * block.height * block.depth >
         pipeline->maxTotalThreadsPerThreadgroup()) {
         ONCE(LOG_ERROR(MetalRenderer,
                        "Compute block {}x{}x{} exceeds the maximum of {} "
                        "threads",
-                       block.x(), block.y(), block.z(),
+                       block.width, block.height, block.depth,
                        pipeline->maxTotalThreadsPerThreadgroup()));
         return;
     }
@@ -1258,8 +1261,8 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     if (PerfStats::isEnabled()) {
         PerfStats::instance().compute_dispatches++;
         PerfStats::instance().compute_threads +=
-            u64(grid.x()) * grid.y() * grid.z() * block.x() * block.y() *
-            block.z();
+            u64(grid.width) * grid.height * grid.depth * block.width * block.height *
+            block.depth;
     }
 
     auto encoder = command_buffer_impl->getComputeCommandEncoder();
@@ -1318,8 +1321,8 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         retireTextureUploadBuffer(command_buffer_impl, sampler_buffer);
     }
 
-    encoder->dispatchThreadgroups(MTL::Size(grid.x(), grid.y(), grid.z()),
-                                  MTL::Size(block.x(), block.y(), block.z()));
+    encoder->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
+                                  MTL::Size(block.width, block.height, block.depth));
 
     // DEBUG: measure the GPU time of each dispatch in isolation
     static const bool profile = std::getenv("HYDRA_PROFILE_COMPUTE") != nullptr;
@@ -1357,8 +1360,8 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                     static_cast<TextureView*>(binding.texture)->getTexture(),
                     binding.index);
         }
-        enc->dispatchThreadgroups(MTL::Size(grid.x(), grid.y(), grid.z()),
-                                  MTL::Size(block.x(), block.y(), block.z()));
+        enc->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
+                                  MTL::Size(block.width, block.height, block.depth));
         enc->endEncoding();
         cb->commit();
         cb->waitUntilCompleted();
@@ -1370,8 +1373,8 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
             LOG_INFO(MetalRenderer,
                      "DEBUG compute {:#x} grid {}x{}x{} block {}x{}x{}: "
                      "{:.3f} ms (status {})",
-                     dispatch.debug_program_addr, grid.x(), grid.y(),
-                     grid.z(), block.x(), block.y(), block.z(), ms,
+                     dispatch.debug_program_addr, grid.width, grid.height,
+                     grid.depth, block.width, block.height, block.depth, ms,
                      static_cast<int>(cb->status()));
         }
     }
@@ -1583,38 +1586,27 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
 
     // Blend constant
     command_buffer->setBlendColor(
-        state.blend_constant.x(), state.blend_constant.y(),
-        state.blend_constant.z(), state.blend_constant.w());
+        state.blend_constant.x, state.blend_constant.y,
+        state.blend_constant.z, state.blend_constant.w);
 
     // Viewport and scissor
     MTL::Viewport viewports[VIEWPORT_COUNT];
     MTL::ScissorRect scissors[VIEWPORT_COUNT];
     for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
-        // Viewport
-        const auto& viewport = state.viewports[i];
-        viewports[i] = MTL::Viewport(static_cast<f64>(viewport.rect.origin.x()),
-                                     static_cast<f64>(viewport.rect.origin.y()),
-                                     static_cast<f64>(viewport.rect.size.x()),
-                                     static_cast<f64>(viewport.rect.size.y()),
-                                     static_cast<f64>(viewport.depth_near),
-                                     static_cast<f64>(viewport.depth_far));
+        viewports[i] = state.viewports[i];
 
         // Scissor
         // Metal requires the scissor to lie within the render pass
-        const auto& scissor = state.scissors[i];
-        u32 x = scissor.origin.x();
-        u32 y = scissor.origin.y();
-        u32 width = scissor.size.x();
-        u32 height = scissor.size.y();
+        scissors[i] = state.scissors[i];
         if (state.render_pass) {
-            const auto rp_width = state.render_pass->getWidth();
-            const auto rp_height = state.render_pass->getHeight();
-            x = std::min(x, rp_width);
-            y = std::min(y, rp_height);
-            width = std::min(width, rp_width - x);
-            height = std::min(height, rp_height - y);
+            const NS::UInteger rp_width = state.render_pass->getWidth();
+            const NS::UInteger rp_height = state.render_pass->getHeight();
+            auto& scissor = scissors[i];
+            scissor.x = std::min(scissor.x, rp_width);
+            scissor.y = std::min(scissor.y, rp_height);
+            scissor.width = std::min(scissor.width, rp_width - scissor.x);
+            scissor.height = std::min(scissor.height, rp_height - scissor.y);
         }
-        scissors[i] = MTL::ScissorRect(x, y, width, height);
     }
     command_buffer->setViewports(viewports);
     command_buffer->setScissors(scissors);

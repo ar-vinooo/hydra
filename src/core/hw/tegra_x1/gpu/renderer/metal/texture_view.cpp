@@ -51,7 +51,7 @@ TextureView::TextureView(Texture* base, const TextureViewDescriptor& descriptor)
     }
 
     texture = base->getTexture()->newTextureView(
-        pixel_format, toMtlTextureType(type),
+        pixel_format, type,
         NS::Range(descriptor.levels.getBegin(), descriptor.levels.getSize()),
         NS::Range(descriptor.layers.getBegin(), descriptor.layers.getSize()),
         swizzle_channels_mtl);

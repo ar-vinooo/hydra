@@ -1,18 +1,19 @@
 # Sampler border colors (TEX D-9)
 
-Status: IMPLEMENTED_UNVERIFIED. Written without building or running anything (project rule); tests were added but have not been executed.
+Status: IMPLEMENTED, HOST-VERIFIED by focused Metal result tests on 2026-10-18.
+Exact guest semantics are still PARTIAL pending NVIDIA hardware evidence.
 
 ## Guest semantics and evidence
 
 | Item | Class | Evidence |
 |---|---|---|
-| Border = 4 raw 32-bit words in the TSC (0x10..0x1C), float for float formats | CONFIRMED | `clb097tex.h`, Eden `TSCEntry::border_color` |
-| Separate 8-bit sRGB border (R/G/B at TSC 0x08 bits 24-31, 0x0C bits 12-19 / 20-27), alpha shared; used when `srgb_conversion` is set and the texture is sRGB | STRONGLY INFERRED | Eden `SrgbBorderColor()`, `Sampler::MakeKey` (`srgb_border`), `has_srgb_border_color` |
-| Integer textures: border words are raw component bits | STRONGLY INFERRED | Eden keeps the raw words and forces nearest filtering for integer formats (`force_nearest`); no float conversion exists in Eden |
-| Depth compare: border depth is the first component | STRONGLY INFERRED | Vulkan custom border (Eden passes the same words); not documented by NVIDIA |
-| CLAMP_OGL border vs edge by filter | CONFIRMED (Eden) | already implemented |
-| MIRROR_ONCE_BORDER = mirror once (`|u|`), then border (GL `MIRROR_CLAMP_TO_BORDER_EXT` definition) | STRONGLY INFERRED | NVIDIA GL extension is defined for this hardware; Eden has no equivalent and falls back to an edge mode |
-| The border color bypasses the TIC component swizzle | HYPOTHESIS | Eden adds `VK_EXT_border_color_swizzle` mapping to compensate Vulkan swizzling the border, which implies hardware does not; the shader blends the unswizzled border |
+| Four 32-bit TSC border fields and separate packed sRGB R/G/B fields | CONFIRMED ENCODING | NVIDIA `clb097tex.h`: `TEXSAMP2..7` border fields |
+| BORDER, CLAMP_OGL and MIRROR_ONCE_BORDER address-mode values | CONFIRMED ENCODING | NVIDIA `clb097tex.h`: `TEXSAMP0_ADDRESS_{U,V,P}` |
+| Integer textures interpret the border words as raw component bits | UNVERIFIED GUEST SEMANTICS | Current behavior passes Hydra's Metal tests; NVIDIA header names the fields but does not define the conversion rule |
+| Depth compare uses the first border component | UNVERIFIED GUEST SEMANTICS | Current Metal implementation is tested; not established by NVIDIA documentation |
+| CLAMP_OGL selects border or edge according to filtering | UNVERIFIED GUEST SEMANTICS | Encoding is documented; exact transition behavior still needs an NVIDIA trace |
+| MIRROR_ONCE_BORDER mirrors once (`|u|`) and then uses the border | PARTIALLY CONFIRMED | NVIDIA documents the mode name; coordinate-boundary behavior needs hardware confirmation |
+| Border color bypasses the TIC component swizzle | UNVERIFIED GUEST SEMANTICS | Current shader behavior is tested only against its host-side oracle |
 
 ## Implementation
 
@@ -37,9 +38,13 @@ Metal only has transparent black, opaque black and opaque white. Anything else i
 - Each distinct border color produces a distinct shader variant; animated border colors would recompile shaders.
 - Metal's depth border preset values (0 / 1) are assumed for depth textures with presets.
 
-## Tests (not run)
+## Tests
 
 - `texture_format_tests`: `testSamplerBorders` (presets, integer, depth, sRGB, mirror-to-border, unused border).
 - `shader_library_tests`: `testTextureBorderEmulation` (decoded TEX with a custom border, linear and nearest, coverage 0 / 0.5 / 1 per axis).
+
+Both suites pass with `MTL_DEBUG_LAYER=1` as part of the 2026-10-18
+continuation. These tests validate the Metal implementation against Hydra's
+expected values; they do not substitute for NVIDIA hardware-semantic evidence.
 
 Gameplay validation pending. Header changes (`const.hpp`, `shader_cache.hpp`, `3d.hpp`) require a full `hydra` rebuild and restart (hot-reload ABI).

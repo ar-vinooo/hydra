@@ -2,27 +2,6 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-MTL::TextureType toMtlTextureType(TextureType type) {
-    switch (type) {
-    case TextureType::_1D:
-        return MTL::TextureType1D;
-    case TextureType::_1DArray:
-        return MTL::TextureType1DArray;
-    case TextureType::_1DBuffer:
-        return MTL::TextureTypeTextureBuffer;
-    case TextureType::_2D:
-        return MTL::TextureType2D;
-    case TextureType::_2DArray:
-        return MTL::TextureType2DArray;
-    case TextureType::_3D:
-        return MTL::TextureType3D;
-    case TextureType::Cube:
-        return MTL::TextureTypeCube;
-    case TextureType::CubeArray:
-        return MTL::TextureTypeCubeArray;
-    }
-}
-
 #define PIXEL_FORMAT_ENTRY(format, pixel_format, has_depth, has_stencil,       \
                            component_indices)                                  \
     {                                                                          \
@@ -735,64 +714,6 @@ MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle) {
     }
 }
 
-MTL::BlendOperation toMtlBlendOperation(const BlendOperation blend_op) {
-    switch (blend_op) {
-    case BlendOperation::Add:
-        return MTL::BlendOperationAdd;
-    case BlendOperation::Sub:
-        return MTL::BlendOperationSubtract;
-    case BlendOperation::RevSub:
-        return MTL::BlendOperationReverseSubtract;
-    case BlendOperation::Min:
-        return MTL::BlendOperationMin;
-    case BlendOperation::Max:
-        return MTL::BlendOperationMax;
-    }
-}
-
-MTL::BlendFactor toMtlBlendFactor(const BlendFactor blend_factor) {
-    switch (blend_factor) {
-    case BlendFactor::Zero:
-        return MTL::BlendFactorZero;
-    case BlendFactor::One:
-        return MTL::BlendFactorOne;
-    case BlendFactor::SrcColor:
-        return MTL::BlendFactorSourceColor;
-    case BlendFactor::InvSrcColor:
-        return MTL::BlendFactorOneMinusSourceColor;
-    case BlendFactor::SrcAlpha:
-        return MTL::BlendFactorSourceAlpha;
-    case BlendFactor::InvSrcAlpha:
-        return MTL::BlendFactorOneMinusSourceAlpha;
-    case BlendFactor::DstAlpha:
-        return MTL::BlendFactorDestinationAlpha;
-    case BlendFactor::InvDstAlpha:
-        return MTL::BlendFactorOneMinusDestinationAlpha;
-    case BlendFactor::DstColor:
-        return MTL::BlendFactorDestinationColor;
-    case BlendFactor::InvDstColor:
-        return MTL::BlendFactorOneMinusDestinationColor;
-    case BlendFactor::SrcAlphaSaturate:
-        return MTL::BlendFactorSourceAlphaSaturated;
-    case BlendFactor::Src1Color:
-        return MTL::BlendFactorSource1Color;
-    case BlendFactor::InvSrc1Color:
-        return MTL::BlendFactorOneMinusSource1Color;
-    case BlendFactor::Src1Alpha:
-        return MTL::BlendFactorSource1Alpha;
-    case BlendFactor::InvSrc1Alpha:
-        return MTL::BlendFactorOneMinusSource1Alpha;
-    case BlendFactor::ConstColor:
-        return MTL::BlendFactorBlendColor;
-    case BlendFactor::InvConstColor:
-        return MTL::BlendFactorOneMinusBlendColor;
-    case BlendFactor::ConstAlpha:
-        return MTL::BlendFactorBlendAlpha;
-    case BlendFactor::InvConstAlpha:
-        return MTL::BlendFactorOneMinusBlendAlpha;
-    }
-}
-
 MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter) {
     switch (filter) {
     case SamplerFilter::Nearest:
@@ -804,17 +725,6 @@ MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter) {
         return MTL::SamplerMinMagFilterLinear;
     default:
         return MTL::SamplerMinMagFilterNearest;
-    }
-}
-
-MTL::SamplerMipFilter toMtlSamplerMipFilter(const SamplerMipFilter filter) {
-    switch (filter) {
-    case SamplerMipFilter::Nearest:
-        return MTL::SamplerMipFilterNearest;
-    case SamplerMipFilter::Linear:
-        return MTL::SamplerMipFilterLinear;
-    default:
-        return MTL::SamplerMipFilterNotMipmapped;
     }
 }
 

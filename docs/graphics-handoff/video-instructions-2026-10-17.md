@@ -2,6 +2,9 @@
 
 The video family is **partially implemented**. These are integer shader
 instructions, unrelated to the emulator's NVDEC/video playback engine.
+Metal result tests verify Hydra's implementation, but encodings or semantics
+known only from disassemblers/emulators remain unverified until NVIDIA hardware
+traces corroborate them.
 
 ## Implemented
 
@@ -36,7 +39,7 @@ when the immediate's upper bits coincide with the register selector fields.
 Unsupported modifiers produce an explicit shader diagnostic; they are not
 silently ignored. This is not full video-family completion.
 
-## References
+## Secondary comparisons
 
 - Local Eden `video_helper.cpp`, `video_multiply_add.cpp`,
   `video_minimum_maximum.cpp`, `video_set_predicate.cpp`, and `maxwell.inc`.
@@ -48,6 +51,8 @@ silently ignored. This is not full video-family completion.
 - [Archived Ryujinx VMNMX/VSETP implementation](https://git.axenov.dev/Museum/ryujinx/src/commit/b6614c6ad5d7d19594b80f4917df27bf476e8f03/Ryujinx.Graphics.Shader/Instructions/InstEmitVideoMinMax.cs):
   secondary operation/saturation ordering and evidence of the mixed-sign
   disagreement. The archive preserves the original implementation and commit.
+
+None of these secondary sources is treated as NVIDIA-semantic proof.
 
 ## Validation
 

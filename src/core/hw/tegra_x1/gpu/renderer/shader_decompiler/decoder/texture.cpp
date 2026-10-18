@@ -282,7 +282,7 @@ void emitTextureQuery(DecoderContext& context, pred_t pred, bool pred_inv,
                     context.builder.opTextureQueryDimension(cbuf_index, i, lod));
         for (u32 i = 0; i < results.size(); i++)
             context.builder.opCopy(
-                ir::Value::createRegister(dst + static_cast<u8>(i)), results[i]);
+                ir::Value::createRegister(offsetRegister(dst, i)), results[i]);
         break;
     }
     default:
@@ -322,8 +322,10 @@ void copyTextureResult(ir::Builder& builder, std::array<reg_t, 4> dsts,
 
 void copyTextureResult(ir::Builder& builder, reg_t dst, ir::Value res,
                        u8 component_mask) {
-    copyTextureResult(builder, {dst + 0, dst + 1, dst + 2, dst + 3}, res,
-                      component_mask);
+    copyTextureResult(builder,
+                      {offsetRegister(dst, 0), offsetRegister(dst, 1),
+                       offsetRegister(dst, 2), offsetRegister(dst, 3)},
+                      res, component_mask);
 }
 
 // Packs the enabled components as F16 pairs: the first two into dst_a, the
@@ -368,8 +370,14 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
                        u32 cbuf_index, bool f16 = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
-#define RA() ir::Value::createRegister(src_a++, ir::ScalarType::F32)
-#define RB() ir::Value::createRegister(src_b++, ir::ScalarType::F32)
+    u32 src_a_offset = 0;
+    u32 src_b_offset = 0;
+#define RA()                                                                  \
+    ir::Value::createRegister(offsetRegister(src_a, src_a_offset++),          \
+                              ir::ScalarType::F32)
+#define RB()                                                                  \
+    ir::Value::createRegister(offsetRegister(src_b, src_b_offset++),          \
+                              ir::ScalarType::F32)
 
     TextureType type;
     TextureSampleFlags flags =
@@ -433,14 +441,16 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureSampleTarget::_2DArray:
         type = TextureType::_2DArray;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RB());
         break;
     case TextureSampleTarget::_2DArrayLodZero:
         type = TextureType::_2DArray;
         flags |= TextureSampleFlags::Lod;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RB());
         flags |= TextureSampleFlags::LodZero;
@@ -449,7 +459,8 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
     case TextureSampleTarget::_2DArrayLodZeroDepthCompare:
         type = TextureType::_2DArray;
         flags |= TextureSampleFlags::DepthCompare | TextureSampleFlags::Lod;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RB());
         cmp_value = RB();
@@ -486,6 +497,8 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         lod = RB();
         break;
     }
+#undef RA
+#undef RB
 
     const auto coords_v =
         context.builder.opVectorConstruct(ir::ScalarType::F32, coords);
@@ -500,7 +513,8 @@ void emitTextureSample(DecoderContext& context, pred_t pred, bool pred_inv,
         copyTextureResultF16(context.builder, dst0, dst1, res, component_mask);
     else
         copyTextureResult(context.builder,
-                          {dst0 + 0, dst0 + 1, dst1 + 0, dst1 + 1}, res,
+                          {offsetRegister(dst0, 0), offsetRegister(dst0, 1),
+                           offsetRegister(dst1, 0), offsetRegister(dst1, 1)}, res,
                           component_mask);
 
     if (conditional)
@@ -548,32 +562,32 @@ void emitTexelFetchSwizzled(DecoderContext& context, InstTlds inst) {
         coords = {reg(src_a), reg(src_b)};
         break;
     case 4: // 2D.LZ.AOFFI
-        coords = {reg(src_a), reg(src_a + 1)};
+        coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
         texel_offset = offset(src_b);
         break;
     case 5: // 2D.LL
-        coords = {reg(src_a), reg(src_a + 1)};
+        coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
         lod = reg(src_b);
         lod_zero = false;
         break;
     case 6: // 2D.LZ.MS
         ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TLDS multisample fetch"));
-        coords = {reg(src_a), reg(src_a + 1)};
+        coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
         break;
     case 7: // 3D.LZ
         type = TextureType::_3D;
-        coords = {reg(src_a), reg(src_a + 1), reg(src_b)};
+        coords = {reg(src_a), reg(offsetRegister(src_a, 1)), reg(src_b)};
         break;
     case 8: // 2D array.LZ
         type = TextureType::_2DArray;
         array_index = arrayIndex(b, src_a);
-        coords = {reg(src_b), reg(src_b + 1)};
+        coords = {reg(src_b), reg(offsetRegister(src_b, 1))};
         break;
     case 12: // 2D.LL.AOFFI
-        coords = {reg(src_a), reg(src_a + 1)};
+        coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
         lod = reg(src_b);
         lod_zero = false;
-        texel_offset = offset(src_b + 1);
+        texel_offset = offset(offsetRegister(src_b, 1));
         break;
     default:
         LOG_ERROR(ShaderDecompiler, "Invalid TLDS encoding {}",
@@ -598,8 +612,10 @@ void emitTexelFetchSwizzled(DecoderContext& context, InstTlds inst) {
     if (!inst.f32)
         copyTextureResultF16(b, dst0, dst1, res, component_mask);
     else
-        copyTextureResult(b, {dst0 + 0, dst0 + 1, dst1 + 0, dst1 + 1}, res,
-                          component_mask);
+        copyTextureResult(
+            b, {offsetRegister(dst0, 0), offsetRegister(dst0, 1),
+                offsetRegister(dst1, 0), offsetRegister(dst1, 1)},
+            res, component_mask);
     if (conditional)
         b.opEndIf();
 }
@@ -612,8 +628,14 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
                         bool aoffi = false, bool dc = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
-#define RA() ir::Value::createRegister(src_a++, ir::ScalarType::F32)
-#define RB() ir::Value::createRegister(src_b++, ir::ScalarType::F32)
+    u32 src_a_offset = 0;
+    u32 src_b_offset = 0;
+#define RA()                                                                  \
+    ir::Value::createRegister(offsetRegister(src_a, src_a_offset++),          \
+                              ir::ScalarType::F32)
+#define RB()                                                                  \
+    ir::Value::createRegister(offsetRegister(src_b, src_b_offset++),          \
+                              ir::ScalarType::F32)
 
     TextureType type;
     TextureSampleFlags flags =
@@ -627,7 +649,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureDimension::_1DArray:
         type = TextureType::_1DArray;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         break;
     case TextureDimension::_2D:
@@ -637,7 +660,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureDimension::_2DArray:
         type = TextureType::_2DArray;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RA());
         break;
@@ -649,7 +673,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureDimension::_3DArray:
         type = TextureType::_3DArray;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RA());
         coords.push_back(RA());
@@ -662,7 +687,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     case TextureDimension::CubeArray:
         type = TextureType::CubeArray;
-        array_index = arrayIndex(context.builder, src_a++);
+        array_index =
+            arrayIndex(context.builder, offsetRegister(src_a, src_a_offset++));
         coords.push_back(RA());
         coords.push_back(RA());
         coords.push_back(RA());
@@ -693,8 +719,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
     ir::Value texel_offset = ir::Value::createUndefined();
     if (aoffi) {
         auto& b = context.builder;
-        const auto packed =
-            ir::Value::createRegister(src_b++, ir::ScalarType::I32);
+        const auto packed = ir::Value::createRegister(
+            offsetRegister(src_b, src_b_offset++), ir::ScalarType::I32);
         std::vector<ir::Value> values;
         for (u32 axis = 0; axis < coords.size(); ++axis)
             values.push_back(b.opBitfieldExtract(
@@ -708,6 +734,8 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
         flags |= TextureSampleFlags::DepthCompare;
         cmp_value = RB();
     }
+#undef RA
+#undef RB
 
     const auto coords_v =
         context.builder.opVectorConstruct(ir::ScalarType::F32, coords);
@@ -735,12 +763,16 @@ void emitTextureGather(DecoderContext& context, pred_t pred, bool pred_inv,
                        dimension == TextureDimension::CubeArray;
     const bool cube = dimension == TextureDimension::Cube ||
                       dimension == TextureDimension::CubeArray;
-    const auto layer =
-        array ? arrayIndex(b, src_a++) : ir::Value::createUndefined();
+    u32 src_a_offset = 0;
+    u32 src_b_offset = 0;
+    const auto layer = array
+                           ? arrayIndex(
+                                 b, offsetRegister(src_a, src_a_offset++))
+                           : ir::Value::createUndefined();
     std::vector<ir::Value> coordinates;
     for (u32 axis = 0; axis < (cube ? 3u : 2u); ++axis)
-        coordinates.push_back(
-            ir::Value::createRegister(src_a++, ir::ScalarType::F32));
+        coordinates.push_back(ir::Value::createRegister(
+            offsetRegister(src_a, src_a_offset++), ir::ScalarType::F32));
     const auto coords_v = b.opVectorConstruct(ir::ScalarType::F32, coordinates);
     const auto type = cube
                           ? (array ? TextureType::CubeArray : TextureType::Cube)
@@ -749,8 +781,8 @@ void emitTextureGather(DecoderContext& context, pred_t pred, bool pred_inv,
     auto single_offset = ir::Value::createUndefined();
     auto per_texel_offsets = ir::Value::createUndefined();
     if (offset == TextureOffset::Aoffi) {
-        const auto packed =
-            ir::Value::createRegister(src_b++, ir::ScalarType::I32);
+        const auto packed = ir::Value::createRegister(
+            offsetRegister(src_b, src_b_offset++), ir::ScalarType::I32);
         single_offset = b.opVectorConstruct(
             ir::ScalarType::I32,
             {b.opBitfieldExtract(packed, ir::Value::createConstantU(0),
@@ -759,16 +791,17 @@ void emitTextureGather(DecoderContext& context, pred_t pred, bool pred_inv,
                                  ir::Value::createConstantU(6))});
         flags |= TextureSampleFlags::Offset;
     } else if (offset == TextureOffset::Ptp) {
-        const auto low =
-            ir::Value::createRegister(src_b++, ir::ScalarType::U32);
-        const auto high =
-            ir::Value::createRegister(src_b++, ir::ScalarType::U32);
+        const auto low = ir::Value::createRegister(
+            offsetRegister(src_b, src_b_offset++), ir::ScalarType::U32);
+        const auto high = ir::Value::createRegister(
+            offsetRegister(src_b, src_b_offset++), ir::ScalarType::U32);
         per_texel_offsets =
             b.opVectorConstruct(ir::ScalarType::U32, {low, high});
         flags |= TextureSampleFlags::Offsets;
     }
     const auto cmp_value =
-        dc ? ir::Value::createRegister(src_b, ir::ScalarType::F32)
+        dc ? ir::Value::createRegister(offsetRegister(src_b, src_b_offset),
+                                       ir::ScalarType::F32)
            : ir::Value::createUndefined();
     const auto res = b.opTextureGather(
         cbuf_index, coords_v, toTexComponent(component), cmp_value, type, flags,
@@ -789,15 +822,17 @@ void emitTextureGather2(DecoderContext& context, pred_t pred, bool pred_inv,
     // With extra operands, both coordinates are in register A and register B
     // holds the offset and depth reference
     const bool extra_operands = aoffi || dc;
+    u32 src_b_offset = 0;
     std::array<ir::Value, 2> coords{
         ir::Value::createRegister(src_a, ir::ScalarType::F32),
-        ir::Value::createRegister(extra_operands ? reg_t(src_a + 1) : src_b,
+        ir::Value::createRegister(extra_operands ? offsetRegister(src_a, 1)
+                                                 : src_b,
                                   ir::ScalarType::F32)};
     auto flags = TextureSampleFlags::Gather;
     auto single_offset = ir::Value::createUndefined();
     if (aoffi) {
-        const auto packed =
-            ir::Value::createRegister(src_b++, ir::ScalarType::I32);
+        const auto packed = ir::Value::createRegister(
+            offsetRegister(src_b, src_b_offset++), ir::ScalarType::I32);
         auto& b = context.builder;
         single_offset = b.opVectorConstruct(
             ir::ScalarType::I32,
@@ -810,7 +845,8 @@ void emitTextureGather2(DecoderContext& context, pred_t pred, bool pred_inv,
     const auto coords_v = context.builder.opVectorConstruct(
         ir::ScalarType::F32, {coords[0], coords[1]});
     const auto cmp_value =
-        dc ? ir::Value::createRegister(src_b, ir::ScalarType::F32)
+        dc ? ir::Value::createRegister(offsetRegister(src_b, src_b_offset),
+                                       ir::ScalarType::F32)
            : ir::Value::createUndefined();
 
     const auto res = context.builder.opTextureGather(
@@ -819,8 +855,11 @@ void emitTextureGather2(DecoderContext& context, pred_t pred, bool pred_inv,
     if (f16)
         copyTextureResultF16(context.builder, dst0, dst1, res, 0b1111);
     else
-        copyTextureResult(context.builder,
-                          {dst0 + 0, dst0 + 1, dst1 + 0, dst1 + 1}, res, 0b1111);
+        copyTextureResult(
+            context.builder,
+            {offsetRegister(dst0, 0), offsetRegister(dst0, 1),
+             offsetRegister(dst1, 0), offsetRegister(dst1, 1)},
+            res, 0b1111);
 
     if (conditional)
         context.builder.opEndIf();
@@ -837,9 +876,12 @@ void emitMipLevelQuery(DecoderContext& context, const InstTmml& inst,
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, inst.pred.get(), inst.pred_inv.get());
 
-    reg_t coordinate = inst.src.get();
+    const reg_t coordinate = inst.src.get();
+    u32 coordinate_offset = 0;
     const auto next = [&] {
-        return ir::Value::createRegister(coordinate++, ir::ScalarType::F32);
+        return ir::Value::createRegister(
+            offsetRegister(coordinate, coordinate_offset++),
+            ir::ScalarType::F32);
     };
     TextureType type;
     u32 axes;
@@ -885,13 +927,14 @@ void emitMipLevelQuery(DecoderContext& context, const InstTmml& inst,
     }
     // The array index is not needed on the host
     if (array)
-        coordinate++;
+        coordinate_offset++;
     std::vector<ir::Value> values;
     for (u32 axis = 0; axis < axes; axis++)
         values.push_back(next());
     const auto coords = b.opVectorConstruct(ir::ScalarType::F32, values);
 
-    reg_t dst = inst.dst.get();
+    const reg_t dst = inst.dst.get();
+    u32 dst_offset = 0;
     for (u32 element = 0; element < 4; element++) {
         if ((inst.write_mask.get() & (1u << element)) == 0)
             continue;
@@ -907,9 +950,9 @@ void emitMipLevelQuery(DecoderContext& context, const InstTmml& inst,
         } else {
             value = ir::Value::createConstantF(0.0f);
         }
-        b.opCopy(ir::Value::createRegister(dst++, element < 2
-                                                      ? ir::ScalarType::U32
-                                                      : ir::ScalarType::F32),
+        b.opCopy(ir::Value::createRegister(
+                     offsetRegister(dst, dst_offset++),
+                     element < 2 ? ir::ScalarType::U32 : ir::ScalarType::F32),
                  value);
     }
 
@@ -956,10 +999,12 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
     const auto conditional =
         handlePredCond(context.builder, inst.pred, inst.pred_inv);
     auto& b = context.builder;
-    reg_t coordinate = inst.src_a;
+    const reg_t coordinate = inst.src_a;
+    u32 coordinate_offset = 0;
     u32 binding = inst.cbuf_index;
     if (bindless) {
-        const auto tracked = trackBindlessHandle(context, coordinate++);
+        const auto tracked = trackBindlessHandle(
+            context, offsetRegister(coordinate, coordinate_offset++));
         if (!tracked) {
             if (conditional)
                 b.opEndIf();
@@ -985,25 +1030,28 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
     const u32 axes = is_1d ? 1 : (cube || inst.dim == TextureDimension::_3D ? 3 : 2);
     std::vector<ir::Value> coordinate_values;
     for (u32 axis = 0; axis < axes; axis++)
-        coordinate_values.push_back(
-            ir::Value::createRegister(coordinate++, ir::ScalarType::F32));
+        coordinate_values.push_back(ir::Value::createRegister(
+            offsetRegister(coordinate, coordinate_offset++),
+            ir::ScalarType::F32));
     const auto coords =
         b.opVectorConstruct(ir::ScalarType::F32, coordinate_values);
-    const auto packed =
-        ir::Value::createRegister(coordinate, ir::ScalarType::I32);
+    const auto packed = ir::Value::createRegister(
+        offsetRegister(coordinate, coordinate_offset), ir::ScalarType::I32);
     auto layer = ir::Value::createUndefined();
     if (array)
         layer = b.opBitwiseAnd(
-            ir::Value::createRegister(coordinate, ir::ScalarType::U32),
+            ir::Value::createRegister(
+                offsetRegister(coordinate, coordinate_offset),
+                ir::ScalarType::U32),
             ir::Value::createConstantU(inst.lc ? 0xfffu : 0xffffu));
     // Derivatives are interleaved per axis: dx.x, dy.x, dx.y, dy.y
     std::vector<ir::Value> dx_values, dy_values;
     for (u32 axis = 0; axis < axes; axis++) {
         dx_values.push_back(ir::Value::createRegister(
-            static_cast<reg_t>(inst.src_b.get() + axis * 2),
+            offsetRegister(inst.src_b.get(), axis * 2),
             ir::ScalarType::F32));
         dy_values.push_back(ir::Value::createRegister(
-            static_cast<reg_t>(inst.src_b.get() + axis * 2 + 1),
+            offsetRegister(inst.src_b.get(), axis * 2 + 1),
             ir::ScalarType::F32));
     }
     const auto dx = b.opVectorConstruct(ir::ScalarType::F32, dx_values);
@@ -1022,8 +1070,9 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
     }
     auto clamp = ir::Value::createUndefined();
     if (inst.lc) {
-        const auto raw =
-            ir::Value::createRegister(coordinate, ir::ScalarType::U32);
+        const auto raw = ir::Value::createRegister(
+            offsetRegister(coordinate, coordinate_offset),
+            ir::ScalarType::U32);
         clamp = b.opMultiply(
             b.opCast(b.opBitfieldExtract(raw, ir::Value::createConstantU(20),
                                          ir::Value::createConstantU(12)),
@@ -1060,7 +1109,7 @@ void emitTxqB(DecoderContext& context, InstTxqB inst) {
     if (!index)
         return;
     emitTextureQuery(context, inst.pred, inst.pred_inv, inst.query, inst.dst,
-                     inst.write_mask, static_cast<reg_t>(inst.src.get() + 1),
+                     inst.write_mask, offsetRegister(inst.src.get(), 1),
                      *index);
 }
 
@@ -1070,7 +1119,7 @@ void emitTexB(DecoderContext& context, InstTexB inst) {
         return;
     emitTextureSample2(context, inst.pred, inst.pred_inv, false, inst.dim,
                        inst.dst, inst.write_mask, inst.src_a,
-                       static_cast<reg_t>(inst.src_b.get() + 1), *index,
+                       offsetRegister(inst.src_b.get(), 1), *index,
                        inst.lod, inst.aoffi, inst.dc);
 }
 
@@ -1088,7 +1137,7 @@ void emitTldB(DecoderContext& context, InstTldB inst) {
         return;
     emitTextureSample2(context, inst.pred, inst.pred_inv, true, inst.dim,
                        inst.dst, inst.write_mask, inst.src_a,
-                       static_cast<reg_t>(inst.src_b.get() + 1), *index,
+                       offsetRegister(inst.src_b.get(), 1), *index,
                        inst.lod ? Lod::Ll : Lod::Lz, inst.aoffi);
 }
 
@@ -1098,7 +1147,7 @@ void emitTld4B(DecoderContext& context, InstTld4B inst) {
         return;
     emitTextureGather(context, inst.pred, inst.pred_inv, inst.component,
                       inst.dst, inst.write_mask, inst.src_a,
-                      static_cast<reg_t>(inst.src_b.get() + 1), *index,
+                      offsetRegister(inst.src_b.get(), 1), *index,
                       inst.offset, inst.dc, inst.dim);
 }
 

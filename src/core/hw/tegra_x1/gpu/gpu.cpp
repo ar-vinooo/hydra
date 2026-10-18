@@ -257,7 +257,7 @@ Gpu::getTexture(renderer::ICommandBuffer* command_buffer, cpu::IMmu* mmu,
     // TODO: why are there more planes?
     const renderer::TextureDescriptor descriptor(
         mmu->unmapAddr(guest_address),
-        renderer::TextureType::_2D,
+        MTL::TextureType2D,
         renderer::toTextureFormat(plane.color_format), is_linear, plane.pitch,
         plane.width, plane.height, 1, 1, 1, 0x0, plane.block_height_gobs_log2,
         0x0);

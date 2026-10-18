@@ -266,8 +266,8 @@ bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor,
         return false;
 
     if (base_descriptor.getLevelDimensions(out_level) !=
-        uint3({view_descriptor.width, view_descriptor.height,
-               view_descriptor.depth}))
+        MTL::Size(view_descriptor.width, view_descriptor.height,
+                  view_descriptor.depth))
         return false;
 
     // Matching dimensions do not imply matching guest byte layout. In
@@ -307,17 +307,17 @@ bool haveCompatibleLayout(const TextureDescriptor& descriptor1, u32 level1,
 
     const auto dims1 = descriptor1.getLevelDimensions(level1);
     const auto dims2 = descriptor2.getLevelDimensions(level2);
-    if (dims1.z() != dims2.z())
+    if (static_cast<u32>(dims1.depth) != static_cast<u32>(dims2.depth))
         return false;
 
     const auto block_size_log2 = descriptor1.getLevelBlockSizeLog2(level1);
     if (block_size_log2 != descriptor2.getLevelBlockSizeLog2(level2))
         return false;
 
-    const u32 block_width = GOB_WIDTH << block_size_log2.x();
-    return align(getTextureFormatStride(descriptor1.format, dims1.x()),
+    const u32 block_width = GOB_WIDTH << static_cast<u32>(block_size_log2.width);
+    return align(getTextureFormatStride(descriptor1.format, static_cast<u32>(dims1.width)),
                  block_width) ==
-           align(getTextureFormatStride(descriptor2.format, dims2.x()),
+           align(getTextureFormatStride(descriptor2.format, static_cast<u32>(dims2.width)),
                  block_width);
 }
 
@@ -377,7 +377,7 @@ bool calculateLevelAndSlice(const TextureDescriptor& base1_descriptor,
     const auto dims1 = base1_descriptor.getLevelDimensions(out_level1);
     const auto dims2 = base2_descriptor.getLevelDimensions(out_level2);
     // Z can differ
-    return dims1.x() == dims2.x() && dims1.y() == dims2.y();
+    return static_cast<u32>(dims1.width) == static_cast<u32>(dims2.width) && static_cast<u32>(dims1.height) == static_cast<u32>(dims2.height);
 }
 
 } // namespace
@@ -413,7 +413,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
 
     // Buffer subranges are not mip/layer views. Keep exact-sized storages;
     // overlapping GPU contents are synchronized by byte range in update().
-    if (descriptor.type == TextureType::_1DBuffer) {
+    if (descriptor.type == MTL::TextureTypeTextureBuffer) {
         auto& storage =
             group.cache.insert(getFreeStorageKey(group, storage_hash));
         return getTexture(command_buffer, storage, mem, descriptor,
@@ -437,9 +437,9 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                     descriptor.level_count == 1 &&
                     calculateLevelAndLayer(other_descriptor, descriptor.ptr,
                                            level, layer) &&
-                    other_descriptor.getLevelDimensions(level).y() ==
+                    static_cast<u32>(other_descriptor.getLevelDimensions(level).height) ==
                         descriptor.height &&
-                    other_descriptor.getLevelDimensions(level).x() <=
+                    static_cast<u32>(other_descriptor.getLevelDimensions(level).width) <=
                         descriptor.width &&
                     haveCompatibleLayout(other_descriptor, level, descriptor,
                                          0);
@@ -667,12 +667,12 @@ void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
         const auto dims = descriptor.getLevelDimensions(level);
         const auto other_dims =
             other_descriptor.getLevelDimensions(other_level);
-        const uint3 size({std::min(dims.x(), other_dims.x()),
-                          std::min(dims.y(), other_dims.y()),
-                          std::min(dims.z(), other_dims.z())});
+        const MTL::Size size(std::min(static_cast<u32>(dims.width), static_cast<u32>(other_dims.width)),
+                             std::min(static_cast<u32>(dims.height), static_cast<u32>(other_dims.height)),
+                             std::min(static_cast<u32>(dims.depth), static_cast<u32>(other_dims.depth)));
         storage.base->copyFrom(
-            command_buffer, other_storage.base, uint3({0, 0, 0}), other_level,
-            other_layer, uint3({0, 0, 0}), level, layer, size,
+            command_buffer, other_storage.base, MTL::Origin(0, 0, 0), other_level,
+            other_layer, MTL::Origin(0, 0, 0), level, layer, size,
             std::min(descriptor.layer_count - layer,
                      other_descriptor.layer_count - other_layer));
         return;
@@ -713,7 +713,7 @@ void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
         std::min(descriptor.level_count - level,
                  other_descriptor.level_count - other_level);
 
-    if (slice == 0 && other_slice == 0 && dims.z() == other_dims.z()) {
+    if (slice == 0 && other_slice == 0 && static_cast<u32>(dims.depth) == static_cast<u32>(other_dims.depth)) {
         // Do a simplified copy in case we are copying whole levels
         storage.base->copyFrom(command_buffer, other_storage.base, other_level,
                                0, level, 0, level_count, 1);
@@ -721,12 +721,13 @@ void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
         ASSERT_DEBUG(
             level_count == 1, Gpu,
             "Cannot copy multiple 3D levels with non-matching dimensions");
-        const u32 slice_count =
-            std::min(dims.z() - slice, other_dims.z() - other_slice);
+        const NS::UInteger slice_count =
+            std::min(static_cast<u32>(dims.depth) - slice, static_cast<u32>(other_dims.depth) - other_slice);
         storage.base->copyFrom(command_buffer, other_storage.base,
-                               uint3({0, 0, other_slice}), other_level, 0,
-                               uint3({0, 0, slice}), level, 0,
-                               uint3({dims.x(), dims.y(), slice_count}), 1);
+                               MTL::Origin(0, 0, other_slice), other_level, 0,
+                               MTL::Origin(0, 0, slice), level, 0,
+                               MTL::Size(static_cast<u32>(dims.width), static_cast<u32>(dims.height), slice_count),
+                               1);
     }
 }
 
@@ -798,10 +799,10 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
     u32 size = 0;
     for (u32 level = 0; level < descriptor.level_count; level++) {
         const auto dims = descriptor.getLevelDimensions(level);
-        const u32 stride = getTextureFormatStride(descriptor.format, dims.x());
-        const u32 rows = getTextureFormatRows(descriptor.format, dims.y());
+        const u32 stride = getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
+        const u32 rows = getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
         const u32 slice_stride = rows * stride;
-        size += dims.z() * slice_stride;
+        size += static_cast<u32>(dims.depth) * slice_stride;
     }
     size *= descriptor.layer_count;
 
@@ -843,9 +844,9 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                 const auto block_size_log2 =
                     descriptor.getLevelBlockSizeLog2(level);
                 const u32 stride =
-                    getTextureFormatStride(descriptor.format, dims.x());
+                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
                 const u32 rows =
-                    getTextureFormatRows(descriptor.format, dims.y());
+                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
                 const u32 slice_stride = rows * stride;
 
                 // Convert
@@ -853,9 +854,9 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                 // (TIC tile width spacing), e.g. 4000 byte rows take 64 GOBs,
                 // not 63. Mip levels aren't (like yuzu).
                 convertBlockLinearToLinear(
-                    align(stride, GOB_WIDTH << block_size_log2.x()),
+                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width)),
                     rows,
-                    dims.z(), block_size_log2.y(), block_size_log2.z(),
+                    static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height), static_cast<u32>(block_size_log2.depth),
                     in_data + in_offset,
                     [=](const u8* in_gob, u32 gob_x, u32 gob_y, u32 gob_z) {
                         const u32 x = gob_x * GOB_WIDTH;
@@ -878,7 +879,7 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                     });
 
                 // Add offset
-                offset += dims.z() * slice_stride;
+                offset += static_cast<u32>(dims.depth) * slice_stride;
             }
         }
     }

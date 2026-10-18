@@ -150,12 +150,20 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         tls_crnt_gmmu->getMmu()->protectsGpuWrites();
     // DEBUG: "reload_buffers" reloads buffer textures on every use
     const auto& reload_descriptor = storage.base->getDescriptor();
-    const bool reload_buffers = reload_descriptor.type == TextureType::_1DBuffer &&
+    const bool reload_buffers = reload_descriptor.type == MTL::TextureTypeTextureBuffer &&
                                 usage == TextureUsage::Read && debugFlag("reload_buffers");
     const bool reload_sampled = debugFlag("reload_sampled");
-    const bool cpu_only_range = (!reload_buffers && !reload_sampled) ||
+    // DEBUG: "reload_always" reloads every use of a texture the GPU never
+    // wrote, to tell stale CPU data from other corruption
+    const bool reload_always = debugFlag("reload_always");
+    const bool cpu_only_range =
+        (!reload_buffers && !reload_sampled && !reload_always) ||
         !mem.hasGpuWriteSince(reload_descriptor.getRange(), TextureCacheTimePoint{});
-    bool force_reload = cpu_only_range && reload_buffers;
+    bool force_reload =
+        cpu_only_range &&
+        (reload_buffers ||
+         (reload_always && usage == TextureUsage::Read &&
+          storage.gpu_written_timestamp == TextureCacheTimePoint{}));
     // DEBUG: "reload_sampled" reloads once every texture the GPU never wrote
     // (their contents only come from guest memory)
     {
@@ -259,8 +267,8 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         getHostTextureFormat(other_descriptor.format) != other_descriptor.format;
                     if (expanded &&
                         (descriptor.format != other_descriptor.format ||
-                         descriptor.type == TextureType::_1DBuffer ||
-                         other_descriptor.type == TextureType::_1DBuffer)) {
+                         descriptor.type == MTL::TextureTypeTextureBuffer ||
+                         other_descriptor.type == MTL::TextureTypeTextureBuffer)) {
                         alias_sync_complete = false;
                         reportUnsupportedAlias(descriptor, other_descriptor);
                         continue;
@@ -284,11 +292,11 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                             command_buffer, other_storage.base,
                             begin - other_range.getBegin(),
                             begin - range.getBegin(), end - begin);
-                    } else if ((descriptor.type == TextureType::_1DBuffer &&
-                                other_descriptor.type == TextureType::_2D) ||
-                               (descriptor.type == TextureType::_2D &&
-                                other_descriptor.type == TextureType::_1DBuffer)) {
-                        const auto& surface = descriptor.type == TextureType::_2D
+                    } else if ((descriptor.type == MTL::TextureTypeTextureBuffer &&
+                                other_descriptor.type == MTL::TextureType2D) ||
+                               (descriptor.type == MTL::TextureType2D &&
+                                other_descriptor.type == MTL::TextureTypeTextureBuffer)) {
+                        const auto& surface = descriptor.type == MTL::TextureType2D
                                                   ? descriptor : other_descriptor;
                         if (surface.level_count == 1 && surface.layer_count == 1 &&
                             surface.depth == 1 && !isTextureFormatCompressed(surface.format) &&
@@ -397,14 +405,6 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                  TextureStorage& storage,
                                  ztd::Range<uptr> range) {
     const auto& descriptor = storage.base->getDescriptor();
-    // Depth stencil formats are stored differently on the host. These stay
-    // unflushed, so their GPU contents are never replaced by guest memory.
-    if (getTextureFormatInfo(descriptor.format).is_depth_stencil ||
-        descriptor.type == TextureType::_3D) {
-        ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Flushing {} texture with format {}",
-                                 descriptor.type, descriptor.format));
-        return;
-    }
     // A partial readback does not make the rest of the GPU storage coherent.
     if (range.getBegin() <= descriptor.ptr &&
         range.getEnd() >= descriptor.ptr + descriptor.size)
@@ -414,8 +414,9 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
     u32 size = 0;
     for (u32 level = 0; level < descriptor.level_count; level++) {
         const auto dims = descriptor.getLevelDimensions(level);
-        size += getTextureFormatStride(descriptor.format, dims.x()) *
-                getTextureFormatRows(descriptor.format, dims.y());
+        size += static_cast<u32>(dims.depth) *
+                getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width)) *
+                getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
     }
     size *= descriptor.layer_count;
     auto tmp_buffer = renderer.allocateTextureUploadBuffer(size);
@@ -429,12 +430,13 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
     for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
         for (u32 level = 0; level < descriptor.level_count; level++) {
             const auto dims = descriptor.getLevelDimensions(level);
-            tmp_buffer->copyFrom(command_buffer, view, uint3({0, 0, 0}),
-                                 uint3({dims.x(), dims.y(), 1}),
+            tmp_buffer->copyFrom(command_buffer, view, MTL::Origin(0, 0, 0),
+                                 dims,
                                  ztd::Range<u32>::fromSize(level, 1),
                                  ztd::Range<u32>::fromSize(layer, 1), offset);
-            offset += getTextureFormatStride(descriptor.format, dims.x()) *
-                      getTextureFormatRows(descriptor.format, dims.y());
+            offset += static_cast<u32>(dims.depth) *
+                      getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width)) *
+                      getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
         }
     }
     // DEBUG: which textures are read back each frame (synchronous waits)
@@ -492,9 +494,9 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                 const auto block_size_log2 =
                     descriptor.getLevelBlockSizeLog2(level);
                 const u32 stride =
-                    getTextureFormatStride(descriptor.format, dims.x());
+                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
                 const u32 rows =
-                    getTextureFormatRows(descriptor.format, dims.y());
+                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
                 const u8* level_data = in_data + offset;
                 const uptr level_begin = descriptor.ptr + out_offset;
                 const u32 level_size = descriptor.getLevelSize(level);
@@ -502,7 +504,7 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                 const uptr end =
                     std::min(level_begin + level_size, range.getEnd());
                 if (begin >= end) {
-                    offset += rows * stride;
+                    offset += static_cast<u32>(dims.depth) * rows * stride;
                     continue;
                 }
                 // CPU page faults and DMA copies can request only a few bytes
@@ -513,15 +515,15 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                 std::memcpy(tiled.data(), out_data + out_offset, level_size);
                 auto* tiled_data = tiled.data();
                 const u32 tiled_stride =
-                    align(stride, GOB_WIDTH << block_size_log2.x());
+                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width));
                 convertLinearToBlockLinear(
-                    tiled_stride, rows, 1, block_size_log2.y(),
-                    block_size_log2.z(),
+                    tiled_stride, rows, static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height),
+                    static_cast<u32>(block_size_log2.depth),
                     [=](u32 gob_x, u32 gob_y, u32 gob_z, u8* out_gob) {
                         const u64 gob_offset = getBlockLinearOffset(
                             gob_x * GOB_WIDTH, gob_y * GOB_HEIGHT, gob_z,
-                            tiled_stride, rows, block_size_log2.y(),
-                            block_size_log2.z());
+                            tiled_stride, rows, static_cast<u32>(block_size_log2.height),
+                            static_cast<u32>(block_size_log2.depth));
                         convertBlockLinearToLinear(
                             GOB_WIDTH, GOB_WIDTH, GOB_SIZE, GOB_HEIGHT, 1, 0, 0,
                             tiled_data + gob_offset, out_gob);
@@ -534,6 +536,8 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                 break;
                             std::memcpy(out_gob + local_y * GOB_WIDTH,
                                         level_data +
+                                            static_cast<usize>(gob_z) * rows *
+                                                stride +
                                             static_cast<usize>(y) * stride + x,
                                         std::min(GOB_WIDTH, stride - x));
                         }
@@ -541,7 +545,7 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                     tiled.data());
                 std::memcpy(reinterpret_cast<void*>(begin),
                             tiled.data() + (begin - level_begin), end - begin);
-                offset += rows * stride;
+                offset += static_cast<u32>(dims.depth) * rows * stride;
             }
         }
     }

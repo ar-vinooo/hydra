@@ -167,7 +167,7 @@ void Compute::launch(const u32 index, const u32 arg) {
                 resource_mapping.texture_types.find(binding_index);
             const bool is_1d =
                 type_it != resource_mapping.texture_types.end() &&
-                type_it->second == renderer::TextureType::_1D;
+                type_it->second == MTL::TextureType1D;
             const auto handle = readTextureHandle(qmd, binding_index);
             const auto tic = get_tic(binding_index);
             if (!tic)
@@ -213,9 +213,10 @@ void Compute::launch(const u32 index, const u32 arg) {
     renderer::ComputeDispatch dispatch{};
     dispatch.shader = shader;
     dispatch.debug_program_addr = program_addr;
-    dispatch.grid_size = uint3({qmd.gridDimX(), qmd.gridDimY(), qmd.gridDimZ()});
+    dispatch.grid_size =
+        MTL::Size(qmd.gridDimX(), qmd.gridDimY(), qmd.gridDimZ());
     dispatch.block_size =
-        uint3({qmd.blockDimX(), qmd.blockDimY(), qmd.blockDimZ()});
+        MTL::Size(qmd.blockDimX(), qmd.blockDimY(), qmd.blockDimZ());
 
     // Uniform buffers
     for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {

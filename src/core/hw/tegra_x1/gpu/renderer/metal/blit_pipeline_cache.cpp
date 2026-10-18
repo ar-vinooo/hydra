@@ -4,6 +4,14 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+namespace {
+
+u32 type_index(MTL::DataType type) {
+    return type == MTL::DataTypeUInt ? 1u : type == MTL::DataTypeInt ? 2u : 0u;
+}
+
+} // namespace
+
 BlitPipelineCache::BlitPipelineCache(MTL::Device* device_) : device{device_} {
     // Source
     auto shader_source = R"(
@@ -73,17 +81,21 @@ BlitPipelineCache::createHot0(const BlitPipelineDescriptor& descriptor) {
         }
     )";
     // Integer textures can't be filtered, they are read texel by texel
-    static const char* const types[] = {"float", "uint", "int"};
+    const auto type_name = [](MTL::DataType type) {
+        return type == MTL::DataTypeUInt  ? "uint"
+               : type == MTL::DataTypeInt ? "int"
+                                          : "float";
+    };
     std::string source = shader_source;
     const auto replace = [&](const std::string& from, const std::string& to) {
         for (auto pos = source.find(from); pos != std::string::npos;
              pos = source.find(from, pos + to.size()))
             source.replace(pos, from.size(), to);
     };
-    const std::string src_type = types[descriptor.src_type];
+    const std::string src_type = type_name(descriptor.src_type);
     replace("SRC_T", src_type);
-    replace("DST4", std::string(types[descriptor.dst_type]) + "4");
-    if (descriptor.src_type == 0) {
+    replace("DST4", std::string(type_name(descriptor.dst_type)) + "4");
+    if (descriptor.src_type == MTL::DataTypeFloat) {
         replace("SAMPLE", "float4 color = tex.sample(samplr, tex_coord);");
     } else {
         replace("SAMPLE",
@@ -92,7 +104,8 @@ BlitPipelineCache::createHot0(const BlitPipelineDescriptor& descriptor) {
                 " int2(0), size - 1);"
                 " " + src_type + "4 color = tex.read(uint2(texel));");
     }
-    replace("OPACITY", descriptor.src_type == 0 && descriptor.dst_type == 0
+    replace("OPACITY", descriptor.src_type == MTL::DataTypeFloat &&
+                               descriptor.dst_type == MTL::DataTypeFloat
                            ? "color.a *= params.opacity;"
                            : "");
 
@@ -143,8 +156,8 @@ u32 BlitPipelineCache::hashHot1(const BlitPipelineDescriptor& descriptor) {
     return static_cast<u32>(descriptor.pixel_format) |
            (static_cast<u32>(descriptor.transparent) << 12) |
            (static_cast<u32>(descriptor.copy_alpha) << 13) |
-           (static_cast<u32>(descriptor.src_type) << 14) |
-           (static_cast<u32>(descriptor.dst_type) << 16);
+           (type_index(descriptor.src_type) << 14) |
+           (type_index(descriptor.dst_type) << 16);
 }
 
 void BlitPipelineCache::destroyElement(MTL::RenderPipelineState* pipeline) {

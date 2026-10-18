@@ -416,8 +416,8 @@ renderer::TextureDescriptor
 TwoD::getTextureDescriptor(const Texture2DInfo& info) const {
     return renderer::TextureDescriptor(
         tls_crnt_gmmu->unmapAddr(static_cast<u64>(info.addr) & 0xffffffffffull),
-        info.depth > 1 ? renderer::TextureType::_3D
-                       : renderer::TextureType::_2D,
+        info.depth > 1 ? MTL::TextureType3D
+                       : MTL::TextureType2D,
         renderer::toTextureFormat(info.format),
         info.layout == MemoryLayout::Pitch, info.stride, info.width,
         info.height, std::max(info.depth, 1u), 1, 1, 0x0,

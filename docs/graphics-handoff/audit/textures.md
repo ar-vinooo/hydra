@@ -1,5 +1,10 @@
 # Hydra texture & image system audit (Maxwell TIC/TSC → Metal)
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Audit date: 2026-10-17. Repository: `/Users/arvino/Documents/Project/hydra`, branch `arvino` with uncommitted work. This was a read-only audit: nothing in the repo was modified, built or run.
 
 **Line numbers.** All `file:line` citations reflect the working tree at about 10:20 local time. `engines/3d.cpp`, `renderer/const.hpp` and the MSL emitter changed during the audit (another session is editing them), so numbers can drift by a few dozen lines. The quoted code is authoritative.

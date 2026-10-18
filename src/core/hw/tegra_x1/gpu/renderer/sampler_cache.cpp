@@ -38,7 +38,7 @@ bool SamplerCache::equals(const SamplerDescriptor& a,
            a.address_mode_t == b.address_mode_t &&
            a.address_mode_r == b.address_mode_r &&
            a.depth_compare_op == b.depth_compare_op &&
-           a.border_color_u == b.border_color_u && a.min_lod == b.min_lod &&
+           simd_all(a.border_color_u == b.border_color_u) && a.min_lod == b.min_lod &&
            a.max_lod == b.max_lod && a.lod_bias == b.lod_bias &&
            a.max_anisotropy == b.max_anisotropy &&
            a.integer_texture == b.integer_texture;

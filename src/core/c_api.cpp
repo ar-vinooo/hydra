@@ -1291,11 +1291,27 @@ HYDRA_EXPORT uint64_t hydraTextureDescriptorGetPtr(const void* descriptor) {
 
 HYDRA_EXPORT HydraTextureType
 hydraTextureDescriptorGetType(const void* descriptor) {
-    return static_cast<HydraTextureType>(
-        static_cast<
-            const hydra::hw::tegra_x1::gpu::renderer::TextureDescriptor*>(
-            descriptor)
-            ->type);
+    switch (static_cast<
+                const hydra::hw::tegra_x1::gpu::renderer::TextureDescriptor*>(
+                descriptor)
+                ->type) {
+    case MTL::TextureType1D:
+        return HYDRA_TEXTURE_TYPE_1D;
+    case MTL::TextureType1DArray:
+        return HYDRA_TEXTURE_TYPE_1D_ARRAY;
+    case MTL::TextureTypeTextureBuffer:
+        return HYDRA_TEXTURE_TYPE_1D_BUFFER;
+    case MTL::TextureType2DArray:
+        return HYDRA_TEXTURE_TYPE_2D_ARRAY;
+    case MTL::TextureType3D:
+        return HYDRA_TEXTURE_TYPE_3D;
+    case MTL::TextureTypeCube:
+        return HYDRA_TEXTURE_TYPE_CUBE;
+    case MTL::TextureTypeCubeArray:
+        return HYDRA_TEXTURE_TYPE_CUBE_ARRAY;
+    default:
+        return HYDRA_TEXTURE_TYPE_2D;
+    }
 }
 
 HYDRA_EXPORT HydraTextureFormat

@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
                                  std::istreambuf_iterator<char>());
             GuestShaderState state{};
             if (type == ShaderType::Fragment) {
-                state.color_target_data_types[0] = ColorDataType::Float;
+                state.color_target_data_types[0] = MTL::DataTypeFloat;
             }
             ShaderBackend backend{};
             std::vector<u8> out;

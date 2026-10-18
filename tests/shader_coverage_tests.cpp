@@ -332,7 +332,7 @@ void testFrontFacing(MTL::Device* device) {
     DecompilerContext context{};
     context.type = ShaderType::Fragment;
     GuestShaderState guest{};
-    guest.color_target_data_types[0] = ColorDataType::UInt;
+    guest.color_target_data_types[0] = MTL::DataTypeUInt;
     ir::Module module;
     ir::Builder builder(module);
     decoder::DecoderContext decoder_context{context, nullptr, builder};
@@ -417,7 +417,7 @@ void testPointSizeAndCoord(MTL::Device* device) {
         DecompilerContext fs_context{};
         fs_context.type = ShaderType::Fragment;
         GuestShaderState fs_state{};
-        fs_state.color_target_data_types[0] = ColorDataType::Float;
+        fs_state.color_target_data_types[0] = MTL::DataTypeFloat;
         fs_state.point_coord_origin_bottom = origin_bottom;
         ir::Module fs_module;
         ir::Builder fs_builder(fs_module);
@@ -692,7 +692,7 @@ kernel void check_sr(device uint* out [[buffer(0)]]) {
     DecompilerContext context{};
     context.type = ShaderType::Fragment;
     GuestShaderState state{};
-    state.color_target_data_types[0] = ColorDataType::UInt;
+    state.color_target_data_types[0] = MTL::DataTypeUInt;
     ir::Module module;
     ir::Builder builder(module);
     decoder::DecoderContext decoder_context{context, nullptr, builder};
@@ -1849,7 +1849,7 @@ void testMipLevelQuery(MTL::Device* device) {
         context.type = ShaderType::Fragment;
         GuestShaderState guest{};
         guest.unnormalized_textures.push_back(1);
-        guest.color_target_data_types[0] = ColorDataType::Float;
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
         ir::Module module;
         ir::Builder builder(module);
         const u32 axes = type == shader_decomp::TextureType::_1D     ? 1
@@ -2177,6 +2177,8 @@ void testGlobalMemory(MTL::Device* device) {
                                  0x55555555, 0x66666666, 0x77777777, 0x88888888};
         storage.resize(16, 0xdeadbeef);
         AluState input;
+        input.regs[0] = 0x13579bdf;
+        input.regs[1] = 0x2468ace0;
         input.regs[2] = 8;
         input.regs[5] = 0x1234abcd;
         const auto results = runAlu(
@@ -2184,7 +2186,8 @@ void testGlobalMemory(MTL::Device* device) {
             {pointer(12, 2), ldg(B32, 4, 12, 4), ldg(B64, 6, 12, 8),
              ldg(U8, 8, 12, 1), ldg(S8, 9, 12, 3), ldg(U16, 10, 12, 2),
              ldg(S16, 11, 12, 0), ldg(B32, 13, 12, 0x100),
-             ldg(B128, 16, 12, 16), stg(B32, 5, 12, 20), stg(U8, 5, 12, 1),
+             ldg(B128, 16, 12, 16), ldg(B128, 254, 12, 16),
+             stg(B32, 5, 12, 20), stg(U8, 5, 12, 1),
              stg(B32, 5, 12, 0x100), stg(U16, 5, 12, 0)},
             {input}, cbuf, 0, "LDG/STG storage buffer", 0, &storage);
         const auto& r = results[0].regs;
@@ -2198,6 +2201,8 @@ void testGlobalMemory(MTL::Device* device) {
         expect(r[16] == 0x77777777 && r[17] == 0x88888888 && r[18] == 0 &&
                    r[19] == 0,
                "LDG.128 zeroes the words beyond the buffer size");
+        expect(r[0] == input.regs[0] && r[1] == input.regs[1],
+               "multi-register destinations stop at RZ instead of wrapping to R0");
         expect(storage[7] == 0x1234abcd, "STG.32 stores a word");
         expect(storage[2] == 0xa5b6abcd,
                "STG.U8 and STG.U16 merge into their word");
@@ -2735,7 +2740,8 @@ kernel void check_cas(device uint* out [[buffer(0)]],
 
 } // namespace
 
-// Host references of the conversions (Eden's semantics; NaN converts to 0)
+// Host oracle for Hydra's current conversion behavior. NVIDIA edge semantics
+// still need hardware confirmation; NaN currently converts to zero.
 u32 f2iReference(float x, u32 round, bool is_signed, bool is_16, bool abs_,
                  bool neg) {
     if (abs_)
@@ -3172,7 +3178,7 @@ void testAlphaTest(MTL::Device* device) {
         DecompilerContext context{};
         context.type = ShaderType::Fragment;
         GuestShaderState guest{};
-        guest.color_target_data_types[0] = ColorDataType::Float;
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
         guest.alpha_test_func = test_case.func;
         guest.alpha_test_ref = test_case.ref;
         ir::Module module;
@@ -3261,9 +3267,9 @@ void testDualSourceBlending(MTL::Device* device) {
     DecompilerContext context{};
     context.type = ShaderType::Fragment;
     GuestShaderState guest{};
-    guest.color_target_data_types[0] = ColorDataType::Float;
+    guest.color_target_data_types[0] = MTL::DataTypeFloat;
     guest.dual_source_blending = true;
-    guest.color_target_data_types[1] = ColorDataType::Float;
+    guest.color_target_data_types[1] = MTL::DataTypeFloat;
     ir::Module module;
     ir::Builder builder(module);
     const float colors[8] = {0.25f, 0.5f, 0.75f, 1.0f, 1.0f, 0.5f, 0.0f, 1.0f};

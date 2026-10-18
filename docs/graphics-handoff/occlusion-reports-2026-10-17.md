@@ -1,6 +1,6 @@
 # Occlusion queries and report completion — 2026-10-17
 
-Implemented as the next continuation. No staging, commits, game launches or GUI actions. The full graphics backlog remains open.
+Implemented as the next continuation. No staging, commits, game launches or GUI actions. The full graphics backlog remains open. NVIDIA documents the report and render-enable methods; the in-memory comparison structure and EQ/NE interpretation are host-tested but remain guest-semantics unverified pending NVIDIA hardware/NVN traces.
 
 ## Behavior
 
@@ -14,7 +14,9 @@ Implemented as the next continuation. No staging, commits, game launches or GUI 
 ## References and evidence
 
 - Local NVIDIA `clb197.h`: `SET_ZPASS_PIXEL_COUNT` (byte 0x1514), `CLEAR_REPORT_VALUE` (0x1530), `SET_REPORT_SEMAPHORE_*` (0x1B00–0x1B0C), report encodings 0x2/0x15, one-/four-word structure sizes, and `SET_RENDER_ENABLE_*` / override.
-- Local Eden `maxwell_3d.cpp::ProcessQueryCondition` and `maxwell_3d.h::ReportSemaphore::Compare`: comparison field offsets and each conditional mode. The reference location is recorded in the main handoff README.
+- A secondary emulator supplied the hypothesis for comparison-field offsets
+  and conditional modes. It is not authoritative and does not promote that
+  layout to verified NVIDIA semantics.
 - Apple [visibility counting](https://developer.apple.com/documentation/metal/mtlvisibilityresultmode/counting), [visibilityResultBuffer](https://developer.apple.com/documentation/metal/mtlrenderpassdescriptor/visibilityresultbuffer), and [visibility result reset/accumulation](https://developer.apple.com/documentation/metal/mtlvisibilityresulttype).
 - The SDK marks the explicit `visibilityResultType` property as macOS 26+. This implementation uses separate storage across render encoders, retaining the existing macOS 15 deployment target rather than requiring that newer property.
 

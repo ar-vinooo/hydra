@@ -1,5 +1,10 @@
 # Hydra GPU audit: compute, GPU memory, command submission and synchronization
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Read-only audit of `/Users/arvino/Documents/Project/hydra`. No build or run was done.
 Scope: MAXWELL_COMPUTE_B (B1C0) and QMD, inline-to-memory (I2M), PFIFO/GPFIFO host methods (B06F),
 engine semaphores and reports, fences and syncpoints, GMMU, buffer and index caches, CPU/GPU coherency

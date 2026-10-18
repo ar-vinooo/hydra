@@ -16,11 +16,12 @@ reg_t getReg(instruction_t inst, u32 shift) {
     return static_cast<reg_t>(extractBits(inst, shift, 8));
 }
 
-// Register value at an offset from a base register, RZ reads as zero
+// Register value at an offset from a base register, RZ reads as zero.
 ir::Value getRegOffset(reg_t base, u32 offset) {
-    if (base == RZ)
+    const auto reg = offsetRegister(base, offset);
+    if (reg == RZ)
         return ir::Value::createConstantU(0);
-    return ir::Value::createRegister(static_cast<reg_t>(base + offset));
+    return ir::Value::createRegister(reg);
 }
 
 ir::Value getSrcBReg(instruction_t inst) {
@@ -123,7 +124,7 @@ void emitSharedAccess(DecoderContext& context, instruction_t inst, bool store,
                     loadMem(addOffset(builder, addr, i * 4)));
             for (u32 i = 0; i < count; i++)
                 builder.opCopy(ir::Value::createRegister(
-                                   static_cast<reg_t>(data + i)),
+                                   offsetRegister(data, i)),
                                values[i]);
         }
     }
@@ -483,8 +484,8 @@ void emitSuld(DecoderContext& context, instruction_t inst) {
             if ((mask & (1u << i)) == 0)
                 continue;
             builder.opCopy(
-                ir::Value::createRegister(
-                    static_cast<reg_t>(dst + reg_offset++), ir::ScalarType::U32),
+                ir::Value::createRegister(offsetRegister(dst, reg_offset++),
+                                          ir::ScalarType::U32),
                 builder.opVectorExtract(value, static_cast<u8>(i)));
         }
     } else {
@@ -494,7 +495,7 @@ void emitSuld(DecoderContext& context, instruction_t inst) {
         const auto value = builder.opImageLoad(*index, type, coords, raw_size);
         for (u32 i = 0; i < count; i++)
             builder.opCopy(
-                ir::Value::createRegister(static_cast<reg_t>(dst + i),
+                ir::Value::createRegister(offsetRegister(dst, i),
                                           ir::ScalarType::U32),
                 builder.opVectorExtract(value, static_cast<u8>(i)));
     }

@@ -29,7 +29,7 @@ class BufferBase {
         copyFromImpl(command_buffer, src, dst_offset, src_offset, size_);
     }
     virtual void copyFrom(ICommandBuffer* command_buffer, ITextureView* src,
-                          const uint3 src_origin, const uint3 src_size,
+                          const MTL::Origin src_origin, const MTL::Size src_size,
                           const ztd::Range<u32> src_levels,
                           const ztd::Range<u32> src_layers,
                           u64 dst_offset = 0) = 0;

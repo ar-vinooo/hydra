@@ -12,7 +12,10 @@ Implemented and tested at decoder level. Gameplay validation is pending. No comm
 
 ## Evidence
 
-Guest register semantics were checked against the local NVIDIA `clb197.h`, definitions `NVB197_SET_DA_PRIMITIVE_RESTART` / `_INDEX` (byte offsets 0x1644 / 0x1648). The local Eden reference has the matching `PrimitiveRestart { u32 enabled; u32 index; }` at 0x1644 in `maxwell_3d.h`; `renderer_opengl/gl_rasterizer.cpp` passes the complete register to `glPrimitiveRestartIndex` when enabled. Local reference location is recorded in the handoff README, section 1.
+Guest register semantics were checked against NVIDIA `clb197.h`, definitions
+`NVB197_SET_DA_PRIMITIVE_RESTART` / `_INDEX` (byte offsets 0x1644 / 0x1648).
+Secondary-emulator agreement is not used as proof. Metal's documented
+fixed-index restart constraints determine the host-side conversion path.
 
 Metal's fixed maximum-index strip restart constraint is recorded in the original front-end audit, B23. List conversion avoids relying on a Metal restart-disable toggle.
 

@@ -1,5 +1,10 @@
 # Graphics continuation — 2026-10-17
 
+> Evidence policy update (2026-10-18): NVIDIA documentation/hardware evidence
+> defines guest behavior and Apple Metal documentation/validation defines host
+> behavior. The emulator sources listed below were secondary comparisons only;
+> they do not establish NVIDIA semantics.
+
 The request covers the entire master backlog. It is not complete. No commits, staging, game launches or GUI actions were performed. Existing changes to the viewport workaround and shader fixtures were preserved.
 
 ## Implemented
@@ -11,9 +16,12 @@ The request covers the entire master backlog. It is not complete. No commits, st
 - 2D clipping intersects the guest clip rectangle and destination bounds using wide arithmetic. Source coordinates and extents retain fractional scaling and mirror signs. The compressed-alias guest-memory fallback now receives the clipped destination region and only handles integral nonnegative source coordinates. CORNER uses the reference whole-source-texel derivative correction; a derivative of 1 keeps the existing 1:1 alignment.
 - Unnormalized TIC coordinates specialize graphics and compute shaders. TEX/gather coordinates and explicit TXD gradients are divided by texture dimensions; TMML uses normalized coordinates for LOD queries. Buffer reads retain integer addressing, and cube samples retain direction coordinates. Shader keys include this state.
 
-## References
+## Evidence and secondary comparisons
 
-The local reference directory recorded in the handoff README is still available. Semantics were checked against:
+The local reference directory recorded in the handoff README was used during
+development. The NVIDIA entries are primary encoding evidence; the Eden
+entries only record implementation comparisons that still require primary
+corroboration:
 
 - NVIDIA `clb197.h`: inline index packing, BEGIN/END and restart method offsets.
 - NVIDIA `cl902d.h`: clip rectangle offsets and sample-origin encodings.

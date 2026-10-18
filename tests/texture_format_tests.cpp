@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/sampler_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
@@ -106,7 +107,7 @@ void testSamplerBorders() {
     set_border(1, 1, 1, 1);
     check(emulated(TextureFormat::R32Uint) &&
               engines::decodeSampler(tsc, TextureFormat::R32Uint)
-                      .border_color_u.x() == 1u,
+                      .border_color_u.x == 1u,
           "Integer borders keep their raw bits and are emulated");
     set_border(0, 0, 0, 0);
     check(!emulated(TextureFormat::R32Uint),
@@ -117,7 +118,7 @@ void testSamplerBorders() {
     const auto integer = engines::decodeSampler(tsc, TextureFormat::R32Uint);
     check(integer.min_filter == SamplerFilter::Nearest &&
               integer.mag_filter == SamplerFilter::Nearest &&
-              integer.mip_filter == SamplerMipFilter::Nearest &&
+              integer.mip_filter == MTL::SamplerMipFilterNearest &&
               integer.integer_texture,
           "Integer textures sample with nearest filters");
 
@@ -139,18 +140,18 @@ void testSamplerBorders() {
                std::bit_cast<u32>(0.5f), one);
     const auto srgb = engines::decodeSampler(tsc, TextureFormat::RGBA8Unorm_sRGB);
     const auto linear_188 = std::pow((188.0f / 255.0f + 0.055f) / 1.055f, 2.4f);
-    check(std::abs(std::bit_cast<f32>(srgb.border_color_u.x()) - linear_188) <
+    check(std::abs(std::bit_cast<f32>(srgb.border_color_u.x) - linear_188) <
                   1e-5f &&
-              srgb.border_color_u.w() == one,
+              srgb.border_color_u.w == one,
           "sRGB textures use the sRGB border color converted to linear");
     check(std::bit_cast<f32>(engines::decodeSampler(
                                  tsc, TextureFormat::RGBA8Unorm)
-                                 .border_color_u.x()) == 0.5f,
+                                 .border_color_u.x) == 0.5f,
           "Non-sRGB textures use the float border color");
     tsc.srgb_conversion = 0;
     check(std::bit_cast<f32>(engines::decodeSampler(
                                  tsc, TextureFormat::RGBA8Unorm_sRGB)
-                                 .border_color_u.x()) == 0.5f,
+                                 .border_color_u.x) == 0.5f,
           "Disabled sRGB conversion keeps the float border color");
 
     // Metal cannot mirror to the border
@@ -160,7 +161,7 @@ void testSamplerBorders() {
     tsc.address_u = tsc.address_v = tsc.address_p = 2;
     set_border(one, 0, 0, one);
     check(!emulated() &&
-              engines::decodeSampler(tsc).border_color_u.x() == 0u,
+              engines::decodeSampler(tsc).border_color_u.x == 0u,
           "Samplers that never address the border ignore its color");
     std::cout << "PASS: sampler border presets, integer, depth and sRGB "
                  "borders\n";
@@ -427,7 +428,7 @@ void testHostFormatCoverage() {
         const u32 height = info.block_height * 2;
         const u32 stride = getTextureFormatStride(format, width);
         const TextureDescriptor descriptor(ptr + slot * 0x200,
-                                           TextureType::_2D, format, true,
+                                           MTL::TextureType2D, format, true,
                                            stride, width, height, 1, 1, 1, 0,
                                            0, 0);
         slot++;
@@ -446,8 +447,6 @@ void testHostFormatCoverage() {
                   MTL::SamplerMinMagFilterLinear &&
               metal::toMtlSamplerMinMagFilter(SamplerFilter::Vcaa8Tap) ==
                   MTL::SamplerMinMagFilterLinear &&
-              metal::toMtlSamplerMipFilter(static_cast<SamplerMipFilter>(0)) ==
-                  MTL::SamplerMipFilterNotMipmapped &&
               metal::toMtlSwizzle(static_cast<ImageSwizzle>(1)) ==
                   MTL::TextureSwizzleZero,
           "Sampler and swizzle conversions handle every encoding");
@@ -544,12 +543,12 @@ void testPackedFormatSwizzles() {
             const auto format = toTextureFormat(word, false);
             check(format != TextureFormat::Invalid,
                   "Packed TIC format is supported");
-            const TextureDescriptor descriptor(address, TextureType::_2D,
+            const TextureDescriptor descriptor(address, MTL::TextureType2D,
                                                format, true, 8, 4, 1, 1, 1, 1,
                                                0, 0, 0);
             auto* view = cache.find(
                 commands.get(), descriptor,
-                TextureViewDescriptor(TextureType::_2D,
+                TextureViewDescriptor(MTL::TextureType2D,
                                       toSampledTextureFormat(word, false),
                                       ztd::Range<u32>(0, 1),
                                       ztd::Range<u32>(0, 1),
@@ -619,12 +618,12 @@ void testZ24UploadLayouts() {
     for (const auto& layout : layouts) {
         const uptr address = ptr + slot++ * 0x400;
         std::memcpy(reinterpret_cast<void*>(address), &word, sizeof(word));
-        const TextureDescriptor descriptor(address, TextureType::_2D,
+        const TextureDescriptor descriptor(address, MTL::TextureType2D,
                                            layout.format, true, 4, 1, 1, 1, 1,
                                            1, 0, 0, 0);
         auto* depth_view = cache.find(
             commands.get(), descriptor,
-            TextureViewDescriptor(TextureType::_2D, layout.format,
+            TextureViewDescriptor(MTL::TextureType2D, layout.format,
                                   ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1)),
             TextureUsage::Read);
         const auto depth = readTexels<f32>(
@@ -635,7 +634,7 @@ void testZ24UploadLayouts() {
 
         auto* stencil_view = cache.find(
             commands.get(), descriptor,
-            TextureViewDescriptor(TextureType::_2D, TextureFormat::S8Uint,
+            TextureViewDescriptor(MTL::TextureType2D, TextureFormat::S8Uint,
                                   ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1)),
             TextureUsage::Read);
         const auto stencil = readTexels<u32>(
@@ -646,7 +645,7 @@ void testZ24UploadLayouts() {
     }
 
     // Float depth cannot be viewed from the packed formats
-    TextureDescriptor packed(ptr + 0x1000, TextureType::_2D,
+    TextureDescriptor packed(ptr + 0x1000, MTL::TextureType2D,
                              TextureFormat::S8Uint_Z24Unorm, true, 16, 4, 4, 1,
                              1, 1, 0, 0, 0);
     auto* packed_view = cache.find(commands.get(), packed, TextureUsage::Read);
@@ -662,6 +661,109 @@ void testZ24UploadLayouts() {
     std::cout << "PASS: Z24S8 and S8Z24 uploads decode their own layouts\n";
 }
 
+void testDepthStencilReadback() {
+    std::vector<u8> memory(1 << 16, 0);
+    const auto ptr = reinterpret_cast<uptr>(memory.data());
+    struct Case {
+        TextureFormat format;
+        u32 bytes_per_pixel;
+        uptr offset;
+    };
+    const Case cases[] = {
+        {TextureFormat::Z24Unorm_S8Uint, 4, 0x0000},
+        {TextureFormat::S8Uint_Z24Unorm, 4, 0x1000},
+        {TextureFormat::Z24Unorm_X8Uint, 4, 0x2000},
+        {TextureFormat::Z32Float_X24S8Uint, 8, 0x3000},
+    };
+    for (const auto& test_case : cases) {
+        for (u32 i = 0; i < 16; i++) {
+            if (test_case.bytes_per_pixel == 8) {
+                const u32 words[]{
+                    std::bit_cast<u32>(static_cast<f32>(i) / 15.0f),
+                    static_cast<u32>(0x30 + i),
+                };
+                std::memcpy(memory.data() + test_case.offset + i * 8, words,
+                            sizeof(words));
+            } else {
+                const u32 depth = (i * 0x111111u) & 0xffffffu;
+                u32 word = depth | ((0x40u + i) << 24);
+                if (test_case.format == TextureFormat::S8Uint_Z24Unorm)
+                    word = (depth << 8) | (0x40u + i);
+                if (test_case.format == TextureFormat::Z24Unorm_X8Uint)
+                    word = depth;
+                std::memcpy(memory.data() + test_case.offset + i * 4, &word,
+                            sizeof(word));
+            }
+        }
+    }
+
+    metal::Renderer renderer;
+    auto& cache = renderer.getTextureCache();
+    for (const auto& test_case : cases) {
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        const u32 stride = 4 * test_case.bytes_per_pixel;
+        const TextureDescriptor descriptor(
+            ptr + test_case.offset, MTL::TextureType2D, test_case.format, true,
+            stride, 4, 4, 1, 1, 1, 0, 0, 0);
+        auto* view = cache.find(commands.get(), descriptor, TextureUsage::Read);
+        auto* native = renderer.getDevice()->newBuffer(
+            16 + 16 * test_case.bytes_per_pixel,
+            MTL::ResourceStorageModeShared);
+        std::memset(native->contents(), 0xcd, native->length());
+        {
+            metal::Buffer result(native);
+            result.copyFrom(commands.get(), view, MTL::Origin(0, 0, 0),
+                            MTL::Size(4, 4, 1),
+                            ztd::Range<u32>::fromSize(0, 1),
+                            ztd::Range<u32>::fromSize(0, 1), 16);
+            commands.reset();
+            const auto* actual =
+                static_cast<const u8*>(native->contents()) + 16;
+            const auto* expected = memory.data() + test_case.offset;
+            if (test_case.bytes_per_pixel == 8) {
+                check(std::memcmp(actual, expected, 16 * 8) == 0,
+                      "D32FS8 readback restores guest layout");
+            } else {
+                for (u32 i = 0; i < 16; i++) {
+                    u32 actual_word;
+                    u32 expected_word;
+                    std::memcpy(&actual_word, actual + i * 4,
+                                sizeof(actual_word));
+                    std::memcpy(&expected_word, expected + i * 4,
+                                sizeof(expected_word));
+                    const bool stencil_low =
+                        test_case.format == TextureFormat::S8Uint_Z24Unorm;
+                    const u32 actual_depth =
+                        stencil_low ? actual_word >> 8
+                                    : actual_word & 0xffffffu;
+                    const u32 expected_depth =
+                        stencil_low ? expected_word >> 8
+                                    : expected_word & 0xffffffu;
+                    const u32 actual_stencil =
+                        stencil_low ? actual_word & 0xffu : actual_word >> 24;
+                    const u32 expected_stencil =
+                        stencil_low ? expected_word & 0xffu
+                                    : expected_word >> 24;
+                    const u32 depth_difference =
+                        actual_depth > expected_depth
+                            ? actual_depth - expected_depth
+                            : expected_depth - actual_depth;
+                    if (depth_difference > 1)
+                        std::cerr << "Z24 format "
+                                  << static_cast<u32>(test_case.format)
+                                  << " texel " << i << ": " << actual_depth
+                                  << " expected " << expected_depth << "\n";
+                    check(depth_difference <= 1,
+                          "Z24 readback is within one normalized integer step");
+                    check(actual_stencil == expected_stencil,
+                          "Packed stencil readback restores its guest byte");
+                }
+            }
+        }
+    }
+    std::cout << "PASS: packed depth/stencil texture readback\n";
+}
+
 // A2R10G10B10 render targets keep red in bits 20-29
 void testBgr10A2RenderTarget() {
     std::vector<u8> memory(1 << 12, 0);
@@ -670,7 +772,7 @@ void testBgr10A2RenderTarget() {
     auto& cache = renderer.getTextureCache();
     std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
     const TextureDescriptor descriptor(
-        ptr, TextureType::_2D,
+        ptr, MTL::TextureType2D,
         toTextureFormat(ColorSurfaceFormat::BGR10A2Unorm), true, 16, 4, 1, 1,
         1, 1, 0, 0, 0);
     auto* view = cache.find(commands.get(), descriptor, TextureUsage::Write);
@@ -700,20 +802,20 @@ void testBgr10A2RenderTarget() {
 // Guest descriptors Metal rejects are adapted (or refused) before creation
 void testTextureShapeLegalization() {
     struct Case {
-        TextureType type;
+        MTL::TextureType type;
         u32 width, height, depth, layers, levels;
         bool valid;
-        TextureType expected_type;
+        MTL::TextureType expected_type;
         u32 expected_levels;
     };
     const Case cases[] = {
-        {TextureType::_2D, 4, 4, 1, 3, 8, true, TextureType::_2DArray, 3},
-        {TextureType::_1D, 8, 1, 1, 1, 3, true, TextureType::_1D, 1},
-        {TextureType::_1D, 8, 1, 1, 2, 1, true, TextureType::_1DArray, 1},
-        {TextureType::Cube, 8, 8, 1, 12, 4, true, TextureType::CubeArray, 4},
-        {TextureType::_3D, 4, 4, 16, 1, 8, true, TextureType::_3D, 5},
-        {TextureType::Cube, 8, 4, 1, 6, 1, false, TextureType::Cube, 1},
-        {TextureType::_2D, 32768, 4, 1, 1, 1, false, TextureType::_2D, 1},
+        {MTL::TextureType2D, 4, 4, 1, 3, 8, true, MTL::TextureType2DArray, 3},
+        {MTL::TextureType1D, 8, 1, 1, 1, 3, true, MTL::TextureType1D, 1},
+        {MTL::TextureType1D, 8, 1, 1, 2, 1, true, MTL::TextureType1DArray, 1},
+        {MTL::TextureTypeCube, 8, 8, 1, 12, 4, true, MTL::TextureTypeCubeArray, 4},
+        {MTL::TextureType3D, 4, 4, 16, 1, 8, true, MTL::TextureType3D, 5},
+        {MTL::TextureTypeCube, 8, 4, 1, 6, 1, false, MTL::TextureTypeCube, 1},
+        {MTL::TextureType2D, 32768, 4, 1, 1, 1, false, MTL::TextureType2D, 1},
     };
 
     std::vector<u8> memory(1 << 20, 0);
@@ -796,7 +898,7 @@ void testStorageHashCollision() {
     for (u32 offset = 0; offset < 64 && !collision; offset++) {
         const auto ptr = reinterpret_cast<uptr>(memory.data()) + offset * 0x100;
         const auto make = [ptr](u32 width, u32 height) {
-            return TextureDescriptor(ptr, TextureType::_2D,
+            return TextureDescriptor(ptr, MTL::TextureType2D,
                                      TextureFormat::RGBA8Unorm, true,
                                      width * 4, width, height, 1, 1, 1, 0, 0,
                                      0);
@@ -850,10 +952,10 @@ void testAliasQueries() {
     auto& cache = renderer.getTextureCache();
     std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
     std::scoped_lock lock(cache.getMutex());
-    const TextureDescriptor compressed(ptr, TextureType::_2D,
+    const TextureDescriptor compressed(ptr, MTL::TextureType2D,
                                        TextureFormat::BC1_RGBA, false, 0, 16,
                                        16, 1, 1, 1, 0, 0, 0);
-    const TextureDescriptor target(ptr + 0x8000, TextureType::_2D,
+    const TextureDescriptor target(ptr + 0x8000, MTL::TextureType2D,
                                    TextureFormat::RGBA32Float, false, 0, 4, 4,
                                    1, 1, 1, 0, 0, 0);
     cache.find(commands.get(), compressed, TextureUsage::Read);
@@ -887,7 +989,7 @@ void testCrossFormatCopies() {
     auto& cache = renderer.getTextureCache();
     std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
     const auto make = [ptr](uptr offset, TextureFormat format) {
-        return TextureDescriptor(ptr + offset, TextureType::_2D, format, true,
+        return TextureDescriptor(ptr + offset, MTL::TextureType2D, format, true,
                                  16, 4, 4, 1, 1, 1, 0, 0, 0);
     };
     struct Case {
@@ -928,9 +1030,76 @@ void testCrossFormatCopies() {
                  "buffers\n";
 }
 
+// NVN copies compressed blocks through RGBA32 pixels: both directions must
+// preserve the 16 byte blocks even though a block covers 4x4 texels
+void testBlockShapeCopies() {
+    std::vector<u8> memory(1 << 16, 0);
+    const auto ptr = reinterpret_cast<uptr>(memory.data());
+    for (u32 i = 0; i < 256; i++) {
+        memory[i] = static_cast<u8>(i * 5 + 3);
+        memory[0x2000 + i] = static_cast<u8>(i * 11 + 7);
+    }
+    metal::Renderer renderer;
+    auto& cache = renderer.getTextureCache();
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    const auto texels = [ptr](uptr offset) {
+        return TextureDescriptor(ptr + offset, MTL::TextureType2D,
+                                 TextureFormat::RGBA32Uint, true, 64, 4, 4, 1,
+                                 1, 1, 0, 0, 0);
+    };
+    const auto blocks = [ptr](uptr offset) {
+        return TextureDescriptor(ptr + offset, MTL::TextureType2D,
+                                 TextureFormat::BC3_RGBA, true, 64, 16, 16, 1,
+                                 1, 1, 0, 0, 0);
+    };
+    struct Case {
+        const char* name;
+        uptr src_offset;
+        bool src_is_blocks;
+        uptr dst_offset;
+    };
+    const Case cases[] = {
+        {"RGBA32 texels to BC3 blocks", 0x0, false, 0x4000},
+        {"BC3 blocks to RGBA32 texels", 0x2000, true, 0x6000},
+    };
+    for (const auto& test_case : cases) {
+        auto* src = cache.find(commands.get(),
+                               test_case.src_is_blocks
+                                   ? blocks(test_case.src_offset)
+                                   : texels(test_case.src_offset),
+                               TextureUsage::Read);
+        auto* dst = cache.find(commands.get(),
+                               test_case.src_is_blocks
+                                   ? texels(test_case.dst_offset)
+                                   : blocks(test_case.dst_offset),
+                               TextureUsage::Read);
+        dst->getBase()->copyFrom(commands.get(), src->getBase(), 0, 0, 0, 0, 1,
+                                 1);
+        auto* native =
+            static_cast<metal::Texture*>(dst->getBase())->getTexture();
+        auto* result = renderer.getDevice()->newBuffer(
+            256, MTL::ResourceStorageModeShared);
+        static_cast<metal::CommandBuffer*>(commands.get())
+            ->getBlitCommandEncoder()
+            ->copyFromTexture(native, 0, 0, MTL::Origin(0, 0, 0),
+                              test_case.src_is_blocks ? MTL::Size(4, 4, 1)
+                                                      : MTL::Size(16, 16, 1),
+                              result, 0, 64, 256);
+        commands.reset(renderer.createCommandBuffer());
+        check(std::memcmp(result->contents(),
+                          memory.data() + test_case.src_offset, 256) == 0,
+              test_case.name);
+        result->release();
+    }
+    commands.reset();
+    std::cout << "PASS: copies between texels and compressed blocks of equal "
+                 "size\n";
+}
+
 } // namespace
 
 void runTextureFormatTests() {
+    testBlockShapeCopies();
     testCrossFormatCopies();
     testSamplerDecoding();
     testSamplerBorders();
@@ -944,5 +1113,6 @@ void runTextureFormatTests() {
     testHostFormatCoverage();
     testPackedFormatSwizzles();
     testZ24UploadLayouts();
+    testDepthStencilReadback();
     testBgr10A2RenderTarget();
 }

@@ -16,7 +16,7 @@ struct Source {
 
 Source getRegisterSource(reg_t reg) {
     return {ir::Value::createRegister(reg, ir::ScalarType::U32),
-            ir::Value::createRegister(reg == RZ ? RZ : reg_t(reg + 1),
+            ir::Value::createRegister(offsetRegister(reg, 1),
                                       ir::ScalarType::U32)};
 }
 
@@ -67,7 +67,7 @@ void writePair(ir::Builder& builder, reg_t dst, const ir::Value& lo,
                const ir::Value& hi) {
     writeWord(builder, dst, lo);
     if (dst != RZ)
-        writeWord(builder, dst + 1, hi);
+        writeWord(builder, offsetRegister(dst, 1), hi);
 }
 
 // Format code of the F16/F32 helpers (1 F16, 2 F32)

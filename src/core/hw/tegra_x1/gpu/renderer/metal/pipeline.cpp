@@ -35,13 +35,10 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     // Layered rendering and viewport selection require the primitive class
     if (vertex_shader->getDescriptor().writes_layer) {
         switch (descriptor.topology_class) {
-        case PrimitiveTopologyClass::Point:
+        case MTL::PrimitiveTopologyClassPoint:
+        case MTL::PrimitiveTopologyClassLine:
             pipeline_descriptor->setInputPrimitiveTopology(
-                MTL::PrimitiveTopologyClassPoint);
-            break;
-        case PrimitiveTopologyClass::Line:
-            pipeline_descriptor->setInputPrimitiveTopology(
-                MTL::PrimitiveTopologyClassLine);
+                descriptor.topology_class);
             break;
         default:
             pipeline_descriptor->setInputPrimitiveTopology(
@@ -171,17 +168,17 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         if (color_target_state.blend_enabled) {
             color_attachment_descriptor->setBlendingEnabled(true);
             color_attachment_descriptor->setRgbBlendOperation(
-                toMtlBlendOperation(color_target_state.rgb_op));
+                color_target_state.rgb_op);
             color_attachment_descriptor->setSourceRGBBlendFactor(
-                toMtlBlendFactor(color_target_state.src_rgb_factor));
+                color_target_state.src_rgb_factor);
             color_attachment_descriptor->setDestinationRGBBlendFactor(
-                toMtlBlendFactor(color_target_state.dst_rgb_factor));
+                color_target_state.dst_rgb_factor);
             color_attachment_descriptor->setAlphaBlendOperation(
-                toMtlBlendOperation(color_target_state.alpha_op));
+                color_target_state.alpha_op);
             color_attachment_descriptor->setSourceAlphaBlendFactor(
-                toMtlBlendFactor(color_target_state.src_alpha_factor));
+                color_target_state.src_alpha_factor);
             color_attachment_descriptor->setDestinationAlphaBlendFactor(
-                toMtlBlendFactor(color_target_state.dst_alpha_factor));
+                color_target_state.dst_alpha_factor);
         }
     }
 

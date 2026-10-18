@@ -55,8 +55,8 @@ struct GuestShaderState {
     // shader's output 1 is that color
     bool dual_source_blending{false};
     engines::VertexAttribState vertex_attrib_states[VERTEX_ATTRIB_COUNT];
-    ColorDataType color_target_data_types[COLOR_TARGET_COUNT] = {
-        ColorDataType::Invalid};
+    MTL::DataType color_target_data_types[COLOR_TARGET_COUNT] = {
+        MTL::DataTypeNone};
     // Compute
     u32 shared_memory_size{0};
     std::map<u32, TextureFormat> image_formats;

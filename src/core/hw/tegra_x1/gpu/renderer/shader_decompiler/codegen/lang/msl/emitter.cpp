@@ -25,27 +25,27 @@ std::string_view pixelImapTypeToStr(PixelImapType type) {
     }
 }
 
-renderer::TextureType toRendererTextureType(TextureType type) {
+MTL::TextureType toRendererTextureType(TextureType type) {
     switch (type) {
     case TextureType::_1D:
-        return renderer::TextureType::_1D;
+        return MTL::TextureType1D;
     case TextureType::_1DArray:
-        return renderer::TextureType::_1DArray;
+        return MTL::TextureType1DArray;
     case TextureType::_2D:
-        return renderer::TextureType::_2D;
+        return MTL::TextureType2D;
     case TextureType::_2DArray:
-        return renderer::TextureType::_2DArray;
+        return MTL::TextureType2DArray;
     case TextureType::_3D:
     case TextureType::_3DArray:
-        return renderer::TextureType::_3D;
+        return MTL::TextureType3D;
     case TextureType::Cube:
-        return renderer::TextureType::Cube;
+        return MTL::TextureTypeCube;
     case TextureType::CubeArray:
-        return renderer::TextureType::CubeArray;
+        return MTL::TextureTypeCubeArray;
     case TextureType::Buffer:
-        return renderer::TextureType::_1DBuffer;
+        return MTL::TextureTypeTextureBuffer;
     default:
-        return renderer::TextureType::_2D;
+        return MTL::TextureType2D;
     }
 }
 
@@ -158,9 +158,9 @@ std::string getBorderSamplerDeclaration(u32 index, const char* variant,
                                                           : "linear";
     };
     const char* mip = "none";
-    if (d.mip_filter == renderer::SamplerMipFilter::Nearest)
+    if (d.mip_filter == MTL::SamplerMipFilterNearest)
         mip = "nearest";
-    else if (d.mip_filter == renderer::SamplerMipFilter::Linear)
+    else if (d.mip_filter == MTL::SamplerMipFilterLinear)
         mip = "linear";
     std::string result = fmt::format(
         "constexpr sampler hydra_bs{}_{}(coord::normalized, s_address::{}, "
@@ -926,7 +926,7 @@ void MslEmitter::emitDeclarations() {
         for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
             const auto color_target_data_type =
                 state.color_target_data_types[i];
-            if (color_target_data_type == ColorDataType::Invalid)
+            if (color_target_data_type == MTL::DataTypeNone)
                 continue;
 
             const auto sv = Sv(SvSemantic::UserInOut, i);
@@ -1131,7 +1131,7 @@ void MslEmitter::emitMainPrototype() {
         context.fragment_depth_register == invalid<u32>()) {
         for (u8 i = 0; i < COLOR_TARGET_COUNT; ++i) {
             const auto type = state.color_target_data_types[i];
-            if (type != ColorDataType::Invalid)
+            if (type != MTL::DataTypeNone)
                 writeStatement("__out.{} = vec<{}, 4>(1, 0, 1, 1)",
                                getSvStr(Sv(SvSemantic::UserInOut, i)), toType(type));
         }
@@ -1268,7 +1268,7 @@ void MslEmitter::emitExitReturn() {
         state.alpha_test_func != engines::CompareOp::Invalid &&
         state.alpha_test_func != engines::CompareOp::Always &&
         (context.fragment_output_mask & 0x8u) != 0 &&
-        state.color_target_data_types[0] == ColorDataType::Float) {
+        state.color_target_data_types[0] == MTL::DataTypeFloat) {
         const auto alpha = getSvAccessQualifiedStr(
             SvAccess(Sv(SvSemantic::UserInOut, 0), 3), true);
         const auto ref = getConstantStr(state.alpha_test_ref);
@@ -1300,7 +1300,7 @@ void MslEmitter::emitExitReturn() {
     if (context.type == ShaderType::Fragment && state.debug_highlight) {
         for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
             const auto data_type = state.color_target_data_types[i];
-            if (data_type == ColorDataType::Invalid)
+            if (data_type == MTL::DataTypeNone)
                 continue;
             const auto sv = Sv(SvSemantic::UserInOut, i);
             static const std::string color = [] {
@@ -1331,7 +1331,7 @@ void MslEmitter::emitExitReturn() {
             }
             for (u8 i = 0; i < COLOR_TARGET_COUNT; ++i) {
                 const auto type = state.color_target_data_types[i];
-                if (type != ColorDataType::Invalid)
+                if (type != MTL::DataTypeNone)
                     writeStatement("__out.{} = vec<{}, 4>({})", getSvStr(Sv(SvSemantic::UserInOut, i)), toType(type), color);
             }
         } else {
@@ -1442,6 +1442,15 @@ void MslEmitter::emitTextureSample(
     };
     const auto is_gather = any(flags & TextureSampleFlags::Gather);
 
+    // DEBUG: isolation switch, remove with the other HYDRA_NO_* switches
+    static const bool neutral_3d =
+        std::getenv("HYDRA_DEBUG_NEUTRAL_3D") != nullptr;
+    if (neutral_3d && !is_buffer &&
+        (type == TextureType::_3D || type == TextureType::_3DArray)) {
+        storeValue(dst, "float4(0.0)");
+        return;
+    }
+
     // Guest border handling Metal cannot express: the shader samples with its
     // own samplers and blends the border in
     const renderer::SamplerDescriptor* border = nullptr;
@@ -1498,15 +1507,15 @@ void MslEmitter::emitTextureSample(
     };
     const auto border_bits = [&]() {
         return fmt::format("uint4({:#010x}u, {:#010x}u, {:#010x}u, {:#010x}u)",
-                           border->border_color_u.x(),
-                           border->border_color_u.y(),
-                           border->border_color_u.z(),
-                           border->border_color_u.w());
+                           border->border_color_u.x,
+                           border->border_color_u.y,
+                           border->border_color_u.z,
+                           border->border_color_u.w);
     };
     const auto border_float = [&](u32 component) {
         const std::array<u32, 4> words = {
-            border->border_color_u.x(), border->border_color_u.y(),
-            border->border_color_u.z(), border->border_color_u.w()};
+            border->border_color_u.x, border->border_color_u.y,
+            border->border_color_u.z, border->border_color_u.w};
         return fmt::format("as_type<float>({:#010x}u)", words[component & 3]);
     };
     // 1.0 where the border depth passes minus where depth 0 passes: the

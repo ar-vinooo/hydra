@@ -17,7 +17,7 @@ struct Double {
 Double registerPair(instruction_t inst, u32 offset) {
     const auto reg = static_cast<reg_t>(extractBits(inst, offset, 8));
     return {ir::Value::createRegister(reg, ir::ScalarType::U32),
-            ir::Value::createRegister(reg == RZ ? RZ : reg_t(reg + 1),
+            ir::Value::createRegister(offsetRegister(reg, 1),
                                       ir::ScalarType::U32)};
 }
 
@@ -62,7 +62,9 @@ void writePair(ir::Builder& b, reg_t dst, const ir::Value& lo,
     if (dst == RZ)
         return;
     b.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32), lo);
-    b.opCopy(ir::Value::createRegister(reg_t(dst + 1), ir::ScalarType::U32), hi);
+    b.opCopy(ir::Value::createRegister(offsetRegister(dst, 1),
+                                       ir::ScalarType::U32),
+             hi);
 }
 
 bool begin(DecoderContext& context, instruction_t inst) {

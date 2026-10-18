@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
+
+#include <numeric>
 #include "core/hot/table.hpp"
 
 #include <map>
@@ -23,14 +25,38 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
                 MTL::Origin src_origin, MTL::Texture* dst,
                 TextureFormat dst_format, u32 dst_slice, u32 dst_level,
                 MTL::Origin dst_origin, MTL::Size size) {
+    const auto& src_info = getTextureFormatInfo(src_format);
+    const auto& dst_info = getTextureFormatInfo(dst_format);
+    // Sizes are in destination texels: they only bound the source when the
+    // formats have the same block shape
+    if (src_info.block_width == dst_info.block_width &&
+        src_info.block_height == dst_info.block_height) {
+        const auto available = [](NS::UInteger extent, u32 level,
+                                  NS::UInteger origin) {
+            const NS::UInteger level_extent =
+                std::max<NS::UInteger>(extent >> level, 1);
+            return origin < level_extent ? level_extent - origin
+                                         : NS::UInteger(0);
+        };
+        size.width = std::min({size.width,
+                               available(src->width(), src_level, src_origin.x),
+                               available(dst->width(), dst_level, dst_origin.x)});
+        size.height =
+            std::min({size.height,
+                      available(src->height(), src_level, src_origin.y),
+                      available(dst->height(), dst_level, dst_origin.y)});
+        size.depth = std::min({size.depth,
+                               available(src->depth(), src_level, src_origin.z),
+                               available(dst->depth(), dst_level, dst_origin.z)});
+        if (size.width == 0 || size.height == 0 || size.depth == 0)
+            return;
+    }
     if (src->pixelFormat() == dst->pixelFormat()) {
         encoder->copyFromTexture(src, src_slice, src_level, src_origin, size,
                                  dst, dst_slice, dst_level, dst_origin);
         return;
     }
 
-    const auto& src_info = getTextureFormatInfo(src_format);
-    const auto& dst_info = getTextureFormatInfo(dst_format);
     const bool same_texel = src_info.bytes_per_block ==
                                 dst_info.bytes_per_block &&
                             src_info.block_width == dst_info.block_width &&
@@ -49,6 +75,81 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
     const bool sizes_match = same_texel &&
                              host_matches_guest(src_format, src_host) &&
                              host_matches_guest(dst_format, dst_host);
+    // Texels standing in for compressed blocks of the same size (RGBA32 or
+    // RG32 pixels for BC blocks, which NVN copies compressed data through):
+    // copy the rows through a buffer. A memory row is a row of texels, or of
+    // blocks for compressed formats. Other pairs of different texel sizes
+    // are conversions, which this does not do.
+    const auto is_texel = [](const TextureFormatInfo& info) {
+        return info.block_width == 1 && info.block_height == 1;
+    };
+    if (!same_texel && !src_ds && !dst_ds && src->buffer() == nullptr &&
+        is_texel(src_info) != is_texel(dst_info) &&
+        src_info.bytes_per_block == dst_info.bytes_per_block &&
+        host_matches_guest(src_format, src_host) &&
+        host_matches_guest(dst_format, dst_host)) {
+        const auto level_extent = [](NS::UInteger extent, u32 level) {
+            return std::max<NS::UInteger>(extent >> level, 1);
+        };
+        const auto ceil_div = [](u64 value, u64 divisor) {
+            return (value + divisor - 1) / divisor;
+        };
+        const u64 src_width = level_extent(src->width(), src_level);
+        const u64 src_height = level_extent(src->height(), src_level);
+        const u64 src_depth = level_extent(src->depth(), src_level);
+        const u64 dst_width = level_extent(dst->width(), dst_level);
+        const u64 dst_height = level_extent(dst->height(), dst_level);
+        const u64 dst_depth = level_extent(dst->depth(), dst_level);
+        if (src_origin.x >= src_width || src_origin.y >= src_height ||
+            src_origin.z >= src_depth || dst_origin.x >= dst_width ||
+            dst_origin.y >= dst_height || dst_origin.z >= dst_depth)
+            return;
+        size.depth = std::min<NS::UInteger>(
+            {size.depth,
+             static_cast<NS::UInteger>(src_depth - src_origin.z),
+             static_cast<NS::UInteger>(dst_depth - dst_origin.z)});
+        // Whole texels (blocks) of both formats in every row
+        const u64 granule = std::lcm<u64>(src_info.bytes_per_block,
+                                          dst_info.bytes_per_block);
+        const u64 row_bytes =
+            std::min({ceil_div(size.width, dst_info.block_width) *
+                          dst_info.bytes_per_block,
+                      ceil_div(src_width - src_origin.x, src_info.block_width) *
+                          src_info.bytes_per_block,
+                      ceil_div(dst_width - dst_origin.x, dst_info.block_width) *
+                          dst_info.bytes_per_block}) /
+            granule * granule;
+        const u64 rows = std::min({
+            ceil_div(size.height, dst_info.block_height),
+            ceil_div(src_height - src_origin.y, src_info.block_height),
+            ceil_div(dst_height - dst_origin.y, dst_info.block_height)});
+        if (row_bytes != 0 && rows != 0 && size.depth != 0) {
+            const u64 image_bytes = row_bytes * rows;
+            const u64 src_blocks_x = row_bytes / src_info.bytes_per_block;
+            const u64 dst_blocks_x = row_bytes / dst_info.bytes_per_block;
+            auto* buffer = src->device()->newBuffer(
+                image_bytes * size.depth, MTL::ResourceStorageModePrivate);
+            encoder->copyFromTexture(
+                src, src_slice, src_level, src_origin,
+                MTL::Size(std::min<u64>(src_blocks_x * src_info.block_width,
+                                        src_width - src_origin.x),
+                          std::min<u64>(rows * src_info.block_height,
+                                        src_height - src_origin.y),
+                          size.depth),
+                buffer, 0, row_bytes, image_bytes);
+            encoder->copyFromBuffer(
+                buffer, 0, row_bytes, image_bytes,
+                MTL::Size(std::min<u64>(dst_blocks_x * dst_info.block_width,
+                                        dst_width - dst_origin.x),
+                          std::min<u64>(rows * dst_info.block_height,
+                                        dst_height - dst_origin.y),
+                          size.depth),
+                dst, dst_slice, dst_level, dst_origin);
+            buffer->release();
+            return;
+        }
+    }
+
     if (!sizes_match) {
         ONCE(LOG_NOT_IMPLEMENTED(MetalRenderer, "Texture copy from {} to {}",
                                  src_format, dst_format));
@@ -87,7 +188,7 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
 
 Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
     : ITexture(descriptor) {
-    const auto type = toMtlTextureType(descriptor.type);
+    const auto type = descriptor.type;
 
     MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
     desc->setTextureType(type);
@@ -98,15 +199,15 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
     desc->setStorageMode(MTL::StorageModePrivate);
 
     switch (descriptor.type) {
-    case TextureType::_1DArray:
-    case TextureType::_2DArray:
+    case MTL::TextureType1DArray:
+    case MTL::TextureType2DArray:
         desc->setArrayLength(descriptor.layer_count);
         break;
-    case TextureType::Cube:
+    case MTL::TextureTypeCube:
         ASSERT_DEBUG(descriptor.layer_count == 6, MetalRenderer,
                      "Invalid cube layer count {}", descriptor.layer_count);
         break;
-    case TextureType::CubeArray:
+    case MTL::TextureTypeCubeArray:
         ASSERT_DEBUG(descriptor.layer_count % 6 == 0, MetalRenderer,
                      "Invalid cube array layer count {}",
                      descriptor.layer_count);
@@ -132,7 +233,7 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
             write_usage |= MTL::TextureUsageShaderAtomic;
     }
 
-    if (descriptor.type == TextureType::_1DBuffer) {
+    if (descriptor.type == MTL::TextureTypeTextureBuffer) {
         const auto alignment =
             device->minimumLinearTextureAlignmentForPixelFormat(
                 pixel_format_info.pixel_format);
@@ -268,14 +369,14 @@ void Texture::copyBufferBytesHot1(ICommandBuffer* command_buffer,
                "A mixed byte copy requires one buffer and one 2D texture");
         const auto* surface = src_buffer ? this : source;
         const auto& d = surface->descriptor;
-        ASSERT(d.type == TextureType::_2D && d.level_count == 1 && d.layer_count == 1 &&
+        ASSERT(d.type == MTL::TextureType2D && d.level_count == 1 && d.layer_count == 1 &&
                    d.depth == 1 && !isTextureFormatCompressed(d.format) &&
                    !isTextureFormatDepthOrStencil(d.format), MetalRenderer,
                "Mixed byte copy requires a single-level non-depth 2D surface");
         const u64 row_bytes = getTextureFormatStride(d.format, d.width);
         const auto blocks = d.getLevelBlockSizeLog2(0);
         ASSERT(row_bytes != 0 && d.height != 0 && row_bytes * d.height <= UINT32_MAX &&
-                   blocks.x() <= 5 && blocks.y() <= 5 && blocks.z() <= 5 &&
+                   static_cast<u32>(blocks.width) <= 5 && static_cast<u32>(blocks.height) <= 5 && static_cast<u32>(blocks.depth) <= 5 &&
                    (!d.is_linear || d.linear_stride >= row_bytes), MetalRenderer,
                "Invalid mixed byte copy surface layout");
         thread_count = row_bytes * d.height;
@@ -288,9 +389,9 @@ void Texture::copyBufferBytesHot1(ICommandBuffer* command_buffer,
         params[3] = row_bytes;
         params[4] = d.height;
         params[5] = d.is_linear ? d.linear_stride : 0;
-        params[6] = blocks.x();
-        params[7] = blocks.y();
-        params[8] = blocks.z();
+        params[6] = static_cast<u32>(blocks.width);
+        params[7] = static_cast<u32>(blocks.height);
+        params[8] = static_cast<u32>(blocks.depth);
         params[9] = src_buffer ? 1 : 0;
         if (src_buffer) dst_buffer = packed;
         else src_buffer = packed;
@@ -338,16 +439,16 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
             // Calculate sizes
             const auto dims = descriptor.getLevelDimensions(level);
             const auto stride =
-                getTextureFormatStride(descriptor.format, dims.x());
+                getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
             const auto slice_stride = getTextureFormatSliceStride(
-                descriptor.format, dims.x(), dims.y());
+                descriptor.format, static_cast<u32>(dims.width), static_cast<u32>(dims.height));
 
             // Copy
             if (expanded) {
                 const auto host_format = getHostTextureFormat(descriptor.format);
-                const auto host_stride = getTextureFormatStride(host_format, dims.x());
-                const u64 host_slice = static_cast<u64>(host_stride) * dims.y();
-                const u64 host_size = host_slice * dims.z();
+                const auto host_stride = getTextureFormatStride(host_format, static_cast<u32>(dims.width));
+                const u64 host_slice = static_cast<u64>(host_stride) * static_cast<u32>(dims.height);
+                const u64 host_size = host_slice * static_cast<u32>(dims.depth);
                 ASSERT(mtl_src->contents() != nullptr, MetalRenderer,
                        "Expanded texture uploads require mapped source bytes");
                 auto* staging = texture->device()->newBuffer(
@@ -355,12 +456,12 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
                 expandTexturePixels(descriptor.format,
                     static_cast<const u8*>(mtl_src->contents()) + offset,
                     static_cast<u8*>(staging->contents()),
-                    static_cast<usize>(dims.x()) * dims.y() * dims.z());
+                    static_cast<usize>(static_cast<u32>(dims.width)) * static_cast<u32>(dims.height) * static_cast<u32>(dims.depth));
                 if (buffer_backing) {
                     encoder->copyFromBuffer(staging, 0, buffer_backing, 0, host_size);
                 } else {
                     encoder->copyFromBuffer(staging, 0, host_stride, host_slice,
-                                            MTL::Size(dims.x(), dims.y(), dims.z()),
+                                            dims,
                                             texture, layer, level,
                                             MTL::Origin(0, 0, 0));
                 }
@@ -372,23 +473,23 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
                     dims, layer, level);
             } else {
                 encoder->copyFromBuffer(mtl_src, offset, stride, slice_stride,
-                                        MTL::Size(dims.x(), dims.y(), dims.z()),
+                                        dims,
                                         texture, layer, level,
                                         MTL::Origin(0, 0, 0));
             }
 
             // Add offset
-            offset += dims.z() * slice_stride;
+            offset += static_cast<u32>(dims.depth) * slice_stride;
         }
     }
 }
 
 void Texture::copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
-                                         const u8* src, const uint3 dims,
+                                         const u8* src, const MTL::Size dims,
                                          const u32 layer, const u32 level) {
     // Metal can only upload depth and stencil of a packed depth stencil
     // texture separately, so split the guest data into 2 planes
-    const usize pixel_count = static_cast<usize>(dims.x()) * dims.y() * dims.z();
+    const usize pixel_count = static_cast<usize>(static_cast<u32>(dims.width)) * static_cast<u32>(dims.height) * static_cast<u32>(dims.depth);
     auto device = texture->device();
     auto depth_buffer = device->newBuffer(pixel_count * sizeof(f32),
                                           MTL::ResourceStorageModeShared);
@@ -427,14 +528,14 @@ void Texture::copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
         }
     }
 
-    const auto size = MTL::Size(dims.x(), dims.y(), dims.z());
-    encoder->copyFromBuffer(depth_buffer, 0, dims.x() * sizeof(f32),
-                            static_cast<usize>(dims.x()) * dims.y() *
+    const auto size = dims;
+    encoder->copyFromBuffer(depth_buffer, 0, static_cast<u32>(dims.width) * sizeof(f32),
+                            static_cast<usize>(static_cast<u32>(dims.width)) * static_cast<u32>(dims.height) *
                                 sizeof(f32),
                             size, texture, layer, level, MTL::Origin(0, 0, 0),
                             MTL::BlitOptionDepthFromDepthStencil);
-    encoder->copyFromBuffer(stencil_buffer, 0, dims.x(),
-                            static_cast<usize>(dims.x()) * dims.y(), size,
+    encoder->copyFromBuffer(stencil_buffer, 0, static_cast<u32>(dims.width),
+                            static_cast<usize>(static_cast<u32>(dims.width)) * static_cast<u32>(dims.height), size,
                             texture, layer, level, MTL::Origin(0, 0, 0),
                             MTL::BlitOptionStencilFromDepthStencil);
 
@@ -462,16 +563,16 @@ void Texture::copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
                        src_layer + i, src_level + j, MTL::Origin(0, 0, 0),
                        texture, descriptor.format, dst_layer + i,
                        crnt_dst_level, MTL::Origin(0, 0, 0),
-                       MTL::Size(dims.x(), dims.y(), dims.z()));
+                       dims);
         }
     }
 }
 
 void Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
-                       const uint3 src_origin, const u32 src_level,
-                       const u32 src_layer, const uint3 dst_origin,
+                       const MTL::Origin src_origin, const u32 src_level,
+                       const u32 src_layer, const MTL::Origin dst_origin,
                        const u32 dst_level, const u32 dst_layer,
-                       const uint3 size, const u32 layer_count) {
+                       const MTL::Size size, const u32 layer_count) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
     const auto mtl_src = static_cast<const Texture*>(src)->getTexture();
@@ -481,10 +582,10 @@ void Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
     for (u32 i = 0; i < layer_count; i++) {
         copyRegion(encoder, mtl_src, src->getDescriptor().format,
                    src_layer + i, src_level,
-                   MTL::Origin(src_origin.x(), src_origin.y(), src_origin.z()),
+                   MTL::Origin(src_origin.x, src_origin.y, src_origin.z),
                    texture, descriptor.format, dst_layer + i, dst_level,
-                   MTL::Origin(dst_origin.x(), dst_origin.y(), dst_origin.z()),
-                   MTL::Size(size.x(), size.y(), size.z()));
+                   MTL::Origin(dst_origin.x, dst_origin.y, dst_origin.z),
+                   MTL::Size(size.width, size.height, size.depth));
     }
 }
 

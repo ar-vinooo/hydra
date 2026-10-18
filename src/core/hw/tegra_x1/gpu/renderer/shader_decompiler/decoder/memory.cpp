@@ -39,7 +39,7 @@ void emitLoadAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
 
     for (u32 i = 0; i < count; i++) {
         context.builder.opCopy(
-            ir::Value::createRegister(dst + static_cast<u8>(i)), values[i]);
+            ir::Value::createRegister(offsetRegister(dst, i)), values[i]);
     }
 
     if (conditional)
@@ -73,7 +73,7 @@ void emitStoreAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opCopy(
             ir::Value::createAttrMemory(
                 AMem(dst, dst_offset + i * sizeof(u32), false)),
-            ir::Value::createRegister(src + static_cast<u8>(i)));
+            ir::Value::createRegister(offsetRegister(src, i)));
     }
 
     if (conditional)
@@ -158,7 +158,7 @@ void emitLoadConstant(DecoderContext& context, pred_t pred, bool pred_inv,
 
     for (u32 i = 0; i < count; i++) {
         context.builder.opCopy(
-            ir::Value::createRegister(dst + static_cast<u8>(i)), values[i]);
+            ir::Value::createRegister(offsetRegister(dst, i)), values[i]);
     }
 
     if (conditional)
@@ -249,7 +249,7 @@ void emitLoadGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
     if (dst != RZ)
         for (u32 i = 0; i < count; i++)
             context.builder.opCopy(
-                ir::Value::createRegister(dst + static_cast<u8>(i)), values[i]);
+                ir::Value::createRegister(offsetRegister(dst, i)), values[i]);
 
     if (conditional)
         context.builder.opEndIf();
@@ -272,7 +272,7 @@ void emitStoreGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
                 access->binding, offsetWord(context, access->offset, i),
                 access->size,
                 context.builder.opCopy(
-                    ir::Value::createRegister(src + static_cast<u8>(i))),
+                    ir::Value::createRegister(offsetRegister(src, i))),
                 static_cast<u32>(size) <= 4 ? static_cast<u32>(size) : 4);
     }
 
@@ -431,7 +431,7 @@ void emitAtomCas(DecoderContext& context, InstAtomCas inst) {
     if (access) {
         const auto compare = b.opCopy(ir::Value::createRegister(operand));
         const auto value = b.opCopy(
-            ir::Value::createRegister(operand + static_cast<u8>(1)));
+            ir::Value::createRegister(offsetRegister(operand, 1)));
         result = b.opAtomicStorageCas(access->binding, access->offset,
                                       access->size, compare, value);
     } else {

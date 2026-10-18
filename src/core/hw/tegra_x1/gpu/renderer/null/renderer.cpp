@@ -50,10 +50,10 @@ ITexture* Renderer::createTexture(const TextureDescriptor& descriptor) {
 
 void Renderer::blitTexture(
     [[maybe_unused]] ICommandBuffer* command_buffer,
-    [[maybe_unused]] ITextureView* src, [[maybe_unused]] float3 src_origin,
-    [[maybe_unused]] uint3 src_size, [[maybe_unused]] u32 src_level,
+    [[maybe_unused]] ITextureView* src, [[maybe_unused]] simd::float3 src_origin,
+    [[maybe_unused]] MTL::Size src_size, [[maybe_unused]] u32 src_level,
     [[maybe_unused]] u32 src_layer, [[maybe_unused]] ITextureView* dst,
-    [[maybe_unused]] float3 dst_origin, [[maybe_unused]] uint3 dst_size,
+    [[maybe_unused]] simd::float3 dst_origin, [[maybe_unused]] MTL::Size dst_size,
     [[maybe_unused]] u32 dst_level, [[maybe_unused]] u32 dst_layer,
     [[maybe_unused]] u32 level_count, [[maybe_unused]] u32 layer_count, [[maybe_unused]] const BlitOptions& options) {}
 
@@ -74,7 +74,7 @@ void Renderer::bindRenderPass(
 void Renderer::clearColor([[maybe_unused]] ICommandBuffer* command_buffer,
                           [[maybe_unused]] u32 render_target_id,
                           [[maybe_unused]] u32 layer, [[maybe_unused]] u8 mask,
-                          [[maybe_unused]] const uint4 color) {}
+                          [[maybe_unused]] const simd::uint4 color) {}
 
 void Renderer::clearDepth([[maybe_unused]] ICommandBuffer* command_buffer,
                           [[maybe_unused]] u32 layer,
@@ -98,7 +98,7 @@ void Renderer::setDepthTestEnabled([[maybe_unused]] bool enabled) {}
 void Renderer::setDepthWriteEnabled([[maybe_unused]] bool enabled) {}
 void Renderer::setDepthCompareOp([[maybe_unused]] engines::CompareOp op) {}
 
-void Renderer::setBlendConstant([[maybe_unused]] const float4 color) {}
+void Renderer::setBlendConstant([[maybe_unused]] const simd::float4 color) {}
 
 void Renderer::setDepthBias([[maybe_unused]] f32 constant,
                             [[maybe_unused]] f32 slope,
@@ -106,9 +106,9 @@ void Renderer::setDepthBias([[maybe_unused]] f32 constant,
 
 // Viewport and scissor
 void Renderer::setViewport([[maybe_unused]] u32 index,
-                           [[maybe_unused]] const Viewport& viewport) {}
+                           [[maybe_unused]] const MTL::Viewport& viewport) {}
 void Renderer::setScissor([[maybe_unused]] u32 index,
-                          [[maybe_unused]] const Scissor& scissor) {}
+                          [[maybe_unused]] const MTL::ScissorRect& scissor) {}
 
 // Resource binding
 void Renderer::bindVertexBuffer([[maybe_unused]] const BufferView& buffer,

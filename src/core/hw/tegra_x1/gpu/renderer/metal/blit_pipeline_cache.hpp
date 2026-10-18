@@ -5,8 +5,8 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 struct BlitParams {
-    float2 src_offset;
-    float2 src_scale;
+    simd::float2 src_offset;
+    simd::float2 src_scale;
     f32 opacity;
     f32 _padding; // Match MSL struct size (aligned to float2)
 };
@@ -15,9 +15,9 @@ struct BlitPipelineDescriptor {
     MTL::PixelFormat pixel_format;
     bool transparent;
     bool copy_alpha = false;
-    // 0 float, 1 uint, 2 int
-    u8 src_type = 0;
-    u8 dst_type = 0;
+    // Component type of the source and destination (float, uint or int)
+    MTL::DataType src_type = MTL::DataTypeFloat;
+    MTL::DataType dst_type = MTL::DataTypeFloat;
 };
 
 class BlitPipelineCache

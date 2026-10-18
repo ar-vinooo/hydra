@@ -61,9 +61,9 @@ ITexture* Renderer::createTexture(const TextureDescriptor& descriptor) {
 }
 
 void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
-                           float3 src_origin, uint3 src_size, u32 src_level,
-                           u32 src_layer, ITextureView* dst, float3 dst_origin,
-                           uint3 dst_size, u32 dst_level, u32 dst_layer,
+                           simd::float3 src_origin, MTL::Size src_size, u32 src_level,
+                           u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
+                           MTL::Size dst_size, u32 dst_level, u32 dst_layer,
                            u32 level_count, u32 layer_count, const BlitOptions& options) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_blitTextureHot9)(
@@ -98,7 +98,7 @@ void Renderer::bindRenderPass(const RenderPassBase* render_pass) {
 }
 
 void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
-                          u32 layer, u8 mask, const uint4 color) {
+                          u32 layer, u8 mask, const simd::uint4 color) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_clearColorHot14)(
         command_buffer, render_target_id, layer, mask, color);
@@ -191,7 +191,7 @@ void Renderer::setDepthBias(f32 constant, f32 slope, f32 clamp) {
         constant, slope, clamp);
 }
 
-void Renderer::setBlendConstant(const float4 color) {
+void Renderer::setBlendConstant(const simd::float4 color) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setBlendConstantHot28)(color);
@@ -203,13 +203,13 @@ void Renderer::setDepthCompareOp(engines::CompareOp op) {
             hot_scope.table().renderer_setDepthCompareOpHot29)(op);
 }
 
-void Renderer::setViewport(u32 index, const Viewport& viewport) {
+void Renderer::setViewport(u32 index, const MTL::Viewport& viewport) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_setViewportHot30)(
         index, viewport);
 }
 
-void Renderer::setScissor(u32 index, const Scissor& scissor) {
+void Renderer::setScissor(u32 index, const MTL::ScissorRect& scissor) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setScissorHot31)(index, scissor);
@@ -534,7 +534,7 @@ void Texture::copyFrom(ICommandBuffer* command_buffer, const BufferBase* src,
 }
 
 void Texture::copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
-                                         const u8* src, const uint3 dims,
+                                         const u8* src, const MTL::Size dims,
                                          const u32 layer, const u32 level) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
@@ -553,10 +553,10 @@ void Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
 }
 
 void Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
-                       const uint3 src_origin, const u32 src_level,
-                       const u32 src_layer, const uint3 dst_origin,
+                       const MTL::Origin src_origin, const u32 src_level,
+                       const u32 src_layer, const MTL::Origin dst_origin,
                        const u32 dst_level, const u32 dst_layer,
-                       const uint3 size, const u32 layer_count) {
+                       const MTL::Size size, const u32 layer_count) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().texture_copyFromHot5)(
         command_buffer, src, src_origin, src_level, src_layer, dst_origin,
@@ -807,7 +807,7 @@ void decompile(ztd::io::MemoryStream& stream, ShaderType type,
 #ifdef ZTD_PLATFORM_APPLE
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 void Buffer::copyFrom(ICommandBuffer* command_buffer, ITextureView* src,
-                      const uint3 src_origin, const uint3 src_size,
+                      const MTL::Origin src_origin, const MTL::Size src_size,
                       const ztd::Range<u32> src_levels,
                       const ztd::Range<u32> src_layers, u64 dst_offset) {
     ::hydra::hot::Scope hot_scope;

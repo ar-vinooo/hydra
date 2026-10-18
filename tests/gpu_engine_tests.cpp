@@ -412,12 +412,12 @@ void testRendererClears() {
     auto& cache = renderer.getTextureCache();
     const auto ptr = reinterpret_cast<uptr>(guest_memory.data());
     auto* color = cache.find(commands.get(),
-                             TextureDescriptor(ptr, TextureType::_2D,
+                             TextureDescriptor(ptr, MTL::TextureType2D,
                                                TextureFormat::RGBA8Unorm, false,
                                                0, 8, 8, 1, 1, 1, 0, 0, 0),
                              TextureUsage::Write);
     auto* depth = cache.find(commands.get(),
-                             TextureDescriptor(ptr + 0x10000, TextureType::_2D,
+                             TextureDescriptor(ptr + 0x10000, MTL::TextureType2D,
                                                TextureFormat::Z32Float, false, 0,
                                                8, 8, 1, 1, 1, 0, 0, 0),
                              TextureUsage::Write);
@@ -427,16 +427,16 @@ void testRendererClears() {
     std::unique_ptr<RenderPassBase> pass(
         renderer.createRenderPass(pass_descriptor));
     renderer.bindRenderPass(pass.get());
-    const Scissor full(uint2({0, 0}), uint2({8, 8}));
+    const MTL::ScissorRect full(0, 0, 8, 8);
     renderer.setClearState({.rect = full});
-    renderer.clearColor(commands.get(), 0, 0, 0xf, uint4({0, 0, 0, 0}));
+    renderer.clearColor(commands.get(), 0, 0, 0xf, simd::uint4{0, 0, 0, 0});
     renderer.clearDepth(commands.get(), 0, 0.75f);
     // Partial color clear right after the depth clear
-    renderer.setClearState({.rect = Scissor(uint2({2, 1}), uint2({4, 2}))});
+    renderer.setClearState({.rect = MTL::ScissorRect(2, 1, 4, 2)});
     renderer.clearColor(commands.get(), 0, 0, 0xf,
-                        uint4({std::bit_cast<u32>(1.0f), 0,
-                               std::bit_cast<u32>(1.0f),
-                               std::bit_cast<u32>(1.0f)}));
+                        simd::uint4{std::bit_cast<u32>(1.0f), 0,
+                                    std::bit_cast<u32>(1.0f),
+                                    std::bit_cast<u32>(1.0f)});
     commands.reset();
 
     auto* device = static_cast<metal::TextureView*>(color)->getTexture()->device();
@@ -479,10 +479,10 @@ void testOcclusionReports() {
     auto& cache = renderer.getTextureCache();
     const auto ptr = reinterpret_cast<uptr>(image_memory.data());
     auto* color = cache.find(commands.get(),
-        TextureDescriptor(ptr, TextureType::_2D, TextureFormat::RGBA8Unorm,
+        TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
                           false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
     auto* depth = cache.find(commands.get(),
-        TextureDescriptor(ptr + 0x10000, TextureType::_2D, TextureFormat::Z32Float,
+        TextureDescriptor(ptr + 0x10000, MTL::TextureType2D, TextureFormat::Z32Float,
                           false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
     RenderPassDescriptor pass_descriptor{};
     pass_descriptor.color_targets[0].texture = color;
@@ -516,9 +516,9 @@ fragment float4 main_() { return float4(1); }
     pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
     std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
     renderer.bindPipeline(pipeline.get());
-    const Scissor full(uint2({0, 0}), uint2({4, 4}));
+    const MTL::ScissorRect full(0, 0, 4, 4);
     for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
-        renderer.setViewport(i, {FloatRect2D(float2({0, 0}), float2({4, 4})), 0, 1});
+        renderer.setViewport(i, MTL::Viewport{0, 0, 4, 4, 0, 1});
         renderer.setScissor(i, full);
     }
     renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
@@ -594,13 +594,13 @@ fragment float4 main_() { return float4(1); }
                        across_submissions).c_str());
     engine.method(0x54c, 1);
     draw();
-    renderer.clearColor(commands.get(), 0, 0, 0xf, uint4({0, 0, 0, 0}));
+    renderer.clearColor(commands.get(), 0, 0, 0xf, simd::uint4{0, 0, 0, 0});
     renderer.clearDepth(commands.get(), 0, 0.75f);
     draw();
     expect(report(0x15) == 32, "Clear passes preserve earlier counts and add no samples");
     engine.method(0x54c, 1);
     for (u32 i = 0; i < VIEWPORT_COUNT; i++)
-        renderer.setScissor(i, Scissor(uint2({0, 0}), uint2({2, 2})));
+        renderer.setScissor(i, MTL::ScissorRect(0, 0, 2, 2));
     draw();
     expect(report(0x15) == 4, "Scissor coverage determines the actual sample count");
     for (u32 i = 0; i < VIEWPORT_COUNT; i++)
@@ -1020,7 +1020,17 @@ void testInlineIndices() {
     expect(engine.getRegs().primitive_restart_enabled == 1 &&
                engine.getRegs().primitive_restart_index == 99,
            "Restart registers match NVIDIA method offsets");
-    std::cout << "PASS: inline indexed methods, END lifecycle and restart registers\n";
+    engine.method(0x35d, 7);
+    engine.method(0x4c6, 0);
+    engine.method(0x48f, 160);
+    expect(PerfStats::instance().draws.load() == before + 1,
+           "DRAW_AUTO with zero stride is ignored safely");
+    engine.method(0x4c6, 16);
+    engine.method(0x48f, 160);
+    expect(PerfStats::instance().draws.load() == before + 2 &&
+               engine.getRegs().vertex_array_start == 7,
+           "DRAW_AUTO submits byte count divided by stride from vertex zero");
+    std::cout << "PASS: inline indices, restart registers and DRAW_AUTO fallback\n";
 }
 
 void testClippedBlitRegions() {

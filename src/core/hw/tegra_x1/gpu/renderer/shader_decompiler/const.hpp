@@ -22,6 +22,15 @@ struct local_t {
 constexpr reg_t RZ = 0xff;
 constexpr pred_t PT = 0x7;
 
+// Consecutive operands never wrap past the zero register into R0.
+constexpr reg_t offsetRegister(reg_t reg, u32 offset) {
+    const u32 index = static_cast<u32>(reg);
+    return index >= static_cast<u32>(RZ) ||
+                   offset >= static_cast<u32>(RZ) - index
+               ? RZ
+               : reg_t(static_cast<u8>(index + offset));
+}
+
 struct AMem {
     reg_t reg;
     u64 imm;

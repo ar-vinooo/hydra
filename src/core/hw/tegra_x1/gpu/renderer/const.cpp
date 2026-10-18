@@ -8,38 +8,40 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-TextureTypeClass getTextureTypeClass(TextureType type) {
+TextureTypeClass getTextureTypeClass(MTL::TextureType type) {
     switch (type) {
-    case TextureType::_1D:
-    case TextureType::_1DArray:
+    case MTL::TextureType1D:
+    case MTL::TextureType1DArray:
         return TextureTypeClass::_1D;
-    case TextureType::_1DBuffer:
+    case MTL::TextureTypeTextureBuffer:
         return TextureTypeClass::_1DBuffer;
-    case TextureType::_2D:
-    case TextureType::_2DArray:
-    case TextureType::Cube:
-    case TextureType::CubeArray:
+    case MTL::TextureType2D:
+    case MTL::TextureType2DArray:
+    case MTL::TextureTypeCube:
+    case MTL::TextureTypeCubeArray:
         return TextureTypeClass::_2D;
-    case TextureType::_3D:
+    case MTL::TextureType3D:
         return TextureTypeClass::_3D;
+    default:
+        return TextureTypeClass::_2D;
     }
 }
 
-bool legalizeTextureShape(TextureType& type, u32 width, u32 height, u32 depth,
+bool legalizeTextureShape(MTL::TextureType& type, u32 width, u32 height, u32 depth,
                           u32 layer_count, u32& level_count) {
     if (layer_count > 1) {
-        if (type == TextureType::_1D)
-            type = TextureType::_1DArray;
-        else if (type == TextureType::_2D)
-            type = TextureType::_2DArray;
-        else if (type == TextureType::Cube && layer_count > 6)
-            type = TextureType::CubeArray;
+        if (type == MTL::TextureType1D)
+            type = MTL::TextureType1DArray;
+        else if (type == MTL::TextureType2D)
+            type = MTL::TextureType2DArray;
+        else if (type == MTL::TextureTypeCube && layer_count > 6)
+            type = MTL::TextureTypeCubeArray;
     }
 
     constexpr u32 MAX_SIZE = 16384;
     constexpr u32 MAX_LAYERS = 2048;
     const bool is_cube =
-        type == TextureType::Cube || type == TextureType::CubeArray;
+        type == MTL::TextureTypeCube || type == MTL::TextureTypeCubeArray;
     if (width == 0 || height == 0 || depth == 0 || layer_count == 0 ||
         width > MAX_SIZE || height > MAX_SIZE || depth > MAX_LAYERS ||
         layer_count > MAX_LAYERS ||
@@ -47,10 +49,10 @@ bool legalizeTextureShape(TextureType& type, u32 width, u32 height, u32 depth,
         return false;
 
     const u32 max_level_count = static_cast<u32>(std::bit_width(
-        std::max({width, height, type == TextureType::_3D ? depth : 1u})));
+        std::max({width, height, type == MTL::TextureType3D ? depth : 1u})));
     level_count = std::clamp(level_count, 1u, max_level_count);
-    if (type == TextureType::_1D || type == TextureType::_1DArray ||
-        type == TextureType::_1DBuffer)
+    if (type == MTL::TextureType1D || type == MTL::TextureType1DArray ||
+        type == MTL::TextureTypeTextureBuffer)
         level_count = 1;
     return true;
 }
@@ -710,7 +712,7 @@ bool isTextureFormatDepthOrStencil(const TextureFormat format) {
     return info.is_depth_stencil;
 }
 
-ColorDataType toColorDataType(ColorSurfaceFormat format) {
+MTL::DataType toColorDataType(ColorSurfaceFormat format) {
     switch (format) {
     case ColorSurfaceFormat::RGBA32Float:
     case ColorSurfaceFormat::RGBX32Float:
@@ -750,7 +752,7 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::BGR5X1UnormUnknownFC:
     case ColorSurfaceFormat::BGRX8UnormUnknownFD:
     case ColorSurfaceFormat::BGRX8UnormUnknownFE:
-        return ColorDataType::Float;
+        return MTL::DataTypeFloat;
     case ColorSurfaceFormat::RGBA32Sint:
     case ColorSurfaceFormat::RGBX32Sint:
     case ColorSurfaceFormat::RGBA16Sint:
@@ -761,7 +763,7 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::RG8Sint:
     case ColorSurfaceFormat::R16Sint:
     case ColorSurfaceFormat::R8Sint:
-        return ColorDataType::Int;
+        return MTL::DataTypeInt;
     case ColorSurfaceFormat::RGBA32Uint:
     case ColorSurfaceFormat::RGBX32Uint:
     case ColorSurfaceFormat::RGBA16Uint:
@@ -773,9 +775,9 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::RG8Uint:
     case ColorSurfaceFormat::R16Uint:
     case ColorSurfaceFormat::R8Uint:
-        return ColorDataType::UInt;
+        return MTL::DataTypeUInt;
     default:
-        return ColorDataType::Invalid;
+        return MTL::DataTypeNone;
     }
 }
 
@@ -847,9 +849,9 @@ u32 adjustDim(u32 dim, u32 level) { return std::max(dim >> level, 1u); }
 
 } // namespace
 
-uint3 TextureDescriptor::getLevelDimensions(u32 level) const {
-    return uint3({adjustDim(width, level), adjustDim(height, level),
-                  adjustDim(depth, level)});
+MTL::Size TextureDescriptor::getLevelDimensions(u32 level) const {
+    return MTL::Size(adjustDim(width, level), adjustDim(height, level),
+                     adjustDim(depth, level));
 }
 
 namespace {
@@ -863,16 +865,19 @@ u32 adjustBlockSizeLog2(u32 size_log2, u32 gob_dim, u32 dim) {
 
 } // namespace
 
-uint3 TextureDescriptor::getLevelBlockSizeLog2(u32 level) const {
+MTL::Size TextureDescriptor::getLevelBlockSizeLog2(u32 level) const {
     const auto dims = getLevelDimensions(level);
 
-    const u32 stride = getTextureFormatStride(format, dims.x());
-    const u32 rows = getTextureFormatRows(format, dims.y());
-    const u32 slices = dims.z();
+    const u32 stride =
+        getTextureFormatStride(format, static_cast<u32>(dims.width));
+    const u32 rows =
+        getTextureFormatRows(format, static_cast<u32>(dims.height));
+    const u32 slices = static_cast<u32>(dims.depth);
 
-    return uint3({adjustBlockSizeLog2(block_width_gobs_log2, GOB_WIDTH, stride),
-                  adjustBlockSizeLog2(block_height_gobs_log2, GOB_HEIGHT, rows),
-                  adjustBlockSizeLog2(block_depth_gobs_log2, 1, slices)});
+    return MTL::Size(
+        adjustBlockSizeLog2(block_width_gobs_log2, GOB_WIDTH, stride),
+        adjustBlockSizeLog2(block_height_gobs_log2, GOB_HEIGHT, rows),
+        adjustBlockSizeLog2(block_depth_gobs_log2, 1, slices));
 }
 
 u32 TextureDescriptor::getLevelOffset(u32 level) const {
@@ -887,15 +892,15 @@ u32 TextureDescriptor::getLevelSize(u32 level) const {
     const auto dims = getLevelDimensions(level);
     const auto block_size_log2 = getLevelBlockSizeLog2(level);
 
-    const u32 block_width = GOB_WIDTH << block_size_log2.x();
-    const u32 block_height = GOB_HEIGHT << block_size_log2.y();
-    const u32 block_depth = 1u << block_size_log2.z();
+    const u32 block_width = GOB_WIDTH << static_cast<u32>(block_size_log2.width);
+    const u32 block_height = GOB_HEIGHT << static_cast<u32>(block_size_log2.height);
+    const u32 block_depth = 1u << static_cast<u32>(block_size_log2.depth);
 
     const u32 stride =
-        align(getTextureFormatStride(format, dims.x()), block_width);
+        align(getTextureFormatStride(format, static_cast<u32>(dims.width)), block_width);
     const u32 rows =
-        align(getTextureFormatRows(format, dims.y()), block_height);
-    const u32 slices = align(dims.z(), block_depth);
+        align(getTextureFormatRows(format, static_cast<u32>(dims.height)), block_height);
+    const u32 slices = align(static_cast<u32>(dims.depth), block_depth);
 
     return slices * rows * stride;
 }

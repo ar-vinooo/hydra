@@ -7,34 +7,12 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 namespace {
 
-MTL::StencilOperation toMtlStencilOp(StencilOp op) {
-    switch (op) {
-    case StencilOp::Keep:
-        return MTL::StencilOperationKeep;
-    case StencilOp::Zero:
-        return MTL::StencilOperationZero;
-    case StencilOp::Replace:
-        return MTL::StencilOperationReplace;
-    case StencilOp::IncrSat:
-        return MTL::StencilOperationIncrementClamp;
-    case StencilOp::DecrSat:
-        return MTL::StencilOperationDecrementClamp;
-    case StencilOp::Invert:
-        return MTL::StencilOperationInvert;
-    case StencilOp::Incr:
-        return MTL::StencilOperationIncrementWrap;
-    case StencilOp::Decr:
-        return MTL::StencilOperationDecrementWrap;
-    }
-    return MTL::StencilOperationKeep;
-}
-
 MTL::StencilDescriptor* createStencilDescriptor(const StencilFaceState& face) {
     auto desc = MTL::StencilDescriptor::alloc()->init();
     desc->setStencilCompareFunction(toMtlCompareFunc(face.func));
-    desc->setStencilFailureOperation(toMtlStencilOp(face.fail_op));
-    desc->setDepthFailureOperation(toMtlStencilOp(face.depth_fail_op));
-    desc->setDepthStencilPassOperation(toMtlStencilOp(face.pass_op));
+    desc->setStencilFailureOperation(face.fail_op);
+    desc->setDepthFailureOperation(face.depth_fail_op);
+    desc->setDepthStencilPassOperation(face.pass_op);
     desc->setReadMask(face.func_mask & 0xff);
     desc->setWriteMask(face.write_mask & 0xff);
     return desc;

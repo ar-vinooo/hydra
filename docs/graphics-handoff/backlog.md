@@ -1,6 +1,9 @@
 # Master backlog (from audits + evidence)
 
-Legend: [x] done in tree + tested, [~] done untested, [ ] open
+Legend: [x] done in tree + result-tested, [~] implemented or host-tested but
+guest semantics still need primary evidence, [ ] open. An [x] only claims
+NVIDIA guest semantics when its entry cites NVIDIA documentation or hardware
+traces. Another emulator alone never qualifies an item for [x].
 
 ## Done this session
 - [x] Stage I/O: front facing, point coord (+origin), primitive ID, layer/viewport (FS in + VS out), point size (fixed/program), clip distances (mask), instance ID without base instance, per-instance divisor (constant step + offset bind)
@@ -9,11 +12,16 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [x] writeReg/getReg bounds in all builds (2D B1, compute B18)
 - [~] ALLOC_AS_EX argument order (services B1)
 - [~] GMMU reservations zero-filled (services B2)
-- [x] MME interpreter rewrite (Eden semantics), Regs3D MME scratch, nested macro calls
+- [~] MME interpreter rewrite, Regs3D MME scratch, nested macro calls. Tests
+  cover Hydra's current behavior, but semantics originally sourced only from a
+  secondary emulator still need NVIDIA documentation or hardware traces.
 - [x] Clear state (rect, stencil mask/layer), clears independent of draw state (3D-BE B1/B9/B10)
 - [x] XMAD cbuf PSL/MRG; LDC small ints; TEXS/TLDS/TLD4S/TXD/TXQ fixes; shared CAS/8-16 bit stores
 - [x] Format crashes: RGBA32Sint, X8Z24, 0x40-0x47/unknown → Invalid (no abort), A2R10G10B10 → BGR10A2, X1R5G5B5/Z/O variants, invalid RT skipped (3D/2D)
-- [x] TIC table: +26 Eden encodings (BC6H, BC7 sRGB, BC4 snorm, RG8 U/S, RGB10A2 U, E5B9G9R9, ETC2/EAC x10, depth alternates, S8Z24, X8Z24, R32B24G8, A5B5G5R1)
+- [~] TIC table: +26 added encodings (BC6H, BC7 sRGB, BC4 snorm, RG8 U/S,
+  RGB10A2 U, E5B9G9R9, ETC2/EAC x10, depth alternates, S8Z24, X8Z24,
+  R32B24G8, A5B5G5R1). Revalidate every mapping against NVIDIA
+  `clb097tex.h`; secondary-emulator agreement is insufficient.
 - [x] Packed 16-bit formats: A1B5G5R5/B5G6R5/A4B4G4R4/A5B5G5R1 value-remapped swizzles (TEX D-3/D-4)
 - [x] Z24S8 (stencil low) vs S8Z24 (stencil high) separate host formats + upload decoders (TEX D-19); Z32F separate cache group (D-6)
 - [x] Sampler/swizzle converters total; TSC mag filter 3 bits (D-11)
@@ -21,7 +29,11 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [x] Index buffer FIRST/limit (B6); decoded index buffers content-checked (B7); u8/u32 input types, fan/polygon→list, quad strip, line loop
 - [x] Texture shapes legalized for Metal (array promotion, level clamp, 1D single level, non-square cube/oversize rejected) (TEX D-15)
 - [x] Collision-safe caches: exact texture group keys, storage/view probing with descriptor checks, CacheBase equals for sampler/pipeline/render pass/Metal caches (TEX D-7)
-- [x] Conversions rewritten per Eden: F2I (RN-even, clamp, NaN→0, H1, 16/64-bit), F2F (H1, F16 low half, SAT, F64<->F32 exact), I2I (SAT bit 50, sign bit 13, selector, zero-extended truncation), I2F (selector, 64-bit source, least-value neg/abs)
+- [~] Conversions implemented and Metal-result tested: F2I (RN-even, clamp,
+  NaN→0, H1, 16/64-bit), F2F (H1, F16 low half, SAT, F64<->F32 exact),
+  I2I (SAT bit 50, sign bit 13, selector, zero-extended truncation), I2F
+  (selector, 64-bit source, least-value neg/abs). Guest edge semantics need
+  NVIDIA documentation or hardware traces.
 - [x] MUFU.RCP64H/RSQ64H seeds (no host abort); getLogical/getConstantStr vectors total; half cbuf operands as F32; HADD2.R neg_a bit 43
 - [x] Inline-to-memory rewrite: LAUNCH_DMA reset, byte-exact, pitch lines, block linear, multi-mapping writes (2D B2 / compute B8)
 - [x] DMA pitch destination range for single-line copies (2D B4)
@@ -38,13 +50,30 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 - [x] 32-bit signed IR arithmetic wraps through unsigned bits (no signed-overflow UB in MSL)
 - [x] Closest Metal border color preset (was snapping wrongly, TEX D-9 partly)
 - [x] Perf/stability: TIC format conversion cached (was a ~130-way compare chain per texture per draw), nearest samplers memoized, GPU lookup benchmark in xci tests (5 ns vs 8.6 ns bare map), warning spam removed (texture combining, MODIFY mappings), buffer-snapshot and thread-wait tests updated to current semantics
-- [x] Raster: SET_RASTER_ENABLE discard (power-on 1), cull FRONT_AND_BACK skips polygons, winding always updated, depth bias halved + POINT/LINE/FILL enables, depth clamp from VIEWPORT_CLIP_CONTROL geometry clip (Eden), vertex stream index bound (3D-FE B15-B17, B24, B25, B28)
+- [x] Raster: SET_RASTER_ENABLE discard (power-on 1), cull FRONT_AND_BACK skips polygons, winding always updated, depth bias halved + POINT/LINE/FILL enables, vertex stream index bound (3D-FE B15-B17, B24, B25, B28)
+- [~] Depth-clamp selection from VIEWPORT_CLIP_CONTROL is mapped to Metal and
+  host-tested, but its guest-state rule needs NVIDIA documentation or hardware
+  trace confirmation.
 
 - [x] DMA: semaphores (1/4 word releases), BL→BL, transfer NONE; puller semaphores + host fences behind `HYDRA_GPU_FENCES` (default off)
 - [x] Control flow CAL/RET/PRET/PCNT/CONT; TMML; SULD/SURED/SUST.D/SUATOM variants
-- [x] Local conditional rendering TRUE/FALSE/CONDITIONAL/EQ/NE and override; comparison data is read across mappings and checked against real query reports.
+- [~] Local conditional rendering TRUE/FALSE/CONDITIONAL/EQ/NE and override is
+  host-tested, including real query reports and split mappings. NVIDIA defines
+  the render-enable methods, but the in-memory comparison structure and EQ/NE
+  interpretation still need NVIDIA hardware/NVN trace confirmation.
 - [x] 2D: signed fixed point, exact du/dx extents, SAMPLE_MODE filter, integer blit pipelines, no source layer from word 0x90
 - [x] Shader corpus tool (`hydra-shader-corpus-tests`)
+- [x] Consecutive shader register operands saturate at RZ instead of wrapping
+  R254/R255 into R0/R1. Memory, surface, texture, FP64 and conversion paths use
+  the shared helper; an LDG.128 Metal result test covers the boundary.
+- [x] `DRAW_AUTO` (0x48F) byte-count fallback: validated NVIDIA method/stride
+  offsets, zero-stride guard and `byte_count / stride` non-indexed draw from
+  vertex zero. Method tests pass; transform-feedback-produced counts remain P2.
+- [x] Texture coherence readback: packed Z24S8/S8Z24/X8Z24/D32FS8 restores the
+  guest layout, 3D copies use a real bytes-per-image, and block-linear retile
+  visits every depth slice. Direct and cache-flush Metal tests pass.
+- [x] Compressed-block ↔ equal-byte RGBA32/RG32 alias copies use an intermediate
+  Metal buffer and preserve the raw block bytes in both directions.
 
 - [~] Review pass 2026-10-17 (IMPLEMENTED_UNVERIFIED): D3D blend factors 0xC/0xD (BOTHSRCALPHA/BOTHINVSRCALPHA) set both factors; audio voice interpolation reads the next wave/loop start at buffer boundaries; TIC `RES_VIEW_MIN/MAX_MIP_LEVEL` clamp the sampler LOD range (absolute levels, color-key headers excluded; view stays whole); `alignLayerSize` uses block rows for compressed formats; `adjustBlockSizeLog2` no longer shifts by -1. 2D engine registers/maths verified against cl902d.h (no bug); 2D gaps: color key in blit path, BLEND/PREMULT/pattern ROPs, DIRECTION.
 
@@ -56,15 +85,23 @@ Legend: [x] done in tree + tested, [~] done untested, [ ] open
 ## P1 — widespread correctness
 - [x] Indexed primitive restart enable/custom index (3D-FE B23): segmented assembly for u8/u16/u32, disabled maximum-index preservation, cache identity; native fixed-index u16/u32 strips retained. Decoder tests pass; gameplay pending. See `primitive-restart-2026-10-17.md`.
 - [x] Inline index draws 0x57A/0x57C/0x4C1: unpack u32/u16/u8 words, accumulate until END, submit as u32 indices through the shared indexed path. Method/lifecycle tests pass with rasterization disabled; pixel coverage pending.
-- [ ] Restart topology-change modes, inline alignment controls, DRAW_AUTO (needs transform feedback). Non-indexed restart is a hardware no-op.
+- [ ] Restart topology-change modes and inline alignment controls. Their exact
+  state transitions are not established by the available references.
 - [x] ALU: FMZ for FMUL/FFMA/HMUL2/HFMA2 operand variants; IADD3/ISCADD/LEA u32 overflow regression tests; BFE signed replicate for offset >= 32 + CC; IADD32I.PO decoder mask. Metal result tests pass. Float rounding/FTZ/CC completeness remains outside this item.
 - [x] Unnormalized TIC coordinates specialized in graphics/compute shaders; TEX/gather coordinates, explicit TXD gradients and TMML LOD coordinates scale by texture dimensions. TEX/TXD result tests and fragment TMML compilation pass. Cube coordinates retain direction semantics.
-- [~] Exact sampler border colors (shader emulation, TEX D-9): custom float/integer/sRGB/depth borders and mirror-to-border via baked samplers; IMPLEMENTED_UNVERIFIED, tests written not run. See `sampler-borders-2026-10-17.md`.
+- [~] Sampler border shader emulation: custom float/integer/sRGB/depth borders
+  and mirror-to-border pass focused Metal result tests. NVIDIA confirms the
+  TSC fields and address-mode encodings, but integer/depth/swizzle and
+  CLAMP_OGL edge semantics still need hardware confirmation. See
+  `sampler-borders-2026-10-17.md`.
 - [x] Global memory + SSBO: LDG/STG/ATOM/RED/ATOM.CAS via NVN descriptor tracking, guest-memory aliasing, bounds-checked MSL, buffer-cache coherence for GPU-written ranges (`global-memory-2026-10-17.md`, `fp64-reports-2026-10-17.md`). Open: texture-cache invalidation, 64-bit atomics, indirect descriptors. No corpus shader uses it yet.
 - [x] Completion-ordered payload/ZPASS reports and real Metal occlusion counts (0x2/0x15). Register 0x545 gates counting; reset epochs, indexed draws, cross-pass/submission accumulation, page rollover/folding, report sizes/mapping boundaries and conditional comparisons have tests. Reports currently wait for GPU completion.
 - [x] Report semaphore acquire (bounded wait) and reduction (`fp64-reports-2026-10-17.md`).
 - [ ] Report awaken/trap, other report counters, asynchronous report publication with owned guest-memory lifetime.
-- [x] 2D clip rectangles and destination bounds preserve scaled/mirrored source coordinates; CORNER follows the reference whole-texel derivative correction, preserving 1:1 alignment. Geometry tests pass; gameplay pending.
+- [~] 2D clip rectangles and destination bounds preserve scaled/mirrored source
+  coordinates and pass geometry tests. The current CORNER whole-texel
+  derivative correction preserves 1:1 alignment, but its exact NVIDIA
+  semantics still need a hardware/NVN trace.
 - [x] 2D: binary ROP truth tables on raw copies, volume slices, overlapping copies (Codex; see `queue-vsync-slices-2026-10-17.md`). Other operations still rejected.
 - [x] PEXIT target stacks and direct absolute JMP, including predicates and program/header relocation; Metal result tests pass.
 - [x] DMA slices (LINE_COUNT across Z, LAYER start, bounds)

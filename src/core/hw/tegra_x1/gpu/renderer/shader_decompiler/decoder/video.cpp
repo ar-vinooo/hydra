@@ -75,8 +75,8 @@ void write(DecoderContext& context, instruction_t inst, ir::Value result) {
 } // namespace
 
 void emitVmad(DecoderContext& context, instruction_t inst) {
-    // Verified base form matches Eden's Maxwell translator. Do not silently
-    // discard modifiers whose carry/saturation/scaling semantics are unknown.
+    // The base form is host-tested. Do not silently discard modifiers whose
+    // carry/saturation/scaling semantics lack NVIDIA hardware evidence.
     if (extractBits(inst, 47, 1) || extractBits(inst, 51, 2) ||
         extractBits(inst, 55, 1)) {
         LOG_NOT_IMPLEMENTED(ShaderDecompiler, "VMAD CC/scale/saturation");

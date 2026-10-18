@@ -11,7 +11,11 @@ Status: implementation and validation in progress. No commits or staging; no GUI
 - MOV immediate sign extension; LEA.HI constant-buffer decode mask includes X.
 - IADD3, ISCADD and LEA low-word arithmetic use unsigned operations to preserve guest wraparound.
 - Floating min/max emit fmin/fmax; bitfield extraction clamps its arguments and returns zero for empty/out-of-range extracts.
-- TSC decode factored into `decodeSampler`: signed 13-bit/256 LOD bias, anisotropy table, filter-sensitive CLAMP_OGL. MIRROR_ONCE_BORDER follows the reference fallback to mirror clamp edge (not exact border emulation).
+- TSC decode factored into `decodeSampler`: signed 13-bit/256 LOD bias,
+  anisotropy table, filter-sensitive CLAMP_OGL. At this point
+  MIRROR_ONCE_BORDER used a secondary-comparator fallback to mirror clamp edge;
+  that fallback was not NVIDIA-verified and was superseded by the later shader
+  emulation described in `sampler-borders-2026-10-17.md`.
 - Sampler cache identities include bias and anisotropy. Integer sampled views select nearest samplers in the render binding path. Arbitrary border colors still need shader emulation; exact white matching corrected.
 - GPU test found native sampler LOD bias insufficient with instruction bias on this host. Bias is specialized per used binding and combined in MSL, including gradient scaling. The native sampler does not apply bias again. Explicit-level accesses ignore bias.
 - GL depth compare encodings map to their D3D equivalents. Added constant/secondary-source blend factor decoding, Add/One/Zero reset values, and disabled blending on integer targets.

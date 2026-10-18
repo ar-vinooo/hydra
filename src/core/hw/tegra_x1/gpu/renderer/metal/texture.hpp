@@ -24,9 +24,9 @@ class Texture final : public ITexture {
                   const u32 dst_layer, const u32 level_count,
                   const u32 layer_count) override;
     void copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
-                  const uint3 src_origin, const u32 src_level,
-                  const u32 src_layer, const uint3 dst_origin,
-                  const u32 dst_level, const u32 dst_layer, const uint3 size,
+                  const MTL::Origin src_origin, const u32 src_level,
+                  const u32 src_layer, const MTL::Origin dst_origin,
+                  const u32 dst_level, const u32 dst_layer, const MTL::Size size,
                   const u32 layer_count) override;
 
   private:
@@ -35,7 +35,7 @@ class Texture final : public ITexture {
     MTL::ComputePipelineState* byte_copy_pipeline = nullptr;
 
     void copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
-                                    const u8* src, const uint3 dims,
+                                    const u8* src, const MTL::Size dims,
                                     const u32 layer, const u32 level);
 
   public:
@@ -51,17 +51,17 @@ class Texture final : public ITexture {
                       const ztd::Range<u32> dst_levels,
                       const ztd::Range<u32> dst_layers);
     void copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
-                                        const u8* src, const uint3 dims,
+                                        const u8* src, const MTL::Size dims,
                                         const u32 layer, const u32 level);
     void copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
                       const u32 src_level, const u32 src_layer,
                       const u32 dst_level, const u32 dst_layer,
                       const u32 level_count, const u32 layer_count);
     void copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
-                      const uint3 src_origin, const u32 src_level,
-                      const u32 src_layer, const uint3 dst_origin,
+                      const MTL::Origin src_origin, const u32 src_level,
+                      const u32 src_layer, const MTL::Origin dst_origin,
                       const u32 dst_level, const u32 dst_layer,
-                      const uint3 size, const u32 layer_count);
+                      const MTL::Size size, const u32 layer_count);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

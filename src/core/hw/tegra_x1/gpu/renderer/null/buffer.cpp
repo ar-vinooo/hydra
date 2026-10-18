@@ -9,8 +9,8 @@ Buffer::~Buffer() { delete[] buffer; }
 
 void Buffer::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                       [[maybe_unused]] ITextureView* src,
-                      [[maybe_unused]] const uint3 src_origin,
-                      [[maybe_unused]] const uint3 src_size,
+                      [[maybe_unused]] const MTL::Origin src_origin,
+                      [[maybe_unused]] const MTL::Size src_size,
                       [[maybe_unused]] const ztd::Range<u32> src_levels,
                       [[maybe_unused]] const ztd::Range<u32> src_layers,
                       [[maybe_unused]] u64 dst_offset) {}

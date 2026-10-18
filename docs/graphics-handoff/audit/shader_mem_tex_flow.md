@@ -1,5 +1,10 @@
 # Hydra Maxwell (SM 5.3) shader translation audit — memory, texture/surface, control flow, warp/system, stage I/O
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Read-only audit. Nothing in the repository was modified, built or run.
 
 ## 0. Scope, sources, conventions

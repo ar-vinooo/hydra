@@ -1,5 +1,10 @@
 # Hydra audit: graphics OS services and frame presentation
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Scope: nvdrv (nvservices) devices and ioctls, syncpoint and fence semantics, vi (vi:u/vi:s/vi:m),
 IHOSBinderDriver and the IGraphicBufferProducer buffer queue, the compositor, frame pacing and the
 host CAMetalLayer presentation path. Read-only audit of `/Users/arvino/Documents/Project/hydra`

@@ -1,5 +1,10 @@
 # Hydra GPU audit: 2D engine, DMA copy engine, inline-to-memory, surface layouts
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Scope: FERMI_TWOD_A (0x902D), MAXWELL_DMA_COPY_A (0xB0B5), KEPLER_INLINE_TO_MEMORY_B (0xA140) plus the I2M
 method block embedded in MAXWELL_B 3D (0xB197) and compute (0xB1C0), the block-linear / pitch surface code they use,
 and their coherency with Hydra's texture and buffer caches. Read-only audit of the working tree on branch `arvino`

@@ -298,6 +298,11 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
         hash.add(sampler.integer_texture);
     }
 
+    // DEBUG: isolation switch of the emitter
+    static const bool neutral_3d =
+        std::getenv("HYDRA_DEBUG_NEUTRAL_3D") != nullptr;
+    hash.add(neutral_3d);
+
     hash.add(descriptor.state.unnormalized_textures.size());
     for (const auto index : descriptor.state.unnormalized_textures)
         hash.add(index);

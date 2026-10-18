@@ -11,7 +11,7 @@ Sampler::Sampler(MTL::Device* device, const SamplerDescriptor& descriptor)
     desc->setSupportArgumentBuffers(true);
     desc->setMinFilter(toMtlSamplerMinMagFilter(descriptor.min_filter));
     desc->setMagFilter(toMtlSamplerMinMagFilter(descriptor.mag_filter));
-    desc->setMipFilter(toMtlSamplerMipFilter(descriptor.mip_filter));
+    desc->setMipFilter(descriptor.mip_filter);
     desc->setLodMinClamp(descriptor.min_lod);
     desc->setLodMaxClamp(descriptor.max_lod);
     // Bias is combined with the instruction bias in generated MSL.

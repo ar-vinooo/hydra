@@ -52,13 +52,13 @@ inline ir::ScalarType toType(const engines::VertexAttribState& state) {
     return toType(state.type);
 }
 
-inline ir::ScalarType toType(ColorDataType color_data_type) {
+inline ir::ScalarType toType(MTL::DataType color_data_type) {
     switch (color_data_type) {
-    case ColorDataType::Float:
+    case MTL::DataTypeFloat:
         return ir::ScalarType::F32;
-    case ColorDataType::Int:
+    case MTL::DataTypeInt:
         return ir::ScalarType::I32;
-    case ColorDataType::UInt:
+    case MTL::DataTypeUInt:
         return ir::ScalarType::U32;
     default:
         unreachable();

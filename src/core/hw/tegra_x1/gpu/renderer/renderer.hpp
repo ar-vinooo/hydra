@@ -59,8 +59,8 @@ struct ComputeDispatch {
         ITextureView* texture;
     };
     std::vector<ImageBinding> images;
-    uint3 grid_size;
-    uint3 block_size;
+    MTL::Size grid_size;
+    MTL::Size block_size;
     // DEBUG: guest program address
     u64 debug_program_addr{0};
 };
@@ -138,9 +138,9 @@ class IRenderer {
     // Texture
     virtual ITexture* createTexture(const TextureDescriptor& descriptor) = 0;
     virtual void blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
-                             float3 src_origin, uint3 src_size, u32 src_level,
+                             simd::float3 src_origin, MTL::Size src_size, u32 src_level,
                              u32 src_layer, ITextureView* dst,
-                             float3 dst_origin, uint3 dst_size, u32 dst_level,
+                             simd::float3 dst_origin, MTL::Size dst_size, u32 dst_level,
                              u32 dst_layer, u32 level_count,
                              u32 layer_count, const BlitOptions& options) = 0;
 
@@ -169,7 +169,7 @@ class IRenderer {
     virtual void setClearState(const ClearState& clear_state) = 0;
     virtual void clearColor(ICommandBuffer* command_buffer,
                             u32 render_target_id, u32 layer, u8 mask,
-                            const uint4 color) = 0;
+                            const simd::uint4 color) = 0;
     virtual void clearDepth(ICommandBuffer* command_buffer, u32 layer,
                             const float value) = 0;
     virtual void clearStencil(ICommandBuffer* command_buffer, u32 layer,
@@ -187,7 +187,7 @@ class IRenderer {
     virtual void setDepthTestEnabled(bool enabled) = 0;
     virtual void setDepthWriteEnabled(bool enabled) = 0;
     virtual void setDepthCompareOp(engines::CompareOp op) = 0;
-    virtual void setBlendConstant(const float4 color) = 0;
+    virtual void setBlendConstant(const simd::float4 color) = 0;
     virtual void setDepthBias(f32 constant, f32 slope, f32 clamp) = 0;
     virtual void setStencilState(const StencilState& stencil) = 0;
     virtual void setCullState(bool enabled, engines::CullFaceMode mode,
@@ -202,8 +202,8 @@ class IRenderer {
                      [[maybe_unused]] const std::string& path) {}
 
     // Viewport and scissor
-    virtual void setViewport(u32 index, const Viewport& viewport) = 0;
-    virtual void setScissor(u32 index, const Scissor& scissor) = 0;
+    virtual void setViewport(u32 index, const MTL::Viewport& viewport) = 0;
+    virtual void setScissor(u32 index, const MTL::ScissorRect& scissor) = 0;
 
     // Resource binding
     virtual void bindVertexBuffer(const BufferView& buffer, u32 index) = 0;

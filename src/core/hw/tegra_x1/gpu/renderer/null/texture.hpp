@@ -24,9 +24,9 @@ class Texture final : public ITexture {
                   const u32 dst_layer, const u32 level_count,
                   const u32 layer_count) override;
     void copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
-                  const uint3 src_origin, const u32 src_level,
-                  const u32 src_layer, const uint3 dst_origin,
-                  const u32 dst_level, const u32 dst_layer, const uint3 size,
+                  const MTL::Origin src_origin, const u32 src_level,
+                  const u32 src_layer, const MTL::Origin dst_origin,
+                  const u32 dst_level, const u32 dst_layer, const MTL::Size size,
                   const u32 layer_count) override;
 };
 

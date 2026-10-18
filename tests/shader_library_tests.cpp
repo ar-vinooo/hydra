@@ -906,7 +906,7 @@ void testQuadDerivatives(MTL::Device* device) {
     DecompilerContext context{};
     context.type = ShaderType::Fragment;
     GuestShaderState guest{};
-    guest.color_target_data_types[0] = ColorDataType::Float;
+    guest.color_target_data_types[0] = MTL::DataTypeFloat;
     ir::Module module;
     ir::Builder builder(module);
     for (u32 axis = 0; axis < 2; ++axis) {
@@ -1014,7 +1014,7 @@ void testFragmentDepth(MTL::Device* device) {
             ztd::io::MemoryStream stream(bytes);
             GuestShaderState guest{};
             for (u32 i = 0; i < color_count; ++i)
-                guest.color_target_data_types[i] = ColorDataType::Float;
+                guest.color_target_data_types[i] = MTL::DataTypeFloat;
             ShaderBackend backend;
             std::vector<u8> generated;
             ResourceMapping mapping;
@@ -1749,13 +1749,13 @@ void testTextureLodSelection() {
             const SamplerDescriptor sampler_descriptor{
                 .min_filter = SamplerFilter::Nearest,
                 .mag_filter = SamplerFilter::Nearest,
-                .mip_filter = SamplerMipFilter::Linear,
+                .mip_filter = MTL::SamplerMipFilterLinear,
                 .address_mode_s = SamplerAddressMode::ClampToEdge,
                 .address_mode_t = SamplerAddressMode::ClampToEdge,
                 .address_mode_r = SamplerAddressMode::ClampToEdge,
                 .depth_compare_op =
                     hydra::hw::tegra_x1::gpu::engines::CompareOp::Invalid,
-                .border_color_u = uint4({0, 0, 0, 0}),
+                .border_color_u = simd::uint4{0, 0, 0, 0},
                 .min_lod = scenario < 3 || scenario >= 6 ? 0.0f : clamp,
                 .max_lod = scenario < 3 || scenario >= 6 ? 15.0f : clamp,
                 .lod_bias = scenario == 8 ? 1.0f : scenario == 9 ? -1.0f : 0.0f,
@@ -1775,7 +1775,7 @@ void testTextureLodSelection() {
             DecompilerContext context{};
             context.type = ShaderType::Fragment;
             GuestShaderState guest{};
-            guest.color_target_data_types[0] = ColorDataType::Float;
+            guest.color_target_data_types[0] = MTL::DataTypeFloat;
             ir::Module module;
             ir::Builder builder(module);
             for (u32 axis = 0; axis < 2; ++axis) {
@@ -1932,20 +1932,20 @@ void testTextureBorderEmulation() {
         const SamplerDescriptor sampler_descriptor{
             .min_filter = filter,
             .mag_filter = filter,
-            .mip_filter = SamplerMipFilter::NotMipmapped,
+            .mip_filter = MTL::SamplerMipFilterNotMipmapped,
             .address_mode_s = SamplerAddressMode::ClampToBorder,
             .address_mode_t = SamplerAddressMode::ClampToBorder,
             .address_mode_r = SamplerAddressMode::ClampToBorder,
             .depth_compare_op =
                 hydra::hw::tegra_x1::gpu::engines::CompareOp::Invalid,
-            .border_color_u = std::bit_cast<uint4>(border_color),
+            .border_color_u = std::bit_cast<simd::uint4>(border_color),
         };
         check(samplerNeedsBorderEmulation(sampler_descriptor),
               "A custom border color is emulated");
         DecompilerContext context{};
         context.type = ShaderType::Fragment;
         GuestShaderState guest{};
-        guest.color_target_data_types[0] = ColorDataType::Float;
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
         guest.border_samplers.emplace(7, sampler_descriptor);
         ir::Module module;
         ir::Builder builder(module);
@@ -2143,7 +2143,7 @@ void testTextureOffsetAndGather(MTL::Device* device) {
         DecompilerContext context{};
         context.type = ShaderType::Fragment;
         GuestShaderState guest{};
-        guest.color_target_data_types[0] = ColorDataType::Float;
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
         ir::Module module;
         ir::Builder builder(module);
         const auto undefined = ir::Value::createUndefined();

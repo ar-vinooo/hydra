@@ -610,7 +610,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     // Write usage is for storage images
     renderer::ITextureView*
     getTexture(const TextureImageControl& tic,
-               std::optional<renderer::TextureType> shader_type = std::nullopt,
+               std::optional<MTL::TextureType> shader_type = std::nullopt,
                renderer::TextureUsage usage = renderer::TextureUsage::Read) const;
     renderer::SamplerBase*
     getSampler(const TextureSamplerControl& tsc,
@@ -681,6 +681,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     void inlineIndex8(const u32 index, const u32 arg);
     void drawVertexElementsImpl(u32 count,
                                std::optional<ztd::Range<uptr>> inline_range);
+    void drawAuto(const u32 index, const u32 byte_count);
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
     // Draws with their topology, first vertex or index and count in the
@@ -697,7 +698,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     };
 
     // Area a clear is restricted to by the clear control register
-    renderer::Scissor getClearRect() const;
+    MTL::ScissorRect getClearRect() const;
 
     void clearBuffer(const u32 index, const ClearBufferData data);
 
@@ -726,8 +727,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     void labelCaptureDraw(u32 count);
     u32 capture_draw_index{0};
 
-    renderer::Viewport getViewport(u32 index);
-    renderer::Scissor getScissor(u32 index);
+    MTL::Viewport getViewport(u32 index);
+    MTL::ScissorRect getScissor(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
     renderer::ShaderBase* getShader(ShaderStage stage,
                                     u32 fragment_input_mask = 0,

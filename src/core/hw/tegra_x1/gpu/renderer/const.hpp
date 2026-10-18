@@ -1,22 +1,12 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/metal_cpp.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
 class ITextureView;
 class ShaderBase;
-
-enum class TextureType {
-    _1D,
-    _1DArray,
-    _1DBuffer,
-    _2D,
-    _2DArray,
-    _3D,
-    Cube,
-    CubeArray,
-};
 
 enum class TextureTypeClass {
     _1D,
@@ -25,12 +15,12 @@ enum class TextureTypeClass {
     _3D,
 };
 
-TextureTypeClass getTextureTypeClass(TextureType type);
+TextureTypeClass getTextureTypeClass(MTL::TextureType type);
 
 // Adapts the shape of a guest texture to what the host can create: several
 // layers need an array type, levels below 1x1 do not exist and 1D textures
 // have a single level. Returns false for textures the host cannot create.
-bool legalizeTextureShape(TextureType& type, u32 width, u32 height, u32 depth,
+bool legalizeTextureShape(MTL::TextureType& type, u32 width, u32 height, u32 depth,
                           u32 layer_count, u32& level_count);
 
 enum class TextureFormat {
@@ -202,14 +192,8 @@ u32 getTextureFormatBpp(const TextureFormat format);
 bool isTextureFormatCompressed(const TextureFormat format);
 bool isTextureFormatDepthOrStencil(const TextureFormat format);
 
-enum class ColorDataType : u8 {
-    Invalid,
-    Float,
-    Int,
-    UInt,
-};
-
-ColorDataType toColorDataType(ColorSurfaceFormat format);
+// MTL::DataTypeNone for formats without a color data type
+MTL::DataType toColorDataType(ColorSurfaceFormat format);
 
 struct SwizzleChannels {
     ImageSwizzle r : 3;
@@ -240,7 +224,7 @@ SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word
 
 struct TextureDescriptor {
     uptr ptr;
-    TextureType type;
+    MTL::TextureType type;
     TextureFormat format;
     bool is_linear;
     u32 linear_stride;
@@ -255,7 +239,7 @@ struct TextureDescriptor {
     u32 layer_size;
     u32 size;
 
-    TextureDescriptor(uptr ptr_, TextureType type_, TextureFormat format_,
+    TextureDescriptor(uptr ptr_, MTL::TextureType type_, TextureFormat format_,
                       bool is_linear_, u32 linear_stride_, u32 width_,
                       u32 height_, u32 depth_, u32 level_count_,
                       u32 layer_count_, u32 block_width_gobs_log2_,
@@ -278,8 +262,8 @@ struct TextureDescriptor {
     u32 getGroupHash() const;
     u32 getStorageHash() const;
 
-    uint3 getLevelDimensions(u32 level) const;
-    uint3 getLevelBlockSizeLog2(u32 level) const;
+    MTL::Size getLevelDimensions(u32 level) const;
+    MTL::Size getLevelBlockSizeLog2(u32 level) const;
     u32 getLevelOffset(u32 level) const;
     u32 getLevelSize(u32 level) const;
 
@@ -288,13 +272,13 @@ struct TextureDescriptor {
 };
 
 struct TextureViewDescriptor {
-    TextureType type;
+    MTL::TextureType type;
     TextureFormat format;
     ztd::Range<u32> levels;
     ztd::Range<u32> layers;
     SwizzleChannels swizzle_channels;
 
-    TextureViewDescriptor(TextureType type_, TextureFormat format_,
+    TextureViewDescriptor(MTL::TextureType type_, TextureFormat format_,
                           ztd::Range<u32> levels_, ztd::Range<u32> layers_,
                           SwizzleChannels swizzle_channels_ = SwizzleChannels())
         : type{type_}, format{format_}, levels{levels_}, layers{layers_},
@@ -320,12 +304,6 @@ enum class SamplerFilter {
     Vcaa8Tap = 4,
 };
 
-enum class SamplerMipFilter {
-    NotMipmapped = 1,
-    Nearest = 2,
-    Linear = 3,
-};
-
 enum class SamplerAddressMode {
     Repeat = 0,
     MirroredRepeat = 1,
@@ -340,12 +318,12 @@ enum class SamplerAddressMode {
 struct SamplerDescriptor {
     SamplerFilter min_filter;
     SamplerFilter mag_filter;
-    SamplerMipFilter mip_filter;
+    MTL::SamplerMipFilter mip_filter;
     SamplerAddressMode address_mode_s;
     SamplerAddressMode address_mode_t;
     SamplerAddressMode address_mode_r;
     engines::CompareOp depth_compare_op;
-    uint4 border_color_u;
+    simd::uint4 border_color_u;
     f32 min_lod = 0.0f;
     f32 max_lod = 15.0f;
     f32 lod_bias = 0.0f;
@@ -417,10 +395,10 @@ constexpr bool samplerMirrorsToBorder(const SamplerDescriptor& descriptor) {
 
 inline SamplerBorderPreset
 getSamplerBorderPreset(const SamplerDescriptor& descriptor) {
-    const auto r = descriptor.border_color_u.x();
-    const auto g = descriptor.border_color_u.y();
-    const auto b = descriptor.border_color_u.z();
-    const auto a = descriptor.border_color_u.w();
+    const auto r = descriptor.border_color_u.x;
+    const auto g = descriptor.border_color_u.y;
+    const auto b = descriptor.border_color_u.z;
+    const auto a = descriptor.border_color_u.w;
     if (descriptor.integer_texture) {
         return (r | g | b | a) == 0 ? SamplerBorderPreset::TransparentBlack
                                     : SamplerBorderPreset::Custom;
@@ -457,40 +435,10 @@ inline bool samplerNeedsBorderEmulation(const SamplerDescriptor& descriptor) {
 // Anisotropic filtering needs linear minification and mip filtering
 constexpr u32 getEffectiveSamplerAnisotropy(const SamplerDescriptor& descriptor) {
     if (descriptor.min_filter != SamplerFilter::Nearest &&
-        descriptor.mip_filter == SamplerMipFilter::Linear)
+        descriptor.mip_filter == MTL::SamplerMipFilterLinear)
         return std::clamp(descriptor.max_anisotropy, 1u, 16u);
     return 1u;
 }
-
-enum class BlendOperation {
-    Add = 1,
-    Sub = 2,
-    RevSub = 3,
-    Min = 4,
-    Max = 5,
-};
-
-enum class BlendFactor {
-    Zero = 1,
-    One = 2,
-    SrcColor = 3,
-    InvSrcColor = 4,
-    SrcAlpha = 5,
-    InvSrcAlpha = 6,
-    DstAlpha = 7,
-    InvDstAlpha = 8,
-    DstColor = 9,
-    InvDstColor = 10,
-    SrcAlphaSaturate = 11,
-    Src1Color = 16,
-    InvSrc1Color = 17,
-    Src1Alpha = 18,
-    InvSrc1Alpha = 19,
-    ConstColor = 20,
-    InvConstColor = 21,
-    ConstAlpha = 22,
-    InvConstAlpha = 23,
-};
 
 struct RenderTargetDescriptor {
     ITextureView* texture;
@@ -511,16 +459,8 @@ struct RenderPassDescriptor {
     RenderTargetDescriptor depth_stencil_target;
 };
 
-struct Viewport {
-    FloatRect2D rect;
-    f32 depth_near;
-    f32 depth_far;
-};
-
-using Scissor = UIntRect2D;
-
 struct ClearState {
-    Scissor rect;
+    MTL::ScissorRect rect;
     u32 stencil_write_mask{0xff};
 };
 
@@ -633,13 +573,13 @@ struct ResourceMapping {
     std::vector<StorageBuffer> storage_buffers;
     std::map<u32, u32> textures;
     // Texture type the shader declares for each binding
-    std::map<u32, TextureType> texture_types;
+    std::map<u32, MTL::TextureType> texture_types;
     u32 sampler_buffer_index{invalid<u32>()};
     // Fragment shader user inputs (bit per location)
     u32 stage_input_mask{0};
     // Storage images (surfaces), keyed like textures
     std::map<u32, u32> images;
-    std::map<u32, TextureType> image_types;
+    std::map<u32, MTL::TextureType> image_types;
     // The vertex shader exports the render target layer or viewport index
     bool writes_layer{false};
 
@@ -674,30 +614,19 @@ struct ColorTargetState {
     TextureFormat format;
     engines::ColorWriteMask write_mask;
     bool blend_enabled;
-    BlendOperation rgb_op;
-    BlendFactor src_rgb_factor;
-    BlendFactor dst_rgb_factor;
-    BlendOperation alpha_op;
-    BlendFactor src_alpha_factor;
-    BlendFactor dst_alpha_factor;
-};
-
-enum class StencilOp {
-    Keep,
-    Zero,
-    Replace,
-    IncrSat,
-    DecrSat,
-    Invert,
-    Incr,
-    Decr,
+    MTL::BlendOperation rgb_op;
+    MTL::BlendFactor src_rgb_factor;
+    MTL::BlendFactor dst_rgb_factor;
+    MTL::BlendOperation alpha_op;
+    MTL::BlendFactor src_alpha_factor;
+    MTL::BlendFactor dst_alpha_factor;
 };
 
 struct StencilFaceState {
     engines::CompareOp func{engines::CompareOp::Always};
-    StencilOp fail_op{StencilOp::Keep};
-    StencilOp depth_fail_op{StencilOp::Keep};
-    StencilOp pass_op{StencilOp::Keep};
+    MTL::StencilOperation fail_op{MTL::StencilOperationKeep};
+    MTL::StencilOperation depth_fail_op{MTL::StencilOperationKeep};
+    MTL::StencilOperation pass_op{MTL::StencilOperationKeep};
     u32 ref{0};
     u32 func_mask{0xff};
     u32 write_mask{0xff};
@@ -709,20 +638,14 @@ struct StencilState {
     StencilFaceState back{};
 };
 
-enum class PrimitiveTopologyClass : u32 {
-    Unspecified,
-    Point,
-    Line,
-    Triangle,
-};
-
 struct PipelineDescriptor {
     ShaderBase* shaders[static_cast<usize>(ShaderType::Count)];
     VertexState vertex_state;
     ColorTargetState color_target_states[COLOR_TARGET_COUNT];
     TextureFormat depth_stencil_format{TextureFormat::Invalid};
     // Required when the vertex shader selects the layer or viewport
-    PrimitiveTopologyClass topology_class{PrimitiveTopologyClass::Unspecified};
+    MTL::PrimitiveTopologyClass topology_class{
+        MTL::PrimitiveTopologyClassUnspecified};
 };
 
 usize getVertexFormatSize(engines::VertexAttribSize size);
@@ -734,11 +657,6 @@ enum class TextureUsage {
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer
-
-ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::renderer::TextureType, _1D,
-                       "1D", _1DArray, "1D array", _1DBuffer, "1D buffer", _2D,
-                       "2D", _2DArray, "2D array", _3D, "3D", Cube, "cube",
-                       CubeArray, "cube array")
 
 ENABLE_ENUM_FORMATTING(
     hydra::hw::tegra_x1::gpu::renderer::TextureFormat, Invalid, "invalid",

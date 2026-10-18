@@ -296,7 +296,7 @@ void LangEmitter::emitFunction(const ir::Function& func) {
             source_register += 4;
             const auto color_target_data_type =
                 state.color_target_data_types[i];
-            if (color_target_data_type == ColorDataType::Invalid)
+            if (color_target_data_type == MTL::DataTypeNone)
                 continue;
 
             for (u8 c = 0; c < 4; c++) {

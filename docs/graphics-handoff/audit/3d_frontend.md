@@ -1,5 +1,10 @@
 # Hydra audit: MAXWELL_B (0xB197) 3D front-end and geometry pipeline
 
+> Evidence policy (2026-10-18): NVIDIA documentation/headers define guest
+> behavior; Apple Metal documentation, SDK headers and validation define host
+> behavior. Eden and other emulators are historical comparators only. Any
+> conclusion based solely on them is unverified and must be corroborated.
+
 Read-only audit of `/Users/arvino/Documents/Project/hydra`. Nothing in the repository was modified, built or run.
 
 ## Scope, method and snapshot
