@@ -67,3 +67,41 @@ gpu-engine, render-hash, raster-state, texture-cache (asersi format alpha diperb
 shader-library, frame-trace, visual-diagnostic, blend/vertex/depth-stencil Python:
 lulus. `hydra-shader-corpus-tests` crash (mutex) pada dump yang berisi BRX; crash
 yang sama tanpa perubahan hari ini, jadi sudah ada sebelumnya.
+
+## Zona waktu: footer POSIX TZ (selesai)
+`parseTimeZoneBinary` ([tzif.cpp](../../src/core/horizon/services/timesrv/internal/tzif.cpp))
+dulu hanya mencetak "Time zone name parsing not implemented" untuk footer
+`\nEST5EDT,M3.2.0,M11.1.0\n`. Kini footer di-parse (port `tzparse` dari IANA tzcode,
+format `<nama>`, `Jn`, `n`, `Mm.w.d`, `/waktu`) dan diperluas menjadi transisi
+eksplisit dari 1970 sampai tabel penuh (1000 entri), ditambahkan setelah transisi
+terakhir di file, persis cara tzload. Footer tanpa DST (`JST-9`) tidak menambah apa
+pun (tipenya sudah ada); nama DST tanpa tanggal butuh `posixrules` dan dilewati.
+`tests/timezone_reference.py` + `hydra-timezone-tests`: 15 zona dari tzdata sistem
+(NY, LA, London, Paris, Dublin, Sydney, Lord Howe, Auckland, Tokyo, Kolkata, Kathmandu,
+St Johns, Santiago, Sao Paulo, UTC), transisi tersimpan setelah 2020 sengaja dibuang
+sehingga 2021-2100 bergantung pada footer; offset, flag DST, dan singkatan dibandingkan
+dengan `zoneinfo` (sekitar 110 ribu probe per zona). Semua cocok; mutasi (offset salah
+pada aturan start) membuat 10 zona gagal. Santiago hanya dibandingkan mulai 2025 karena
+pemerintah Chile memundurkan jadwal 2022-2024. Ini data tzdata sistem, bukan firmware
+Switch (TimeZoneBinary tidak dipakai di tes). **Tidak terkait macet Crash 4**: warning
+itu juga ada di run yang berhasil.
+
+## Crash 4: nvmap padding, cache shader, tekstur BC streaming (19 Oktober, sesi malam)
+- **Macet = game abort.** `MapBufferEx` gagal (`InvalidAddress`) untuk pool NVN 0x1E9000
+  yang dipetakan 0x1F0000 (dibulatkan ke big page): ekor padding tidak punya memori guest
+  tetapi diperiksa. Kini hanya bagian nvmap yang dipetakan/diperiksa (`nvhost_as_gpu.cpp`,
+  juga `remap`); tes `shutdown_tests --check-gpu-address-space/--check-gpu-as-lifecycle`.
+  Log asli ada di `~/Library/Logs/Hydra` (config `log_output = "file"`), bukan stdout.
+- **Cache shader** dinamai `registryID` GPU yang berubah antar sesi, sehingga tiap sesi
+  mengompilasi ulang ribuan shader. Kini `v3-<hash nama GPU>-<hash OS>`; cache lama
+  digabung ke folder baru lewat clone APFS.
+- **Blok warna acak pada material streaming** (pilar, bangku, jalan, badan Crash): Unreal
+  men-stream tekstur BC dengan merender blok ke target `rgba32float`/`rg32float` yang
+  memakai alamat mip BC. `synchronize2DWith2D` membandingkan dimensi piksel sehingga
+  gagal ("cannot synchronize 2D textures") dan tekstur BC tetap basi. Kini
+  `calculateBlockTexelAlias` memetakan level BC <-> texel berukuran sama dengan blok
+  (menyalin lewat jalur buffer yang sudah ada di `Texture::copyFrom`), dan bila gagal
+  dipakai sinkron lewat memori guest (decode ditunda, sekali per update). Tes
+  `texture_cache_tests` "BC blocks written through RGBA32 render targets" gagal pada kode
+  lama dengan peringatan yang sama dengan di game dan lulus sekarang.
+- Belum diverifikasi di game; foto sebelum perbaikan ada di sesi ini.
