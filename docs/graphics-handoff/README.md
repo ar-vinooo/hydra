@@ -1,10 +1,17 @@
 # Hydra graphics work: handoff
 
+**Titik masuk untuk melanjutkan percakapan (2026-10-18):**
+[Tujuan, alur render, progress, dan langkah berikutnya](tujuan-dan-progress-2026-10-18.md).
+Jalur instruksi masih **OPEN**; status teknis terbarunya ada di
+[README PFIFO](../../tests/README-pfifo.md). Bagian historis di bawah perlu
+dibaca bersama catatan lanjutan tersebut.
+
 Status as of 2026-10-18. This covers the graphics-compatibility work done on branch `arvino`: what changed, how it was verified, what is still open, and the rules for continuing. Nothing here is committed.
 
 Read sections 1–3 before touching code. Section 5 lists the design decisions that will bite you if you don't know them.
 
 Files in this folder:
+- `referensi.md`: daftar referensi CPU, GPU, Horizon OS, audio, dan host dari pengguna beserta aturan penggunaannya.
 - `occlusion-reports-2026-10-17.md`: native occlusion counts, completion-ordered reports and local conditional rendering.
 - `continuation-all-2026-10-17.md`: subsequent implementation, validated scope and explicitly open work.
 - `primitive-restart-2026-10-17.md`: indexed primitive restart continuation, references, validation and remaining draw scope.

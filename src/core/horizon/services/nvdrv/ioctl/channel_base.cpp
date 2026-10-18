@@ -20,7 +20,8 @@ DEFINE_IOCTL_TABLE(
                                      allocObjCtx, 0x0b, zCullBind, 0x0c,
                                      setErrorNotifier, 0x0d, setPriority, 0x17,
                                      getErrorNotification, 0x18, allocGpfifoEx,
-                                     0x1a, allocGpfifoEx, 0x1b, submitGpfifo))
+                                     0x1a, allocGpfifoEx, 0x1b, submitGpfifo, 0x1d,
+                                     setTimeslice))
 
 NvResult ChannelBase::submit(IoctlContext* context) {
     video::traceSubmission(videoEngineName(), *context);
@@ -128,8 +129,10 @@ NvResult ChannelBase::getSyncpoint(IoctlContext* context, u32 module_id, u32* ou
         *out_value = 0;
         return NvResult::Success;
     }
-    if (!video_syncpoint)
-        video_syncpoint = context->system.getGpu().getVideoSyncpoints().allocate();
+    if (!video_syncpoint) {
+        video_syncpoints = context->system.getGpu().shareVideoSyncpoints();
+        video_syncpoint = video_syncpoints->allocate();
+    }
     if (!video_syncpoint) return NvResult::InsufficientMemory;
     *out_value = *video_syncpoint;
     return NvResult::Success;
@@ -218,6 +221,14 @@ NvResult ChannelBase::setNvMapFd(u32 fd_id) {
 
 NvResult ChannelBase::setTimeout(u32 timeout) {
     LOG_FUNC_WITH_ARGS_STUBBED(Services, "timeout: {}", timeout);
+    return NvResult::Success;
+}
+
+// Switchbrew: NVGPU_IOCTL_CHANNEL_SET_TIMESLICE (in/out u32, microseconds).
+// Hydra schedules channels cooperatively, so the value is only remembered.
+NvResult ChannelBase::setTimeslice(InOutSingle<u32> timeslice) {
+    timeslice_us = timeslice;
+    LOG_DEBUG(Services, "SetTimeslice: {} us", timeslice_us);
     return NvResult::Success;
 }
 

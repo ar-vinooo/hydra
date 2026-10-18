@@ -277,7 +277,8 @@ u32 getMinimumWidth(u32 width, renderer::TextureFormat format, u32 width_hint) {
 
 } // namespace
 
-DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x485, 2,
+DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0xb2, 1,
+                    incrementSyncPoint, u32, 0x485, 2,
                     drawVertexArrayCompact, u32, 0x5f9, 6,
                     drawVertexElementsCompact, u32, 0x45, 1,
                     loadMmeInstructionRamPointer, u32, 0x46, 1,
@@ -292,6 +293,28 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x485, 2,
                     ClearBufferData, 0x6c3, 1, setReportSemaphore, u32, 0x8c4,
                     1, firmwareCall4, u32, 0x8e4, 16, loadConstBuffer, u32,
                     0x900, 5 * 8, bindGroup, u32)
+
+void ThreeD::incrementSyncPoint(u32 index, u32 arg) {
+    (void)index;
+    // NVB197_INCREMENT_SYNC_POINT: INDEX[11:0], CLEAN_L2[16], CONDITION[20].
+    const u32 id = arg & 0xfff;
+    auto& syncpoints = gpu.getVideoSyncpoints();
+    if (!syncpoints.read(id)) {
+        LOG_ERROR(Gpu, "3D increment references unallocated syncpoint {}", id);
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return;
+    }
+    // Conservatively wait for both stream-out and ROP completion. Metal shared
+    // buffer writes are visible to the CPU after this checkpoint.
+    if (tls_crnt_command_buffer &&
+        !gpu.getRenderer().synchronize(tls_crnt_command_buffer)) {
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return;
+    }
+    syncpoints.complete(id, 1);
+}
 
 ThreeD::ThreeD(Gpu& gpu_) : gpu{gpu_}, macro_driver{createMacroDriver(*this)} {
     // Initialize default state
@@ -1640,9 +1663,8 @@ u32 ThreeD::getGeometryLayerSource() {
 
     const auto gpu_addr =
         static_cast<u64>(regs.shader_program_region) + program.offset;
-    static std::map<u64, u32> layer_sources;
-    if (const auto it = layer_sources.find(gpu_addr);
-        it != layer_sources.end())
+    if (const auto it = geometry_layer_sources.find(gpu_addr);
+        it != geometry_layer_sources.end())
         return it->second;
 
     const auto code = tls_crnt_gmmu->readMappedBytes(gpu_addr, 0x10000);
@@ -1654,7 +1676,7 @@ u32 ThreeD::getGeometryLayerSource() {
                  gpu_addr, *source);
     else
         LOG_WARN(Engines, "Unsupported geometry shader {:#x}", gpu_addr);
-    layer_sources[gpu_addr] = source.value_or(0);
+    geometry_layer_sources[gpu_addr] = source.value_or(0);
     return source.value_or(0);
 }
 
@@ -1862,10 +1884,10 @@ ThreeD::getTexture(const TextureImageControl& tic,
         // The shader was not specialized for a buffer texture
         if (shader_type && *shader_type != MTL::TextureType1D &&
             *shader_type != MTL::TextureTypeTextureBuffer) {
-            ONCE(LOG_WARN(Engines,
-                          "Buffer texture bound to a {} texture binding, "
-                          "ignoring",
-                          *shader_type));
+            ONCE(LOG_DEBUG(Engines,
+                           "Buffer texture bound to a {} texture binding, "
+                           "not bound",
+                           *shader_type));
             return nullptr;
         }
 
@@ -2013,13 +2035,29 @@ ThreeD::getTexture(const TextureImageControl& tic,
     default:
         break;
     }
-    if (shader_type && view_type != *shader_type)
-        LOG_WARN(Engines,
+    if (shader_type && view_type != *shader_type) {
+        // Sampling a texture with a different dimensionality than the
+        // instruction asks for is undefined on hardware, and Metal cannot read
+        // it through a differently typed binding. Bind nothing instead of a
+        // texture the pipeline would misinterpret, unless
+        // HYDRA_BIND_MISMATCHED_TEXTURES restores the previous behavior (for
+        // comparing visual differences).
+        static const bool verbose = std::getenv("HYDRA_LOG_TEXTURE_MISMATCHES") != nullptr;
+        static const bool bind_anyway = std::getenv("HYDRA_BIND_MISMATCHED_TEXTURES") != nullptr;
+        static std::atomic<u32> reports{0};
+        constexpr u32 REPORT_LIMIT = 32;
+        if (verbose || (reports.load(std::memory_order_relaxed) < REPORT_LIMIT &&
+                        reports.fetch_add(1, std::memory_order_relaxed) < REPORT_LIMIT))
+            LOG_INFO(Engines,
                  "Texture type mismatch (TIC: {}, shader: {}) for {} "
                  "texture at GPU address {:#x}, {}x{}x{}, {} layers, {} "
-                 "levels, format {}",
+                 "levels, format {}; {}",
                  type, *shader_type, is_image ? "image" : "sampled", gpu_addr,
-                 width, height, depth, layer_count, level_count, format);
+                 width, height, depth, layer_count, level_count, format,
+                 bind_anyway ? "bound anyway" : "not bound");
+        if (!bind_anyway)
+            return nullptr;
+    }
 
     // Depth stencil textures can be sampled through their stencil plane
     const auto view_format =
@@ -2300,6 +2338,14 @@ void ThreeD::configureShaderStage(
                 static u32 bad_tic_count = 0;
                 if (bad_tic_count++ < 10) {
                     const auto raw = reinterpret_cast<const u32*>(&tic);
+                    // An all-zero descriptor is the null texture: nothing to
+                    // report, the binding stays empty.
+                    bool null_descriptor = true;
+                    for (u32 i = 0; i < 8; i++)
+                        null_descriptor &= raw[i] == 0;
+                    if (null_descriptor)
+                        bad_tic_count--;
+                    else
                     LOG_WARN(Engines,
                              "DEBUG bad TIC: stage {}, binding {:#x}, handle "
                              "{:#010x}, image {:#x} (max {:#x}), words {:08x} "
@@ -2521,7 +2567,7 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                 continue;
             }
             const auto data = reinterpret_cast<const f32*>(range.getBegin());
-            const usize n = std::min<usize>(range.getSize() / sizeof(f32), 40);
+            const usize n = std::min<usize>(range.getSize() / sizeof(f32), 160);
             str += fmt::format("    {} c{} (size {:#x}): {}\n",
                                stage == ShaderStage::VertexB ? "VS" : "FS", i,
                                range.getSize(), fmt::join(data, data + n, " "));

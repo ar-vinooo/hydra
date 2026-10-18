@@ -9,6 +9,8 @@
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 #include "core/system.hpp"
 
 namespace hydra::horizon::kernel {
@@ -120,18 +122,56 @@ u64 Process::getUsedUserMemorySize() const {
 }
 
 void Process::resizeHeap(u64 size) {
+    const auto map_heap = [&] {
+        mmu->map(HEAP_REGION.getBegin(), heap_mem.get(),
+                 {.type = MemoryType::Normal_1_0_0,
+                  .attr = MemoryAttribute::None,
+                  .perm = MemoryPermission::ReadWrite});
+    };
     if (heap_mem == nullptr) {
         heap_mem.reset(system.getCpu().allocateMemory(size));
-    } else {
-        mmu->unmap(ztd::Range<vaddr_t>::fromSize(HEAP_REGION.getBegin(),
-                                                 heap_mem->getSize()));
-        heap_mem->resize(size);
+        map_heap();
+        return;
     }
 
-    mmu->map(HEAP_REGION.getBegin(), heap_mem.get(),
-             {.type = MemoryType::Normal_1_0_0,
-              .attr = MemoryAttribute::None,
-              .perm = MemoryPermission::ReadWrite});
+    // The old host memory may be referenced by GPU mappings and by queued GPU
+    // work, so it is never freed here: the heap moves to new memory with its
+    // contents, GPU mappings follow it, and the old block is kept until the
+    // process is cleaned up.
+    auto old_heap = std::move(heap_mem);
+    const uptr old_ptr = old_heap->getPtr();
+    const u64 old_size = old_heap->getSize();
+    const auto old_range = ztd::Range<uptr>::fromSize(old_ptr, old_size);
+    system.getGpu().getRenderer().flushMemoryForCpu(old_range);
+
+    heap_mem.reset(system.getCpu().allocateMemory(size));
+    std::memcpy(reinterpret_cast<void*>(heap_mem->getPtr()),
+                reinterpret_cast<const void*>(old_ptr),
+                std::min(old_size, heap_mem->getSize()));
+    mmu->unmap(ztd::Range<vaddr_t>::fromSize(HEAP_REGION.getBegin(), old_size));
+    map_heap();
+
+    std::vector<std::shared_ptr<hw::tegra_x1::gpu::GMmu>> spaces;
+    {
+        std::scoped_lock lock(gpu_spaces_mutex);
+        for (const auto& weak : gpu_spaces)
+            if (auto space = weak.lock())
+                spaces.push_back(std::move(space));
+    }
+    const auto rebase = [&](hw::tegra_x1::gpu::GMmu& space) {
+        for (const auto& range : space.rebaseHostRange(
+                 old_ptr, old_ptr + old_size, heap_mem->getPtr(), heap_mem->getSize()))
+            mmu->enableWriteTracking(ztd::Range<vaddr_t>(
+                alignDown(range.getBegin(), hw::tegra_x1::cpu::GUEST_PAGE_SIZE),
+                align(range.getEnd(), hw::tegra_x1::cpu::GUEST_PAGE_SIZE)));
+    };
+    for (const auto& space : spaces)
+        rebase(*space);
+    rebase(gmmu);
+    system.getGpu().getRenderer().invalidateMemory(old_range);
+
+    std::scoped_lock lock(retired_mutex);
+    retired_heaps.push_back(std::move(old_heap));
 }
 
 void Process::mapAliasRun(vaddr_t begin, vaddr_t end) {
@@ -308,12 +348,40 @@ void Process::supervisorResume() {
     signalStateChange(ProcessState::Started);
 }
 
+std::shared_ptr<hw::tegra_x1::gpu::GMmu> Process::createGpuAddressSpace() {
+    std::scoped_lock lock(gpu_spaces_mutex);
+    if (gpu_spaces_stopped)
+        return {};
+    auto space = std::make_shared<hw::tegra_x1::gpu::GMmu>(mmu.get());
+    std::erase_if(gpu_spaces, [](const auto& weak) { return weak.expired(); });
+    gpu_spaces.push_back(space);
+    return space;
+}
+
 void Process::cleanUp() {
     joinThreads();
+    std::vector<std::shared_ptr<hw::tegra_x1::gpu::GMmu>> spaces;
+    {
+        std::scoped_lock lock(gpu_spaces_mutex);
+        gpu_spaces_stopped = true;
+        for (const auto& weak : gpu_spaces) {
+            if (auto space = weak.lock()) {
+                space->cancelGpuWork();
+                spaces.push_back(std::move(space));
+            }
+        }
+        gpu_spaces.clear();
+    }
+    // Cancel all spaces before draining: channels in different spaces may wait
+    // on each other. Guest backing remains alive until every drain completes.
+    gmmu.cancelGpuWork();
+    for (const auto& space : spaces)
+        system.getGpu().getPfifo().cancel(*space);
     system.getGpu().getPfifo().cancel(gmmu);
     executable_mems.clear();
     main_thread_stack_mem = nullptr;
     heap_mem = nullptr;
+    retired_heaps.clear();
     releaseAliasMemory();
 
     // Main thread

@@ -20,7 +20,8 @@ class NvMap : public FdBase {
 
   private:
     // Ioctls
-    NvResult create(System* system, u32 size, Handle* out_handle);
+    NvResult create(System* system, kernel::Process* process, u32 size,
+                    Handle* out_handle);
     NvResult fromId(u32 id, Handle* out_handle);
     NvResult alloc(System* system, Handle handle, u32 heap_mask, u32 flags,
                    InOutSingle<u32> inout_alignment, Aligned<u8, 8> kind,

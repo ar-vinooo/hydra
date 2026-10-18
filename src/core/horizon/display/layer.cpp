@@ -48,17 +48,14 @@ bool Layer::acquirePresentTexture(
     src_rect.size.x() = input.rect.right - input.rect.left;
     src_rect.size.y() = input.rect.bottom - input.rect.top;
 
-    // HACK
-    if (src_rect.size.x() == 0) {
+    // An empty crop rectangle means "no crop" (the whole buffer), as in the
+    // Android BufferQueue this interface comes from
+    if (src_rect.size.x() == 0)
         src_rect.size.x() = static_cast<i32>(
             present_texture.value()->getBase()->getDescriptor().width);
-        ONCE(LOG_WARN(Other, "Invalid src width"));
-    }
-    if (src_rect.size.y() == 0) {
+    if (src_rect.size.y() == 0)
         src_rect.size.y() = static_cast<i32>(
             present_texture.value()->getBase()->getDescriptor().height);
-        ONCE(LOG_WARN(Other, "Invalid src height"));
-    }
 
     if (any(input.transform_flags & horizon::display::TransformFlags::FlipH)) {
         src_rect.origin.x() += src_rect.size.x();

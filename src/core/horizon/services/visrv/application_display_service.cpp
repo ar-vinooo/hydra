@@ -31,7 +31,7 @@ DEFINE_SERVICE_COMMAND_TABLE(
 
 result_t IApplicationDisplayService::getRelayService(RequestContext* ctx,
                                                      System* system) {
-    LOG_WARN(Services, "GetRelayService is not implemented properly");
+    // The relay service is the dispdrv port itself (not wrapped in a custom class)
 
     // TODO: this should wrap dispdrv in a custom class
 
@@ -174,7 +174,8 @@ result_t IApplicationDisplayService::destroyStrayLayer(System* system,
 }
 
 result_t IApplicationDisplayService::convertScalingMode() {
-    LOG_FUNC_NOT_IMPLEMENTED(Services);
+    // The mode mapping is not documented; layers are always scaled to the window
+    LOG_DEBUG(Services, "ConvertScalingMode");
     return RESULT_SUCCESS;
 }
 

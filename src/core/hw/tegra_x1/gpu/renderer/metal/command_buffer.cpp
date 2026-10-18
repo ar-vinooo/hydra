@@ -156,6 +156,9 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
 }
 
 f64 CommandBuffer::debugCommitAndWaitHot5() {
+    const bool profile = PerfStats::isEnabled();
+    const auto start = profile ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
     endEncoding();
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
@@ -176,6 +179,29 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     const auto ms =
         (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) *
         1000.0;
+    if (profile) {
+        const auto now = std::chrono::steady_clock::now();
+        static thread_local auto last = start;
+        static thread_local u64 checkpoints = 0;
+        static thread_local f64 wall_ms = 0.0;
+        static thread_local f64 gpu_ms = 0.0;
+        ++checkpoints;
+        wall_ms += std::chrono::duration<f64, std::milli>(now - start).count();
+        gpu_ms += std::max(ms, 0.0);
+        PerfStats::instance().command_buffers++;
+        if (ms > 0.0)
+            PerfStats::instance().gpu_ns += static_cast<u64>(ms * 1'000'000.0);
+        const auto elapsed = std::chrono::duration<f64>(now - last).count();
+        if (elapsed >= 2.0) {
+            LOG_INFO(MetalRenderer, "CHECKPOINT: {} in {:.2f}s, {:.2f} ms CPU blocking, "
+                                    "{:.2f} ms GPU execution, {:.3f} ms average blocking",
+                     checkpoints, elapsed, wall_ms, gpu_ms,
+                     wall_ms / static_cast<f64>(checkpoints));
+            checkpoints = 0;
+            wall_ms = gpu_ms = 0.0;
+            last = now;
+        }
+    }
     command_buffer->release();
     TMP_AUTORELEASE_POOL_BEGIN();
     command_buffer = command_queue->commandBuffer()->retain();

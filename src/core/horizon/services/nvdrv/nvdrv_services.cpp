@@ -173,12 +173,18 @@ result_t INvDrvServices::ioctlImpl(
         .in_buffer_stream = std::move(in_buffer_stream),
         .out_stream = std::move(out_stream),
         .out_buffer_stream = std::move(out_buffer_stream),
+        .resolve_fd = [this](u32 id) -> ioctl::FdBase* {
+            const auto target = fd_pool.get(Handle(id));
+            return target ? target.value()->get() : nullptr;
+        },
     };
     video::traceIoctl(fd->get()->videoEngineName(), context, code);
     NvResult result = (fd->get()->*func)(context, type, nr);
-    if (result != NvResult::Success && !fd->get()->videoEngineName().empty())
-        LOG_WARN(Services, "{} ioctl 0x{:08x} failed with device result {}",
-            fd->get()->videoEngineName(), code, static_cast<u32>(result));
+    const bool pending_event_wait = type == 0 && (nr == 0x1d || nr == 0x1e) &&
+                                    result == NvResult::Timeout;
+    if (result != NvResult::Success && !pending_event_wait)
+        LOG_WARN(Services, "fd {} ({}) ioctl 0x{:08x} failed with device result {}",
+            fd_handle, fd->get()->videoEngineName(), code, static_cast<u32>(result));
 
     // Write result
     *out_result = result;

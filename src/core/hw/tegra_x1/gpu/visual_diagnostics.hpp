@@ -39,6 +39,9 @@ class VisualDiagnostics {
     void completed(uint64_t id, uint64_t epoch, std::string_view status,
                    std::string_view error, double gpu_seconds);
     void command(uint64_t address, uint32_t header);
+    void commandFault(uint32_t method, uint32_t subchannel, uint32_t argument);
+    uint64_t commandAddress() const { return command_address; }
+    uint32_t commandHeader() const { return command_header; }
     bool beginDraw(uint64_t vs, uint64_t fs);
     void selectResource(uint64_t address);
     bool selected() const { return capturing && draw_selected; }

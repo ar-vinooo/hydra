@@ -122,7 +122,11 @@ IFileSystem::getEntryType(System* system,
     filesystem::IEntry* entry;
     const auto res = system->getOs().getFilesystem().getEntry(path, entry);
     if (res != filesystem::FsResult::Success) {
-        LOG_WARN(Services, "Error getting entry \"{}\": {}", path, res);
+        // Guests probe for optional files (saves, caches); that is not an error
+        if (res == filesystem::FsResult::DoesNotExist)
+            LOG_DEBUG(Services, "Entry \"{}\" does not exist", path);
+        else
+            LOG_WARN(Services, "Error getting entry \"{}\": {}", path, res);
         return MAKE_RESULT(Fs, 1);
     }
 

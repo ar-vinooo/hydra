@@ -155,6 +155,17 @@ void VisualDiagnostics::event(std::string_view type, const Fields& fields) {
     if (enabled()) record(type, fields, submission_id, frame, draw_index);
 }
 
+void VisualDiagnostics::commandFault(uint32_t method, uint32_t subchannel,
+                                     uint32_t argument) {
+    if (!enabled()) return;
+    event("command_fault", {{"command_address", std::to_string(command_address)},
+        {"command_header", std::to_string(command_header)},
+        {"method", std::to_string(method)}, {"subchannel", std::to_string(subchannel)},
+        {"argument", std::to_string(argument)}});
+    if (capturing)
+        finish("command_fault");
+}
+
 void VisualDiagnostics::finish(std::string_view reason) {
     if (!capturing) return;
     event("capture_end", {{"reason", std::string(reason)},

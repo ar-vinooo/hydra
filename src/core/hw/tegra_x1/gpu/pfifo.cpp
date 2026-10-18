@@ -35,6 +35,62 @@ enum class TertiaryOpcode : u32 {
     Grp0UseSubDevMask = 3,
 };
 
+// The Tegra channel is a single subdevice. gk20a programs its PBDMA with
+// SUBDEVICE_ID 1 and channel DMA filtering enabled, so a mask selects it when
+// bit 0 is set.
+constexpr u32 SUBDEVICE_ID = 1;
+
+struct DecodeTrace {
+    struct Word {
+        uptr address;
+        u32 raw;
+        u32 remaining;
+        u32 method;
+        u32 subchannel;
+    };
+    const PfifoDecodeState* owner{nullptr};
+    std::array<Word, 64> words{};
+    u64 count{0};
+    uptr entry_begin{0};
+    uptr entry_end{0};
+
+    void record(const PfifoDecodeState& state, uptr address, u32 raw,
+                uptr begin, uptr end) {
+        if (owner != &state) {
+            owner = &state;
+            count = 0;
+        }
+        words[count++ % words.size()] = {
+            address, raw, state.remaining, state.method, state.subchannel};
+        entry_begin = begin;
+        entry_end = end;
+    }
+
+    void dump(GMmu& gmmu) const {
+        LOG_ERROR(Gpu, "PFIFO fault history: entry [{:#x}, {:#x}), {} recorded words",
+                  entry_begin, entry_end, std::min<u64>(count, words.size()));
+        const auto start = count > words.size() ? count - words.size() : 0;
+        for (auto i = start; i < count; ++i) {
+            const auto& word = words[i % words.size()];
+            const auto bytes = gmmu.readMappedBytes(word.address, sizeof(u32));
+            u32 current = 0;
+            if (bytes.size() == sizeof(current))
+                std::memcpy(&current, bytes.data(), sizeof(current));
+            LOG_ERROR(Gpu, "PFIFO word {:#x}: read {:#010x}, current {:#010x}, mapped {}, "
+                           "pending {}, method {:#x}, subchannel {}",
+                      word.address, word.raw, current, bytes.size() == sizeof(current),
+                      word.remaining, word.method, word.subchannel);
+        }
+    }
+};
+
+bool decodeTraceEnabled() {
+    static const bool enabled = std::getenv("HYDRA_PFIFO_TRACE") != nullptr;
+    return enabled;
+}
+
+thread_local DecodeTrace decode_trace;
+
 } // namespace
 
 } // namespace hydra::hw::tegra_x1::gpu
@@ -111,7 +167,10 @@ class PushBufferReader {
 } // namespace
 
 PfifoDecodeState::PfifoDecodeState() = default;
-PfifoDecodeState::~PfifoDecodeState() = default;
+PfifoDecodeState::~PfifoDecodeState() {
+    if (release_fence)
+        release_fence();
+}
 
 void PfifoDecodeState::fail(u32 code) {
     u32 expected = 0;
@@ -302,6 +361,10 @@ void Pfifo::threadFunc() {
                 gpu.getRenderer().applyCaptureRequests();
                 tls_crnt_command_buffer =
                     gpu.getRenderer().createCommandBuffer();
+                // Retain the AS through host completion, including yielded/faulted work.
+                if (entry_list.decode_state)
+                    tls_crnt_command_buffer->onCompleted(
+                        [state = entry_list.decode_state] {});
                 if (entry_list.decode_state && !decode.context)
                     decode.context = std::make_unique<GpuChannelContext>(gpu);
                 tls_crnt_decode_state = &decode;
@@ -374,21 +437,20 @@ void Pfifo::threadFunc() {
 
 bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
                         u64& word_offset) {
-    // clb06f.h: conditional fetch and LEVEL_SUBROUTINE need distinct
-    // execution rules. Never execute these as an unconditional main segment.
-    if ((entry.gpu_addr_lo & 1u) != 0 || entry.is_push_buffer != 0) {
-        LOG_ERROR(Gpu, "Unsupported conditional/subroutine GPFIFO entry");
-        state.fail(25);
-        return false;
-    }
+    // LEVEL controls USERD progress reporting, not packet execution or a call stack.
+    // USERD TOP_LEVEL_GET is not exposed by Hydra yet; both levels execute here.
+    // A conditional segment is only fetched while the subdevice is active;
+    // otherwise it behaves as a NOP entry (dev_pbdma.ref, GP_ENTRY0_FETCH).
+    if ((entry.gpu_addr_lo & 1u) != 0 && !state.subdevice_active)
+        return true;
     // CPU writes queued by write tracking must reach the caches first
     tls_crnt_gmmu->getMmu()->applyPendingInvalidations();
     LOG_DEBUG(
         Gpu,
         "Gpfifo entry (addr lo: {:#x}, addr hi: {:#x}, size: {:#x}, allow "
-        "flush: {}, is push buffer: {}, sync: {})",
+        "flush: {}, subroutine level: {}, sync: {})",
         entry.gpu_addr_lo, entry.gpu_addr_hi, entry.size, entry.allow_flush,
-        entry.is_push_buffer, entry.sync);
+        entry.level_subroutine, entry.sync);
 
     uptr gpu_addr = static_cast<u64>(entry.gpu_addr_lo) |
                     (static_cast<u64>(entry.gpu_addr_hi) << 32);
@@ -408,6 +470,8 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
             return false;
         }
         ++word_offset;
+        if (decodeTraceEnabled())
+            decode_trace.record(state, command_address, *word, gpu_addr, end);
         if (state.remaining != 0) {
             processMethodArg(*word, state);
         } else {
@@ -415,6 +479,8 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
             if (!submitCommand(*word, state))
                 break;
         }
+        if (state.failed && decodeTraceEnabled())
+            decode_trace.dump(*tls_crnt_gmmu);
         if (state.semaphore_wait || state.syncpoint_wait || state.failed)
             return false;
     }
@@ -441,6 +507,15 @@ bool Pfifo::submitCommand(u32 raw_header, PfifoDecodeState& state) {
                 header.secondary_opcode == SecondaryOpcode::Grp0UseTert;
             state.method = extractBits(raw_header, 2, 11);
             state.remaining = extractBits(raw_header, 18, 11);
+        } else if (header.secondary_opcode == SecondaryOpcode::Grp0UseTert &&
+                   tert == TertiaryOpcode::Grp0SetSubDevMask) {
+            state.subdevice_active = (extractBits(raw_header, 4, 12) & SUBDEVICE_ID) != 0;
+        } else if (header.secondary_opcode == SecondaryOpcode::Grp0UseTert &&
+                   tert == TertiaryOpcode::Grp0StoreSubDevMask) {
+            state.stored_subdevice_mask = extractBits(raw_header, 4, 12);
+        } else if (header.secondary_opcode == SecondaryOpcode::Grp0UseTert &&
+                   tert == TertiaryOpcode::Grp0UseSubDevMask) {
+            state.subdevice_active = (state.stored_subdevice_mask & SUBDEVICE_ID) != 0;
         } else {
             LOG_ERROR(Gpu, "Unsupported PFIFO subdevice operation {}", tert);
             state.fail(25);
@@ -478,6 +553,15 @@ bool Pfifo::submitCommand(u32 raw_header, PfifoDecodeState& state) {
 void Pfifo::processMethodArg(u32 arg, PfifoDecodeState& state) {
     // Collect macro arguments until the packet is complete, even when it is
     // split across submissions. Incomplete packets must not execute a macro.
+    if (!state.subdevice_active) {
+        // Consumed without delivery; the packet layout still advances
+        if (state.increment)
+            ++state.method;
+        if (state.one_increment)
+            state.increment = false;
+        --state.remaining;
+        return;
+    }
     if (state.method >= MACRO_METHODS_REGION)
         state.macro_args.emplace_back(state.method, arg);
     else

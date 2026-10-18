@@ -7,6 +7,21 @@
 
 namespace hydra::hw::tegra_x1::gpu {
 
+GMmu::~GMmu() {
+    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
+    for (const auto block : zero_blocks)
+        free(reinterpret_cast<void*>(block));
+}
+
+AddressSpace GMmu::allocateZeroBlock(u64 size) {
+    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
+    void* ptr = calloc(1, size);
+    ASSERT(ptr != nullptr || size == 0, Gpu,
+           "Failed to allocate {:#x} bytes of sparse GPU memory", size);
+    zero_blocks.push_back(reinterpret_cast<uptr>(ptr));
+    return {reinterpret_cast<uptr>(ptr), size};
+}
+
 std::vector<u8> GMmu::readMappedBytes(uptr gpu_addr, usize max_size) {
     std::vector<u8> bytes;
     bytes.reserve(max_size);
@@ -113,12 +128,7 @@ uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
 
     // Reserved GPU address space without guest backing reads as zero, like
     // sparse memory
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    const uptr ptr = reinterpret_cast<uptr>(calloc(1, range.getSize()));
-
-    AddressSpace as;
-    as.ptr = ptr;
-    as.size = range.getSize();
+    const AddressSpace as = allocateZeroBlock(range.getSize());
 
     if (gpu_addr == invalid<uptr>()) {
         gpu_addr = address_space_base;
@@ -131,12 +141,13 @@ uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
     return gpu_addr;
 }
 
-void GMmu::carveOut(uptr begin, uptr end) {
+void GMmu::carveOut(uptr begin, uptr end, bool host_only) {
     for (auto it = mapped_ranges.begin(); it != mapped_ranges.end();) {
         const uptr other_begin = it->first;
         const AddressSpace other = it->second;
         const uptr other_end = other_begin + other.size;
-        if (other_end <= begin || other_begin >= end) {
+        if (other_end <= begin || other_begin >= end ||
+            (host_only && other.guest != 0)) {
             ++it;
             continue;
         }
@@ -185,8 +196,66 @@ void GMmu::mapIntoGaps(uptr base, AddressSpace as) {
 void GMmu::unbindToSparse(uptr gpu_addr, u64 size) {
     std::unique_lock lock(mutex);
     carveOut(gpu_addr, gpu_addr + size);
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    mapLocked(gpu_addr, {reinterpret_cast<uptr>(calloc(1, size)), size});
+    mapLocked(gpu_addr, allocateZeroBlock(size));
+}
+
+void GMmu::reserveSparse(uptr gpu_addr, u64 size) {
+    if (size == 0)
+        return;
+    std::unique_lock lock(mutex);
+    mapIntoGaps(gpu_addr, allocateZeroBlock(size));
+}
+
+void GMmu::unmapRange(uptr gpu_addr, u64 size, bool restore_sparse) {
+    if (size == 0)
+        return;
+    std::unique_lock lock(mutex);
+    carveOut(gpu_addr, gpu_addr + size);
+    if (restore_sparse)
+        mapIntoGaps(gpu_addr, allocateZeroBlock(size));
+}
+
+std::vector<ztd::Range<vaddr_t>> GMmu::rebaseHostRange(uptr old_begin, uptr old_end,
+                                                       uptr new_begin, u64 new_size) {
+    std::vector<ztd::Range<vaddr_t>> guest_ranges;
+    std::unique_lock lock(mutex);
+    std::vector<std::pair<uptr, AddressSpace>> pieces;
+    for (auto it = mapped_ranges.begin(); it != mapped_ranges.end();) {
+        const uptr gpu = it->first;
+        const AddressSpace as = it->second;
+        const uptr as_end = as.ptr + as.size;
+        if (as.guest == 0 || as_end <= old_begin || as.ptr >= old_end) {
+            ++it;
+            continue;
+        }
+        it = mapped_ranges.erase(it);
+        const uptr in_begin = std::max(as.ptr, old_begin);
+        const uptr in_end = std::min(as_end, old_end);
+        if (in_begin > as.ptr)
+            pieces.push_back({gpu, {as.ptr, in_begin - as.ptr, as.guest}});
+        const u64 offset = in_begin - old_begin;
+        if (offset < new_size) {
+            const u64 size = std::min<u64>(in_end - in_begin, new_size - offset);
+            const uptr piece_gpu = gpu + (in_begin - as.ptr);
+            const vaddr_t piece_guest = as.guest + (in_begin - as.ptr);
+            pieces.push_back({piece_gpu, {new_begin + offset, size, piece_guest}});
+            guest_ranges.push_back(ztd::Range<vaddr_t>::fromSize(piece_guest, size));
+        }
+        if (as_end > in_end)
+            pieces.push_back({gpu + (in_end - as.ptr),
+                              {in_end, as_end - in_end, as.guest + (in_end - as.ptr)}});
+    }
+    for (const auto& [gpu, as] : pieces)
+        mapLocked(gpu, as);
+    generation.fetch_add(1, std::memory_order_release);
+    return guest_ranges;
+}
+
+void GMmu::releaseSparse(uptr gpu_addr, u64 size) {
+    if (size == 0)
+        return;
+    std::unique_lock lock(mutex);
+    carveOut(gpu_addr, gpu_addr + size, true);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu

@@ -20,6 +20,7 @@ struct AddressSpace {
 class GMmu : public GenericMmu<GMmu, AddressSpace> {
   public:
     explicit GMmu(cpu::IMmu* mmu_) : mmu{mmu_} {}
+    ~GMmu();
     void cancelGpuWork() { gpu_cancelled.store(true, std::memory_order_release); }
     bool gpuWorkCancelled() const { return gpu_cancelled.load(std::memory_order_acquire); }
 
@@ -51,11 +52,31 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
     // Sparse memory without backing reads as zero
     void unbindToSparse(uptr gpu_addr, u64 size);
 
+    // Reserves GPU address space: zero backed when sparse, otherwise only the
+    // address range is claimed by the caller and reads fault. Existing
+    // mappings are preserved.
+    void reserveSparse(uptr gpu_addr, u64 size);
+    // Moves mappings backed by [old_begin, old_end) to the same offsets of
+    // new_begin (mappings beyond new_size become unmapped). Returns the guest
+    // ranges that now point at the new memory.
+    std::vector<ztd::Range<vaddr_t>> rebaseHostRange(uptr old_begin, uptr old_end,
+                                                     uptr new_begin, u64 new_size);
+    // Removes the mappings in the range (sparse reservations read as zero
+    // again when restore_sparse is set)
+    void unmapRange(uptr gpu_addr, u64 size, bool restore_sparse);
+    // Drops the zero backing of a released sparse reservation, keeping buffer
+    // mappings that were placed inside it
+    void releaseSparse(uptr gpu_addr, u64 size);
+
   private:
     // Mappings are kept disjoint: a buffer replaces whatever it overlaps,
     // while a reservation only fills the parts that are still unmapped. The
     // caller holds the mapping mutex exclusively.
-    void carveOut(uptr begin, uptr end);
+    void carveOut(uptr begin, uptr end, bool host_only = false);
+    // Zero backing is owned by the GMMU until it is destroyed: queued or
+    // in-flight GPU work may still hold pointers into blocks that were
+    // unmapped, so they are never freed earlier.
+    AddressSpace allocateZeroBlock(u64 size);
     void mapIntoGaps(uptr base, AddressSpace as);
 
   public:
@@ -74,6 +95,7 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
   private:
     cpu::IMmu* mmu;
     std::atomic<bool> gpu_cancelled{false};
+    std::vector<uptr> zero_blocks;
 
     // TODO: use a better way to allocate new memory
     uptr address_space_base{GPU_PAGE_SIZE};

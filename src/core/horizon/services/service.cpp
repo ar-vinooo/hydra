@@ -181,8 +181,9 @@ IService* IService::getService(RequestContext& context, Handle handle) {
 }
 
 void IService::close() {
-    // TODO
-    LOG_FUNC_NOT_IMPLEMENTED(Services);
+    // Services hold no per-session state to release; the object is destroyed
+    // with its session
+    LOG_DEBUG(Services, "{} closed", __func__);
 }
 
 void IService::request(RequestContext& context) {

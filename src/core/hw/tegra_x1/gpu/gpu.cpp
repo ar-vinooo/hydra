@@ -1,11 +1,11 @@
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
 #ifdef ZTD_PLATFORM_APPLE
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #endif
 #include "core/hw/tegra_x1/gpu/renderer/null/renderer.hpp"
 
@@ -78,8 +78,17 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
                       "Unknown engine class ID 0x{:08x} for subchannel {}, "
                       "keeping the current engine",
                       set_object_arg.class_id, subchannel);
-            if (tls_crnt_decode_state)
+            if (tls_crnt_decode_state) {
+                auto& diagnostics = VisualDiagnostics::instance();
+                if (diagnostics.enabled()) {
+                    LOG_ERROR(Gpu, "Fault source: GPU header at {:#x}, word {:#010x}, "
+                                   "method {:#x}, subchannel {}, argument {:#010x}",
+                              diagnostics.commandAddress(), diagnostics.commandHeader(),
+                              tls_crnt_decode_state->method, subchannel, arg);
+                    diagnostics.commandFault(tls_crnt_decode_state->method, subchannel, arg);
+                }
                 tls_crnt_decode_state->fail(25);
+            }
             return;
         }
 
@@ -123,7 +132,21 @@ bool Gpu::reserveFence(Fence& out_fence, PfifoDecodeState* channel, u32 incremen
         if (!id)
             return false;
         channel_id = *id;
-        fence_syncpoints.insert(*id);
+        // A reused counter keeps its value; targets continue from it
+        target = video_syncpoints->read(*id).value_or(0);
+        {
+            std::scoped_lock registry_lock(fence_registry->mutex);
+            fence_registry->ids.insert(*id);
+        }
+        if (channel)
+            channel->release_fence = [syncpoints = video_syncpoints,
+                                      registry = fence_registry, id = *id] {
+                {
+                    std::scoped_lock registry_lock(registry->mutex);
+                    registry->ids.erase(id);
+                }
+                syncpoints->release(id);
+            };
     }
     target += increments;
     out_fence = {channel_id, target};
@@ -149,23 +172,24 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                 << 32) |
                puller_regs[SEMAPHORE_ADDRESS_LOW];
     };
-    // Host pointer of the semaphore if the memory is mapped
-    const auto resolve = [&](u64 size) -> u8* {
+    // Host pointer of the semaphore (plus a byte offset) if the memory is
+    // mapped. A 16-byte report can straddle host mappings, so its words are
+    // resolved separately.
+    const auto resolve = [&](u64 size, u64 offset = 0) -> u8* {
+        const u64 address = semaphore_address() + offset;
         uptr base;
         const auto as = tls_crnt_gmmu != nullptr
-                            ? tls_crnt_gmmu->findAddr(semaphore_address(), base)
+                            ? tls_crnt_gmmu->findAddr(address, base)
                             : std::nullopt;
-        if (!as || as->ptr == 0 ||
-            semaphore_address() - base + size > as->size ||
-            (as->ptr + semaphore_address() - base) %
+        if (!as || as->ptr == 0 || address - base + size > as->size ||
+            (as->ptr + address - base) %
                 std::atomic_ref<u32>::required_alignment != 0) {
-            ONCE(LOG_WARN(Gpu, "Semaphore in unmapped memory {:#x}",
-                          semaphore_address()));
+            ONCE(LOG_WARN(Gpu, "Semaphore in unmapped memory {:#x}", address));
             if (tls_crnt_decode_state)
                 tls_crnt_decode_state->fail(31);
             return nullptr;
         }
-        return reinterpret_cast<u8*>(as->ptr + (semaphore_address() - base));
+        return reinterpret_cast<u8*>(as->ptr + (address - base));
     };
     const auto invalidate = [&](u8* ptr, u64 size) {
         renderer->invalidateMemory(
@@ -174,17 +198,10 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     const auto wait_for_gpu = [&] {
         if (tls_crnt_command_buffer == nullptr)
             return true;
-        renderer->debugSyncCommandBuffer(tls_crnt_command_buffer);
-#ifdef ZTD_PLATFORM_APPLE
-        if (CONFIG_INSTANCE.getGpuRenderer() == GpuRenderer::Metal) {
-            const bool succeeded = static_cast<renderer::metal::CommandBuffer*>(
-                tls_crnt_command_buffer)->lastSubmissionSucceeded();
-            if (!succeeded && tls_crnt_decode_state)
-                tls_crnt_decode_state->fail(25);
-            return succeeded;
-        }
-#endif
-        return true;
+        const bool succeeded = renderer->synchronize(tls_crnt_command_buffer);
+        if (!succeeded && tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return succeeded;
     };
     // Submit prior work before polling: it may produce the semaphore itself.
     // A pending acquire blocks later methods until satisfied or shutdown.
@@ -214,6 +231,33 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     case SEMAPHORE_SEQUENCE:
     case SYNCPOINT_PAYLOAD:
         break;
+    // clb06f.h: interrupts and framebuffer flushes have no host consumer; the
+    // caches they would flush are coherent here (GPU writes reach guest memory
+    // when the CPU touches them).
+    case 0x8: // NON_STALL_INTERRUPT
+    case 0x9: // FB_FLUSH
+        break;
+    case 0xa: // MEM_OP_A and MEM_OP_B only carry operands (removed from the
+    case 0xb: // published header); MEM_OP_C holds the TLB operand
+    case 0xc:
+        break;
+    case 0xd: { // MEM_OP_D: OPERATION[31:27]
+        switch (arg >> 27) {
+        case 0x5: // MEMBAR
+            wait_for_gpu();
+            break;
+        case 0x9:  // MMU_TLB_INVALIDATE: mappings are looked up directly
+        case 0xd:  // L2_PEERMEM_INVALIDATE
+        case 0xe:  // L2_SYSMEM_INVALIDATE
+        case 0xf:  // L2_CLEAN_COMPTAGS
+        case 0x10: // L2_FLUSH_DIRTY
+            break;
+        default:
+            ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Memory operation {:#x}", arg >> 27));
+            break;
+        }
+        break;
+    }
     case WAIT_FOR_IDLE:
         wait_for_gpu();
         break;
@@ -227,15 +271,57 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             const u64 size = (arg & (1u << 24)) != 0 ? 4 : 16;
             if ((arg & (1u << 20)) == 0 && !wait_for_gpu())
                 break;
-            if (auto* ptr = resolve(size)) {
-                if (size == 16) {
-                    const u64 timestamp = engines::getGpuTimestamp();
-                    std::memcpy(ptr + 8, &timestamp, sizeof(timestamp));
-                }
-                std::atomic_ref<u32>(*reinterpret_cast<u32*>(ptr))
-                    .store(payload, std::memory_order_release);
-                invalidate(ptr, size);
+            auto* ptr = resolve(sizeof(u32));
+            auto* timestamp_ptr = ptr != nullptr && size == 16 ? resolve(sizeof(u64), 8) : nullptr;
+            if (ptr == nullptr || (size == 16 && timestamp_ptr == nullptr))
+                break;
+            if (timestamp_ptr != nullptr) {
+                const u64 timestamp = engines::getGpuTimestamp();
+                std::memcpy(timestamp_ptr, &timestamp, sizeof(timestamp));
+                invalidate(timestamp_ptr, sizeof(timestamp));
             }
+            std::atomic_ref<u32>(*reinterpret_cast<u32*>(ptr))
+                .store(payload, std::memory_order_release);
+            invalidate(ptr, sizeof(u32));
+            break;
+        }
+        case 0x10: { // REDUCTION: atomic read-modify-write of the 4-byte word
+            const u32 reduction = (arg >> 27) & 0xf;
+            const bool is_signed = (arg & (1u << 31)) == 0; // FORMAT_SIGNED = 0
+            // INC/DEC wrap semantics are not defined by clb06f.h
+            if (reduction > 5) {
+                ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Semaphore reduction {}", reduction));
+                if (tls_crnt_decode_state)
+                    tls_crnt_decode_state->fail(25);
+                break;
+            }
+            if ((arg & (1u << 20)) == 0 && !wait_for_gpu())
+                break;
+            auto* ptr = resolve(sizeof(u32));
+            if (ptr == nullptr)
+                break;
+            std::atomic_ref<u32> word(*reinterpret_cast<u32*>(ptr));
+            u32 old = word.load(std::memory_order_acquire);
+            while (true) {
+                u32 value;
+                switch (reduction) {
+                case 0: // MIN
+                    value = is_signed ? static_cast<u32>(std::min(static_cast<i32>(old), static_cast<i32>(payload)))
+                                      : std::min(old, payload);
+                    break;
+                case 1: // MAX
+                    value = is_signed ? static_cast<u32>(std::max(static_cast<i32>(old), static_cast<i32>(payload)))
+                                      : std::max(old, payload);
+                    break;
+                case 2: value = old ^ payload; break;
+                case 3: value = old & payload; break;
+                case 4: value = old | payload; break;
+                default: value = old + payload; break; // ADD wraps
+                }
+                if (word.compare_exchange_weak(old, value, std::memory_order_acq_rel))
+                    break;
+            }
+            invalidate(ptr, sizeof(u32));
             break;
         }
         case 0x4: // Acquire greater or equal

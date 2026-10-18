@@ -51,6 +51,8 @@ class Process;
 
 namespace hydra::horizon::services::nvdrv::ioctl {
 
+class FdBase;
+
 struct IoctlContext {
     System& system;
     kernel::Process* process;
@@ -58,6 +60,7 @@ struct IoctlContext {
     std::optional<ztd::io::MemoryStream> in_buffer_stream;
     std::optional<ztd::io::MemoryStream> out_stream;
     std::optional<ztd::io::MemoryStream> out_buffer_stream;
+    std::function<FdBase*(u32)> resolve_fd;
 };
 
 template <typename In, typename Out>

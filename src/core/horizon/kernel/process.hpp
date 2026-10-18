@@ -170,12 +170,16 @@ class Process : public SynchronizationObject {
     hw::tegra_x1::cpu::IMmu* getMmu() const { return mmu.get(); }
     hw::tegra_x1::cpu::IMemory* getHeapMemory() const { return heap_mem.get(); }
     u64 getUsedUserMemorySize() const;
+    std::shared_ptr<hw::tegra_x1::gpu::GMmu> createGpuAddressSpace();
 
   private:
     System& system;
 
     std::unique_ptr<hw::tegra_x1::cpu::IMmu> mmu;
     hw::tegra_x1::gpu::GMmu gmmu;
+    std::mutex gpu_spaces_mutex;
+    std::vector<std::weak_ptr<hw::tegra_x1::gpu::GMmu>> gpu_spaces;
+    bool gpu_spaces_stopped{false};
 
     AppletState applet_state;
 
@@ -189,6 +193,9 @@ class Process : public SynchronizationObject {
     std::vector<std::unique_ptr<hw::tegra_x1::cpu::IMemory>> executable_mems;
     std::unique_ptr<hw::tegra_x1::cpu::IMemory> main_thread_stack_mem;
     std::unique_ptr<hw::tegra_x1::cpu::IMemory> heap_mem;
+    // Replaced heap blocks stay alive while the GPU may still use them
+    std::mutex retired_mutex;
+    std::vector<std::unique_ptr<hw::tegra_x1::cpu::IMemory>> retired_heaps;
 
     // Memory mapped with svcMapPhysicalMemory. The whole alias region is
     // backed by one lazily committed host reservation, so memory that is

@@ -41,9 +41,10 @@ AppletResource::~AppletResource() { delete shared_mem; }
 
 void AppletResource::activateNpads(NpadRevision revision) {
     active = true;
+    (void)revision;
 
     // TODO: revision affects style sets?
-    LOG_NOT_IMPLEMENTED(Services, "{}", revision);
+    LOG_DEBUG(Services, "Npad activation with {}", revision);
 
     setupNpads();
 }

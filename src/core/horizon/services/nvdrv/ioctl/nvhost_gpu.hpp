@@ -8,36 +8,31 @@ namespace hydra::horizon::services::nvdrv::ioctl {
 
 class NvHostGpu : public ChannelBase {
   public:
-    NvHostGpu()
-        : sm_exception_bpt_int_report_event{new kernel::Event(
-              false, "NvHostGpu SM exception BPT int report event")},
-          sm_exception_bpt_pause_report_event{new kernel::Event(
-              false, "NvHostGpu SM exception BPT pause report event")},
-          error_notifier_event{
-              new kernel::Event(false, "NvHostGpu error notifier event")} {
-        error_notifier_event->retain();
-        auto event = std::shared_ptr<kernel::Event>(error_notifier_event,
-            [](kernel::Event* value) { value->release(); });
-        decode_state->on_fault = [event] { event->signal(); };
-    }
-    ~NvHostGpu() override {
-        sm_exception_bpt_int_report_event->release();
-        sm_exception_bpt_pause_report_event->release();
-        error_notifier_event->release();
-    }
+    NvHostGpu();
+    ~NvHostGpu() override;
 
     NvResult ioctl(IoctlContext& context, u32 type, u32 nr) override;
     NvResult ioctl2(IoctlContext& context, u32 type,
                     u32 nr) override;
     NvResult queryEvent(u32 event_id_u32, kernel::Event*& out_event) override;
     const auto& getChannelState() const { return decode_state; }
+    NvResult bindAddressSpace(kernel::Process& process,
+                               std::shared_ptr<hw::tegra_x1::gpu::GMmu> space) override;
 
   private:
     kernel::Event* sm_exception_bpt_int_report_event;
     kernel::Event* sm_exception_bpt_pause_report_event;
     kernel::Event* error_notifier_event;
+    std::mutex address_space_mutex;
+    kernel::Process* address_space_owner{nullptr};
     std::shared_ptr<hw::tegra_x1::gpu::PfifoDecodeState> decode_state{
         std::make_shared<hw::tegra_x1::gpu::PfifoDecodeState>()};
+
+    struct ErrorNotifier {
+        std::mutex mutex;
+        bool enabled{false};
+    };
+    std::shared_ptr<ErrorNotifier> error_notifier{std::make_shared<ErrorNotifier>()};
 
     // Ioctls
     NvResult
@@ -52,7 +47,7 @@ class NvHostGpu : public ChannelBase {
     NvResult zCullBind(gpu_vaddr_t addr, u32 mode,
                        [[maybe_unused]] u32 reserved) override;
     NvResult setErrorNotifier(u64 offset, u64 size, u32 mem,
-                              [[maybe_unused]] u32 reserved) override;
+                              u32 reserved) override;
     NvResult getErrorNotification(u64* out_timestamp, u32* out_info32,
                                   u16* out_info16, u16* out_status) override;
     NvResult

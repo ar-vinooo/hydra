@@ -17,8 +17,22 @@ class Syncpoints {
   public:
     std::optional<std::uint32_t> allocate() {
         std::scoped_lock lock(mutex);
+        if (!free_ids.empty()) {
+            const auto id = free_ids.back();
+            free_ids.pop_back();
+            return id;
+        }
         if (next == values.size()) return std::nullopt;
         return next++;
+    }
+    // The counter keeps its value for the next owner, like a Host1x
+    // syncpoint; callers release only once nothing can still increment it.
+    void release(std::uint32_t id) {
+        std::scoped_lock lock(mutex);
+        if (!id || id >= next) return;
+        for (const auto free_id : free_ids)
+            if (free_id == id) return;
+        free_ids.push_back(id);
     }
     std::optional<std::uint32_t> read(std::uint32_t id) {
         std::scoped_lock lock(mutex);
@@ -80,6 +94,7 @@ class Syncpoints {
     std::condition_variable reached_cv;
     std::array<std::uint32_t, 192> values{};
     std::uint32_t next = 1;
+    std::vector<std::uint32_t> free_ids;
     struct Wait {
         std::uint32_t id, threshold;
         std::function<void()> callback;

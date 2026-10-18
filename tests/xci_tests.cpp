@@ -293,7 +293,7 @@ void checkGpuMappings(System* test_system, kernel::Process* test_process) {
     copy.method(0x105, 0);
     copy.method(0x106, static_cast<u32>(2 * page));
     copy.method(0x107, 0);
-    copy.method(0xc0, 0x180); // Pitch/Pitch, one block, zero pitches/count.
+    copy.method(0xc0, 0x182); // Non-pipelined Pitch/Pitch, one block.
     check(std::memcmp(reinterpret_cast<const void*>(first->getPtr()), input,
                       page) == 0 &&
               std::memcmp(reinterpret_cast<const void*>(second->getPtr()),
@@ -314,7 +314,7 @@ void checkGpuMappings(System* test_system, kernel::Process* test_process) {
     copy.method(0x105, 64);
     copy.method(0x106, 16);
     copy.method(0x107, 2);
-    copy.method(0xc0, 0x380); // Two pitched lines; preserve destination padding.
+    copy.method(0xc0, 0x382); // Non-pipelined, two pitched lines; preserve padding.
     const auto* output = reinterpret_cast<const u8*>(first->getPtr());
     check(std::memcmp(output, input, 16) == 0 &&
               std::memcmp(output + 64, input + 32, 16) == 0 &&
@@ -328,6 +328,11 @@ void checkGpuMappings(System* test_system, kernel::Process* test_process) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--check-mmu-lookup") {
+            checkMmuLookup();
+            checkThreadWaits();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--check-gpu-memory") {
             checkShaderReadBounds();
             CONFIG_INSTANCE.getCpuBackend() = CpuBackend::Dynarmic;

@@ -9,10 +9,10 @@ DEFINE_IOCTL_TABLE(NvMap,
                                             fromId, 0x04, alloc, 0x05, free,
                                             0x09, param, 0x0e, getId))
 
-NvResult NvMap::create(System* system, u32 size, Handle* out_handle) {
+NvResult NvMap::create(System* system, kernel::Process* process, u32 size, Handle* out_handle) {
     if (size == 0)
         return NvResult::InvalidSize;
-    const auto handle = system->getGpu().createMap(size);
+    const auto handle = system->getGpu().createMap(size, process);
     if (!handle)
         return NvResult::InsufficientMemory;
     *out_handle = handle->getRaw();

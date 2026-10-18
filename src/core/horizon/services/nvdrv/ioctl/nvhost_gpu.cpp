@@ -2,7 +2,6 @@
 
 #include "core/horizon/kernel/process.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
-#include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/system.hpp"
 
 namespace hydra::horizon::services::nvdrv::ioctl {
@@ -15,9 +14,52 @@ enum class EventId {
     ErrorNotifierEvent,
 };
 
+struct ErrorNotifierArgs {
+    u64 offset;
+    u64 size;
+    u32 mem;
+    u32 reserved;
+};
+static_assert(sizeof(ErrorNotifierArgs) == 24);
+static_assert(offsetof(ErrorNotifierArgs, mem) == 16);
+
+}
+
+NvHostGpu::NvHostGpu()
+    : sm_exception_bpt_int_report_event{new kernel::Event(
+          false, "NvHostGpu SM exception BPT int report event")},
+      sm_exception_bpt_pause_report_event{new kernel::Event(
+          false, "NvHostGpu SM exception BPT pause report event")},
+      error_notifier_event{new kernel::Event(
+          false, "NvHostGpu error notifier event")} {
+    error_notifier_event->retain();
+    auto event = std::shared_ptr<kernel::Event>(error_notifier_event,
+        [](kernel::Event* value) { value->release(); });
+    decode_state->on_fault = [event, target = error_notifier] {
+        std::scoped_lock lock(target->mutex);
+        if (target->enabled)
+            event->signal();
+    };
+}
+
+NvHostGpu::~NvHostGpu() {
+    sm_exception_bpt_int_report_event->release();
+    sm_exception_bpt_pause_report_event->release();
+    error_notifier_event->release();
 }
 
 NvResult NvHostGpu::ioctl(IoctlContext& context, u32 type, u32 nr) {
+    if (type == 0x48 && nr == 0x0c) {
+        if (!context.in_stream || !context.process)
+            return NvResult::BadParameter;
+        auto& stream = *context.in_stream;
+        if (stream.getSeek() > stream.getSize() ||
+            stream.getSize() - stream.getSeek() < sizeof(ErrorNotifierArgs))
+            return NvResult::InvalidSize;
+        ErrorNotifierArgs args;
+        std::memcpy(&args, stream.getPtr() + stream.getSeek(), sizeof(args));
+        return setErrorNotifier(args.offset, args.size, args.mem, args.reserved);
+    }
     if (type == 0x48 && (nr == 0x08 || nr == 0x1b))
         return submitGpfifoChecked(context, false);
     if (type == 0x48 && nr == 0x17) {
@@ -84,38 +126,14 @@ NvResult NvHostGpu::submitGpfifoChecked(IoctlContext& context,
         if (context.in_buffer_stream &&
             !has_bytes(context.in_buffer_stream, entry_bytes))
             return NvResult::InvalidSize;
-    } else if (gpfifo == 0 && !has_bytes(context.in_stream, HEADER_SIZE + entry_bytes)) {
+    } else if (!has_bytes(context.in_stream, HEADER_SIZE + entry_bytes)) {
         return NvResult::InvalidSize;
     }
     if (!context.process)
         return NvResult::BadParameter;
 
-    // NVIDIA's ioctl1 copies from args.gpfifo in the process address space;
-    // ioctl2 supplies the entries inline. Keep the existing null-pointer
-    // appended-array path for internal callers.
-    std::vector<ztd::Range<uptr>> guest_pieces;
-    if (!inline_entries && gpfifo != 0 && count != 0) {
-        if (!kernel::ADDRESS_SPACE.contains(gpfifo) ||
-            entry_bytes > kernel::ADDRESS_SPACE.getEnd() - gpfifo)
-            return NvResult::InvalidAddress;
-        u64 copied = 0;
-        auto* mmu = context.process->getMmu();
-        while (copied < entry_bytes) {
-            const auto address = gpfifo + copied;
-            const auto region = mmu->queryRegion(address);
-            if (region.state.type == kernel::MemoryType::Free ||
-                !any(region.state.perm & kernel::MemoryPermission::Read))
-                return NvResult::InvalidAddress;
-            const auto host = mmu->unmapAddr(address);
-            if (host == 0)
-                return NvResult::InvalidAddress;
-            const u64 amount = std::min(entry_bytes - copied,
-                hw::tegra_x1::cpu::GUEST_PAGE_SIZE -
-                    (address % hw::tegra_x1::cpu::GUEST_PAGE_SIZE));
-            guest_pieces.push_back(ztd::Range<uptr>::fromSize(host, amount));
-            copied += amount;
-        }
-    }
+    // Switch ioctl1 appends entries to the IPC header; args.gpfifo is ignored.
+    // Ioctl2 carries the same entries in its separate inline input buffer.
     // Copy only after validating the whole array; IPC buffers can be unaligned.
     std::vector<GpfifoEntry> entries;
     try {
@@ -124,20 +142,12 @@ NvResult NvHostGpu::submitGpfifoChecked(IoctlContext& context,
         return NvResult::InsufficientMemory;
     }
     if (count != 0) {
-        if (!guest_pieces.empty()) {
-            auto* destination = reinterpret_cast<u8*>(entries.data());
-            for (const auto& piece : guest_pieces) {
-                std::memcpy(destination, reinterpret_cast<const void*>(piece.getBegin()),
-                            piece.getSize());
-                destination += piece.getSize();
-            }
-        } else {
-            const auto* source = inline_entries
-                ? context.in_buffer_stream->getPtr() + context.in_buffer_stream->getSeek()
-                : input + HEADER_SIZE;
-            std::memcpy(entries.data(), source, static_cast<usize>(entry_bytes));
-        }
+        const auto* source = inline_entries
+            ? context.in_buffer_stream->getPtr() + context.in_buffer_stream->getSeek()
+            : input + HEADER_SIZE;
+        std::memcpy(entries.data(), source, static_cast<usize>(entry_bytes));
     }
+
     u32 detailed_error = 0;
     const auto result = submitGpfifo(&context.system, context.process,
         gpfifo, count, {flags, &detailed_error}, {&fence}, entries.data());
@@ -176,7 +186,20 @@ NvResult NvHostGpu::queryEvent(u32 event_id_u32, kernel::Event*& out_event) {
     return NvResult::Success;
 }
 
-// TODO: gpfifo
+NvResult NvHostGpu::bindAddressSpace(kernel::Process& process,
+                                     std::shared_ptr<hw::tegra_x1::gpu::GMmu> space) {
+    std::scoped_lock lock(address_space_mutex);
+    if (!space || space->getMmu() != process.getMmu())
+        return NvResult::BadParameter;
+    if (space->gpuWorkCancelled() || decode_state->failed)
+        return NvResult::InvalidState;
+    if (decode_state->address_space)
+        return NvResult::BadValue;
+    address_space_owner = &process;
+    decode_state->address_space = std::move(space);
+    return NvResult::Success;
+}
+
 NvResult NvHostGpu::submitGpfifo(
     System* system, kernel::Process* process, u64 gpfifo, u32 num_entries,
     InOut<hw::tegra_x1::gpu::GpfifoFlags, u32> inout_flags_and_detailed_error,
@@ -184,33 +207,54 @@ NvResult NvHostGpu::submitGpfifo(
     const hw::tegra_x1::gpu::GpfifoEntry* entries) {
     (void)gpfifo;
 
+    std::shared_ptr<hw::tegra_x1::gpu::GMmu> space;
+    {
+        std::scoped_lock lock(address_space_mutex);
+        if (!process || address_space_owner != process || !decode_state->address_space)
+            return NvResult::InvalidState;
+        space = decode_state->address_space;
+    }
     auto& gpu = system->getGpu();
     if (decode_state->failed || gpu.getPfifo().isStopping() ||
-        process->getGMmu().gpuWorkCancelled())
+        space->gpuWorkCancelled())
         return NvResult::InvalidState;
     const hw::tegra_x1::gpu::GpfifoFlags flags =
         inout_flags_and_detailed_error;
     constexpr auto supported = hw::tegra_x1::gpu::GpfifoFlags::FenceWait |
         hw::tegra_x1::gpu::GpfifoFlags::FenceGet |
-        hw::tegra_x1::gpu::GpfifoFlags::SuppressWfi;
-    if (any(flags & ~supported))
+        hw::tegra_x1::gpu::GpfifoFlags::HwFormat |
+        hw::tegra_x1::gpu::GpfifoFlags::SuppressWfi |
+        hw::tegra_x1::gpu::GpfifoFlags::IncrementWithValue;
+    // HW_FORMAT entries already use the native two-word layout consumed by PFIFO.
+    if (any(flags & ~supported)) {
+        LOG_WARN(Services, "Unsupported GPFIFO submit flags {:#x}", static_cast<u32>(flags));
         return NvResult::NotSupported;
+    }
     // FENCE_WAIT: the fence the submission has to wait for comes in
     const hw::tegra_x1::gpu::Fence wait_fence = inout_fence.get();
     if (any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceWait) &&
         wait_fence.id != 0 && !gpu.getVideoSyncpoints().read(wait_fence.id))
         return NvResult::BadValue;
-    // A fence is reached when the host finished the submission
+    const bool reserve_guest_increments =
+        any(flags & hw::tegra_x1::gpu::GpfifoFlags::IncrementWithValue);
+    const bool get_fence = any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceGet);
+    if (reserve_guest_increments && any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceWait))
+        return NvResult::BadParameter;
     hw::tegra_x1::gpu::Fence fence{};
     std::function<void()> on_complete;
-    if (any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceGet)) {
-        if (!gpu.reserveFence(fence, decode_state.get()))
+    if (get_fence || reserve_guest_increments) {
+        // Bit 8 reserves the increments issued by the guest command stream;
+        // reservation must not advance the completed counter a second time.
+        const u32 increments = (reserve_guest_increments ? wait_fence.value : 0u) +
+                               (get_fence ? 1u : 0u);
+        if (!gpu.reserveFence(fence, decode_state.get(), increments))
             return NvResult::InsufficientMemory;
-        on_complete = gpu.makeFenceSignal(fence);
+        if (get_fence)
+            on_complete = gpu.makeFenceSignal(fence);
     }
 
     if (!gpu.getPfifo().submitEntries(
-        process->getGMmu(),
+        *space,
         std::span<const hw::tegra_x1::gpu::GpfifoEntry>(entries, num_entries),
         flags, std::move(on_complete), wait_fence, decode_state))
         return NvResult::InvalidState;
@@ -237,11 +281,17 @@ NvResult NvHostGpu::zCullBind(gpu_vaddr_t addr, u32 mode,
     return NvResult::Success;
 }
 
-NvResult NvHostGpu::setErrorNotifier(u64 offset, u64 size, u32 mem,
+NvResult NvHostGpu::setErrorNotifier([[maybe_unused]] u64 offset,
+                                     [[maybe_unused]] u64 size, u32 mem,
                                      [[maybe_unused]] u32 reserved) {
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Services, "offset: {:#x}, size: {:#x}, memory: {}", offset, size, mem);
-    return NvResult::NotSupported;
+    // Switch uses mem as an enable flag; offset/size are ignored. Error data
+    // is fetched with GET_ERROR_NOTIFICATION, not written to an nvmap buffer.
+    std::scoped_lock lock(error_notifier->mutex);
+    error_notifier->enabled = mem != 0;
+    error_notifier_event->clear();
+    if (error_notifier->enabled && decode_state->failed.load(std::memory_order_acquire))
+        error_notifier_event->signal();
+    return NvResult::Success;
 }
 
 NvResult NvHostGpu::getErrorNotification(u64* out_timestamp, u32* out_info32,

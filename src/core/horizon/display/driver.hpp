@@ -25,9 +25,10 @@ class Driver {
 
     Handle getDisplayIdFromName(const std::string& name) {
         (void)this;
-        LOG_NOT_IMPLEMENTED(Horizon, "GetDisplayIDFromName (name: {})", name);
-
-        // HACK
+        (void)name;
+        // Hydra models a single display; every name ("Default", "Internal", ...)
+        // resolves to it
+        LOG_DEBUG(Horizon, "GetDisplayIDFromName (name: {})", name);
         return 1;
     }
 

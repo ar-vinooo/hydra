@@ -34,6 +34,8 @@ struct PfifoDecodeState : PfifoPacket {
     PfifoDecodeState();
     ~PfifoDecodeState();
     std::unique_ptr<GpuChannelContext> context;
+    // Queued work retains its bound address space even after both FDs close.
+    std::shared_ptr<GMmu> address_space;
     std::optional<PfifoSemaphoreWait> semaphore_wait;
     std::optional<Fence> syncpoint_wait;
     std::atomic<bool> failed{false};
@@ -41,7 +43,14 @@ struct PfifoDecodeState : PfifoPacket {
     std::atomic<u64> fault_time{0};
     std::function<void()> on_fault;
     void fail(u32 code);
+    // Subdevice filtering (dev_pbdma.ref SUBDEVICE_STATUS): while inactive,
+    // methods are consumed but not delivered and conditional segments are
+    // skipped.
+    bool subdevice_active{true};
+    u32 stored_subdevice_mask{0};
     u32 fence_id{0};
+    // Returns the fence counter once no queued work can increment it
+    std::function<void()> release_fence;
     u32 fence_target{0};
     void resetPacket() { static_cast<PfifoPacket&>(*this) = {}; }
 };

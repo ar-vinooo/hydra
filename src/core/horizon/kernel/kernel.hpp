@@ -167,8 +167,7 @@ class Kernel {
     ztd::DoublyLinkedList<IThread*> arbiters;
 
     // Applet resource
-    std::array<bool, MAX_APPLET_RESOURCES> free_applet_resource_user_ids = {
-        true};
+    std::array<bool, MAX_APPLET_RESOURCES> free_applet_resource_user_ids{};
 
     // Helpers
     static void tryAcquireMutex(Process* crnt_process, IThread* thread);

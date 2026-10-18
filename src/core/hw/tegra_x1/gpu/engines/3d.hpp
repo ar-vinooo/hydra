@@ -636,6 +636,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     static constexpr u32 TEXTURE_MEMO_SLOTS = 32;
     std::array<std::array<TextureMemo, TEXTURE_MEMO_SLOTS>, 5> texture_memo{};
     u64 texture_memo_epoch{~0ull};
+    std::map<u64, u32> geometry_layer_sources;
     const void* texture_memo_render_pass{nullptr};
     const void* texture_memo_gmmu{nullptr};
     bool texture_memo_valid{false};
@@ -666,6 +667,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     // Methods
     DEFINE_INLINE_ENGINE_METHODS;
+
+    void incrementSyncPoint(u32 index, u32 arg);
 
     void loadMmeInstructionRamPointer(const u32 index, const u32 ptr);
     void loadMmeInstructionRam(const u32 index, const u32 data);

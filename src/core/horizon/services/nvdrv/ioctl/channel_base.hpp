@@ -3,6 +3,7 @@
 #include "core/horizon/services/nvdrv/ioctl/fd_base.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
 #include "core/video/host1x.hpp"
+#include "core/video/syncpoints.hpp"
 
 namespace hydra::horizon::services::nvdrv::ioctl {
 
@@ -18,12 +19,19 @@ struct UnmapCmdBufferHandle {
 
 class ChannelBase : public FdBase {
   public:
+    ~ChannelBase() override {
+        if (video_syncpoint && video_syncpoints)
+            video_syncpoints->release(*video_syncpoint);
+    }
+
     NvResult ioctl([[maybe_unused]] IoctlContext& context, u32 type,
                    u32 nr) override;
 
   protected:
     u64 user_data = 0;
+    u32 timeslice_us = 0;
     std::optional<u32> video_syncpoint;
+    std::shared_ptr<video::Syncpoints> video_syncpoints;
     video::Host1xState host1x_state;
     std::array<u32, 0x800> video_registers{};
     virtual NvResult executeVideo(IoctlContext&) { return NvResult::Success; }
@@ -40,6 +48,7 @@ class ChannelBase : public FdBase {
     NvResult getUserData(u64* out_data) const;
     NvResult setNvMapFd(u32 fd_id);
     NvResult setTimeout(u32 timeout);
+    NvResult setTimeslice(InOutSingle<u32> timeslice);
     virtual NvResult
     submitGpfifo([[maybe_unused]] System* system,
                  [[maybe_unused]] kernel::Process* process, u64 gpfifo,

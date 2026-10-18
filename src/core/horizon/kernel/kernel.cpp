@@ -18,7 +18,9 @@
 
 namespace hydra::horizon::kernel {
 
-Kernel::Kernel(System& system_) : system{system_}, process_manager(system) {}
+Kernel::Kernel(System& system_) : system{system_}, process_manager(system) {
+    free_applet_resource_user_ids.fill(true);
+}
 
 void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                             hw::tegra_x1::cpu::IThread* guest_thread, u64 id) {
@@ -443,8 +445,9 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
 result_t Kernel::setHeapSize(Process* crnt_process, u64 size, uptr& out_base) {
     LOG_DEBUG(Kernel, "SetHeapSize called (size: 0x{:08x})", size);
 
-    if ((size % HEAP_MEM_ALIGNMENT) != 0)
-        return MAKE_RESULT(Svc, Error::InvalidSize); // TODO: correct?
+    // Switchbrew SVC: a multiple of 0x200000 and at most 4GB (0xCA01)
+    if ((size % HEAP_MEM_ALIGNMENT) != 0 || size > 0x100000000ull)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
 
     crnt_process->resizeHeap(size);
 
@@ -1082,8 +1085,7 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
 
     switch (info_type) {
     case InfoType::CoreMask:
-        LOG_NOT_IMPLEMENTED(Kernel, "CoreMask");
-        // HACK
+        // Hydra exposes four cores; thread affinity is not enforced
         out_info = 0xf;
         return RESULT_SUCCESS;
     case InfoType::AliasRegionAddress:

@@ -49,7 +49,8 @@ class GenericMmu {
         const u64 current_generation =
             generation.load(std::memory_order_acquire);
         for (const auto& entry : cache.entries) {
-            if (entry.owner == this && entry.generation == current_generation &&
+            if (entry.owner == this && entry.identity == identity &&
+                entry.generation == current_generation &&
                 addr - entry.base < entry.size) {
                 out_base = entry.base;
                 return entry.impl;
@@ -63,7 +64,7 @@ class GenericMmu {
         if (impl == nullptr)
             return std::nullopt;
         cache.entries[cache.next++ % cache.entries.size()] = {
-            this, current_generation, out_base, size, *impl};
+            this, identity, current_generation, out_base, size, *impl};
         return *impl;
     }
 
@@ -88,6 +89,7 @@ class GenericMmu {
   private:
     struct CachedMapping {
         const GenericMmu* owner{nullptr};
+        u64 identity{0};
         u64 generation{0};
         uptr base{0};
         u64 size{0};
@@ -146,6 +148,9 @@ class GenericMmu {
     }
 
     mutable std::shared_mutex mutex;
+    // Pointer reuse must not revive entries cached for a destroyed MMU.
+    inline static std::atomic<u64> next_identity{1};
+    const u64 identity{next_identity.fetch_add(1, std::memory_order_relaxed)};
     // Changes whenever a mapping does, invalidating the lookup caches
     std::atomic<u64> generation{1};
     std::map<uptr, Impl> mapped_ranges;

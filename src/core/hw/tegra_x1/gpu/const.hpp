@@ -734,6 +734,7 @@ enum class GpfifoFlags : u32 {
     SyncFence = ZTD_BIT(3),
     SuppressWfi = ZTD_BIT(4),
     SkipBufferRefcounting = ZTD_BIT(5),
+    IncrementWithValue = ZTD_BIT(8),
 };
 ZTD_ENABLE_ENUM_BITWISE_OPERATORS(GpfifoFlags);
 
@@ -741,7 +742,7 @@ struct GpfifoEntry {
     u64 gpu_addr_lo : 32;
     u64 gpu_addr_hi : 8;
     u64 allow_flush : 1;
-    u64 is_push_buffer : 1;
+    u64 level_subroutine : 1;
     u64 size : 21;
     u64 sync : 1;
 };
@@ -1070,10 +1071,11 @@ ENABLE_ENUM_FLAGS_FORMATTING(hydra::hw::tegra_x1::gpu::GpfifoFlags, FenceWait,
                              "fence wait", FenceGet, "fence get", HwFormat,
                              "hw format", SyncFence, "sync fence", SuppressWfi,
                              "suppress WFI", SkipBufferRefcounting,
-                             "skip buffer refcounting")
+                             "skip buffer refcounting", IncrementWithValue,
+                             "increment with value")
 
 ENABLE_STRUCT_FORMATTING(hydra::hw::tegra_x1::gpu::GpfifoEntry, gpu_addr_lo,
                          ":#x", "GPU address low", gpu_addr_hi, ":#x",
                          "GPU address high", allow_flush, "", "allow flush",
-                         is_push_buffer, "", "is push buffer", size, ":#x",
+                         level_subroutine, "", "subroutine level", size, ":#x",
                          "size", sync, "", "sync")

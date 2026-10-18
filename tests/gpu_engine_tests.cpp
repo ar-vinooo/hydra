@@ -1588,6 +1588,18 @@ void testChannelMethodsAndFences() {
     expect(gpu_bytes[0] == 0x09 &&
                syncpoints.read(awaited.id) == awaited.value + 1,
            "Emulated syncpoint increment follows prior GPU work");
+    const auto engine_syncpoint = syncpoints.allocate();
+    expect(engine_syncpoint.has_value(), "Allocate a 3D syncpoint");
+    u32 expected_count = 0;
+    for (u32 flags : {0u, 1u << 16, 1u << 20, (1u << 16) | (1u << 20)}) {
+        ++expected_count;
+        const auto fill = static_cast<u8>(0x20u + expected_count);
+        queue_fill(fill);
+        gpu.get3DEngine().method(0xb2, *engine_syncpoint | flags);
+        expect(syncpoints.read(*engine_syncpoint) == expected_count &&
+                   gpu_bytes[0] == fill && gpu_bytes[15] == fill,
+               "3D stream-out/ROP syncpoint increments follow real GPU writes with either CLEAN_L2 setting");
+    }
     tls_crnt_command_buffer = nullptr;
     commands.reset();
 

@@ -29,6 +29,9 @@ struct MemoryMap {
     u64 size;
     bool write;
     u32 host1x_address = 0;
+    // Creating process; null means unowned (tests). Guest addresses only
+    // resolve in that process, so other processes cannot map the handle.
+    const void* owner = nullptr;
     // TODO: alignment
     // TODO: kind
 };
@@ -58,7 +61,8 @@ class Gpu {
     ZTD_MAKE_NON_MOVABLE(Gpu);
 
     // Memory map
-    std::expected<Handle, ztd::mem::IAllocator::Error> createMap(u64 size) {
+    std::expected<Handle, ztd::mem::IAllocator::Error> createMap(u64 size, const void* owner = nullptr) {
+        std::scoped_lock lock(map_mutex);
         try {
             const auto raw = free_map_handles.empty() ? next_map_handle
                                                       : free_map_handles.back();
@@ -66,7 +70,7 @@ class Gpu {
                 return std::unexpected(
                     ztd::mem::IAllocator::Error::OutOfMemory);
             memory_maps.emplace(
-                raw, MemoryMap{.addr = 0, .size = size, .write = false});
+                raw, MemoryMap{.addr = 0, .size = size, .write = false, .owner = owner});
             if (free_map_handles.empty())
                 ++next_map_handle;
             else
@@ -78,7 +82,8 @@ class Gpu {
     }
 
     bool allocateMap(Handle handle, uptr addr, bool write) {
-        auto memory_map = getMap(handle);
+        std::scoped_lock lock(map_mutex);
+        auto memory_map = findMap(handle);
         if (!memory_map)
             return false;
         memory_map.value()->addr = addr;
@@ -87,6 +92,7 @@ class Gpu {
     }
 
     bool freeMap(Handle handle) {
+        std::scoped_lock maps_lock(map_mutex);
         if (!memory_maps.contains(handle.getRaw()))
             return false;
         free_map_handles.push_back(handle.getRaw());
@@ -105,18 +111,19 @@ class Gpu {
         return true;
     }
 
+    // The pointer stays valid until the handle is freed; table changes
+    // themselves are serialized.
     std::optional<MemoryMap*> getMap(Handle handle) {
-        auto it = memory_maps.find(handle.getRaw());
-        if (it == memory_maps.end())
-            return std::nullopt;
-        return &it->second;
+        std::scoped_lock lock(map_mutex);
+        return findMap(handle);
     }
 
     // Host1x is a separate, 32-bit address space shared by NVDEC and VIC.
     // Keep an assignment stable until the nvmap is freed, including across
     // temporary unmaps while queued surfaces are still referenced.
     std::optional<u32> mapHost1x(Handle handle) {
-        auto map = getMap(handle);
+        std::scoped_lock lock(map_mutex);
+        auto map = findMap(handle);
         if (!map || !(*map)->addr || !(*map)->size)
             return std::nullopt;
         if (!(*map)->host1x_address) {
@@ -131,6 +138,7 @@ class Gpu {
     }
 
     std::optional<u64> resolveHost1x(u64 address, u64 size) const {
+        std::scoped_lock lock(map_mutex);
         for (const auto& [handle, map] : memory_maps) {
             if (!map.host1x_address || address < map.host1x_address)
                 continue;
@@ -165,6 +173,7 @@ class Gpu {
     }
 
     video::Syncpoints& getVideoSyncpoints() { return *video_syncpoints; }
+    std::shared_ptr<video::Syncpoints> shareVideoSyncpoints() { return video_syncpoints; }
 
     // GPU fences. A submission that asks for a fence gets a syncpoint value
     // the host reaches when the Metal command buffer of the submission
@@ -179,8 +188,8 @@ class Gpu {
         };
     }
     bool isFenceSyncpoint(u32 id) {
-        std::scoped_lock lock(fence_mutex);
-        return fence_syncpoints.contains(id);
+        std::scoped_lock lock(fence_registry->mutex);
+        return fence_registry->ids.contains(id);
     }
 
     // Engines
@@ -229,7 +238,14 @@ class Gpu {
     // Memory
     // TODO: move to nvmap
     // Stable addresses while the table grows; no fixed 2048-map limit.
+    mutable std::mutex map_mutex;
     std::map<u32, MemoryMap> memory_maps;
+    std::optional<MemoryMap*> findMap(Handle handle) {
+        auto it = memory_maps.find(handle.getRaw());
+        if (it == memory_maps.end())
+            return std::nullopt;
+        return &it->second;
+    }
     std::vector<u32> free_map_handles;
     u32 next_map_handle = 1;
     u64 next_host1x_address = 0x10000;
@@ -241,7 +257,12 @@ class Gpu {
     std::mutex fence_mutex;
     u32 fence_syncpoint{0};
     u32 fence_target{0};
-    std::set<u32> fence_syncpoints;
+    // Shared with channel states, which release their counter when destroyed
+    struct FenceRegistry {
+        std::mutex mutex;
+        std::set<u32> ids;
+    };
+    std::shared_ptr<FenceRegistry> fence_registry = std::make_shared<FenceRegistry>();
 
     // Puller (host) methods of the channel: semaphores and syncpoints
     void pullerMethod(u32 method, u32 arg);
