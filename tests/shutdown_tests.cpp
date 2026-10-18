@@ -799,6 +799,18 @@ void testGpuAddressSpaceInput(System& system, kernel::Process* process) {
     check(gpu.allocateMap(hole, guest + 0x1f000, true) &&
               map(hole.getRaw(), 0, 0x2000, TARGET) == nv::NvResult::InvalidAddress,
           "A mapping with an unmapped CPU backing tail is rejected");
+    // NVN pools of unaligned size: the guest maps the size rounded up to the big
+    // page size, but only the nvmap allocation has memory behind it
+    const auto padded = gpu.createMap(0x19000).value();
+    constexpr u64 PADDED_TARGET = 0x71000000;
+    check(gpu.allocateMap(padded, guest + 0x7000, true) &&
+              map(padded.getRaw(), 0, 0x20000, PADDED_TARGET) == nv::NvResult::Success &&
+              gmmu.readMappedBytes(PADDED_TARGET, 16) == std::vector<u8>(16, 0x12) &&
+              gmmu.readMappedBytes(PADDED_TARGET + 0x18000, 16) == std::vector<u8>(16, 0x34),
+          "A big-page-rounded mapping of an unaligned nvmap maps its backed part");
+    check(map(padded.getRaw(), 0, 0x30000, PADDED_TARGET + 0x100000) == nv::NvResult::InvalidSize,
+          "Rounding up to the big page size does not allow more than that");
+    check(gpu.freeMap(padded), "Release padding-test nvmap");
     const auto remap = [&](std::span<const nv::ioctl::RemapOp> entries, usize bytes) {
         std::vector<u8> input(1 + entries.size_bytes());
         if (!entries.empty())
@@ -996,9 +1008,13 @@ void testGpuAddressSpaceLifecycle(System& system, kernel::Process* process) {
                   small_map(guest, 0x1000, 0x10000, 0xb0200000) == nv::NvResult::InvalidSize &&
                   bytes(0xb0100000).empty() && bytes(0xb0200000).empty(),
               "Mappings beyond the nvmap's big-page limit are rejected");
-        check(small_map(guest + 0x18000, 0, 0x10000, 0xb0300000) == nv::NvResult::InvalidAddress &&
-                  bytes(0xb0300000).empty(),
-              "The rounded-up tail still needs readable guest backing");
+        // Unreal Engine's NVN memory pools (e.g. 0x1e9000 bytes mapped as 0x1f0000)
+        // end in alignment padding past the nvmap allocation: only the
+        // allocation itself needs readable backing, otherwise the game aborts
+        check(small_map(guest + 0x18000, 0, 0x10000, 0xb0300000) == nv::NvResult::Success &&
+                  bytes(0xb0300000).size() == 16,
+              "The rounded-up padding past the nvmap needs no guest backing");
+        check(unmap(0xb0300000) == nv::NvResult::Success, "Unmap the padded mapping");
         check(unmap(0xb0000000) == nv::NvResult::Success, "Unmap the rounded mapping");
     }
 

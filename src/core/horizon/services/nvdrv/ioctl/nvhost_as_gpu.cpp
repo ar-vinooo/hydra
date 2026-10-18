@@ -252,7 +252,8 @@ namespace {
 // memory.
 NvResult resolveNvmapRange(System& system, kernel::Process& process,
                            Handle handle, u64 offset, u64 size,
-                           ztd::Range<vaddr_t>& range, u64 granularity) {
+                           ztd::Range<vaddr_t>& range, u64 granularity,
+                           ztd::Range<vaddr_t>* backed = nullptr) {
     const auto map = system.getGpu().getMap(handle);
     if (!map)
         return NvResult::BadParameter;
@@ -272,19 +273,40 @@ NvResult resolveNvmapRange(System& system, kernel::Process& process,
     const auto begin = (*map)->addr;
     if (!kernel::ADDRESS_SPACE.contains(begin) ||
         offset > kernel::ADDRESS_SPACE.getEnd() - begin ||
-        size > kernel::ADDRESS_SPACE.getEnd() - begin - offset)
+        size > kernel::ADDRESS_SPACE.getEnd() - begin - offset) {
+        LOG_WARN(Services,
+                 "nvmap {} range outside the guest address space: addr {:#x}, "
+                 "offset {:#x}, size {:#x}",
+                 handle, begin, offset, size);
         return NvResult::InvalidAddress;
+    }
     const auto start = begin + offset;
     const auto end = start + size;
+    // Sizes are rounded up to the big page size, but only the nvmap allocation
+    // itself has guest memory behind it (the rest is alignment padding that
+    // the guest never accesses), e.g. a 0x1e9000 byte NVN pool mapped as 0x1f0000
+    const auto backed_end = std::clamp(
+        align(begin + (*map)->size, hw::tegra_x1::cpu::GUEST_PAGE_SIZE), start,
+        end);
     auto* mmu = process.getMmu();
-    for (auto cursor = start; cursor < end;) {
+    for (auto cursor = start; cursor < backed_end;) {
         const auto region = mmu->queryRegion(cursor);
         if (region.state.type == kernel::MemoryType::Free ||
             !any(region.state.perm & kernel::MemoryPermission::Read) ||
-            mmu->unmapAddr(cursor) == 0)
+            mmu->unmapAddr(cursor) == 0) {
+            LOG_WARN(Services,
+                     "nvmap {} page {:#x} not usable (range {:#x}-{:#x}): "
+                     "type {}, perm {:#x}, backing {:#x}",
+                     handle, cursor, start, end,
+                     static_cast<u32>(region.state.type),
+                     static_cast<u32>(region.state.perm),
+                     static_cast<u64>(mmu->unmapAddr(cursor)));
             return NvResult::InvalidAddress;
-        cursor = std::min(align(cursor + 1, hw::tegra_x1::cpu::GUEST_PAGE_SIZE), end);
+        }
+        cursor = std::min(align(cursor + 1, hw::tegra_x1::cpu::GUEST_PAGE_SIZE), backed_end);
     }
+    if (backed != nullptr)
+        *backed = ztd::Range<vaddr_t>(start, backed_end);
     range = ztd::Range<vaddr_t>::fromSize(start, size);
     return NvResult::Success;
 }
@@ -354,10 +376,10 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
         return NvResult::Success;
     }
 
-    ztd::Range<vaddr_t> range;
+    ztd::Range<vaddr_t> range, backed;
     const auto result = resolveNvmapRange(*system, *process, nvmap_handle,
                                          buffer_offset, mapping_size, range,
-                                         as_big_page_size);
+                                         as_big_page_size, &backed);
     if (result != NvResult::Success) {
         LOG_WARN(Services,
                  "MapBufferEx failed ({}): handle {}, offset {:#x}, size {:#x}, "
@@ -381,9 +403,14 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
 
     // A fixed mapping replaces whatever it overlaps
     dropMappingRecords(addr, addr + range.getSize());
-    inout_addr = address_space->mapBufferToAddressSpace(range, addr);
+    // The whole requested range of GPU addresses stays reserved, only the
+    // part with guest memory behind it is mapped
+    if (backed.getSize() != 0)
+        inout_addr = address_space->mapBufferToAddressSpace(backed, addr);
+    else
+        inout_addr = addr;
     buffer_mappings[*inout_addr.data] = {range.getBegin(), range.getSize()};
-    invalidateGuestRange(system, process, range.getBegin(), range.getSize());
+    invalidateGuestRange(system, process, backed.getBegin(), backed.getSize());
     return NvResult::Success;
 }
 
@@ -442,10 +469,10 @@ NvResult NvHostAsGpu::remap(IoctlContext* context, std::span<const RemapOp> entr
     for (const auto& entry : entries) {
         if (entry.num_pages == 0 || entry.mem_handle == 0)
             continue;
-        ztd::Range<vaddr_t> range;
+        ztd::Range<vaddr_t> range, backed;
         const auto result = resolveNvmapRange(context->system, *context->process,
             Handle(entry.mem_handle), u64(entry.mem_offset_in_pages) * as_big_page_size,
-            u64(entry.num_pages) * as_big_page_size, range, as_big_page_size);
+            u64(entry.num_pages) * as_big_page_size, range, as_big_page_size, &backed);
         if (result != NvResult::Success)
             return result;
     }
@@ -473,8 +500,13 @@ NvResult NvHostAsGpu::remap(IoctlContext* context, std::span<const RemapOp> entr
             }));
         const u64 offset =
             static_cast<u64>(entry.mem_offset_in_pages) * as_big_page_size;
-        gmmu.mapBufferToAddressSpace(
-            ztd::Range<vaddr_t>::fromSize(map->addr + offset, size), gpu_addr);
+        // Alignment padding past the nvmap allocation has no guest memory
+        const u64 backed_size =
+            offset >= map->size ? 0 : std::min<u64>(size, map->size - offset);
+        if (backed_size != 0)
+            gmmu.mapBufferToAddressSpace(
+                ztd::Range<vaddr_t>::fromSize(map->addr + offset, backed_size),
+                gpu_addr);
     }
 
     return NvResult::Success;
