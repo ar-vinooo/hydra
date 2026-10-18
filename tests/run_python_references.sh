@@ -13,7 +13,7 @@ mkdir -p "$NV"
 
 ninja -C "$BUILD" hydra-shader-cache-reference-tests hydra-maxwell-alu-reference-tests \
   hydra-color-target-format-tests hydra-blend-reference-tests hydra-vertex-reference-tests \
-  hydra-depth-stencil-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
+  hydra-depth-stencil-reference-tests hydra-timezone-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
 
 BIN="$BUILD/bin"; T="$ROOT/tests"; fail=0
 run() { echo "== $1"; shift; "$@" 2>&1 | grep -v "Context leak" | tail -${TAIL:-3}; [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1; }
@@ -22,6 +22,7 @@ TAIL=1 run maxwell-alu python3 "$T/maxwell_alu_reference.py" "$BIN/hydra-maxwell
 TAIL=1 run maxwell-texture python3 "$T/maxwell_texture_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
 run color-target-formats python3 "$T/color_target_format_reference.py" "$BIN/hydra-color-target-format-tests" --header "$NV/clb197.h"
 TAIL=1 run msaa-registers python3 "$T/msaa_register_audit.py" "$NV/clb197.h"
+TAIL=1 run timezone python3 "$T/timezone_reference.py" "$BIN/hydra-timezone-tests"
 TAIL=1 run blend python3 "$T/blend_reference.py" "$BIN/hydra-blend-reference-tests"
 TAIL=1 run vertex python3 "$T/vertex_reference.py" "$BIN/hydra-vertex-reference-tests"
 TAIL=1 run depth-stencil python3 "$T/depth_stencil_reference.py" "$BIN/hydra-depth-stencil-reference-tests"
