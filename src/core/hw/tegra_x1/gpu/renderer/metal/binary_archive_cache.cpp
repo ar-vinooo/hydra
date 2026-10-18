@@ -88,12 +88,17 @@ std::string pipelineKey(MTL::RenderPipelineDescriptor* descriptor,
 std::filesystem::path BinaryArchiveCache::defaultPath(MTL::Device* device) {
     // Source/options and pipeline state identify entries; GPU and OS/driver
     // identify the directory. Metal validates the actual binary on every hit.
+    // The GPU is identified by its name: the registry ID changes between
+    // sessions, which threw the whole cache away and recompiled every shader
+    // of the game on each launch.
     const auto* version = NS::ProcessInfo::processInfo()
                               ->operatingSystemVersionString()
                               ->utf8String();
+    const auto* gpu_name = device->name()->utf8String();
     return std::filesystem::path(CONFIG_INSTANCE.getAppDataPath()) / "cache" /
            "metal" /
-           fmt::format("v2-{:016x}-{}", device->registryID(),
+           fmt::format("v3-{}-{}",
+                       hexDigest(gpu_name, std::strlen(gpu_name)).substr(0, 16),
                        hexDigest(version, std::strlen(version)));
 }
 
