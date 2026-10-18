@@ -460,6 +460,25 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
 
     main_process->start();
 
+    // DEBUG: HYDRA_THREAD_DUMP=<file> dumps the guest threads when the file
+    // appears, also before the first frame (progressFrame would never run)
+    if (const char* trigger = std::getenv("HYDRA_THREAD_DUMP")) {
+        std::thread([this, path = std::string(trigger)] {
+            std::error_code ec;
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if (!std::filesystem::exists(path, ec))
+                    continue;
+                std::filesystem::remove(path, ec);
+                if (main_process == nullptr)
+                    LOG_INFO(Other, "THREADDUMP requested but no process exists");
+                else
+                    main_process->debugDumpThreads();
+                std::fflush(nullptr);
+            }
+        }).detach();
+    }
+
     // Activate GDB server
     if (CONFIG_INSTANCE.getGdbEnabled()) {
         if (CONFIG_INSTANCE.getGdbWaitForClient())
