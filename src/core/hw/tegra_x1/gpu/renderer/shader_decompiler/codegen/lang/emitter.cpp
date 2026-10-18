@@ -80,6 +80,9 @@ void LangEmitter::emitMainFunctionPrologue() {
         writeStatement("for (uint zi = 0; zi < 8; zi++) state.p[zi] = false");
     }
 
+    // Backend input conversions must precede the copy into guest attributes.
+    emitStateBindingAssignments();
+
     // Inputs
     // TODO: these are provided in the shader header, no need for analysis
 
@@ -192,8 +195,6 @@ void LangEmitter::emitMainFunctionPrologue() {
     for (auto index : memory_analyzer.getConstBuffers())
         writeStatement("state.c{} = c{}", index, index);
     writeNewline();
-
-    emitStateBindingAssignments();
 }
 
 void LangEmitter::emitFunction(const ir::Function& func) {

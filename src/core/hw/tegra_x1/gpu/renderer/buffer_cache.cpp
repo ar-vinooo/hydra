@@ -48,6 +48,19 @@ std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
 
 BufferCache::~BufferCache() = default;
 
+BufferView BufferCache::snapshot(ztd::Range<uptr> range) {
+    if (range.getSize() == 0)
+        return {};
+    auto* buffer = renderer.createCpuBufferSnapshot(range);
+    if (buffer == nullptr) {
+        buffer = renderer.allocateTemporaryBuffer(range.getSize());
+        if (buffer == nullptr)
+            return {};
+        buffer->copyFrom(range.getBegin());
+    }
+    return BufferView(ownSnapshot(buffer), 0, range.getSize());
+}
+
 void BufferCache::markGpuModified(ztd::Range<uptr> range) {
     uptr begin = range.getBegin();
     uptr end = range.getEnd();

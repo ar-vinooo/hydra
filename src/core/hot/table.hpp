@@ -40,11 +40,16 @@ const Table& getTable();
 // A draw/dispatch (and every nested hot call) stays on one immutable image.
 // Old images remain loaded for in-flight CPU calls and Metal callbacks.
 // The thread-local is reached once per scope: on macOS every access is a
-// _tlv_get_addr call, and hot functions run for every draw
+// _tlv_get_addr call, and hot functions run for every draw. With
+// HYDRA_HOT_RELOAD=0 there is only one image, so scopes skip the thread-local
+// entirely (slot is null).
 class Scope {
   public:
     Scope();
-    ~Scope() { *slot = previous; }
+    ~Scope() {
+        if (slot != nullptr)
+            *slot = previous;
+    }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 

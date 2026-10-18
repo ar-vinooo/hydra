@@ -56,6 +56,7 @@ CommandBuffer::~CommandBuffer() {
     // GPU faults and timeouts are otherwise silent. This runs on a Metal
     // dispatch thread the logger does not know about, so print directly.
     command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
+        completed_buffers.fetch_add(1, std::memory_order_acq_rel);
         if (cb->status() != MTL::CommandBufferStatusError)
             return;
         const auto error = cb->error();
@@ -64,6 +65,7 @@ CommandBuffer::~CommandBuffer() {
                      error ? error->localizedDescription()->utf8String()
                            : "unknown error");
     });
+    submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
     command_buffer->commit();
     // Command buffers execute in commit order on the same queue, so there is no
     // need to wait for the GPU. HYDRA_GPU_SYNC=1 restores the old behaviour
@@ -116,6 +118,7 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Render;
+    has_commands = true;
     ++render_encoders;
     encoder_state.render_pass = render_pass_descriptor;
     encoder_state.render = {};
@@ -134,6 +137,7 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Blit;
+    has_commands = true;
     ++blit_encoders;
 
     return getBlitCommandEncoderUnchecked();
@@ -151,6 +155,7 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Compute;
+    has_commands = true;
 
     return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
 }
@@ -160,8 +165,21 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     const auto start = profile ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
     endEncoding();
+    // Nothing encoded since the last checkpoint and no earlier submission in
+    // flight: there is nothing to commit or wait for
+    if (!has_commands && retired_upload_buffers.empty() &&
+        submitted_buffers.load(std::memory_order_acquire) ==
+            completed_buffers.load(std::memory_order_acquire)) {
+        last_submission_succeeded = true;
+        if (profile)
+            PerfStats::instance().checkpoint_skips++;
+        return 0.0;
+    }
+    submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
+    completed_buffers.fetch_add(1, std::memory_order_acq_rel);
+    has_commands = false;
     last_submission_succeeded =
         command_buffer->status() == MTL::CommandBufferStatusCompleted;
     if (!last_submission_succeeded) {

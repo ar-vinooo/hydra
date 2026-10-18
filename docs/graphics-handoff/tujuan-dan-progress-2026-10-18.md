@@ -490,7 +490,7 @@ mismatch (terbatas 16) dan file save yang belum ada. Perf saat race 28-42 FPS
 ~60 FPS; belum dibandingkan dengan build lama. Ini bukti satu game, bukan
 penutupan tahap A. Berikutnya: warning texture mismatch (cube vs 2D) dan
 pengukuran FPS terhadap build pembanding; tes nvmap lebih kecil dari big page
-masih perlu ditambahkan.
+sudah ditambahkan ke `--check-gpu-as-lifecycle` (terbukti gagal jika batas ketat lama dikembalikan).
 
 ## Pembersihan log W/E (CTR)
 
@@ -547,3 +547,349 @@ Catatan alat: `LOG_DEBUG` dibuang di build release (jangan andalkan log debug);
 laporan mismatch tekstur kini INFO (maks 32). Screenshot jendela:
 `screencapture -l <windowID>` (ID via CoreGraphics), trace manual lewat file
 `<HYDRA_TRACE_DIR>/trigger`.
+
+## Performa: bottleneck encode PFIFO di CTR (18 Oktober 2026)
+
+**Bukti (sampling `sample <pid> 8` pada thread PFIFO, di race, 700-1100 draw/frame):**
+thread PFIFO sibuk ~99%; game CPU-bound pada satu thread. Metal GPU hanya 11-13
+ms/frame, sedangkan encode CPU 19-21 ms/frame (60 FPS butuh <=16,6). Encode hampir
+tidak bergantung jumlah draw (61 draw masih ~20 ms) sehingga biaya tetap per frame
+(checkpoint tunggu-GPU, encoder) ikut besar. Komposisi (inklusif, % thread):
+
+| Bagian | Sebelum | Sesudah |
+|---|---|---|
+| Alokasi MTLBuffer occlusion (`prepareOcclusionQuery`, panggilan kernel) | ~8% | pool (hilang dari profil) |
+| `setReportSemaphore` menunggu GPU | ~8% | ~6% |
+| `incrementSyncPoint` menunggu GPU | ~4% | <3% |
+| `getShader` (2x per draw; hash+find ganda, baca TSC tiap texture) | ~10% | ~10% |
+| Pembuatan render encoder (~67/frame) | ~4% | ~4% |
+| `bindDrawState` (setBuffer/setTexture AGX) | ~15% | ~15% |
+
+**Diperbaiki:** (1) halaman buffer occlusion dipakai ulang lewat pool (didaur ulang
+hanya setelah checkpoint menunggu GPU); (2) `debugCommitAndWait` melewati
+checkpoint bila command buffer belum berisi apa pun dan tidak ada submit lain yang
+masih berjalan (penghitung commit/completion). Terukur: ~4,5 checkpoint/frame
+dilewati, command buffer per frame 10,2 -> 5,7, FPS race ~46-55 -> ~50-52, encode
+~20-21 -> ~19-20 ms. Perbandingan antar sesi tidak apple-to-apple (scene berbeda).
+Statistik baru: baris `CHECKPOINTS skipped` pada `HYDRA_PERF_STATS=1`.
+
+**Belum (opsi, perkiraan dampak dan risiko):**
+- Report/syncpoint asinkron (tulis di completion handler dengan antrean berurutan):
+  ~6-8%; risiko tinggi (ordering, epoch occlusion, render kondisional membaca hasil).
+- Memoisasi `getShader`/`getPipeline`: ~8-10%; risiko sedang-tinggi karena shader
+  bergantung pada konstanta (branch_constants), sampler, dan isi kode guest.
+- Mengurangi jumlah render encoder (gabung pass) atau encode multi-thread: dampak
+  besar, desain besar.
+Setelah semua itu pun 60 FPS konsisten di scene terberat belum terjamin.
+
+## Audit keluar tahap A dan penutupan item kecil (18 Oktober 2026)
+
+**Tekstur 2D di slot cube (ditutup, dengan bukti dari shader).** Shader lighting
+`0x7ef0030` (3.425 baris MSL hasil dump) memilih satu cabang lewat jump table
+(`BRX`; nilai dibaca dari constant buffer c1) dan tiap cabang men-sample satu
+cube probe refleksi: tex22/34/38/40. Binding 0x26 (host slot 11, tex38) hanya
+dipakai di blok `label0x17b` (lookup environment map dengan level = 6 - 6*roughness).
+Slot yang tidak dipilih menyimpan deskriptor lama (di sini RT 2D 640x360) dan
+tidak pernah di-sample di hardware, sehingga tidak membawa dampak; tidak
+mem-bind tekstur bertipe tidak cocok (perubahan sesi ini) aman. Batas: belum
+diverifikasi bahwa cabang itu tidak terpilih pada piksel mana pun; jika terpilih
+dengan deskriptor salah, hasilnya hitam (sebelumnya sampah) dan itu cacat data game.
+
+**SharedMemory yang dilepas saat masih ter-map (tidak diubah, dianalisis).**
+`SharedMemory::~SharedMemory` membebaskan memori host saat refcount handle nol,
+walau page table guest (atau mapping GPU) masih menunjuk ke sana; Horizon asli
+menahan memori sampai di-unmap. Memperbaikinya butuh penghitungan map/unmap per
+rentang (UnmapSharedMemory menerima alamat/ukuran sembarang, bisa parsial) dan
+pelepasan saat proses mati; perubahan refcount kernel itu rapuh dan dampaknya
+nyata hanya bila guest menutup handle sebelum unmap (libnx `shmemClose` unmap
+dulu). Dicatat sebagai risiko yang diketahui, bukan bug yang teramati.
+
+**Status tahap A per gate:**
+
+| Gate | Status |
+|---|---|
+| Input GPFIFO, decode PFIFO, isolasi channel, scheduling, semaphore/syncpoint, fault, lifetime proses | Diimplementasi dan diuji |
+| AS_GPU: binding, reservasi/free/unmap, ownership nvmap, batas heap, pinning heap | Diimplementasi dan diuji |
+| Subdevice mask, conditional fetch, reduction (kecuali INC/DEC), report terbelah, daur ulang syncpoint | Diimplementasi dan diuji |
+| INC/DEC reduction, END_SUBDEVICE_MASK, skip_buffer_refcounting, kode error Switch, getVaRegions/Modify | **Diblokir: tidak ada sumber primer** |
+| DeviceShared, FROM_ID per-klien, SharedMemory lifetime, recovery channel | Ditunda dengan alasan (tanpa gejala teramati) |
+| Validasi hardware/trace dan gameplay luas | Belum ada |
+
+Tahap A tidak ditandai tertutup. Item yang tersisa tidak dapat diselesaikan dengan
+bukti yang tersedia atau tidak punya gejala; keputusan memindahkan fokus ke tahap
+B-D (mulai dari glow ban putih) menunggu persetujuan pengguna sesuai aturan
+"jangan pindah tahap sebelum tahap sebelumnya tuntas".
+
+## Tahap B/C: audit blend terhadap header NVIDIA (18 Oktober 2026)
+
+Acuan primer: [NVIDIA clb197.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197.h)
+(`SET_BLEND_COLOR_OP/SOURCE_COEFF/DEST_COEFF`, `SET_BLEND_ALPHA_*`,
+`SET_BLEND_SEPARATE_FOR_ALPHA`, `SET_BLEND_PER_TARGET_*`).
+
+- **Cocok persis:** nilai operasi (OGL 0x8006-0x800B, D3D 1-5) dan faktor (OGL
+  0x4000/0x4001/0x4300-0x4308/0xC001-0xC004/0xC900-0xC903; D3D 1-0x13) dengan
+  `getBlendOperation`/`getBlendFactor`. Offset struktur global (0x133c-0x1358)
+  dan per target (0x1e00 + j*32) cocok dengan `Regs3D`.
+- **Cacat ditemukan dan diperbaiki:** `SET_BLEND_SEPARATE_FOR_ALPHA` (global dan per
+  target) tidak pernah dibaca; persamaan alpha selalu memakai register alpha
+  walau flag nol. Kini `getBlendEquation` memakai persamaan warna untuk alpha bila
+  bit 0 nol (juga untuk deteksi dual-source). Header hanya menamai field; semantik
+  "alpha mengikuti warna" mengikuti nama register dan perilaku glBlendFunc
+  versus glBlendFuncSeparate, bukan penjelasan eksplisit NVIDIA. Field per target
+  yang bernama `unknown` diganti `separate_for_alpha`; trace blend memuat `sep=`.
+- Tes `testBlendSeparateForAlpha` (gpu-engine): flag nol, satu, bit lain, dan
+  per target. gpu-engine, texture-cache, raster-state, full shutdown lulus.
+  Dampak visual belum diuji pengguna; draw blend CTR yang terlihat di trace
+  (`rgb 0x1(0x2,0x6) a 0x1(0x2,0x6)`) sudah sama sehingga tidak berubah, tetapi
+  draw dengan alpha berbeda (mis. `a 0x3(0x2,0x2)`) bisa berubah jika flag-nya nol.
+
+## Tahap B: audit tata letak register, deskriptor, dan enum terhadap header NVIDIA
+
+Acuan primer (disalin ke scratchpad sesi, bukan fixture):
+[clb197.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197.h) dan
+[clb197tex.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197tex.h).
+Tiga tes baru di `hydra-gpu-engine-tests` memeriksa kecocokan secara otomatis; satu
+mutasi (menggeser `address_v` satu bit) terbukti membuat tes gagal.
+
+| Area | Hasil |
+|---|---|
+| `Regs3D` (`testRegisterLayout`) | 61 register dan 10 stride array cocok dengan offset method header (viewport, scissor, depth/stencil target, atribut vertex, blend, index buffer, report, vertex stream, shader program, constant buffer, bindless) |
+| TIC block-linear (`testTextureDescriptorLayout`) | 53 field cocok dengan `TEXHEAD_BL_*` pada seluruh 256 bit; tiap field diuji sendiri dan tidak boleh menumpang field lain |
+| TSC | 26 field cocok dengan `TEXSAMP0-7` |
+| Atribut vertex dan render target (`testVertexAttributeAndRenderTargetLayout`) | `SET_VERTEX_ATTRIBUTE_A` (stream, source, offset 14 bit, lebar komponen 6 bit, tipe numerik, swap R/B), nilai enum ukuran dan tipe; blok `SET_COLOR_TARGET_*` (offset dan field `MEMORY`) cocok |
+| Enum nilai | `ImageFormat` (semua 77 nilai `COMPONENTS`), tipe komponen dan sumber swizzle TIC, `PrimitiveType` (0-0xE), `TextureType` (0-8), versi header TIC (0-4), jenis filter/mip/anisotropi/alamat sampler, depth compare (D3D 1-8 dan OGL 0x200-0x207), faktor dan operasi blend: cocok |
+| Format | `DepthSurfaceFormat`: seluruh 11 format header ada. `ColorSurfaceFormat`: 8 format header belum ada di enum (0x40-0x47: A16, AF16, AF32, A8R8, R16_A16, RF16_AF16, RF32_AF32, B8G8R8A8); sudah tercatat tidak didukung (draw ke target itu dilewati, bukan abort) |
+
+Satu-satunya cacat perilaku yang ditemukan pada audit ini adalah flag
+`SEPARATE_FOR_ALPHA` (diperbaiki, bagian sebelumnya). Batas: ini audit layout
+dan nilai, bukan bukti bahwa tiap field dipakai dengan semantik yang benar di
+seluruh engine. Belum diaudit: semantik stencil/depth state, nilai format TIC
+penuh (`COMPONENTS` + tipe data) terhadap tabel format Hydra, operasi draw/
+dispatch, DMA/2D/inline. Gameplay belum diuji pengguna.
+
+## Tahap B: penuntasan audit engine dan resource (18 Oktober 2026)
+
+Acuan primer tambahan (NVIDIA open-gpu-doc, disalin ke scratchpad sesi):
+[clb1c0qmd.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/compute/clb1c0qmd.h),
+[clb1c0.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/compute/clb1c0.h),
+[clb0b5.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/dma-copy/clb0b5.h),
+[cl902d.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/twod/cl902d.h),
+[cla140.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/inline-to-memory/cla140.h).
+
+| Area | Hasil | Bukti |
+|---|---|---|
+| Tabel method engine 3D (21 entri: draw, clear, report, MME, constant buffer, bind group, inline index, increment syncpoint) | Nama dan offset cocok dengan header | skrip audit |
+| Indeks register mentah `regs_raw[...]` di `3d.cpp` (stencil depan/belakang, depth bias, clip control, alpha test, user clip, point, render enable, report) | Semua cocok dengan nama register header | skrip audit |
+| Stencil/cull/depth bias | Nilai enum (OGL stencil op/func, 0x404/0x405/0x408, 0x900/0x901) dan offset cocok | skrip audit |
+| `BIND_GROUP_CONSTANT_BUFFER` | VALID bit 0, SHADER_SLOT 8:4, stride 8 word per grup cocok | pembacaan kode + header |
+| QMD compute (V01_07) | 26 field cocok. Dua pelebaran mask mengikuti header: grid width 32 bit (sebelumnya 31) dan `SHADER_LOCAL_MEMORY_LOW_SIZE` 24 bit (sebelumnya 20; accessor tidak dipakai) | `testComputeQmdLayout` |
+| Register compute (SEND_PCAS_A, pool TSC/TIC, program region, bindless) | Cocok | `testComputeQmdLayout` |
+| DMA copy (register, `SET_REMAP_COMPONENTS`, block size, origin; bit `LAUNCH_DMA` diperiksa manual karena struct privat) | Cocok | `testCopyEngineLayout` |
+| 2D (`cl902d.h`: dst/src, clip, color key, ROP, operasi, `PIXELS_FROM_MEMORY`, sample mode) | Cocok | `testTwoDEngineLayout` |
+| Inline-to-memory (`cla140.h`) | Cocok | `testInlineEngineLayout` |
+
+Ditambah tiga audit sebelumnya (layout `Regs3D`, TIC/TSC, atribut vertex/render
+target, format, blend) total tujuh tes layout di `hydra-gpu-engine-tests`.
+
+**Satu-satunya cacat perilaku tahap B:** `SEPARATE_FOR_ALPHA` (sudah diperbaiki).
+
+**Batas yang sengaja dicatat, bukan klaim selesai:**
+- Layout dan nilai enum terbukti; semantik tiap field di seluruh engine hanya
+  diuji sejauh suite yang ada (draw, clear, occlusion, DMA, 2D, texture cache,
+  index, primitive restart, storage coherence) dan gameplay CTR.
+- Pada checkpoint audit ini, constant buffer masih menyimpan pointer host saat
+  bind. Celah remap tanpa bind ulang kemudian diperbaiki; lihat checkpoint
+  "Constant buffer mengikuti mapping GPU" serta koreksi regresi buffer
+  terpisah pada checkpoint berikutnya di akhir dokumen.
+- Invalidasi shader cache oleh `INVALIDATE_SHADER_CACHES` dan oleh penulisan CPU ke
+  kode shader belum ada (kunci cache hanya mencuplik 9 byte kode); ini masuk
+  tahap C (shader dan pipeline).
+- Delapan format render target header (0x40-0x47) belum didukung.
+- `SET_FALCON04` (firmwareCall4) dan `WAIT_FOR_IDLE` kelas 3D hanya disimpan
+  sebagai register; belum ada bukti ia diperlukan.
+
+Tahap B dinyatakan **tuntas sejauh audit sumber primer yang tersedia**; bukan
+bukti kebenaran semantik penuh atau kompatibilitas gameplay.
+
+## Tes referensi blend dan format HDR (18 Oktober 2026)
+
+Dibuat untuk menguji hipotesis bug putih (glow ban, baji cahaya air terjun):
+target HDR terpotong ke 1.0 atau blend additive salah.
+
+- `tests/blend_reference.py` menghitung hasil yang benar di Python murni:
+  persamaan blend (add/sub/rsub/min/max, enam faktor), float16 IEEE, clamp
+  unorm8, dan float tanpa tanda R11G11B10 (alpha dibaca 1).
+- `tests/blend_reference_tests.cpp` (target `hydra-blend-reference-tests`)
+  menggambar kasus yang sama lewat tabel format Maxwell ke Metal milik Hydra
+  (`toMtlPixelFormat`) dan menulis byte mentah target. Python mendekode dan
+  membandingkan.
+- Jalankan: `python3 tests/blend_reference.py <path hydra-blend-reference-tests>`.
+
+Hasil: **2160/2160 kasus cocok** (RGBA16Float, RG11B10Float, RGBA8Unorm; source
+di atas 1.0 dan HDR; dengan `MTL_DEBUG_LAYER=1`). Nilai uji sengaja dijauhkan
+dari titik bulat x.5/255 karena pembulatan tie berbeda 1 LSB antara Python dan
+Metal.
+
+Audit tambahan: seluruh konstanta op/faktor blend di `3d.cpp` (OGL dan D3D,
+termasuk constant color 0xC001-0xC004 dan SRC1 0xC900-0xC903) cocok dengan
+`clb197.h`.
+
+**Yang dibuktikan:** format target dan blend dasar tidak memotong atau salah
+menghitung HDR. **Yang tidak dibuktikan:** konversi enum lewat `getBlendFactor`
+(fungsi privat, hanya diaudit teks), format lain (`RGBX16Float` dipetakan ke
+RGBA16Float sebagai HACK: alpha tidak dibaca 1 seperti hardware), dan jalur
+shader Maxwell ke MSL. Bug putih kini mengarah ke shader atau state spesifik
+game; langkah berikutnya butuh capture satu frame.
+
+## Constant buffer mengikuti mapping GPU (lanjutan 18 Oktober 2026)
+
+Celah lifetime dari audit tahap B ditangani: `ThreeD::bindGroup` kini menyimpan
+alamat GPU dan ukuran, bukan pointer host hasil lookup saat bind. Semua konsumen
+binding 3D memakai `getConstBuffer`: upload uniform, descriptor storage,
+texture handle, constant-buffer branch table shader, trace, dan visual capture.
+Resolver memakai lookup GMMU yang sudah memiliki invalidasi generasi; tidak
+mengalokasikan atau menyalin payload pada jalur ini.
+
+Acuan layout tetap [NVIDIA clb197.h](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197.h):
+`SET_CONSTANT_BUFFER_SELECTOR_A/B/C` (0x2380/84/88), ukuran 16:0, alamat
+upper 7:0 dan lower 31:0; `BIND_GROUP_CONSTANT_BUFFER(j)` (0x2410 + j*32),
+VALID bit 0 dan SHADER_SLOT 8:4. Header membuktikan field register; kebijakan
+mengembalikan range kosong pada backing yang tidak dapat diakses adalah
+perlindungan host Hydra, bukan klaim kode fault hardware terverifikasi.
+
+`testConstBufferRemapping` di `hydra-gpu-engine-tests` memeriksa remap dan
+unmap tanpa bind ulang, heap rebase, pergantian address space, isolasi stage/slot,
+disable, ukuran nol, mapping parsial, serta rentang lintas mapping dengan
+backing host contiguous. Data upload uniform sesudah remap diperiksa berbeda
+dari snapshot sebelumnya; snapshot sebelumnya tetap utuh. Mutasi yang
+mengembalikan penyimpanan pointer host saat bind membuat tes gagal pada
+pemeriksaan mapping sesudah remap (exit 1), lalu perbaikan dipulihkan.
+
+Validasi dengan `-j 6` dan `MTL_DEBUG_LAYER=1`: build aplikasi dan target tes,
+suite GPU engine, shader-library, texture-cache, tes integrasi
+`--check-gpu-heap-resize`, serta full shutdown lulus. Build tetap mengeluarkan
+warning linker dependency Homebrew yang ditargetkan ke macOS lebih baru;
+tidak ada error build. Aplikasi hasil build: `build/swiftui-release/bin/Hydra.app`.
+
+**Batas:** backing host yang tidak contiguous belum bisa di-upload sebagai satu
+uniform buffer; resolver menolaknya dengan warning eksplisit, bukan membaca
+melewati mapping pertama. Dukungan scatter/gather penuh tetap OPEN. Lookup saat
+konsumsi juga bukan jaminan pinning/locking untuk seluruh durasi draw ketika
+mapping diubah secara bersamaan. Jalur compute mengambil binding dari QMD per
+dispatch dan tidak diubah pada pekerjaan ini. Tidak ada gameplay yang dijalankan;
+hubungan dengan glow putih belum terbukti. Invalidasi shader cache dan capture
+frame glow masih merupakan pekerjaan terbuka berikutnya.
+
+## Referensi Python: atribut vertex dan VS→FS (lanjutan 18 Oktober 2026)
+
+Mengikuti saran pengguna, ditambahkan oracle Python independen untuk decoding
+nilai atribut, normalisasi, komponen default, dan pertukaran R/B. Harness C++
+memakai generator MSL dari IR serta pipeline Metal Hydra, lalu mengembalikan
+byte piksel RGBA32Float ke Python. Encoding diperiksa terhadap 26 field/nilai
+header NVIDIA `clb197.h`; persamaan normalisasi memakai referensi OpenGL,
+hasil host diperiksa lewat Metal validation. Batas bukti ini dibedakan dari
+hardware trace GM20B.
+
+Ditemukan bug engine umum: hook backend menukar `__in` sesudah input disalin ke
+register atribut guest. Swap lewat shader tidak berpengaruh; hanya swap native
+Metal untuk UNORM8x4 yang bekerja. Hook sekarang dipanggil sebelum penyalinan.
+Hasil sebelum: **1104/1601 cocok (497 mismatch)**; sesudah: **1601/1601 cocok**.
+Suite shader-library dan GPU engine dengan Metal validation serta build aplikasi
+lulus. Tes dimulai dari IR; decoding instruksi Maxwell belum dibuktikan oleh tes
+ini. Tidak ada gameplay yang dijalankan.
+
+Warna trace CTR `(93, 0, 255, 0)`, UNORM8x4 tanpa swap, menghasilkan
+`(0.3647058904, 0, 1, 0)` sebelum dan sesudah perbaikan. Jadi warna tersebut
+tidak hilang pada konversi atribut/varying yang diuji; belum membuktikan penyebab
+glow putih atau keseluruhan shader partikel game.
+
+Perintah reproduksi, cakupan format, sumber primer, dan batasan tersedia di
+[README vertex reference](../../tests/README-vertex-reference.md).
+
+
+## Regresi scene 3D hitam: constant buffer lintas mapping (18 Oktober 2026)
+
+Pengguna menjalankan build terbaru dan melaporkan HUD CTR tampil, tetapi scene
+3D hitam. Log `Hydra_2026-10-18_15-37-17.714817.log` menunjukkan penolakan
+`Noncontiguous constant buffer at GPU 0x861600 is unsupported` pada detik 1,072,
+kemudian 637.661 warning uniform tidak ter-bind selama sesi tersebut.
+Penolakan itu berasal dari perubahan resolver pada sesi ini. Tes sebelumnya
+justru mengharapkan penolakan buffer terpisah, sehingga belum cukup menjaga
+kompatibilitas; batas yang dicatat ternyata digunakan oleh game.
+
+Koreksi:
+- Binding tetap menyimpan alamat GPU agar remap/rebase terlihat tanpa bind ulang.
+- Backing contiguous memakai jalur cache yang ada. Backing terpisah dibaca dalam
+  urutan alamat GPU ke scratch milik binding; seluruh rentang diperiksa, mapping
+  berlubang tetap tidak dibaca. Ukuran binding memakai field SIZE 16:0 NVIDIA.
+- Upload scratch memakai snapshot immutable, bukan cache berdasarkan alamat
+  scratch (yang tidak memiliki guest write tracking). Snapshot hanya dipakai
+  ulang bila seluruh byte masih sama; upload lama tetap hidup untuk draw yang
+  telah di-encode. Pool snapshot menunggu completion GPU sebelum reuse.
+- Konsumen CPU (konstanta branch, texture handle, descriptor storage, trace)
+  memakai hasil gather yang sama. Tidak ada konversi isi atau aturan per game.
+
+`testConstBufferRemapping` kini mengharuskan dukungan backing terpisah, bukan
+penolakan. Tes memeriksa urutan kedua potongan, reuse byte-identik, perubahan CPU,
+snapshot lama yang tidak berubah, lubang mapping, remap/rebase, dan mask ukuran.
+Kernel Metal sungguhan membaca kedua snapshot melalui binding `constant uint*`
+ke output host dan hasil seluruh word diperiksa. Buffer terpisah kini didukung
+pada jalur ini; catatan unsupported di checkpoint sebelumnya bersifat historis.
+
+Build aplikasi dan suite GPU engine, shader-library, full shutdown, tes heap
+resize, serta **1601/1601 kasus Python vertex** lulus dengan Metal validation.
+Tidak ada gameplay yang dijalankan oleh agen. **Pemulihan scene 3D masih perlu
+verifikasi pengguna**, walaupun jalur penolakan yang terlihat di log telah
+diganti dengan gather + upload yang diuji. Efek performa gather pada gameplay
+belum diukur; pinning terhadap perubahan mapping bersamaan masih batas terpisah.
+
+## Verifikasi pengguna: 3D pulih; efek putih dekat air terjun masih OPEN
+
+Setelah koreksi buffer terpisah, pengguna mengirim dua screenshot CTR dengan
+scene 3D kembali tampil. Ini menggantikan status pemulihan yang sebelumnya
+menunggu verifikasi. Log terbaru `Hydra_2026-10-18_15-43-58.464195.log` memuat
+4.873 baris tanpa W/E/F. Ketiadaan warning tidak membuktikan hasil visual benar.
+
+Pengguna menduga refleksi air: screenshot menunjukkan highlight putih kuat dekat
+air terjun serta lapisan kabut/cahaya di jalan dan sebagian kart. Belum diketahui
+apakah kedua gambar sama-sama Hydra atau salah satunya referensi hardware asli.
+Dari screenshot belum dapat ditentukan apakah sumbernya reflection/environment
+sampling, bloom, atau partikel transparan/depth fade. Tidak ada perubahan shader
+atau brightness berdasarkan dugaan ini. Capture draw scene tersebut belum ada;
+proses Hydra sudah tidak berjalan saat pemeriksaan log. Pengguna tetap menjalankan
+game dan mengatur kameranya sendiri.
+
+## Audit Python 3D: depth/stencil numerik (18 Oktober 2026)
+
+Pengguna meminta perhitungan Python lanjutan untuk mencari bug 3D. Ditambahkan
+`depth_stencil_reference.py` dan harness Metal melalui renderer Hydra. Python
+menghitung dua fragment berurutan; hasil RGBA, D32Float dan stencil 8-bit GPU
+harus cocok persis. Shader tes memakai MSL sederhana agar persamaan fixed-function
+terisolasi. Pipeline, binding uniform, dynamic reference, state cache, render pass
+serta pergantian encoder tetap memakai kode produksi Hydra.
+
+Hasil baru: **6656/6656** kasus cocok: depth 896, operasi stencil 2880,
+perbandingan/mask stencil 2880. Delapan fungsi compare dan delapan operasi
+stencil diuji dengan encoding OGL/D3D, fungsi enable/write depth, batas saturasi/
+wrap, mask, perubahan reference dan render→blit→render. 32 enum dicocokkan langsung
+dengan header NVIDIA; persamaan referensi memakai OpenGL 4.6 §17.3.3–17.3.4.
+Tidak ada reference stencil di atas 255 pada kasus final; semantik register untuk
+nilai tersebut tidak disimpulkan dari aturan clamp pada API GL.
+
+Decoder operasi stencil diekstrak tanpa perubahan dari lambda `drawInternal`
+menjadi helper `decodeStencilOp` agar harness memakai decoder produksi yang sama.
+Mutasi sengaja increment-wrap menjadi increment-clamp menghasilkan **180 mismatch**
+(6476/6656 cocok, exit 1). Decoder benar kemudian dipulihkan dan suite penuh
+kembali 6656/6656. Tidak ditemukan bug perilaku depth/stencil baru dalam subset ini.
+
+Build aplikasi dan target tes lulus (`-j 6`). GPU engine dan raster-state lulus
+dengan Metal validation; oracle Python vertex **1601/1601** dan blend/HDR
+**2160/2160** juga dijalankan kembali dan lulus. Tidak ada gameplay yang dijalankan
+oleh agen, tidak ada commit/stage.
+
+Batas: D32Float+S8 satu sample, stencil front/back sama, depth in-range. Pemilihan
+register 3D, decoding/arithmetic shader Maxwell, depth D16/D24, depth bias/clipping,
+MSAA, explicit fragment depth, sampling depth/reflection serta bloom belum dibuktikan
+oleh tes baru. Efek putih dekat air terjun masih OPEN; hasil ini bukan sertifikasi
+seluruh 3D. Petunjuk reproduksi dan sumber primer ada di
+[README depth/stencil reference](../../tests/README-depth-stencil-reference.md).

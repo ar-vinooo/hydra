@@ -43,14 +43,16 @@ struct RegsCompute {
 };
 static_assert(sizeof(RegsCompute) == 0x983 * sizeof(u32));
 
-// Compute queue meta data (QMD), the launch descriptor in GPU memory
+// Compute queue meta data (QMD), the launch descriptor in GPU memory. Field
+// positions follow NVIDIA's clb1c0qmd.h (QMDV01_07), checked by
+// testComputeQmdLayout
 struct ComputeQmd {
     u32 words[0x40];
 
     static std::optional<ComputeQmd> read(GMmu& gmmu, uptr address);
 
     u32 programStart() const { return words[0x8]; }
-    u32 gridDimX() const { return words[0xc] & 0x7fffffff; }
+    u32 gridDimX() const { return words[0xc]; }
     u32 gridDimY() const { return words[0xd] & 0xffff; }
     u32 gridDimZ() const { return words[0xd] >> 16; }
     u32 sharedAlloc() const { return words[0x11] & 0x3ffff; }
@@ -65,7 +67,7 @@ struct ComputeQmd {
     u32 constBufferSize(u32 index) const {
         return (words[0x1e + index * 2] >> 15) & 0x1ffff;
     }
-    u32 localPosAlloc() const { return words[0x2d] & 0xfffff; }
+    u32 localPosAlloc() const { return words[0x2d] & 0xffffff; }
 };
 
 constexpr u32 COMPUTE_CONST_BUFFER_COUNT = 8;

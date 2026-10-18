@@ -1077,9 +1077,26 @@ bool Renderer::synchronize(ICommandBuffer* command_buffer) {
     return commands->lastSubmissionSucceeded();
 }
 
+void Renderer::recycleOcclusionPages(std::vector<OcclusionPage>& pages) {
+    for (auto& page : pages) {
+        if (free_occlusion_pages.size() >= MAX_POOLED_OCCLUSION_PAGES)
+            break;
+        // The GPU only wrote the entries that were handed out
+        std::memset(page.buffer->contents(), 0, page.count * sizeof(u64));
+        free_occlusion_pages.push_back(std::move(page.buffer));
+    }
+    pages.clear();
+}
+
 void Renderer::resetOcclusionCounter() {
     occlusion_count = 0;
     occlusion_valid = true;
+    // The pages may still be used by submitted work: retire, do not reuse yet
+    for (auto& page : occlusion_pages) {
+        if (retired_occlusion_pages.size() >= MAX_POOLED_OCCLUSION_PAGES)
+            break;
+        retired_occlusion_pages.push_back(std::move(page));
+    }
     occlusion_pages.clear();
 }
 
@@ -1095,7 +1112,10 @@ std::optional<u64> Renderer::getOcclusionCounter(ICommandBuffer* command_buffer)
         for (u32 i = 0; i < page.count; i++)
             occlusion_count += counts[i];
     }
-    occlusion_pages.clear();
+    // The checkpoint waited for everything this thread submitted, including
+    // the pages of earlier resets
+    recycleOcclusionPages(occlusion_pages);
+    recycleOcclusionPages(retired_occlusion_pages);
     return occlusion_count;
 }
 
@@ -1110,14 +1130,19 @@ std::optional<u64> Renderer::prepareOcclusionQuery(CommandBuffer* command_buffer
         if (occlusion_pages.size() >= MAX_OCCLUSION_PAGES &&
             !getOcclusionCounter(command_buffer))
             return std::nullopt;
-        auto* buffer = device->newBuffer(OCCLUSION_PAGE_SIZE * sizeof(u64),
-                                          MTL::ResourceStorageModeShared);
-        ASSERT(buffer != nullptr, MetalRenderer, "Cannot allocate visibility buffer");
-        std::memset(buffer->contents(), 0, OCCLUSION_PAGE_SIZE * sizeof(u64));
-        occlusion_pages.push_back(
-            {std::shared_ptr<MTL::Buffer>(buffer, [](MTL::Buffer* value) {
-                 value->release();
-             }), 0});
+        if (!free_occlusion_pages.empty()) {
+            occlusion_pages.push_back({std::move(free_occlusion_pages.back()), 0});
+            free_occlusion_pages.pop_back();
+        } else {
+            auto* buffer = device->newBuffer(OCCLUSION_PAGE_SIZE * sizeof(u64),
+                                              MTL::ResourceStorageModeShared);
+            ASSERT(buffer != nullptr, MetalRenderer, "Cannot allocate visibility buffer");
+            std::memset(buffer->contents(), 0, OCCLUSION_PAGE_SIZE * sizeof(u64));
+            occlusion_pages.push_back(
+                {std::shared_ptr<MTL::Buffer>(buffer, [](MTL::Buffer* value) {
+                     value->release();
+                 }), 0});
+        }
     }
     auto& page = occlusion_pages.back();
     command_buffer->setVisibilityResultBuffer(page.buffer.get());

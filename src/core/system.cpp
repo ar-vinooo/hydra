@@ -625,6 +625,9 @@ void System::progressFrame(u32 width, u32 height,
                     std::max(frames, 1.0),
                 static_cast<f64>(stats.blit_encoders.exchange(0)) /
                     std::max(frames, 1.0));
+            LOG_INFO(Other, "CHECKPOINTS skipped (nothing in flight): {:.1f}/frame",
+                     static_cast<f64>(stats.checkpoint_skips.exchange(0)) /
+                         std::max(frames, 1.0));
             LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
                      static_cast<f64>(stats.compute_dispatches.exchange(0)) /
                          std::max(frames, 1.0),

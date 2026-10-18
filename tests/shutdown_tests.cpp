@@ -977,6 +977,31 @@ void testGpuAddressSpaceLifecycle(System& system, kernel::Process* process) {
     check(unmap(SPLIT) == nv::NvResult::Success && bytes(SPLIT).empty() &&
               bytes(SPLIT + 0x4000).size() == 16,
           "The head record only covers the bytes before the replacement");
+    // NVN maps whole big pages of an nvmap that is smaller than one: allowed up
+    // to the size rounded up to the big page, with readable backing for every
+    // mapped page (the CTR init regression)
+    {
+        const auto small_map = [&](u64 base, u64 offset, u64 size, u64 target) {
+            const auto small = gpu.createMap(0x8000).value();
+            check(gpu.allocateMap(small, base, true), "Allocate small nvmap");
+            std::array<u64, 5> args{FIXED, small.getRaw(), offset, size, target};
+            const auto status = call(0x06, args);
+            check(gpu.freeMap(small), "Release small nvmap");
+            return status;
+        };
+        check(small_map(guest, 0, 0x10000, 0xb0000000) == nv::NvResult::Success &&
+                  bytes(0xb0000000) == twelve,
+              "A mapping rounded up to the big page of a smaller nvmap succeeds");
+        check(small_map(guest, 0, 0x20000, 0xb0100000) == nv::NvResult::InvalidSize &&
+                  small_map(guest, 0x1000, 0x10000, 0xb0200000) == nv::NvResult::InvalidSize &&
+                  bytes(0xb0100000).empty() && bytes(0xb0200000).empty(),
+              "Mappings beyond the nvmap's big-page limit are rejected");
+        check(small_map(guest + 0x18000, 0, 0x10000, 0xb0300000) == nv::NvResult::InvalidAddress &&
+                  bytes(0xb0300000).empty(),
+              "The rounded-up tail still needs readable guest backing");
+        check(unmap(0xb0000000) == nv::NvResult::Success, "Unmap the rounded mapping");
+    }
+
     // SET_TIMESLICE (0xc004481d) is accepted and echoes the value
     {
         alignas(8) std::array<u32, 2> timeslice{1000, 0}, reply = timeslice;

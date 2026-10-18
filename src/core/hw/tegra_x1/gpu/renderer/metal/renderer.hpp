@@ -218,6 +218,13 @@ class Renderer : public IRenderer {
         u32 count{0};
     };
     std::vector<OcclusionPage> occlusion_pages;
+    // Pages of a reset counter may still be in flight; they return to the
+    // free list only after a checkpoint on this thread waited for them.
+    std::vector<OcclusionPage> retired_occlusion_pages;
+    // Fully zeroed pages: creating a Metal buffer is a kernel call
+    std::vector<std::shared_ptr<MTL::Buffer>> free_occlusion_pages;
+    static constexpr usize MAX_POOLED_OCCLUSION_PAGES = 256;
+    void recycleOcclusionPages(std::vector<OcclusionPage>& pages);
     u64 occlusion_count{0};
     bool occlusion_enabled{false};
     bool occlusion_valid{true};

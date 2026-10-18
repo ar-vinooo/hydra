@@ -657,7 +657,10 @@ faults and no MMU faults; remaining warnings were texture mismatches (capped at
 16) and missing save files. PERF (HYDRA_PERF_STATS) in the race: 28-42 FPS with
 pfifo CPU encode 24-28 ms/frame, Metal GPU 13-14 ms/frame, 1000+ draws/frame;
 about 60 FPS in menus. Not compared with an older build, so no regression
-claim. A test with an nvmap smaller than the mapped big page is still missing.
+claim. `--check-gpu-as-lifecycle` now covers an nvmap smaller than the big page: a
+mapping rounded up to the big page succeeds, mappings past that limit (size or
+offset) are rejected, and the rounded tail still needs readable guest backing.
+Restoring the strict bound makes the test fail, so it guards this regression.
 Also a lesson recorded: a size-alignment check for MapBufferEx (Switchbrew
 "panic") was tried first and removed, since the required alignment is not
 documented.

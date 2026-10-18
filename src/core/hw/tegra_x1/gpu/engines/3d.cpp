@@ -1058,11 +1058,9 @@ void ThreeD::bindGroup(const u32 index, const u32 data) {
         const auto buffer_index = extractBits(data, 4, 5);
         bool valid = (data & 0x1) != 0u;
         if (valid) {
-            const uptr const_buffer_gpu_ptr =
-                tls_crnt_gmmu->unmapAddr(regs.const_buffer_selector);
-
             const auto range = ztd::Range<uptr>::fromSize(
-                const_buffer_gpu_ptr, regs.const_buffer_selector_size);
+                static_cast<u64>(regs.const_buffer_selector),
+                regs.const_buffer_selector_size & 0x1ffffu);
             bound_const_buffers[shader_stage_index][buffer_index] = range;
         } else {
             bound_const_buffers[shader_stage_index][buffer_index] =
@@ -1546,7 +1544,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
                    mapped == MTL::BlendFactorSource1Alpha ||
                    mapped == MTL::BlendFactorOneMinusSource1Alpha;
         };
-        const auto uses_src1 = [&](const auto& blend) {
+        const auto uses_src1 = [&](const auto& blend_regs) {
+            const auto blend = getBlendEquation(blend_regs);
             return is_src1(blend.src_rgb_factor) ||
                    is_src1(blend.dst_rgb_factor) ||
                    is_src1(blend.src_alpha_factor) ||
@@ -1566,8 +1565,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
         if (slot >= CONST_BUFFER_BINDING_COUNT)
             return std::nullopt;
-        const auto& range =
-            bound_const_buffers[static_cast<u32>(stage) - 1][slot];
+        const auto range = getConstBuffer(static_cast<u32>(stage) - 1, slot);
         if (range.getBegin() == 0 || word >= range.getSize() / sizeof(u32))
             return std::nullopt;
         u32 value;
@@ -1803,7 +1801,8 @@ renderer::PipelineBase* ThreeD::getPipeline() {
             !(VisualDiagnostics::instance().selected() &&
               VisualDiagnostics::instance().options().no_blend);
         if (color_target.blend_enabled) {
-            const auto apply = [&](const auto& blend_state) {
+            const auto apply = [&](const auto& blend_regs) {
+                const auto blend_state = getBlendEquation(blend_regs);
                 color_target.rgb_op = getBlendOperation(blend_state.rgb_op);
                 color_target.src_rgb_factor =
                     getBlendFactor(blend_state.src_rgb_factor);
@@ -2118,6 +2117,37 @@ TicLodRange getTicLodRange(const TextureImageControl& tic) {
     return {tic.view_mip_min_level, tic.view_mip_max_level};
 }
 
+MTL::StencilOperation decodeStencilOp(u32 value) {
+    switch (value) {
+    case 0x1e00: // OGL_KEEP
+    case 1:      // D3D_KEEP
+        return MTL::StencilOperationKeep;
+    case 0x0: // OGL_ZERO
+    case 2:   // D3D_ZERO
+        return MTL::StencilOperationZero;
+    case 0x1e01: // OGL_REPLACE
+    case 3:      // D3D_REPLACE
+        return MTL::StencilOperationReplace;
+    case 0x1e02: // OGL_INCRSAT
+    case 4:      // D3D_INCRSAT
+        return MTL::StencilOperationIncrementClamp;
+    case 0x1e03: // OGL_DECRSAT
+    case 5:      // D3D_DECRSAT
+        return MTL::StencilOperationDecrementClamp;
+    case 0x150a: // OGL_INVERT
+    case 6:      // D3D_INVERT
+        return MTL::StencilOperationInvert;
+    case 0x8507: // OGL_INCR
+    case 7:      // D3D_INCR
+        return MTL::StencilOperationIncrementWrap;
+    case 0x8508: // OGL_DECR
+    case 8:      // D3D_DECR
+        return MTL::StencilOperationDecrementWrap;
+    default:
+        return MTL::StencilOperationKeep;
+    }
+}
+
 renderer::SamplerDescriptor
 decodeSampler(const TextureSamplerControl& tsc,
               renderer::TextureFormat texture_format, TicLodRange view_lods) {
@@ -2273,14 +2303,11 @@ void ThreeD::configureShaderStage(
             continue;
 
         // TODO: analyze the shader to get the max possible size
-        const auto range = bound_const_buffers[stage_index][i];
-        if (range.getBegin() == 0x0) {
+        const auto buffer = getConstBufferUpload(stage_index, i);
+        if (!buffer.isValid()) {
             LOG_WARN(Engines, "Uniform buffer at index {} is not bound", index);
             continue;
         }
-
-        const auto buffer = gpu.getRenderer().getBufferCache().get(
-            tls_crnt_command_buffer, range);
         gpu.getRenderer().bindUniformBuffer(buffer, shader_type, index);
     }
 
@@ -2288,7 +2315,7 @@ void ThreeD::configureShaderStage(
     gpu.getRenderer().unbindStorageBuffers(shader_type);
     for (const auto& storage : resource_mapping.storage_buffers) {
         const auto range = resolveStorageBuffer(
-            bound_const_buffers[stage_index][storage.cbuf_slot],
+            getConstBuffer(stage_index, storage.cbuf_slot),
             storage.cbuf_offset);
         if (!range) {
             ONCE(LOG_WARN(Engines,
@@ -2499,9 +2526,14 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
             as->ptr + (static_cast<uptr>(vertex_array.addr) - base));
         const u32 stride = vertex_array.config.stride;
         const u32 avail = static_cast<u32>(std::min<u64>(
-            as->size - (static_cast<uptr>(vertex_array.addr) - base), 48));
+            as->size - (static_cast<uptr>(vertex_array.addr) - base), 512));
         str += fmt::format("    VB{} stride={} bytes: {:02x}\n", i, stride,
                            fmt::join(data, data + std::min(stride, avail), " "));
+        // The first vertices: particles can start with unused entries, and a
+        // single vertex says little about a whole batch
+        for (u32 v = 1; stride != 0 && v < 8 && (v + 1) * stride <= avail; v++)
+            str += fmt::format("    VB{} v{}: {:02x}\n", i, v,
+                               fmt::join(data + v * stride, data + (v + 1) * stride, " "));
     }
     str += fmt::format("    cull: enabled={} mode={:#x} front={:#x} origin={:#x}\n",
                        regs.cull_face_enabled != 0,
@@ -2525,14 +2557,16 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
         }
         if (regs.independent_blend_enabled != 0u) {
             const auto& b = regs.independent_blend_state[i];
-            str += fmt::format(" | [{}] rgb {:#x}({:#x},{:#x}) a {:#x}({:#x},{:#x})",
-                               i, b.rgb_op, b.src_rgb_factor, b.dst_rgb_factor,
+            str += fmt::format(" | [{}] sep={} rgb {:#x}({:#x},{:#x}) a {:#x}({:#x},{:#x})",
+                               i, b.separate_for_alpha & 1u, b.rgb_op,
+                               b.src_rgb_factor, b.dst_rgb_factor,
                                b.alpha_op, b.src_alpha_factor,
                                b.dst_alpha_factor);
         } else {
             const auto& b = regs.blend_state;
-            str += fmt::format(" | [{}] rgb {:#x}({:#x},{:#x}) a {:#x}({:#x},{:#x})",
-                               i, b.rgb_op, b.src_rgb_factor, b.dst_rgb_factor,
+            str += fmt::format(" | [{}] sep={} rgb {:#x}({:#x},{:#x}) a {:#x}({:#x},{:#x})",
+                               i, b.separate_for_alpha & 1u, b.rgb_op,
+                               b.src_rgb_factor, b.dst_rgb_factor,
                                b.alpha_op, b.src_alpha_factor,
                                b.dst_alpha_factor);
         }
@@ -2559,7 +2593,7 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
             if (mapping.uniform_buffers[i] == invalid<u32>() ||
                 i == regs.bindless_texture_const_buffer_slot)
                 continue;
-            const auto range = bound_const_buffers[stage_index][i];
+            const auto range = getConstBuffer(stage_index, i);
             if (range.getBegin() == 0x0) {
                 str += fmt::format("    {} c{}: NOT BOUND\n",
                                    stage == ShaderStage::VertexB ? "VS" : "FS",
@@ -2767,6 +2801,72 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
     }
 }
 
+ztd::Range<uptr> ThreeD::getConstBuffer(u32 stage_index, u32 slot) const {
+    if (stage_index >= static_cast<u32>(ShaderStage::Count) - 1 ||
+        slot >= CONST_BUFFER_BINDING_COUNT || tls_crnt_gmmu == nullptr)
+        return {};
+    // Bindings retain GPU addresses: remapping or rebasing the heap must be
+    // visible without another BIND_GROUP_CONSTANT_BUFFER method.
+    const auto range = bound_const_buffers[stage_index][slot];
+    if (range.getSize() == 0 || range.getEnd() < range.getBegin())
+        return {};
+    uptr host_begin = 0;
+    bool contiguous = true;
+    for (uptr address = range.getBegin(); address < range.getEnd();) {
+        uptr base;
+        const auto mapping = tls_crnt_gmmu->findAddr(address, base);
+        if (!mapping || mapping->ptr == 0)
+            return {};
+        const auto offset = address - base;
+        const auto ptr = mapping->ptr + offset;
+        if (address == range.getBegin())
+            host_begin = ptr;
+        else if (ptr != host_begin + (address - range.getBegin()))
+            contiguous = false;
+        address += std::min<u64>(mapping->size - offset,
+                                 range.getEnd() - address);
+    }
+    if (contiguous)
+        return ztd::Range<uptr>::fromSize(host_begin, range.getSize());
+
+    auto& bytes = gathered_const_buffers[stage_index][slot].bytes;
+    bytes.resize(range.getSize());
+    for (uptr address = range.getBegin(); address < range.getEnd();) {
+        uptr base;
+        const auto mapping = tls_crnt_gmmu->findAddr(address, base);
+        if (!mapping || mapping->ptr == 0)
+            return {};
+        const auto offset = address - base;
+        const auto count = std::min<u64>(mapping->size - offset,
+                                         range.getEnd() - address);
+        std::memcpy(bytes.data() + address - range.getBegin(),
+                    reinterpret_cast<const void*>(mapping->ptr + offset), count);
+        address += count;
+    }
+    return ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(bytes.data()),
+                                     bytes.size());
+}
+
+renderer::BufferView ThreeD::getConstBufferUpload(u32 stage_index, u32 slot) {
+    const auto range = getConstBuffer(stage_index, slot);
+    if (range.getSize() == 0)
+        return {};
+    auto& gathered = gathered_const_buffers[stage_index][slot];
+    auto& cache = gpu.getRenderer().getBufferCache();
+    if (range.getBegin() != reinterpret_cast<uptr>(gathered.bytes.data()))
+        return cache.get(tls_crnt_command_buffer, range);
+
+    // Guest tracking cannot invalidate scratch memory. Reuse only an exact
+    // byte match and retain the old immutable upload for already encoded draws.
+    if (!gathered.upload.isValid() ||
+        gathered.upload.getSize() != range.getSize() ||
+        std::memcmp(reinterpret_cast<const void*>(gathered.upload.getPtr()),
+                    reinterpret_cast<const void*>(range.getBegin()),
+                    range.getSize()) != 0)
+        gathered.upload = cache.snapshot(range);
+    return gathered.upload;
+}
+
 std::optional<u32> ThreeD::readTextureHandle(u32 stage_index,
                                              u32 binding_index) const {
     if (renderer::isConstantTextureIndex(binding_index))
@@ -2783,12 +2883,17 @@ std::optional<u32> ThreeD::readTextureHandle(u32 stage_index,
     if (slot >= CONST_BUFFER_BINDING_COUNT)
         return std::nullopt;
 
-    const auto& range = bound_const_buffers[stage_index][slot];
+    const auto range = getConstBuffer(stage_index, slot);
     const auto read_word = [&](u32 index) -> std::optional<u32> {
         if (range.getBegin() == 0x0 ||
             (static_cast<u64>(index) + 1) * sizeof(u32) > range.getSize())
             return std::nullopt;
-        return reinterpret_cast<const u32*>(range.getBegin())[index];
+        u32 value;
+        std::memcpy(&value,
+                    reinterpret_cast<const void*>(range.getBegin() +
+                                                  u64(index) * sizeof(u32)),
+                    sizeof(value));
+        return value;
     };
 
     auto handle = read_word(word);
@@ -2918,7 +3023,7 @@ void ThreeD::captureVisualDraw(bool after) {
             {"sampler_buffer", std::to_string(mapping.sampler_buffer_index)}});
         for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; ++i) {
             if (mapping.uniform_buffers[i] == invalid<u32>()) continue;
-            const auto& range = bound_const_buffers[static_cast<u32>(stage) - 1][i];
+            const auto range = getConstBuffer(static_cast<u32>(stage) - 1, i);
             visual.event("uniform_binding", {{"stage", fmt::format("{}", stage)},
                 {"guest_slot", std::to_string(i)}, {"host_slot", std::to_string(mapping.uniform_buffers[i])},
                 {"host_address", std::to_string(range.getBegin())}, {"size", std::to_string(range.getSize())}});
@@ -3044,7 +3149,7 @@ bool ThreeD::drawInternal() {
         for (const auto& storage :
              shader->getDescriptor().resource_mapping.storage_buffers) {
             const auto range = resolveStorageBuffer(
-                bound_const_buffers[stage_index][storage.cbuf_slot],
+                getConstBuffer(stage_index, storage.cbuf_slot),
                 storage.cbuf_offset);
             if (range && texture_cache.hasUnflushedGpuWrites(*range))
                 texture_cache.flushMemory(tls_crnt_command_buffer, *range);
@@ -3093,45 +3198,15 @@ bool ThreeD::drawInternal() {
 
     // Stencil, register offsets from NVIDIA's clb197.h
     {
-        const auto decode_op = [](u32 value) {
-            switch (value) {
-            case 0x1e00: // OGL_KEEP
-            case 1:      // D3D_KEEP
-                return MTL::StencilOperationKeep;
-            case 0x0: // OGL_ZERO
-            case 2:   // D3D_ZERO
-                return MTL::StencilOperationZero;
-            case 0x1e01: // OGL_REPLACE
-            case 3:      // D3D_REPLACE
-                return MTL::StencilOperationReplace;
-            case 0x1e02: // OGL_INCRSAT
-            case 4:      // D3D_INCRSAT
-                return MTL::StencilOperationIncrementClamp;
-            case 0x1e03: // OGL_DECRSAT
-            case 5:      // D3D_DECRSAT
-                return MTL::StencilOperationDecrementClamp;
-            case 0x150a: // OGL_INVERT
-            case 6:      // D3D_INVERT
-                return MTL::StencilOperationInvert;
-            case 0x8507: // OGL_INCR
-            case 7:      // D3D_INCR
-                return MTL::StencilOperationIncrementWrap;
-            case 0x8508: // OGL_DECR
-            case 8:      // D3D_DECR
-                return MTL::StencilOperationDecrementWrap;
-            default:
-                return MTL::StencilOperationKeep;
-            }
-        };
         const auto decode_func = decodeCompareOp;
 
         renderer::StencilState stencil{};
         stencil.enabled = regs_raw[0x4e0] != 0;
         stencil.front = {
             .func = decode_func(regs_raw[0x4e4]),
-            .fail_op = decode_op(regs_raw[0x4e1]),
-            .depth_fail_op = decode_op(regs_raw[0x4e2]),
-            .pass_op = decode_op(regs_raw[0x4e3]),
+            .fail_op = decodeStencilOp(regs_raw[0x4e1]),
+            .depth_fail_op = decodeStencilOp(regs_raw[0x4e2]),
+            .pass_op = decodeStencilOp(regs_raw[0x4e3]),
             .ref = regs_raw[0x4e5],
             .func_mask = regs_raw[0x4e6],
             .write_mask = regs_raw[0x4e7],
@@ -3139,9 +3214,9 @@ bool ThreeD::drawInternal() {
         if (regs_raw[0x565] != 0) { // Two sided
             stencil.back = {
                 .func = decode_func(regs_raw[0x569]),
-                .fail_op = decode_op(regs_raw[0x566]),
-                .depth_fail_op = decode_op(regs_raw[0x567]),
-                .pass_op = decode_op(regs_raw[0x568]),
+                .fail_op = decodeStencilOp(regs_raw[0x566]),
+                .depth_fail_op = decodeStencilOp(regs_raw[0x567]),
+                .pass_op = decodeStencilOp(regs_raw[0x568]),
                 .ref = regs_raw[0x3d5],
                 .func_mask = regs_raw[0x3d7],
                 .write_mask = regs_raw[0x3d6],

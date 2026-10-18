@@ -464,6 +464,162 @@ void testRendererClears() {
                  "attachments untouched\n";
 }
 
+void testConstBufferRemapping() {
+    using namespace hydra::hw::tegra_x1::gpu::engines;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    auto& renderer = gpu.getRenderer();
+    GMmu gmmu(nullptr);
+    GMmu other(nullptr);
+    std::array<u32, 16> original{}, replacement{};
+    original.fill(0x11223344);
+    replacement.fill(0xaabbccdd);
+    const uptr old_ptr = reinterpret_cast<uptr>(original.data());
+    const uptr new_ptr = reinterpret_cast<uptr>(replacement.data());
+    constexpr u64 ADDRESS = 0x123400000ull;
+    constexpr u32 SLOT = 3;
+    constexpr u32 STAGE = static_cast<u32>(ShaderStage::Fragment) - 1;
+    constexpr u64 OFFSET = 16;
+    constexpr u64 SIZE = 32;
+    gmmu.map(ADDRESS, {old_ptr, sizeof(original), 0x80000000});
+    tls_crnt_gmmu = &gmmu;
+    std::unique_ptr<renderer::ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    struct ResetContext {
+        ~ResetContext() {
+            tls_crnt_command_buffer = nullptr;
+            tls_crnt_gmmu = nullptr;
+        }
+    } reset_context;
+    const auto bind = [&](u64 address, u32 size, u32 stage = STAGE) {
+        engine.method(0x8e0, size);
+        engine.method(0x8e1, static_cast<u32>(address >> 32));
+        engine.method(0x8e2, static_cast<u32>(address));
+        engine.method(0x904 + stage * 8, 1 | (SLOT << 4));
+    };
+    const auto check_range = [&](uptr ptr) {
+        const auto range = engine.getConstBuffer(STAGE, SLOT);
+        expect(range.getBegin() == ptr && range.getSize() == SIZE,
+               "Constant buffer resolves the complete current GPU mapping");
+    };
+    bind(ADDRESS + OFFSET, SIZE);
+    check_range(old_ptr + OFFSET);
+    const auto before = engine.getConstBufferUpload(STAGE, SLOT);
+    expect(*reinterpret_cast<const u32*>(before.getPtr()) == original[4],
+           "Initial constant buffer upload reads original backing");
+
+    gmmu.map(ADDRESS, {new_ptr, sizeof(replacement)});
+    check_range(new_ptr + OFFSET);
+    const auto after = engine.getConstBufferUpload(STAGE, SLOT);
+    expect(*reinterpret_cast<const u32*>(after.getPtr()) == replacement[4] &&
+               *reinterpret_cast<const u32*>(before.getPtr()) == original[4],
+           "Remap without bind uploads new data and retains the previous snapshot");
+
+    gmmu.unmap(ADDRESS);
+    expect(engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
+           "Unmapped constant buffer does not retain a stale host pointer");
+    gmmu.map(ADDRESS, {old_ptr, sizeof(original), 0x80000000});
+    gmmu.rebaseHostRange(old_ptr, old_ptr + sizeof(original), new_ptr,
+                        sizeof(replacement));
+    check_range(new_ptr + OFFSET);
+
+    other.map(ADDRESS, {old_ptr, sizeof(original)});
+    tls_crnt_gmmu = &other;
+    check_range(old_ptr + OFFSET);
+    tls_crnt_gmmu = &gmmu;
+    check_range(new_ptr + OFFSET);
+    expect(engine.getConstBuffer(0, SLOT).getSize() == 0 &&
+               engine.getConstBuffer(STAGE, SLOT + 1).getSize() == 0,
+           "Constant buffer bindings remain isolated by stage and slot");
+
+    // Both contiguous and scattered mappings preserve the complete binding.
+    gmmu.unmap(ADDRESS);
+    gmmu.map(ADDRESS, {new_ptr, 32});
+    gmmu.map(ADDRESS + 32, {new_ptr + 32, 32});
+    check_range(new_ptr + OFFSET);
+    gmmu.map(ADDRESS + 32, {old_ptr, 32});
+    const auto scattered = engine.getConstBuffer(STAGE, SLOT);
+    expect(scattered.getSize() == SIZE &&
+               std::memcmp(reinterpret_cast<const void*>(scattered.getBegin()),
+                           replacement.data() + 4, 16) == 0 &&
+               std::memcmp(reinterpret_cast<const void*>(scattered.getBegin() + 16),
+                           original.data(), 16) == 0,
+           "Scattered constant buffers gather bytes in GPU address order");
+    const auto scattered_before = engine.getConstBufferUpload(STAGE, SLOT);
+    const auto reused = engine.getConstBufferUpload(STAGE, SLOT);
+    expect(reused.getBase() == scattered_before.getBase(),
+           "Unchanged gathered bytes reuse the immutable upload");
+    original[0] = 0x13579bdf;
+    const auto scattered_after = engine.getConstBufferUpload(STAGE, SLOT);
+    expect(scattered_after.getBase() != scattered_before.getBase() &&
+               reinterpret_cast<const u32*>(scattered_after.getPtr())[4] == original[0] &&
+               reinterpret_cast<const u32*>(scattered_before.getPtr())[4] == 0x11223344,
+           "CPU writes refresh gathered uploads without mutating earlier snapshots");
+
+    auto* device = static_cast<renderer::metal::Renderer&>(renderer).getDevice();
+    NS::Error* error = nullptr;
+    NS_STACK_SCOPED auto library = device->newLibrary(
+        renderer::metal::toNsString(R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void copy_words(constant uint* input [[buffer(0)]],
+                       device uint* output [[buffer(1)]],
+                       uint tid [[thread_position_in_grid]]) {
+    output[tid] = input[tid];
+}
+)"), nullptr, &error);
+    expect(library != nullptr, "Compile gathered uniform readback shader");
+    NS_STACK_SCOPED auto function =
+        library->newFunction(renderer::metal::toNsString("copy_words"));
+    NS_STACK_SCOPED auto pipeline =
+        device->newComputePipelineState(function, &error);
+    expect(pipeline != nullptr, "Create gathered uniform readback pipeline");
+    NS_STACK_SCOPED auto output = device->newBuffer(64, MTL::ResourceStorageModeShared);
+    auto* metal_commands = static_cast<renderer::metal::CommandBuffer*>(commands.get());
+    auto* encoder = metal_commands->getComputeCommandEncoder();
+    encoder->setComputePipelineState(pipeline);
+    const auto encode = [&](const renderer::BufferView& buffer, u64 offset) {
+        auto* native = static_cast<renderer::metal::Buffer*>(buffer.getBase())->getBuffer();
+        encoder->setBuffer(native, buffer.getOffset(), 0);
+        encoder->setBuffer(output, offset, 1);
+        encoder->dispatchThreads(MTL::Size(8, 1, 1), MTL::Size(8, 1, 1));
+    };
+    encode(scattered_before, 0);
+    encode(scattered_after, 32);
+    auto* native = metal_commands->getCommandBuffer()->retain();
+    tls_crnt_command_buffer = nullptr;
+    commands.reset();
+    native->waitUntilCompleted();
+    const bool completed = native->status() == MTL::CommandBufferStatusCompleted;
+    native->release();
+    expect(completed, "GPU reads gathered uniform snapshots successfully");
+    const auto* words = static_cast<const u32*>(output->contents());
+    for (u32 i = 0; i < 16; ++i)
+        expect(words[i] == (i % 8 < 4 ? 0xaabbccdd
+                           : i == 12 ? 0x13579bdf : 0x11223344),
+               "GPU sees both sides of each immutable gathered constant buffer");
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    gmmu.unmap(ADDRESS + 32);
+    expect(engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
+           "Partially mapped constant buffers are unavailable");
+    gmmu.map(ADDRESS + 32, {new_ptr + 32, 32});
+    check_range(new_ptr + OFFSET);
+    engine.method(0x904 + STAGE * 8, SLOT << 4);
+    expect(engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
+           "Disable clears the GPU binding");
+    bind(ADDRESS, 0);
+    expect(engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
+           "Empty constant buffers do not resolve a host range");
+    bind(ADDRESS + OFFSET, SIZE | (1u << 20));
+    check_range(new_ptr + OFFSET);
+    tls_crnt_gmmu = nullptr;
+    tls_crnt_command_buffer = nullptr;
+    commands.reset();
+    std::cout << "PASS: constant buffers follow GPU remap, unmap and heap rebase without rebinding\n";
+}
+
 void testOcclusionReports() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
@@ -1407,6 +1563,542 @@ void testDmaCopies() {
 }
 
 // 2D fixed point coordinates are signed 32.32
+// SET_BLEND_SEPARATE_FOR_ALPHA (clb197.h 0x133c, per target 0x1e00 + j * 32):
+// the alpha registers only apply when the flag is set
+void testBlendSeparateForAlpha() {
+    using namespace hw::tegra_x1::gpu::engines;
+    Regs3D regs{};
+    regs.blend_state = {.separate_for_alpha = 0, .rgb_op = 1,
+                        .src_rgb_factor = 2, .dst_rgb_factor = 6,
+                        .alpha_op = 3, .src_alpha_factor = 5,
+                        .dst_alpha_factor = 7};
+    auto equation = getBlendEquation(regs.blend_state);
+    expect(equation.alpha_op == 1 && equation.src_alpha_factor == 2 &&
+              equation.dst_alpha_factor == 6 && equation.rgb_op == 1 &&
+              equation.src_rgb_factor == 2 && equation.dst_rgb_factor == 6,
+          "Alpha follows the color equation when SEPARATE_FOR_ALPHA is clear");
+    regs.blend_state.separate_for_alpha = 1;
+    equation = getBlendEquation(regs.blend_state);
+    expect(equation.alpha_op == 3 && equation.src_alpha_factor == 5 &&
+              equation.dst_alpha_factor == 7 && equation.rgb_op == 1,
+          "Alpha registers apply when SEPARATE_FOR_ALPHA is set");
+    // Only bit 0 is the enable
+    regs.blend_state.separate_for_alpha = 2;
+    expect(getBlendEquation(regs.blend_state).alpha_op == 1,
+          "Other bits of SEPARATE_FOR_ALPHA do not enable separate alpha");
+    regs.independent_blend_state[3] = {.separate_for_alpha = 1, .rgb_op = 1,
+                                       .src_rgb_factor = 1, .dst_rgb_factor = 1,
+                                       .alpha_op = 5, .src_alpha_factor = 2,
+                                       .dst_alpha_factor = 2};
+    expect(getBlendEquation(regs.independent_blend_state[3]).alpha_op == 5 &&
+              getBlendEquation(regs.independent_blend_state[0]).alpha_op ==
+                  regs.independent_blend_state[0].rgb_op,
+          "Per-target blend state has its own SEPARATE_FOR_ALPHA flag");
+    std::cout << "PASS: blend separate-for-alpha selects the alpha equation\n";
+}
+
+// The register file mirrors the method space: a field's byte offset in Regs3D
+// is the method's byte offset in NVIDIA's clb197.h (checked against the header
+// text, https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197.h).
+void testRegisterLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+    usize checked = 0;
+    const auto at = [&](usize offset, usize header, const char* name) {
+        if (offset != header)
+            throw std::runtime_error(
+                std::string("Regs3D offset differs from clb197.h: ") + name);
+        ++checked;
+    };
+#define HYDRA_REG(member, header_offset, name) \
+    at(offsetof(Regs3D, member), header_offset, name)
+    HYDRA_REG(color_targets, 0x800, "SET_COLOR_TARGET_A(0)");
+    HYDRA_REG(viewport_transforms, 0xa00, "SET_VIEWPORT_SCALE_X(0)");
+    HYDRA_REG(viewports, 0xc00, "SET_VIEWPORT_CLIP_HORIZONTAL(0)");
+    HYDRA_REG(window_rects, 0xd00, "SET_WINDOW_CLIP_HORIZONTAL(0)");
+    HYDRA_REG(vertex_array_start, 0xd74, "SET_VERTEX_ARRAY_START");
+    HYDRA_REG(viewport_z_clip, 0xd7c, "SET_VIEWPORT_Z_CLIP");
+    HYDRA_REG(clear_color, 0xd80, "SET_COLOR_CLEAR_VALUE(0)");
+    HYDRA_REG(clear_depth, 0xd90, "SET_Z_CLEAR_VALUE");
+    HYDRA_REG(clear_stencil, 0xda0, "SET_STENCIL_CLEAR_VALUE");
+    HYDRA_REG(scissors, 0xe00, "SET_SCISSOR_ENABLE(0)");
+    HYDRA_REG(depth_target_addr, 0xfe0, "SET_ZT_A");
+    HYDRA_REG(depth_target_layer_stride, 0xff0, "SET_ZT_ARRAY_PITCH");
+    HYDRA_REG(screen_scissor, 0xff4, "SET_SURFACE_CLIP_HORIZONTAL");
+    HYDRA_REG(vertex_attrib_states, 0x1160, "SET_VERTEX_ATTRIBUTE_A(0)");
+    HYDRA_REG(color_target_control, 0x121c, "SET_CT_SELECT");
+    HYDRA_REG(depth_target_width, 0x1228, "SET_ZT_SIZE_A");
+    HYDRA_REG(depth_target_height, 0x122c, "SET_ZT_SIZE_B");
+    HYDRA_REG(depth_target_array_mode, 0x1230, "SET_ZT_SIZE_C");
+    HYDRA_REG(depth_test_enabled, 0x12cc, "SET_DEPTH_TEST");
+    HYDRA_REG(independent_blend_enabled, 0x12e4, "SET_BLEND_STATE_PER_TARGET");
+    HYDRA_REG(depth_write_enabled, 0x12e8, "SET_DEPTH_WRITE");
+    HYDRA_REG(depth_compare_op, 0x130c, "SET_DEPTH_FUNC");
+    HYDRA_REG(blend_constant, 0x131c, "SET_BLEND_CONST_RED");
+    HYDRA_REG(blend_state.separate_for_alpha, 0x133c, "SET_BLEND_SEPARATE_FOR_ALPHA");
+    HYDRA_REG(blend_state.rgb_op, 0x1340, "SET_BLEND_COLOR_OP");
+    HYDRA_REG(blend_state.src_rgb_factor, 0x1344, "SET_BLEND_COLOR_SOURCE_COEFF");
+    HYDRA_REG(blend_state.dst_rgb_factor, 0x1348, "SET_BLEND_COLOR_DEST_COEFF");
+    HYDRA_REG(blend_state.alpha_op, 0x134c, "SET_BLEND_ALPHA_OP");
+    HYDRA_REG(blend_state.src_alpha_factor, 0x1350, "SET_BLEND_ALPHA_SOURCE_COEFF");
+    HYDRA_REG(blend_state.global_color_key, 0x1354, "SET_GLOBAL_COLOR_KEY");
+    HYDRA_REG(blend_state.dst_alpha_factor, 0x1358, "SET_BLEND_ALPHA_DEST_COEFF");
+    HYDRA_REG(single_rop_control, 0x135c, "SET_SINGLE_ROP_CONTROL");
+    HYDRA_REG(color_blend_enabled, 0x1360, "SET_BLEND(0)");
+    HYDRA_REG(window_origin_flags, 0x13ac, "SET_WINDOW_ORIGIN");
+    HYDRA_REG(base_vertex, 0x1434, "SET_GLOBAL_BASE_VERTEX_INDEX");
+    HYDRA_REG(base_instance, 0x1438, "SET_GLOBAL_BASE_INSTANCE_INDEX");
+    HYDRA_REG(tex_header_pool_max_index, 0x157c, "SET_TEX_HEADER_POOL_C");
+    HYDRA_REG(shader_program_region, 0x1608, "SET_PROGRAM_REGION_A");
+    HYDRA_REG(end, 0x1614, "END");
+    HYDRA_REG(begin, 0x1618, "BEGIN");
+    HYDRA_REG(primitive_restart_enabled, 0x1644, "SET_DA_PRIMITIVE_RESTART");
+    HYDRA_REG(primitive_restart_index, 0x1648, "SET_DA_PRIMITIVE_RESTART_INDEX");
+    HYDRA_REG(index_buffer_addr, 0x17c8, "SET_INDEX_BUFFER_A");
+    HYDRA_REG(index_buffer_limit_addr, 0x17d0, "SET_INDEX_BUFFER_C");
+    HYDRA_REG(index_type, 0x17d8, "SET_INDEX_BUFFER_E");
+    HYDRA_REG(vertex_elements_start, 0x17dc, "SET_INDEX_BUFFER_F");
+    HYDRA_REG(is_vertex_array_per_instance, 0x1880, "SET_VERTEX_STREAM_INSTANCE_A(0)");
+    HYDRA_REG(cull_face_enabled, 0x1918, "OGL_SET_CULL");
+    HYDRA_REG(front_face_winding, 0x191c, "OGL_SET_FRONT_FACE");
+    HYDRA_REG(cull_face_mode, 0x1920, "OGL_SET_CULL_FACE");
+    HYDRA_REG(viewport_transform_enabled, 0x192c, "SET_VIEWPORT_SCALE_OFFSET");
+    HYDRA_REG(color_write_masks, 0x1a00, "SET_CT_WRITE(0)");
+    HYDRA_REG(report_semaphore_addr, 0x1b00, "SET_REPORT_SEMAPHORE_A");
+    HYDRA_REG(report_semaphore_payload, 0x1b08, "SET_REPORT_SEMAPHORE_C");
+    HYDRA_REG(vertex_arrays, 0x1c00, "SET_VERTEX_STREAM_A_FORMAT(0)");
+    HYDRA_REG(independent_blend_state, 0x1e00, "SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA(0)");
+    HYDRA_REG(vertex_array_limits, 0x1f00, "SET_VERTEX_STREAM_LIMIT_A_A(0)");
+    HYDRA_REG(shader_programs, 0x2000, "SET_PIPELINE_SHADER(0)");
+    HYDRA_REG(const_buffer_selector_size, 0x2380, "SET_CONSTANT_BUFFER_SELECTOR_A");
+    HYDRA_REG(load_const_buffer_offset, 0x238c, "LOAD_CONSTANT_BUFFER_OFFSET");
+    HYDRA_REG(bindless_texture_const_buffer_slot, 0x2608, "SET_BINDLESS_TEXTURE");
+#undef HYDRA_REG
+    // Strides of the register arrays
+    const auto stride = [&](usize size, usize header, const char* name) {
+        if (size != header)
+            throw std::runtime_error(
+                std::string("Regs3D array stride differs from clb197.h: ") + name);
+    };
+    stride(sizeof(Regs3D::color_targets[0]), 64, "SET_COLOR_TARGET_A(j)");
+    stride(sizeof(Regs3D::viewport_transforms[0]), 32, "SET_VIEWPORT_SCALE_X(j)");
+    stride(sizeof(Regs3D::viewports[0]), 16, "SET_VIEWPORT_CLIP_HORIZONTAL(j)");
+    stride(sizeof(Regs3D::window_rects[0]), 8, "SET_WINDOW_CLIP_HORIZONTAL(j)");
+    stride(sizeof(Regs3D::scissors[0]), 16, "SET_SCISSOR_ENABLE(j)");
+    stride(sizeof(Regs3D::vertex_attrib_states[0]), 4, "SET_VERTEX_ATTRIBUTE_A(i)");
+    stride(sizeof(Regs3D::vertex_arrays[0]), 16, "SET_VERTEX_STREAM_A_FORMAT(j)");
+    stride(sizeof(Regs3D::independent_blend_state[0]), 32,
+           "SET_BLEND_PER_TARGET_*(j)");
+    stride(sizeof(Regs3D::vertex_array_limits[0]), 8, "SET_VERTEX_STREAM_LIMIT_A_A(j)");
+    stride(sizeof(Regs3D::shader_programs[0]), 64, "SET_PIPELINE_SHADER(j)");
+    std::cout << "PASS: Regs3D layout matches clb197.h (" << checked
+              << " registers, 10 array strides)\n";
+}
+
+// Every field of the guest texture image/sampler descriptors sits at the bit
+// positions of NVIDIA's clb197tex.h (TEXHEAD_BL_* for the block-linear TIC,
+// TEXSAMP0-7 for the TSC). Each field is set alone and all others must read
+// zero, so overlapping or misplaced fields fail.
+template <typename Descriptor, usize WordCount>
+struct DescriptorField {
+    const char* name;
+    u32 lo;
+    u32 hi;
+    std::function<u64(const Descriptor&)> get;
+};
+
+template <typename Descriptor, usize WordCount>
+void checkDescriptorFields(
+    const char* what,
+    const std::vector<DescriptorField<Descriptor, WordCount>>& fields) {
+    static_assert(sizeof(Descriptor) == WordCount * sizeof(u32));
+    const auto build = [&](const std::vector<std::pair<u32, u32>>& ranges,
+                           const std::vector<u64>& values) {
+        std::array<u32, WordCount> words{};
+        for (usize f = 0; f < ranges.size(); f++)
+            for (u32 bit = ranges[f].first; bit <= ranges[f].second; bit++)
+                if (((values[f] >> (bit - ranges[f].first)) & 1u) != 0)
+                    words[bit / 32] |= 1u << (bit % 32);
+        Descriptor descriptor;
+        std::memcpy(&descriptor, words.data(), sizeof(descriptor));
+        return descriptor;
+    };
+    for (usize f = 0; f < fields.size(); f++) {
+        const u32 width = fields[f].hi - fields[f].lo + 1;
+        const u64 all_ones = width == 64 ? ~0ull : (1ull << width) - 1;
+        // Alternating pattern as well as all ones, so a shifted field is caught
+        for (const u64 value : {all_ones, 0x5555555555555555ull & all_ones}) {
+            std::vector<u64> values(fields.size(), 0);
+            values[f] = value;
+            std::vector<std::pair<u32, u32>> ranges;
+            for (const auto& field : fields)
+                ranges.push_back({field.lo, field.hi});
+            const auto descriptor = build(ranges, values);
+            for (usize g = 0; g < fields.size(); g++) {
+                const u64 expected = g == f ? value : 0;
+                if (fields[g].get(descriptor) != expected)
+                    throw std::runtime_error(
+                        std::string(what) + ": field " + fields[g].name +
+                        (g == f ? " does not read back at its header bits"
+                                : " overlaps ") +
+                        (g == f ? "" : fields[f].name));
+            }
+        }
+    }
+}
+
+void testTextureDescriptorLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+#define TIC(name, lo, hi, expr) \
+    DescriptorField<TextureImageControl, 8>{name, lo, hi, \
+        [](const TextureImageControl& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<TextureImageControl, 8>("TIC (TEXHEAD_BL)", {
+        TIC("components", 0, 6, d.format_word.image_format),
+        TIC("r_data_type", 7, 9, d.format_word.component_r),
+        TIC("g_data_type", 10, 12, d.format_word.component_g),
+        TIC("b_data_type", 13, 15, d.format_word.component_b),
+        TIC("a_data_type", 16, 18, d.format_word.component_a),
+        TIC("x_source", 19, 21, d.format_word.swizzle_x),
+        TIC("y_source", 22, 24, d.format_word.swizzle_y),
+        TIC("z_source", 25, 27, d.format_word.swizzle_z),
+        TIC("w_source", 28, 30, d.format_word.swizzle_w),
+        TIC("pack_components", 31, 31, d.format_word.pack),
+        TIC("address_lo", 32, 63, d.addr_lo),
+        TIC("address_hi", 64, 79, d.addr_hi),
+        TIC("view_layer_base_3_7", 80, 84, d.view_layer_base_3_7),
+        TIC("header_version", 85, 87, d.hdr_version),
+        TIC("load_store_hint", 88, 88, d.load_store_hint_maybe),
+        TIC("resource_view_coherency_hash", 89, 92, d.view_coherency_hash),
+        TIC("view_layer_base_8_10", 93, 95, d.view_layer_base_8_10),
+        TIC("gobs_per_block_width", 96, 98, d.tile_width_gobs_log2),
+        TIC("gobs_per_block_height", 99, 101, d.tile_height_gobs_log2),
+        TIC("gobs_per_block_depth", 102, 104, d.tile_depth_gobs_log2),
+        TIC("tile_width_in_gobs", 106, 108, d.sparse_tile_width_gobs_log2),
+        TIC("gob3d", 109, 109, d.gob_3d),
+        TIC("lod_aniso_quality2", 112, 112, d.lod_aniso_quality_2),
+        TIC("lod_aniso_quality", 113, 113, d.lod_aniso_quality),
+        TIC("lod_iso_quality", 114, 114, d.lod_iso_quality),
+        TIC("aniso_coarse_spread_modifier", 115, 116, d.aniso_coarse_spread_modifier),
+        TIC("aniso_spread_scale", 117, 121, d.aniso_spread_scale),
+        TIC("use_header_opt_control", 122, 122, d.use_header_opt_control),
+        TIC("depth_texture", 123, 123, d.depth_texture),
+        TIC("max_mip_level", 124, 127, d.mip_max_levels),
+        TIC("width_minus_one", 128, 143, d.width_minus_one),
+        TIC("view_layer_base_0_2", 144, 146, d.view_layer_base_0_2),
+        TIC("aniso_spread_max_log2", 147, 149, d.aniso_spread_max_log2),
+        TIC("srgb_conversion", 150, 150, d.is_srgb),
+        TIC("texture_type", 151, 154, d.texture_type),
+        TIC("sector_promotion", 155, 156, d.sector_promotion),
+        TIC("border_size", 157, 159, d.border_size),
+        TIC("height_minus_one", 160, 175, d.height_minus_one),
+        TIC("depth_minus_one", 176, 189, d.depth_minus_one),
+        TIC("is_sparse", 190, 190, d.is_sparse),
+        TIC("normalized_coords", 191, 191, d.normalized_coords),
+        TIC("color_key_op", 192, 192, d.color_key_op),
+        TIC("trilin_opt", 193, 197, d.trilin_opt),
+        TIC("mip_lod_bias", 198, 210, d.mip_lod_bias),
+        TIC("aniso_bias", 211, 214, d.aniso_bias),
+        TIC("aniso_fine_spread_func", 215, 216, d.aniso_fine_spread_func),
+        TIC("aniso_coarse_spread_func", 217, 218, d.aniso_coarse_spread_func),
+        TIC("max_anisotropy", 219, 221, d.max_anisotropy),
+        TIC("aniso_fine_spread_modifier", 222, 223, d.aniso_fine_spread_modifier),
+        TIC("res_view_min_mip_level", 224, 227, d.view_mip_min_level),
+        TIC("res_view_max_mip_level", 228, 231, d.view_mip_max_level),
+        TIC("multi_sample_count", 232, 235, d.msaa_mode),
+        TIC("min_lod_clamp", 236, 247, d.min_lod_clamp),
+    });
+#undef TIC
+#define TSC(name, lo, hi, expr) \
+    DescriptorField<TextureSamplerControl, 8>{name, lo, hi, \
+        [](const TextureSamplerControl& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<TextureSamplerControl, 8>("TSC (TEXSAMP0-7)", {
+        TSC("address_u", 0, 2, d.address_u),
+        TSC("address_v", 3, 5, d.address_v),
+        TSC("address_p", 6, 8, d.address_p),
+        TSC("depth_compare", 9, 9, d.depth_compare),
+        TSC("depth_compare_func", 10, 12, d.depth_compare_op),
+        TSC("srgb_conversion", 13, 13, d.srgb_conversion),
+        TSC("max_anisotropy", 20, 22, d.max_anisotropy),
+        TSC("mag_filter", 32, 34, d.mag_filter),
+        TSC("min_lod_clamp_behavior", 35, 35, d.min_lod_clamp_integer_only),
+        TSC("min_filter", 36, 37, d.min_filter),
+        TSC("mip_filter", 38, 39, d.mip_filter),
+        TSC("cubemap_interface_filtering_0", 40, 40, d.cubemap_anisotropy),
+        TSC("cubemap_interface_filtering_1", 41, 41, d.cubemap_interface_filtering),
+        TSC("reduction_filter", 42, 43, d.reduction_filter),
+        TSC("mip_lod_bias", 44, 56, d.mip_lod_bias),
+        TSC("float_coord_normalization", 57, 57, d.float_coord_normalization),
+        TSC("trilin_opt", 58, 62, d.trilin_opt),
+        TSC("min_lod_clamp", 64, 75, d.min_lod_clamp),
+        TSC("max_lod_clamp", 76, 87, d.max_lod_clamp),
+        TSC("srgb_border_color_r", 88, 95, d.srgb_border_color_r),
+        TSC("srgb_border_color_g", 108, 115, d.srgb_border_color_g),
+        TSC("srgb_border_color_b", 116, 123, d.srgb_border_color_b),
+        TSC("border_color_r", 128, 159, d.border_color_r),
+        TSC("border_color_g", 160, 191, d.border_color_g),
+        TSC("border_color_b", 192, 223, d.border_color_b),
+        TSC("border_color_a", 224, 255, d.border_color_a),
+    });
+#undef TSC
+    std::cout << "PASS: TIC/TSC field layout matches clb197tex.h (53 TIC and 26 "
+                 "TSC fields, no overlaps)\n";
+}
+
+// SET_VERTEX_ATTRIBUTE_A(i) (clb197.h 0x1160): STREAM 4:0, SOURCE 6, OFFSET
+// 20:7, COMPONENT_BIT_WIDTHS 26:21, NUMERICAL_TYPE 29:27, SWAP_R_AND_B 31; and
+// SET_COLOR_TARGET_*(j) (0x800 + j * 64)
+void testVertexAttributeAndRenderTargetLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+#define VA(name, lo, hi, expr) \
+    DescriptorField<VertexAttribState, 1>{name, lo, hi, \
+        [](const VertexAttribState& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<VertexAttribState, 1>("SET_VERTEX_ATTRIBUTE_A", {
+        VA("stream", 0, 4, d.buffer_id),
+        VA("source", 6, 6, d.is_fixed),
+        VA("offset", 7, 20, d.offset),
+        VA("component_bit_widths", 21, 26, d.size),
+        VA("numerical_type", 27, 29, d.type),
+        VA("swap_r_and_b", 31, 31, d.bgra),
+    });
+#undef VA
+    // Component widths and numerical types are the header's values
+    expect(static_cast<u32>(VertexAttribSize::_4x32) == 0x01 &&
+               static_cast<u32>(VertexAttribSize::_3x32) == 0x02 &&
+               static_cast<u32>(VertexAttribSize::_4x16) == 0x03 &&
+               static_cast<u32>(VertexAttribSize::_2x32) == 0x04 &&
+               static_cast<u32>(VertexAttribSize::_3x16) == 0x05 &&
+               static_cast<u32>(VertexAttribSize::_4x8) == 0x0a &&
+               static_cast<u32>(VertexAttribSize::_2x16) == 0x0f &&
+               static_cast<u32>(VertexAttribSize::_1x32) == 0x12 &&
+               static_cast<u32>(VertexAttribSize::_3x8) == 0x13 &&
+               static_cast<u32>(VertexAttribSize::_2x8) == 0x18 &&
+               static_cast<u32>(VertexAttribSize::_1x16) == 0x1b &&
+               static_cast<u32>(VertexAttribSize::_1x8) == 0x1d &&
+               static_cast<u32>(VertexAttribSize::A8B8G8R8) == 0x2f &&
+               static_cast<u32>(VertexAttribSize::_10_10_10_2) == 0x30 &&
+               static_cast<u32>(VertexAttribSize::_11_11_10) == 0x31 &&
+               static_cast<u32>(VertexAttribSize::G8R8) == 0x32 &&
+               static_cast<u32>(VertexAttribSize::X8B8G8R8) == 0x33 &&
+               static_cast<u32>(VertexAttribSize::A8) == 0x34,
+           "Vertex component bit width encodings match clb197.h");
+    expect(static_cast<u32>(VertexAttribType::Snorm) == 1 &&
+               static_cast<u32>(VertexAttribType::Unorm) == 2 &&
+               static_cast<u32>(VertexAttribType::Sint) == 3 &&
+               static_cast<u32>(VertexAttribType::Uint) == 4 &&
+               static_cast<u32>(VertexAttribType::Uscaled) == 5 &&
+               static_cast<u32>(VertexAttribType::Sscaled) == 6 &&
+               static_cast<u32>(VertexAttribType::Float) == 7,
+           "Vertex numerical types match clb197.h");
+
+    // Render target register block, relative to SET_COLOR_TARGET_A(0) = 0x800
+    const auto rt = [&](usize offset, usize header, const char* name) {
+        if (offset != header - 0x800)
+            throw std::runtime_error(
+                std::string("RenderTarget offset differs from clb197.h: ") + name);
+    };
+    rt(offsetof(RenderTarget, addr), 0x800, "SET_COLOR_TARGET_A/B");
+    rt(offsetof(RenderTarget, width_or_stride), 0x808, "SET_COLOR_TARGET_WIDTH");
+    rt(offsetof(RenderTarget, height), 0x80c, "SET_COLOR_TARGET_HEIGHT");
+    rt(offsetof(RenderTarget, format), 0x810, "SET_COLOR_TARGET_FORMAT");
+    rt(offsetof(RenderTarget, tile_mode), 0x814, "SET_COLOR_TARGET_MEMORY");
+    rt(offsetof(RenderTarget, array_mode), 0x818, "SET_COLOR_TARGET_THIRD_DIMENSION");
+    rt(offsetof(RenderTarget, layer_stride), 0x81c, "SET_COLOR_TARGET_ARRAY_PITCH");
+    rt(offsetof(RenderTarget, base_layer), 0x820, "SET_COLOR_TARGET_LAYER");
+    rt(offsetof(RenderTarget, mark), 0x824, "SET_COLOR_TARGET_MARK");
+    expect(sizeof(RenderTarget) == 64, "SET_COLOR_TARGET_*(j) stride is 64 bytes");
+#define MEM(name, lo, hi, expr) \
+    DescriptorField<decltype(RenderTarget::tile_mode), 1>{name, lo, hi, \
+        [](const decltype(RenderTarget::tile_mode)& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<decltype(RenderTarget::tile_mode), 1>(
+        "SET_COLOR_TARGET_MEMORY", {
+            MEM("block_width", 0, 3, d.width_gobs_log2),
+            MEM("block_height", 4, 7, d.height_gobs_log2),
+            MEM("block_depth", 8, 11, d.depth_gobs_log2),
+            MEM("layout", 12, 12, d.is_linear),
+            MEM("third_dimension_control", 16, 16, d.is_3d),
+        });
+#undef MEM
+    std::cout << "PASS: vertex attribute and render target layout match clb197.h\n";
+}
+
+// ComputeQmd accessors against NVIDIA's clb1c0qmd.h (QMDV01_07)
+void testComputeQmdLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+#define QMD(name, lo, hi, expr) \
+    DescriptorField<ComputeQmd, 64>{name, lo, hi, \
+        [](const ComputeQmd& d) { return static_cast<u64>(expr); }}
+    std::vector<DescriptorField<ComputeQmd, 64>> fields = {
+        QMD("program_offset", 256, 287, d.programStart()),
+        QMD("cta_raster_width", 384, 415, d.gridDimX()),
+        QMD("cta_raster_height", 416, 431, d.gridDimY()),
+        QMD("cta_raster_depth", 432, 447, d.gridDimZ()),
+        QMD("shared_memory_size", 544, 561, d.sharedAlloc()),
+        QMD("cta_thread_dimension0", 592, 607, d.blockDimX()),
+        QMD("cta_thread_dimension1", 608, 623, d.blockDimY()),
+        QMD("cta_thread_dimension2", 624, 639, d.blockDimZ()),
+        QMD("constant_buffer_valid", 640, 647, d.constBufferEnableMask()),
+        QMD("shader_local_memory_low_size", 1440, 1463, d.localPosAlloc()),
+    };
+#undef QMD
+    for (u32 i = 0; i < COMPUTE_CONST_BUFFER_COUNT; i++) {
+        fields.push_back({"constant_buffer_addr", 928 + 64 * i, 967 + 64 * i,
+                          [i](const ComputeQmd& d) { return d.constBufferAddress(i); }});
+        fields.push_back({"constant_buffer_size", 975 + 64 * i, 991 + 64 * i,
+                          [i](const ComputeQmd& d) { return u64(d.constBufferSize(i)); }});
+    }
+    checkDescriptorFields<ComputeQmd, 64>("QMD (QMDV01_07)", fields);
+    // Compute class registers (clb1c0.h)
+    const auto reg = [](usize offset, usize header, const char* name) {
+        if (offset != header)
+            throw std::runtime_error(
+                std::string("RegsCompute offset differs from clb1c0.h: ") + name);
+    };
+    reg(offsetof(RegsCompute, launch_desc_loc), 0x2b4, "SEND_PCAS_A");
+    reg(offsetof(RegsCompute, launch), 0x2bc, "SEND_SIGNALING_PCAS_B");
+    reg(offsetof(RegsCompute, tsc_addr_hi), 0x155c, "SET_TEX_SAMPLER_POOL_A");
+    reg(offsetof(RegsCompute, tsc_limit), 0x1564, "SET_TEX_SAMPLER_POOL_C");
+    reg(offsetof(RegsCompute, tic_addr_hi), 0x1574, "SET_TEX_HEADER_POOL_A");
+    reg(offsetof(RegsCompute, tic_limit), 0x157c, "SET_TEX_HEADER_POOL_C");
+    reg(offsetof(RegsCompute, code_addr_hi), 0x1608, "SET_PROGRAM_REGION_A");
+    reg(offsetof(RegsCompute, tex_cb_index), 0x2608, "SET_BINDLESS_TEXTURE");
+    std::cout << "PASS: compute QMD accessors match clb1c0qmd.h (" << fields.size()
+              << " fields, no overlaps)\n";
+}
+
+// DMA copy engine registers and packed words against NVIDIA's clb0b5.h
+// (MAXWELL_DMA_COPY_A)
+void testCopyEngineLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+    const auto reg = [](usize offset, usize header, const char* name) {
+        if (offset != header)
+            throw std::runtime_error(
+                std::string("RegsCopy offset differs from clb0b5.h: ") + name);
+    };
+    reg(offsetof(RegsCopy, offset_in), 0x400, "OFFSET_IN_UPPER");
+    reg(offsetof(RegsCopy, offset_out), 0x408, "OFFSET_OUT_UPPER");
+    reg(offsetof(RegsCopy, stride_in), 0x410, "PITCH_IN");
+    reg(offsetof(RegsCopy, stride_out), 0x414, "PITCH_OUT");
+    reg(offsetof(RegsCopy, line_length_in), 0x418, "LINE_LENGTH_IN");
+    reg(offsetof(RegsCopy, line_count), 0x41c, "LINE_COUNT");
+    reg(offsetof(RegsCopy, remap_const1), 0x700, "SET_REMAP_CONST_A");
+    reg(offsetof(RegsCopy, remap_const2), 0x704, "SET_REMAP_CONST_B");
+    reg(offsetof(RegsCopy, remap_components), 0x708, "SET_REMAP_COMPONENTS");
+    reg(offsetof(RegsCopy, dst), 0x70c, "SET_DST_BLOCK_SIZE");
+    reg(offsetof(RegsCopy, dst) + offsetof(TextureCopyInfo, stride), 0x710, "SET_DST_WIDTH");
+    reg(offsetof(RegsCopy, dst) + offsetof(TextureCopyInfo, height), 0x714, "SET_DST_HEIGHT");
+    reg(offsetof(RegsCopy, dst) + offsetof(TextureCopyInfo, depth), 0x718, "SET_DST_DEPTH");
+    reg(offsetof(RegsCopy, dst) + offsetof(TextureCopyInfo, layer), 0x71c, "SET_DST_LAYER");
+    reg(offsetof(RegsCopy, dst) + offsetof(TextureCopyInfo, origin), 0x720, "SET_DST_ORIGIN");
+    reg(offsetof(RegsCopy, src), 0x728, "SET_SRC_BLOCK_SIZE");
+    reg(offsetof(RegsCopy, src) + offsetof(TextureCopyInfo, stride), 0x72c, "SET_SRC_WIDTH");
+    reg(offsetof(RegsCopy, src) + offsetof(TextureCopyInfo, origin), 0x73c, "SET_SRC_ORIGIN");
+    using Remap = decltype(RegsCopy::remap_components);
+#define REMAP(name, lo, hi, expr) \
+    DescriptorField<Remap, 1>{name, lo, hi, [](const Remap& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<Remap, 1>("SET_REMAP_COMPONENTS", {
+        REMAP("dst_x", 0, 2, d.dst_x),
+        REMAP("dst_y", 4, 6, d.dst_y),
+        REMAP("dst_z", 8, 10, d.dst_z),
+        REMAP("dst_w", 12, 14, d.dst_w),
+        REMAP("component_size", 16, 17, d.component_size_minus_one),
+        REMAP("num_src_components", 20, 21, d.src_component_count_minus_one),
+        REMAP("num_dst_components", 24, 25, d.dst_component_count_minus_one),
+    });
+#undef REMAP
+#define BLK(name, lo, hi, expr) \
+    DescriptorField<BlockSize, 1>{name, lo, hi, [](const BlockSize& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<BlockSize, 1>("SET_*_BLOCK_SIZE", {
+        BLK("width", 0, 3, d.width),
+        BLK("height", 4, 7, d.height),
+        BLK("depth", 8, 11, d.depth),
+        BLK("gob_height", 12, 15, d.gob_height),
+    });
+#undef BLK
+    using Origin = decltype(TextureCopyInfo::origin);
+#define ORG(name, lo, hi, expr) \
+    DescriptorField<Origin, 1>{name, lo, hi, [](const Origin& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<Origin, 1>("SET_*_ORIGIN", {
+        ORG("x", 0, 15, d.x),
+        ORG("y", 16, 31, d.y),
+    });
+#undef ORG
+    std::cout << "PASS: DMA copy engine layout matches clb0b5.h\n";
+}
+
+// 2D engine registers against NVIDIA's cl902d.h (FERMI_TWOD_A)
+void testTwoDEngineLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+    const auto reg = [](usize offset, usize header, const char* name) {
+        if (offset != header)
+            throw std::runtime_error(
+                std::string("Regs2D offset differs from cl902d.h: ") + name);
+    };
+    reg(offsetof(Regs2D, dst), 0x200, "SET_DST_FORMAT");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, depth), 0x20c, "SET_DST_DEPTH");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, layer), 0x210, "SET_DST_LAYER");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, stride), 0x214, "SET_DST_PITCH");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, width), 0x218, "SET_DST_WIDTH");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, height), 0x21c, "SET_DST_HEIGHT");
+    reg(offsetof(Regs2D, dst) + offsetof(Texture2DInfo, addr), 0x220, "SET_DST_OFFSET_UPPER");
+    reg(offsetof(Regs2D, src), 0x230, "SET_SRC_FORMAT");
+    reg(offsetof(Regs2D, src) + offsetof(Texture2DInfo, depth), 0x23c, "SET_SRC_DEPTH");
+    reg(offsetof(Regs2D, src) + offsetof(Texture2DInfo, stride), 0x244, "SET_SRC_PITCH");
+    reg(offsetof(Regs2D, src) + offsetof(Texture2DInfo, width), 0x248, "SET_SRC_WIDTH");
+    reg(offsetof(Regs2D, src) + offsetof(Texture2DInfo, height), 0x24c, "SET_SRC_HEIGHT");
+    reg(offsetof(Regs2D, clip_x), 0x280, "SET_CLIP_X");
+    reg(offsetof(Regs2D, clip_width), 0x288, "SET_CLIP_WIDTH");
+    reg(offsetof(Regs2D, clip_enabled), 0x290, "SET_CLIP_ENABLE");
+    reg(offsetof(Regs2D, color_key_format), 0x294, "SET_COLOR_KEY_FORMAT");
+    reg(offsetof(Regs2D, color_key), 0x298, "SET_COLOR_KEY");
+    reg(offsetof(Regs2D, color_key_enabled), 0x29c, "SET_COLOR_KEY_ENABLE");
+    reg(offsetof(Regs2D, rop), 0x2a0, "SET_ROP");
+    reg(offsetof(Regs2D, beta1), 0x2a4, "SET_BETA1");
+    reg(offsetof(Regs2D, beta4), 0x2a8, "SET_BETA4");
+    reg(offsetof(Regs2D, operation), 0x2ac, "SET_OPERATION");
+    reg(offsetof(Regs2D, sample_mode), 0x88c, "SET_PIXELS_FROM_MEMORY_SAMPLE_MODE");
+    reg(offsetof(Regs2D, pixels_from_memory), 0x8b0, "SET_PIXELS_FROM_MEMORY_DST_X0");
+    using PFM = PixelsFromMemory;
+    reg(offsetof(PFM, dst_width), 0x8, "..._DST_WIDTH (+0x8b0)");
+    reg(offsetof(PFM, dudx), 0x10, "..._DU_DX_FRAC (+0x8b0)");
+    reg(offsetof(PFM, dvdy), 0x18, "..._DV_DY_FRAC (+0x8b0)");
+    reg(offsetof(PFM, src_x0), 0x20, "..._SRC_X0_FRAC (+0x8b0)");
+    reg(offsetof(PFM, src_y0), 0x28, "..._SRC_Y0_FRAC (+0x8b0)");
+    reg(offsetof(hw::tegra_x1::gpu::engines::FixedPoint, integer), 0x4, "FixedPoint integer word follows the fraction");
+    using Sample = decltype(Regs2D::sample_mode);
+#define SMP(name, lo, hi, expr) \
+    DescriptorField<Sample, 1>{name, lo, hi, [](const Sample& d) { return static_cast<u64>(expr); }}
+    checkDescriptorFields<Sample, 1>("SET_PIXELS_FROM_MEMORY_SAMPLE_MODE", {
+        SMP("origin", 0, 0, d.origin),
+        SMP("filter", 4, 4, d.filter),
+    });
+#undef SMP
+    std::cout << "PASS: 2D engine layout matches cl902d.h\n";
+}
+
+// Inline-to-memory registers shared by the 3D, compute and A140 classes
+// (cla140.h, KEPLER_INLINE_TO_MEMORY_B)
+void testInlineEngineLayout() {
+    using namespace hw::tegra_x1::gpu::engines;
+    const auto reg = [](usize offset, usize header, const char* name) {
+        if (offset != header)
+            throw std::runtime_error(
+                std::string("RegsInline offset differs from cla140.h: ") + name);
+    };
+    reg(offsetof(RegsInline, line_length_in), 0x180, "LINE_LENGTH_IN");
+    reg(offsetof(RegsInline, line_count), 0x184, "LINE_COUNT");
+    reg(offsetof(RegsInline, offset_out), 0x188, "OFFSET_OUT_UPPER");
+    reg(offsetof(RegsInline, pitch_out), 0x190, "PITCH_OUT");
+    reg(offsetof(RegsInline, dst_block_size), 0x194, "SET_DST_BLOCK_SIZE");
+    reg(offsetof(RegsInline, dst_width), 0x198, "SET_DST_WIDTH");
+    reg(offsetof(RegsInline, dst_height), 0x19c, "SET_DST_HEIGHT");
+    reg(offsetof(RegsInline, dst_depth), 0x1a0, "SET_DST_DEPTH");
+    reg(offsetof(RegsInline, dst_layer), 0x1a4, "SET_DST_LAYER");
+    reg(offsetof(RegsInline, dst_origin_bytes_x), 0x1a8, "SET_DST_ORIGIN_BYTES_X");
+    reg(offsetof(RegsInline, dst_origin_samples_y), 0x1ac, "SET_DST_ORIGIN_SAMPLES_Y");
+    reg(offsetof(RegsInline, not_a_reg_0xc), 0x1b0, "LAUNCH_DMA");
+    reg(offsetof(RegsInline, not_a_reg_0xd), 0x1b4, "LOAD_INLINE_DATA");
+    std::cout << "PASS: inline-to-memory layout matches cla140.h\n";
+}
+
 void testTwoDFixedPoint() {
     using engines::FixedPoint;
     const auto value = [](u32 integer, u32 fractional) {
@@ -1632,6 +2324,7 @@ int main() {
         testMacroResultOperations();
         testRendererClears();
         testGuestMemoryBuffer();
+        testConstBufferRemapping();
         testOcclusionReports();
         testReportSemaphoreReductionAndAcquire();
         testConditionalRendering();
@@ -1646,6 +2339,14 @@ int main() {
         testDmaCopies();
         testChannelMethodsAndFences();
         testTwoDFixedPoint();
+        testBlendSeparateForAlpha();
+        testRegisterLayout();
+        testTextureDescriptorLayout();
+        testVertexAttributeAndRenderTargetLayout();
+        testComputeQmdLayout();
+        testCopyEngineLayout();
+        testTwoDEngineLayout();
+        testInlineEngineLayout();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';
         return 1;

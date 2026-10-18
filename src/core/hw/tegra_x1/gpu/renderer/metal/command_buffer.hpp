@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <span>
@@ -113,6 +114,14 @@ class CommandBuffer final : public ICommandBuffer {
     EncoderState encoder_state{};
     MTL::Buffer* visibility_buffer{nullptr};
     bool last_submission_succeeded{true};
+    // Anything was encoded on, or attached to, the current Metal command
+    // buffer since it was created
+    bool has_commands{false};
+    // Commits and completions of every wrapper: when they are equal nothing
+    // is in flight and a checkpoint on an untouched command buffer has
+    // nothing to wait for
+    static inline std::atomic<u64> submitted_buffers{0};
+    static inline std::atomic<u64> completed_buffers{0};
     std::shared_ptr<UploadBufferPool> upload_pool;
     std::vector<MTL::Buffer*> retired_upload_buffers;
     u64 raster_updates{0};
@@ -121,7 +130,11 @@ class CommandBuffer final : public ICommandBuffer {
     u64 blit_encoders{0};
 
   public:
-    GETTER(command_buffer, getCommandBuffer);
+    // Handlers and drawables attached through this are part of the work
+    MTL::CommandBuffer* getCommandBuffer() {
+        has_commands = true;
+        return command_buffer;
+    }
 
   public:
     // ABI-stable implementations selected by the live module.

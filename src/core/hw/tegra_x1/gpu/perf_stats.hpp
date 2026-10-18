@@ -37,6 +37,7 @@ struct PerfStats {
     std::atomic<u64> blit_encoders{0};
     std::atomic<u64> buffer_snapshots{0};
     std::atomic<u64> buffer_snapshot_bytes{0};
+    std::atomic<u64> checkpoint_skips{0};
 
     static PerfStats& instance() {
         static PerfStats stats;

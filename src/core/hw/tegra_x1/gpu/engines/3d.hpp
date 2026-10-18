@@ -157,6 +157,7 @@ struct TicLodRange {
 };
 
 TicLodRange getTicLodRange(const TextureImageControl& tic);
+MTL::StencilOperation decodeStencilOp(u32 value);
 
 // The texture format selects the border color interpretation (integer bits,
 // sRGB border); Invalid for none
@@ -414,7 +415,8 @@ struct Regs3D {
 
     // 0x4cf
     struct {
-        u32 separate_for_alpha; // TODO: is this a bitfield or something?
+        // SET_BLEND_SEPARATE_FOR_ALPHA (clb197.h 0x133c): bit 0
+        u32 separate_for_alpha;
         u32 rgb_op;
         u32 src_rgb_factor;
         u32 dst_rgb_factor;
@@ -532,7 +534,8 @@ struct Regs3D {
 
     // 0x780
     struct {
-        u32 unknown; // TODO: is this just padding?
+        // SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA (clb197.h 0x1e00 + j * 32)
+        u32 separate_for_alpha;
         u32 rgb_op;
         u32 src_rgb_factor;
         u32 dst_rgb_factor;
@@ -582,6 +585,28 @@ struct Regs3D {
 };
 static_assert(sizeof(Regs3D) == MACRO_METHODS_REGION * sizeof(u32));
 
+// The blend equation as the hardware applies it. SET_BLEND_SEPARATE_FOR_ALPHA
+// (clb197.h, ENABLE bit 0) selects separate alpha registers; the header only
+// names the field, and when it is clear the alpha channel follows the color
+// equation like GL's glBlendFunc versus glBlendFuncSeparate.
+struct BlendEquation {
+    u32 rgb_op;
+    u32 src_rgb_factor;
+    u32 dst_rgb_factor;
+    u32 alpha_op;
+    u32 src_alpha_factor;
+    u32 dst_alpha_factor;
+};
+
+template <typename Blend>
+inline BlendEquation getBlendEquation(const Blend& blend) {
+    if ((blend.separate_for_alpha & 1u) == 0u)
+        return {blend.rgb_op,         blend.src_rgb_factor, blend.dst_rgb_factor,
+                blend.rgb_op,         blend.src_rgb_factor, blend.dst_rgb_factor};
+    return {blend.rgb_op,   blend.src_rgb_factor,   blend.dst_rgb_factor,
+            blend.alpha_op, blend.src_alpha_factor, blend.dst_alpha_factor};
+}
+
 class ThreeD : public EngineWithRegsBase<Regs3D>,
                public InlineBase,
                public macro::MacroHost {
@@ -596,6 +621,10 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     // Getters
     const Regs3D& getRegs() const { return regs; }
+    // Resolves a binding against the current GPU address space, gathering
+    // separate host mappings into owned CPU memory when necessary.
+    ztd::Range<uptr> getConstBuffer(u32 stage_index, u32 slot) const;
+    renderer::BufferView getConstBufferUpload(u32 stage_index, u32 slot);
     // Conditional rendering applies to draws and clears.
     bool shouldExecute() const;
     const std::vector<u32>& getInlineIndices() const { return inline_indices; }
@@ -661,9 +690,17 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     // State
     std::vector<ztd::Range<uptr>> storage_writes;
+    // GPU virtual ranges, resolved when consumed rather than at bind time.
     ztd::Range<uptr>
         bound_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
                            [CONST_BUFFER_BINDING_COUNT];
+    struct GatheredConstBuffer {
+        std::vector<u8> bytes;
+        renderer::BufferView upload;
+    };
+    mutable GatheredConstBuffer
+        gathered_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
+                              [CONST_BUFFER_BINDING_COUNT];
 
     // Methods
     DEFINE_INLINE_ENGINE_METHODS;

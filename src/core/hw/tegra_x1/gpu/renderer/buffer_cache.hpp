@@ -33,6 +33,9 @@ class BufferCache {
 
     BufferView get(ICommandBuffer* command_buffer, ztd::Range<uptr> range);
 
+    // Owned CPU data has no guest write tracking or stable cache address.
+    BufferView snapshot(ztd::Range<uptr> range);
+
     void invalidateMemory(ztd::Range<uptr> range);
 
     // Ranges a shader writes through storage buffers. Their contents live in
