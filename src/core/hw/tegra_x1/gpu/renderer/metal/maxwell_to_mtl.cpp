@@ -714,43 +714,16 @@ MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle) {
     }
 }
 
-MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter) {
-    switch (filter) {
-    case SamplerFilter::Nearest:
-        return MTL::SamplerMinMagFilterNearest;
-    case SamplerFilter::Linear:
-    // Anisotropic minification and the VCAA magnification filters
-    case SamplerFilter::Anisotropic:
-    case SamplerFilter::Vcaa8Tap:
-        return MTL::SamplerMinMagFilterLinear;
-    default:
-        return MTL::SamplerMinMagFilterNearest;
-    }
-}
-
 MTL::SamplerAddressMode
-toMtlSamplerAddressMode(const SamplerAddressMode address_mode) {
-    switch (address_mode) {
-    case SamplerAddressMode::Repeat:
-        return MTL::SamplerAddressModeRepeat;
-    case SamplerAddressMode::MirroredRepeat:
-        return MTL::SamplerAddressModeMirrorRepeat;
-    case SamplerAddressMode::ClampToEdge:
-        return MTL::SamplerAddressModeClampToEdge;
-    case SamplerAddressMode::ClampToBorder:
-        return MTL::SamplerAddressModeClampToBorderColor;
-    case SamplerAddressMode::Clamp:
-        // The sampler picks edge or border by its filter (see Sampler)
-        return MTL::SamplerAddressModeClampToEdge;
-    case SamplerAddressMode::MirrorClampToEdge:
+toMtlSamplerAddressMode(const SamplerDescriptor& descriptor, u32 axis) {
+    const MTL::SamplerAddressMode modes[] = {descriptor.address_mode_s,
+                                             descriptor.address_mode_t,
+                                             descriptor.address_mode_r};
+    // Mirrored border addressing is emulated; the mirror-once edge mode is
+    // the closest host fallback
+    if ((descriptor.mirror_to_border_mask >> axis) & 1u)
         return MTL::SamplerAddressModeMirrorClampToEdge;
-    case SamplerAddressMode::MirrorClampToBorder:
-        return MTL::SamplerAddressModeMirrorClampToEdge;
-    case SamplerAddressMode::MirrorClamp:
-        return MTL::SamplerAddressModeMirrorClampToEdge;
-    default:
-        return MTL::SamplerAddressModeRepeat;
-    }
+    return modes[axis];
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

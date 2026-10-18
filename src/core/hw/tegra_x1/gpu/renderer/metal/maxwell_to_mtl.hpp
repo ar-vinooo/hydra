@@ -33,8 +33,7 @@ MTL::CompareFunction toMtlCompareFunc(engines::CompareOp depth_compare_op);
 
 MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle);
 
-MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter);
 MTL::SamplerAddressMode
-toMtlSamplerAddressMode(const SamplerAddressMode address_mode);
+toMtlSamplerAddressMode(const SamplerDescriptor& descriptor, u32 axis);
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

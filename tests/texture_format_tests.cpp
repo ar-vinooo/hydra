@@ -44,10 +44,13 @@ void testSamplerDecoding() {
         const auto descriptor = engines::decodeSampler(tsc);
         check(descriptor.lod_bias == -1.5f && descriptor.max_anisotropy == values[i],
               "TSC signed 4.8 bias and anisotropy table");
-        check(descriptor.address_mode_s == SamplerAddressMode::ClampToBorder,
+        check(descriptor.address_mode_s == MTL::SamplerAddressModeClampToBorderColor,
               "Linear CLAMP_OGL uses border filtering");
-        check(metal::toMtlSamplerAddressMode(descriptor.address_mode_t) ==
-                  MTL::SamplerAddressModeMirrorClampToEdge,
+        check(descriptor.mirror_to_border_mask == 0b010 &&
+                  descriptor.address_mode_t ==
+                      MTL::SamplerAddressModeClampToBorderColor &&
+                  metal::toMtlSamplerAddressMode(descriptor, 1) ==
+                      MTL::SamplerAddressModeMirrorClampToEdge,
               "Mirror-once-border uses the reference fallback");
         auto other = descriptor;
         other.lod_bias = 1.5f;
@@ -59,7 +62,7 @@ void testSamplerDecoding() {
         check(!SamplerCache::equals(descriptor, other), "Anisotropy participates in sampler cache identity");
     }
     tsc.min_filter = tsc.mag_filter = 1;
-    check(engines::decodeSampler(tsc).address_mode_s == SamplerAddressMode::ClampToEdge,
+    check(engines::decodeSampler(tsc).address_mode_s == MTL::SamplerAddressModeClampToEdge,
           "Nearest CLAMP_OGL uses the edge");
     for (u32 i = 0; i < 8; ++i)
         check(metal::toMtlCompareFunc(static_cast<engines::CompareOp>(0x200 + i)) ==
@@ -116,8 +119,8 @@ void testSamplerBorders() {
     check(emulated(TextureFormat::R32Uint),
           "Opaque black float bits are not an integer preset");
     const auto integer = engines::decodeSampler(tsc, TextureFormat::R32Uint);
-    check(integer.min_filter == SamplerFilter::Nearest &&
-              integer.mag_filter == SamplerFilter::Nearest &&
+    check(integer.min_filter == MTL::SamplerMinMagFilterNearest &&
+              integer.mag_filter == MTL::SamplerMinMagFilterNearest &&
               integer.mip_filter == MTL::SamplerMipFilterNearest &&
               integer.integer_texture,
           "Integer textures sample with nearest filters");
@@ -441,15 +444,21 @@ void testHostFormatCoverage() {
     }
     commands.reset();
 
-    check(metal::toMtlSamplerMinMagFilter(static_cast<SamplerFilter>(0)) ==
-                  MTL::SamplerMinMagFilterNearest &&
-              metal::toMtlSamplerMinMagFilter(SamplerFilter::Anisotropic) ==
-                  MTL::SamplerMinMagFilterLinear &&
-              metal::toMtlSamplerMinMagFilter(SamplerFilter::Vcaa8Tap) ==
-                  MTL::SamplerMinMagFilterLinear &&
-              metal::toMtlSwizzle(static_cast<ImageSwizzle>(1)) ==
-                  MTL::TextureSwizzleZero,
-          "Sampler and swizzle conversions handle every encoding");
+    {
+        const auto filters = [](u32 min, u32 mag) {
+            engines::TextureSamplerControl tsc{};
+            tsc.min_filter = min;
+            tsc.mag_filter = mag;
+            return engines::decodeSampler(tsc);
+        };
+        check(filters(0, 1).min_filter == MTL::SamplerMinMagFilterNearest &&
+                  filters(3, 4).min_filter == MTL::SamplerMinMagFilterLinear &&
+                  filters(3, 4).mag_filter == MTL::SamplerMinMagFilterLinear,
+              "Sampler filter decoding folds anisotropic and VCAA to linear");
+    }
+    check(metal::toMtlSwizzle(static_cast<ImageSwizzle>(1)) ==
+              MTL::TextureSwizzleZero,
+          "Swizzle conversion handles every encoding");
 
     std::cout << "PASS: " << formats.size()
               << " guest formats have valid Metal textures\n";

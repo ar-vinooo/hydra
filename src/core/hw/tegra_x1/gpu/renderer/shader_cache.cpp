@@ -290,6 +290,7 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
         hash.add(sampler.address_mode_s);
         hash.add(sampler.address_mode_t);
         hash.add(sampler.address_mode_r);
+        hash.add(sampler.mirror_to_border_mask);
         hash.add(sampler.depth_compare_op);
         hash.add(sampler.border_color_u);
         hash.add(sampler.min_lod);

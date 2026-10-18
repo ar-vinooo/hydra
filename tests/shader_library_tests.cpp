@@ -1747,12 +1747,12 @@ void testTextureLodSelection() {
                                 : scenario == 4 ? 2.0f
                                                 : 1.5f;
             const SamplerDescriptor sampler_descriptor{
-                .min_filter = SamplerFilter::Nearest,
-                .mag_filter = SamplerFilter::Nearest,
+                .min_filter = MTL::SamplerMinMagFilterNearest,
+                .mag_filter = MTL::SamplerMinMagFilterNearest,
                 .mip_filter = MTL::SamplerMipFilterLinear,
-                .address_mode_s = SamplerAddressMode::ClampToEdge,
-                .address_mode_t = SamplerAddressMode::ClampToEdge,
-                .address_mode_r = SamplerAddressMode::ClampToEdge,
+                .address_mode_s = MTL::SamplerAddressModeClampToEdge,
+                .address_mode_t = MTL::SamplerAddressModeClampToEdge,
+                .address_mode_r = MTL::SamplerAddressModeClampToEdge,
                 .depth_compare_op =
                     hydra::hw::tegra_x1::gpu::engines::CompareOp::Invalid,
                 .border_color_u = simd::uint4{0, 0, 0, 0},
@@ -1928,14 +1928,14 @@ void testTextureBorderEmulation() {
     const std::array<float, 4> border_color = {0.25f, 0.5f, 0.75f, 1.0f};
 
     for (const bool linear : {true, false}) {
-        const auto filter = linear ? SamplerFilter::Linear : SamplerFilter::Nearest;
+        const auto filter = linear ? MTL::SamplerMinMagFilterLinear : MTL::SamplerMinMagFilterNearest;
         const SamplerDescriptor sampler_descriptor{
             .min_filter = filter,
             .mag_filter = filter,
             .mip_filter = MTL::SamplerMipFilterNotMipmapped,
-            .address_mode_s = SamplerAddressMode::ClampToBorder,
-            .address_mode_t = SamplerAddressMode::ClampToBorder,
-            .address_mode_r = SamplerAddressMode::ClampToBorder,
+            .address_mode_s = MTL::SamplerAddressModeClampToBorderColor,
+            .address_mode_t = MTL::SamplerAddressModeClampToBorderColor,
+            .address_mode_r = MTL::SamplerAddressModeClampToBorderColor,
             .depth_compare_op =
                 hydra::hw::tegra_x1::gpu::engines::CompareOp::Invalid,
             .border_color_u = std::bit_cast<simd::uint4>(border_color),

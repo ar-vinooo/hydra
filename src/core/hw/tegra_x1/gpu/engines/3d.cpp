@@ -2057,22 +2057,46 @@ renderer::SamplerDescriptor
 decodeSampler(const TextureSamplerControl& tsc,
               renderer::TextureFormat texture_format, TicLodRange view_lods) {
     constexpr u32 anisotropy[] = {1, 2, 4, 6, 8, 10, 12, 16};
-    const auto address = [&](u32 mode) {
-        if (mode == static_cast<u32>(renderer::SamplerAddressMode::Clamp))
+    u8 mirror_to_border_mask = 0;
+    const auto address = [&](u32 mode, u32 axis) {
+        switch (mode) {
+        case 1:
+            return MTL::SamplerAddressModeMirrorRepeat;
+        case 2:
+            return MTL::SamplerAddressModeClampToEdge;
+        case 3:
+            return MTL::SamplerAddressModeClampToBorderColor;
+        case 4: // CLAMP_OGL: border when filtering linearly, edge otherwise
             return tsc.min_filter == 1 && tsc.mag_filter == 1
-                ? renderer::SamplerAddressMode::ClampToEdge
-                : renderer::SamplerAddressMode::ClampToBorder;
-        return static_cast<renderer::SamplerAddressMode>(mode);
+                       ? MTL::SamplerAddressModeClampToEdge
+                       : MTL::SamplerAddressModeClampToBorderColor;
+        case 5:
+        case 7:
+            return MTL::SamplerAddressModeMirrorClampToEdge;
+        case 6: // Mirror-once-border has no Metal mode
+            mirror_to_border_mask |= static_cast<u8>(1u << axis);
+            return MTL::SamplerAddressModeClampToBorderColor;
+        default:
+            return MTL::SamplerAddressModeRepeat;
+        }
     };
+    const auto filter = [](u32 value) {
+        // Nearest is 1; the linear, anisotropic and VCAA modes sample linearly
+        return value >= 2 && value <= 4 ? MTL::SamplerMinMagFilterLinear
+                                        : MTL::SamplerMinMagFilterNearest;
+    };
+    const auto address_s = address(tsc.address_u, 0);
+    const auto address_t = address(tsc.address_v, 1);
+    const auto address_r = address(tsc.address_p, 2);
     renderer::SamplerDescriptor descriptor{
-        .min_filter = static_cast<renderer::SamplerFilter>(tsc.min_filter),
-        .mag_filter = static_cast<renderer::SamplerFilter>(tsc.mag_filter),
+        .min_filter = filter(tsc.min_filter),
+        .mag_filter = filter(tsc.mag_filter),
         .mip_filter = tsc.mip_filter == 2   ? MTL::SamplerMipFilterNearest
                       : tsc.mip_filter == 3 ? MTL::SamplerMipFilterLinear
                                             : MTL::SamplerMipFilterNotMipmapped,
-        .address_mode_s = address(tsc.address_u),
-        .address_mode_t = address(tsc.address_v),
-        .address_mode_r = address(tsc.address_p),
+        .address_mode_s = address_s,
+        .address_mode_t = address_t,
+        .address_mode_r = address_r,
         .depth_compare_op = (tsc.depth_compare ? static_cast<CompareOp>(
                                                      tsc.depth_compare_op + 1)
                                                : CompareOp::Invalid),
@@ -2084,6 +2108,7 @@ decodeSampler(const TextureSamplerControl& tsc,
         .max_anisotropy = anisotropy[tsc.max_anisotropy],
         .integer_texture =
             renderer::getIntegerTextureComponentType(texture_format) != nullptr,
+        .mirror_to_border_mask = mirror_to_border_mask,
     };
 
     // sRGB textures use the separate 8-bit border color, converted to linear
@@ -2106,8 +2131,8 @@ decodeSampler(const TextureSamplerControl& tsc,
 
     // Integer textures cannot be filtered
     if (descriptor.integer_texture) {
-        descriptor.min_filter = renderer::SamplerFilter::Nearest;
-        descriptor.mag_filter = renderer::SamplerFilter::Nearest;
+        descriptor.min_filter = MTL::SamplerMinMagFilterNearest;
+        descriptor.mag_filter = MTL::SamplerMinMagFilterNearest;
         if (descriptor.mip_filter == MTL::SamplerMipFilterLinear)
             descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;

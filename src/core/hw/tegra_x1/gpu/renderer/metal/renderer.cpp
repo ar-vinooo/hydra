@@ -1038,7 +1038,8 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
     if (texture != nullptr && sampler != nullptr &&
         getIntegerTextureComponentType(texture->getDescriptor().format) != nullptr) {
         auto descriptor = sampler->getDescriptor();
-        descriptor.min_filter = descriptor.mag_filter = SamplerFilter::Nearest;
+        descriptor.min_filter = descriptor.mag_filter =
+            MTL::SamplerMinMagFilterNearest;
         descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;
         sampler = getSamplerCache().find(descriptor);

@@ -9,24 +9,16 @@ Sampler::Sampler(MTL::Device* device, const SamplerDescriptor& descriptor)
     : SamplerBase(descriptor) {
     MTL::SamplerDescriptor* desc = MTL::SamplerDescriptor::alloc()->init();
     desc->setSupportArgumentBuffers(true);
-    desc->setMinFilter(toMtlSamplerMinMagFilter(descriptor.min_filter));
-    desc->setMagFilter(toMtlSamplerMinMagFilter(descriptor.mag_filter));
+    desc->setMinFilter(descriptor.min_filter);
+    desc->setMagFilter(descriptor.mag_filter);
     desc->setMipFilter(descriptor.mip_filter);
     desc->setLodMinClamp(descriptor.min_lod);
     desc->setLodMaxClamp(descriptor.max_lod);
     // Bias is combined with the instruction bias in generated MSL.
     desc->setMaxAnisotropy(getEffectiveSamplerAnisotropy(descriptor));
-    // CLAMP_OGL clamps to the border when filtering linearly (like Eden)
-    const bool linear = descriptor.min_filter != SamplerFilter::Nearest ||
-                        descriptor.mag_filter != SamplerFilter::Nearest;
-    const auto address_mode = [linear](SamplerAddressMode mode) {
-        if (mode == SamplerAddressMode::Clamp && linear)
-            return MTL::SamplerAddressModeClampToBorderColor;
-        return toMtlSamplerAddressMode(mode);
-    };
-    desc->setSAddressMode(address_mode(descriptor.address_mode_s));
-    desc->setTAddressMode(address_mode(descriptor.address_mode_t));
-    desc->setRAddressMode(address_mode(descriptor.address_mode_r));
+    desc->setSAddressMode(toMtlSamplerAddressMode(descriptor, 0));
+    desc->setTAddressMode(toMtlSamplerAddressMode(descriptor, 1));
+    desc->setRAddressMode(toMtlSamplerAddressMode(descriptor, 2));
     if (descriptor.depth_compare_op != engines::CompareOp::Invalid)
         desc->setCompareFunction(toMtlCompareFunc(descriptor.depth_compare_op));
 

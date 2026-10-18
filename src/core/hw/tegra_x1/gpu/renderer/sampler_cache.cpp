@@ -18,6 +18,7 @@ u32 SamplerCache::hashHot1(const SamplerDescriptor& descriptor) {
     hash.add(descriptor.address_mode_s);
     hash.add(descriptor.address_mode_t);
     hash.add(descriptor.address_mode_r);
+    hash.add(descriptor.mirror_to_border_mask);
     hash.add(descriptor.depth_compare_op);
     hash.add(descriptor.border_color_u);
     hash.add(descriptor.min_lod);
@@ -37,6 +38,7 @@ bool SamplerCache::equals(const SamplerDescriptor& a,
            a.address_mode_s == b.address_mode_s &&
            a.address_mode_t == b.address_mode_t &&
            a.address_mode_r == b.address_mode_r &&
+           a.mirror_to_border_mask == b.mirror_to_border_mask &&
            a.depth_compare_op == b.depth_compare_op &&
            simd_all(a.border_color_u == b.border_color_u) && a.min_lod == b.min_lod &&
            a.max_lod == b.max_lod && a.lod_bias == b.lod_bias &&

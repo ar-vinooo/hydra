@@ -81,18 +81,18 @@ struct BorderAxis {
     bool border;
 };
 
-BorderAxis getBorderAxis(renderer::SamplerAddressMode mode) {
-    switch (mode) {
-    case renderer::SamplerAddressMode::Repeat:
+BorderAxis getBorderAxis(const renderer::SamplerDescriptor& d, u32 axis) {
+    const MTL::SamplerAddressMode modes[] = {d.address_mode_s, d.address_mode_t,
+                                             d.address_mode_r};
+    const bool mirror_to_border = (d.mirror_to_border_mask >> axis) & 1u;
+    switch (modes[axis]) {
+    case MTL::SamplerAddressModeRepeat:
         return {"repeat", false, false};
-    case renderer::SamplerAddressMode::MirroredRepeat:
+    case MTL::SamplerAddressModeMirrorRepeat:
         return {"mirrored_repeat", false, false};
-    case renderer::SamplerAddressMode::ClampToBorder:
-        return {"clamp_to_border", false, true};
-    case renderer::SamplerAddressMode::MirrorClampToBorder:
-        return {"clamp_to_border", true, true};
-    case renderer::SamplerAddressMode::MirrorClampToEdge:
-    case renderer::SamplerAddressMode::MirrorClamp:
+    case MTL::SamplerAddressModeClampToBorderColor:
+        return {"clamp_to_border", mirror_to_border, true};
+    case MTL::SamplerAddressModeMirrorClampToEdge:
         return {"clamp_to_edge", true, false};
     default:
         return {"clamp_to_edge", false, false};
@@ -153,8 +153,8 @@ bool supportsBorderEmulation(TextureType type) {
 std::string getBorderSamplerDeclaration(u32 index, const char* variant,
                                         const renderer::SamplerDescriptor& d,
                                         bool compare, bool white) {
-    const auto filter = [](renderer::SamplerFilter filter) {
-        return filter == renderer::SamplerFilter::Nearest ? "nearest"
+    const auto filter = [](MTL::SamplerMinMagFilter filter) {
+        return filter == MTL::SamplerMinMagFilterNearest ? "nearest"
                                                           : "linear";
     };
     const char* mip = "none";
@@ -166,9 +166,9 @@ std::string getBorderSamplerDeclaration(u32 index, const char* variant,
         "constexpr sampler hydra_bs{}_{}(coord::normalized, s_address::{}, "
         "t_address::{}, r_address::{}, mag_filter::{}, min_filter::{}, "
         "mip_filter::{}, border_color::{}, lod_clamp({:.6f}, {:.6f})",
-        index, variant, getBorderAxis(d.address_mode_s).address,
-        getBorderAxis(d.address_mode_t).address,
-        getBorderAxis(d.address_mode_r).address, filter(d.mag_filter),
+        index, variant, getBorderAxis(d, 0).address,
+        getBorderAxis(d, 1).address,
+        getBorderAxis(d, 2).address, filter(d.mag_filter),
         filter(d.min_filter), mip, white ? "opaque_white" : "transparent_black",
         d.min_lod, d.max_lod);
     if (const auto anisotropy = renderer::getEffectiveSamplerAnisotropy(d);
@@ -1474,9 +1474,9 @@ void MslEmitter::emitTextureSample(
                                      "Integer texture gathers with borders"));
         } else {
             border = &border_it->second;
-            const std::array axes = {getBorderAxis(border->address_mode_s),
-                                     getBorderAxis(border->address_mode_t),
-                                     getBorderAxis(border->address_mode_r)};
+            const std::array axes = {getBorderAxis(*border, 0),
+                                     getBorderAxis(*border, 1),
+                                     getBorderAxis(*border, 2)};
             mirrors = axes[0].mirror || axes[1].mirror || axes[2].mirror;
             mirror_mask = fmt::format("bool3({}, {}, {})", axes[0].mirror,
                                       axes[1].mirror, axes[2].mirror);

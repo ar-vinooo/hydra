@@ -296,32 +296,13 @@ struct TextureViewDescriptor {
     u32 getHash() const;
 };
 
-enum class SamplerFilter {
-    Nearest = 1,
-    Linear = 2,
-    // MIN_ANISO for minification, VCAA_4_TAP for magnification
-    Anisotropic = 3,
-    Vcaa8Tap = 4,
-};
-
-enum class SamplerAddressMode {
-    Repeat = 0,
-    MirroredRepeat = 1,
-    ClampToEdge = 2,
-    ClampToBorder = 3,
-    Clamp = 4,
-    MirrorClampToEdge = 5,
-    MirrorClampToBorder = 6,
-    MirrorClamp = 7,
-};
-
 struct SamplerDescriptor {
-    SamplerFilter min_filter;
-    SamplerFilter mag_filter;
+    MTL::SamplerMinMagFilter min_filter;
+    MTL::SamplerMinMagFilter mag_filter;
     MTL::SamplerMipFilter mip_filter;
-    SamplerAddressMode address_mode_s;
-    SamplerAddressMode address_mode_t;
-    SamplerAddressMode address_mode_r;
+    MTL::SamplerAddressMode address_mode_s;
+    MTL::SamplerAddressMode address_mode_t;
+    MTL::SamplerAddressMode address_mode_r;
     engines::CompareOp depth_compare_op;
     simd::uint4 border_color_u;
     f32 min_lod = 0.0f;
@@ -331,6 +312,10 @@ struct SamplerDescriptor {
     // The sampled texture has an integer format: the border color holds raw
     // component bits
     bool integer_texture = false;
+    // Axes (bit 0 S, 1 T, 2 R) addressed with mirror-clamp-to-border. Metal
+    // has no such mode: those axes carry ClampToBorderColor and the shader
+    // emulates the mirroring.
+    u8 mirror_to_border_mask = 0;
 };
 
 constexpr bool isSrgbTextureFormat(TextureFormat format) {
@@ -376,21 +361,14 @@ enum class SamplerBorderPreset {
     Custom,
 };
 
-constexpr bool isBorderAddressMode(SamplerAddressMode mode) {
-    return mode == SamplerAddressMode::ClampToBorder ||
-           mode == SamplerAddressMode::MirrorClampToBorder;
-}
-
 constexpr bool samplerUsesBorder(const SamplerDescriptor& descriptor) {
-    return isBorderAddressMode(descriptor.address_mode_s) ||
-           isBorderAddressMode(descriptor.address_mode_t) ||
-           isBorderAddressMode(descriptor.address_mode_r);
+    return descriptor.address_mode_s == MTL::SamplerAddressModeClampToBorderColor ||
+           descriptor.address_mode_t == MTL::SamplerAddressModeClampToBorderColor ||
+           descriptor.address_mode_r == MTL::SamplerAddressModeClampToBorderColor;
 }
 
 constexpr bool samplerMirrorsToBorder(const SamplerDescriptor& descriptor) {
-    return descriptor.address_mode_s == SamplerAddressMode::MirrorClampToBorder ||
-           descriptor.address_mode_t == SamplerAddressMode::MirrorClampToBorder ||
-           descriptor.address_mode_r == SamplerAddressMode::MirrorClampToBorder;
+    return descriptor.mirror_to_border_mask != 0;
 }
 
 inline SamplerBorderPreset
@@ -434,7 +412,7 @@ inline bool samplerNeedsBorderEmulation(const SamplerDescriptor& descriptor) {
 
 // Anisotropic filtering needs linear minification and mip filtering
 constexpr u32 getEffectiveSamplerAnisotropy(const SamplerDescriptor& descriptor) {
-    if (descriptor.min_filter != SamplerFilter::Nearest &&
+    if (descriptor.min_filter != MTL::SamplerMinMagFilterNearest &&
         descriptor.mip_filter == MTL::SamplerMipFilterLinear)
         return std::clamp(descriptor.max_anisotropy, 1u, 16u);
     return 1u;
