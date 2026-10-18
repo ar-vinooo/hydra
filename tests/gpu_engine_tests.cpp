@@ -1563,38 +1563,31 @@ void testDmaCopies() {
 }
 
 // 2D fixed point coordinates are signed 32.32
-// SET_BLEND_SEPARATE_FOR_ALPHA (clb197.h 0x133c, per target 0x1e00 + j * 32):
-// the alpha registers only apply when the flag is set
-void testBlendSeparateForAlpha() {
+// Regression for the captured light-shaft occlusion draw: explicit alpha
+// REVERSE_SUBTRACT must not turn into color ADD at pipeline construction.
+void testExplicitAlphaBlendEquation() {
     using namespace hw::tegra_x1::gpu::engines;
     Regs3D regs{};
-    regs.blend_state = {.separate_for_alpha = 0, .rgb_op = 1,
-                        .src_rgb_factor = 2, .dst_rgb_factor = 6,
-                        .alpha_op = 3, .src_alpha_factor = 5,
-                        .dst_alpha_factor = 7};
-    auto equation = getBlendEquation(regs.blend_state);
-    expect(equation.alpha_op == 1 && equation.src_alpha_factor == 2 &&
-              equation.dst_alpha_factor == 6 && equation.rgb_op == 1 &&
-              equation.src_rgb_factor == 2 && equation.dst_rgb_factor == 6,
-          "Alpha follows the color equation when SEPARATE_FOR_ALPHA is clear");
-    regs.blend_state.separate_for_alpha = 1;
-    equation = getBlendEquation(regs.blend_state);
-    expect(equation.alpha_op == 3 && equation.src_alpha_factor == 5 &&
-              equation.dst_alpha_factor == 7 && equation.rgb_op == 1,
-          "Alpha registers apply when SEPARATE_FOR_ALPHA is set");
-    // Only bit 0 is the enable
-    regs.blend_state.separate_for_alpha = 2;
-    expect(getBlendEquation(regs.blend_state).alpha_op == 1,
-          "Other bits of SEPARATE_FOR_ALPHA do not enable separate alpha");
-    regs.independent_blend_state[3] = {.separate_for_alpha = 1, .rgb_op = 1,
-                                       .src_rgb_factor = 1, .dst_rgb_factor = 1,
-                                       .alpha_op = 5, .src_alpha_factor = 2,
-                                       .dst_alpha_factor = 2};
-    expect(getBlendEquation(regs.independent_blend_state[3]).alpha_op == 5 &&
-              getBlendEquation(regs.independent_blend_state[0]).alpha_op ==
-                  regs.independent_blend_state[0].rgb_op,
-          "Per-target blend state has its own SEPARATE_FOR_ALPHA flag");
-    std::cout << "PASS: blend separate-for-alpha selects the alpha equation\n";
+    for (u32 flag : {0u, 1u, 2u}) {
+        regs.blend_state = {.separate_for_alpha = flag, .rgb_op = 1,
+                            .src_rgb_factor = 2, .dst_rgb_factor = 6,
+                            .alpha_op = 3, .src_alpha_factor = 2,
+                            .dst_alpha_factor = 2};
+        const auto equation = getBlendEquation(regs.blend_state);
+        expect(equation.rgb_op == 1 && equation.src_rgb_factor == 2 &&
+                   equation.dst_rgb_factor == 6 && equation.alpha_op == 3 &&
+                   equation.src_alpha_factor == 2 && equation.dst_alpha_factor == 2,
+               "Captured alpha occlusion equation survives pipeline resolution");
+        regs.independent_blend_state[3] = {.separate_for_alpha = flag, .rgb_op = 1,
+                                           .src_rgb_factor = 1, .dst_rgb_factor = 1,
+                                           .alpha_op = 5, .src_alpha_factor = 5,
+                                           .dst_alpha_factor = 7};
+        const auto independent = getBlendEquation(regs.independent_blend_state[3]);
+        expect(independent.alpha_op == 5 && independent.src_alpha_factor == 5 &&
+                   independent.dst_alpha_factor == 7 && independent.rgb_op == 1,
+               "Independent targets preserve explicit alpha factors and operation");
+    }
+    std::cout << "PASS: explicit color and alpha blend equations are preserved\n";
 }
 
 // The register file mirrors the method space: a field's byte offset in Regs3D
@@ -2339,7 +2332,7 @@ int main() {
         testDmaCopies();
         testChannelMethodsAndFences();
         testTwoDFixedPoint();
-        testBlendSeparateForAlpha();
+        testExplicitAlphaBlendEquation();
         testRegisterLayout();
         testTextureDescriptorLayout();
         testVertexAttributeAndRenderTargetLayout();

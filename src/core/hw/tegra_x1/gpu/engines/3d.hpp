@@ -585,10 +585,11 @@ struct Regs3D {
 };
 static_assert(sizeof(Regs3D) == MACRO_METHODS_REGION * sizeof(u32));
 
-// The blend equation as the hardware applies it. SET_BLEND_SEPARATE_FOR_ALPHA
-// (clb197.h, ENABLE bit 0) selects separate alpha registers; the header only
-// names the field, and when it is clear the alpha channel follows the color
-// equation like GL's glBlendFunc versus glBlendFuncSeparate.
+// Preserve the explicitly programmed color and alpha equations. The NVIDIA
+// header names SEPARATE_FOR_ALPHA but does not specify a draw-time override of
+// the alpha registers. Inferring that override from glBlendFunc discarded the
+// captured ADD-color / REVERSE_SUBTRACT-alpha light-shaft occlusion equation.
+// Register-write side effects of SEPARATE_FOR_ALPHA still need hardware proof.
 struct BlendEquation {
     u32 rgb_op;
     u32 src_rgb_factor;
@@ -598,11 +599,11 @@ struct BlendEquation {
     u32 dst_alpha_factor;
 };
 
+MTL::BlendOperation getBlendOperation(u32 blend_op);
+MTL::BlendFactor getBlendFactor(u32 blend_factor);
+
 template <typename Blend>
 inline BlendEquation getBlendEquation(const Blend& blend) {
-    if ((blend.separate_for_alpha & 1u) == 0u)
-        return {blend.rgb_op,         blend.src_rgb_factor, blend.dst_rgb_factor,
-                blend.rgb_op,         blend.src_rgb_factor, blend.dst_rgb_factor};
     return {blend.rgb_op,   blend.src_rgb_factor,   blend.dst_rgb_factor,
             blend.alpha_op, blend.src_alpha_factor, blend.dst_alpha_factor};
 }

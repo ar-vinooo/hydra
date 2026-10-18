@@ -826,6 +826,12 @@ void Renderer::debugDumpTextureLevelHot23(ICommandBuffer* command_buffer,
                 break;
             case MTL::PixelFormatRGBA8Unorm:
             case MTL::PixelFormatRGBA8Unorm_sRGB:
+                // Keep exact alpha for numerical mask/blend analysis. The PNG
+                // below is intentionally opaque so dark intermediate buffers
+                // remain visible in image viewers.
+                std::ofstream(path + ".rgba8", std::ios::binary)
+                    .write(reinterpret_cast<const char*>(data),
+                           static_cast<std::streamsize>(pixel_count * 4));
                 std::memcpy(rgba.data(), data, pixel_count * 4);
                 for (usize i = 0; i < pixel_count; i++)
                     rgba[i * 4 + 3] = 255;

@@ -893,3 +893,92 @@ MSAA, explicit fragment depth, sampling depth/reflection serta bloom belum dibuk
 oleh tes baru. Efek putih dekat air terjun masih OPEN; hasil ini bukan sertifikasi
 seluruh 3D. Petunjuk reproduksi dan sumber primer ada di
 [README depth/stencil reference](../../tests/README-depth-stencil-reference.md).
+
+## Capture live: silau air terjun terlokalisasi ke light-shaft
+
+Pengguna memarkir kart menghadap silau putih. Sesi diagnostik berada di
+`/tmp/hydra-waterfall-20261018-230217`; aplikasi tetap berjalan. Agen tidak
+mengirim input gameplay. Capture `trace/frame_4.txt` menunjukkan scene opaque
+dan buffer air/partikel sebelum composite masih memiliki detail. Rangkaian
+shader `0xa260030` → `0xa2b0030` → `0xa2d0030` → `0xa280030` menghasilkan mask
+dan radial blur; composite `0x260030` membaca hasilnya pada binding 20.
+
+Eksperimen A/B/A pada posisi yang sama:
+
+- A: shader asli, 112302 piksel RGB masing-masing >=245 dari 921600 piksel.
+- B: hanya empat penggunaan uniform kontribusi light-shaft `c3[0x30]` pada
+  composite diganti nol lewat override MSL sementara. Silau besar hilang;
+  tersisa 3 piksel pada ambang yang sama. Air, scene, fog, dan shadow tetap
+  diproses oleh jalur sebelumnya.
+- A kembali: file override dihapus dan reload diminta. Silau kembali, 90750
+  piksel pada ambang tersebut. Partikel/air bergerak, jadi frame tidak identik.
+
+Penghitungan memakai Python/Pillow. Hasil dan panel pembanding:
+`trace/lightshaft-comparison.json` serta `trace/lightshaft-comparison.png`.
+Capture baseline: `visual/capture-10944851556666`, intervensi:
+`visual/capture-11053236151333`, pemulihan:
+`visual/capture-11266491024250`, semuanya relatif terhadap direktori trace.
+Tidak ada override yang dibiarkan aktif dan tidak ada pengurangan intensitas
+yang diterapkan ke renderer produksi.
+
+Kesimpulan terbatas: kontribusi light-shaft terbukti membawa silau besar ke
+hasil composite. Ini belum membuktikan kesalahan shader lighting utama,
+shadow map, refleksi, atau semantik hardware alpha. Kandidat berikutnya adalah
+mask alpha: draw `0xa2b0030` memakai RGB ADD ONE/ONE_MINUS_SRC_ALPHA, register
+alpha REVERSE_SUBTRACT ONE/ONE, tetapi separate-for-alpha=0; helper saat ini
+memilih persamaan RGB untuk alpha. Audit terdahulu menyatakan semantik flag
+tersebut sebagai inferensi dari nama register, bukan bukti NVIDIA. Jangan
+mengubah persamaan atau membuat tes oracle yang sekadar mengukuhkan inferensi
+itu tanpa pembuktian lebih lanjut. PNG debug RGBA8 saat ini memaksa alpha=255,
+sehingga PNG warna saja tidak dapat dipakai untuk memverifikasi mask alpha.
+Bug cahaya tetap OPEN pada tingkat akar masalah; tahap yang membawa gejalanya
+sudah terlokalisasi.
+
+## Perbaikan alpha mask light-shaft dan verifikasi Python/Metal
+
+**Status gejala:** pengguna menguji build baru dan melaporkan “yay sudah normal”.
+Perbaikan membatalkan interpretasi draw-time separate-alpha dari checkpoint
+audit blend sebelumnya. Interpretasi itu belum memiliki bukti semantik NVIDIA
+dan ternyata membuang persamaan alpha yang diprogram secara eksplisit.
+
+`getBlendEquation` sekarang mempertahankan register operasi/faktor RGB dan alpha.
+Pada draw occlusion `0xa2b0030`, RGB tetap ADD ONE/ONE_MINUS_SRC_ALPHA dan alpha
+tetap REVERSE_SUBTRACT ONE/ONE. Sebelumnya flag nol membuat alpha ikut ADD,
+sehingga alpha air/partikel menjadi sumber cahaya saat radial blur membaca mask.
+Perbaikan ini berlaku pada jalur global, per target, dan pemeriksaan dual-source;
+tidak ada penyesuaian intensitas atau override shader yang diterapkan.
+
+Verifikasi yang dijalankan:
+
+- Python `tests/lightshaft_blend_reference.py`: **1536/1536** hasil GPU Metal
+  cocok dengan perhitungan scalar independen atas persamaan register capture.
+  **24** encoding OGL/D3D global/per target diaudit terhadap header NVIDIA
+  `clb197.h` (SHA-256
+  `175c50f29798b39c6858cafe31497e9e9798c70ca068a64856719003b5d088d7`).
+- Uji mutasi: selector lama direplikasi sementara pada titik resolusi persamaan
+  dalam harness. **960/1536 gagal**, termasuk mask tujuan nol yang salah menjadi
+  positif. Mutasi dihapus, runner dibangun kembali, dan 1536/1536 kembali lulus.
+- Oracle blend/HDR lama **2160/2160** dan gpu-engine lulus dengan Metal API
+  validation. Build aplikasi dan runner lulus dengan `-j 6`.
+- Capture live build baru:
+  `/tmp/hydra-waterfall-alpha-fix-20261018/trace/visual/capture-12428667610083`.
+  Python membaca sidecar RGBA8 mentah: input partikel mempunyai 27851, 28690,
+  dan 31153 piksel ber-alpha positif dalam tiga frame; mask 640×360 sebelum
+  dan sesudah draw tetap alpha nol pada semua 230400 piksel tiap frame.
+  Hasil berada pada `alpha-readback.json` dalam direktori capture tersebut.
+  Sudut live capture ini berbeda dari posisi A/B awal karena pengguna sudah
+  bergerak; konfirmasi air terjun normal berasal dari pengujian pengguna.
+
+Debug dump RGBA8 kini menyimpan sidecar `.png.rgba8` sebelum alpha PNG preview
+dipaksa 255, agar mask dapat diperiksa secara numerik. Hydra build baru sudah
+dibuka (hot reload dinonaktifkan untuk mengisolasi kode executable), tanpa
+override shader. Agen tidak mengirim input gameplay dan tidak commit/stage.
+
+Batas bukti: perbandingan ini **referensi matematika register NVIDIA vs eksekusi
+GPU Apple Metal**, bukan pengujian pada GPU NVIDIA fisik. Header NVIDIA
+mendefinisikan nama dan encoding register, bukan seluruh side effect
+SEPARATE_FOR_ALPHA. Propagasi register saat penulisan flag masih memerlukan
+bukti hardware terpisah. Tes baru memakai selector dan decoder enum produksi
+tetapi menyusun descriptor blend Metal langsung; ia tidak mereplay seluruh
+shader guest atau membuktikan semua cache pipeline dan semua efek pencahayaan.
+Petunjuk rerun: [README light-shaft blend](../../tests/README-lightshaft-blend-reference.md).

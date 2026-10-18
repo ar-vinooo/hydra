@@ -97,6 +97,8 @@ constexpr u32 D3D11_BLEND_OP_REV_SUB = 3;
 constexpr u32 D3D11_BLEND_OP_MIN = 4;
 constexpr u32 D3D11_BLEND_OP_MAX = 5;
 
+} // namespace
+
 MTL::BlendOperation getBlendOperation(u32 blend_op) {
     switch (blend_op) {
     // GL
@@ -246,6 +248,8 @@ MTL::BlendFactor getBlendFactor(u32 blend_factor) {
         }
     }
 }
+
+namespace {
 
 // The "both" source factors (D3D9 BOTHSRCALPHA, BOTHINVSRCALPHA) set the
 // destination factor too: (SrcAlpha, InvSrcAlpha) and (InvSrcAlpha, SrcAlpha)

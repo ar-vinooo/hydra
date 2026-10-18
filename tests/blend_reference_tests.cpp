@@ -2,7 +2,9 @@
 // target bytes. tests/blend_reference.py computes the expected values from the
 // blend/format rules and compares. Usage: <binary> <cases.txt> <out.txt>
 // Case line: <format> <srcFactor> <dstFactor> <op> <dst rgba> <src rgba>
+// Or: registers <format> <global|target> <flag> <six raw regs> <dst> <src>
 #include "core/hw/tegra_x1/gpu/const.hpp"
+#include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
 
@@ -73,10 +75,34 @@ fragment float4 f(constant float4& c [[buffer(0)]]) { return c; }
             std::string fmt, sf, df, op;
             float dst[4], src[4];
             ss >> fmt >> sf >> df >> op;
+            const bool registers = fmt == "registers";
+            engines::BlendEquation equation{};
+            if (registers) {
+                // registers <format> <global|target> <flag> <six raw regs> <dst> <src>
+                const auto kind = df;
+                const auto flag = static_cast<u32>(std::stoul(op));
+                fmt = sf;
+                engines::Regs3D regs{};
+                const auto read = [&](auto& blend) {
+                    blend.separate_for_alpha = flag;
+                    ss >> blend.rgb_op >> blend.src_rgb_factor >> blend.dst_rgb_factor
+                       >> blend.alpha_op >> blend.src_alpha_factor
+                       >> blend.dst_alpha_factor;
+                    equation = engines::getBlendEquation(blend);
+                };
+                if (kind == "global")
+                    read(regs.blend_state);
+                else if (kind == "target")
+                    read(regs.independent_blend_state[3]);
+                else
+                    throw std::runtime_error("invalid register kind: " + kind);
+            }
             for (auto& v : dst)
                 ss >> v;
             for (auto& v : src)
                 ss >> v;
+            if (!ss)
+                throw std::runtime_error("invalid case: " + line);
             // The format goes through Hydra's Maxwell -> Metal table
             const auto pixel_format =
                 toMtlPixelFormat(formats.at(fmt));
@@ -88,12 +114,18 @@ fragment float4 f(constant float4& c [[buffer(0)]]) { return c; }
             auto* ca = pd->colorAttachments()->object(0);
             ca->setPixelFormat(pixel_format);
             ca->setBlendingEnabled(true);
-            ca->setRgbBlendOperation(ops.at(op));
-            ca->setAlphaBlendOperation(ops.at(op));
-            ca->setSourceRGBBlendFactor(factors.at(sf));
-            ca->setSourceAlphaBlendFactor(factors.at(sf));
-            ca->setDestinationRGBBlendFactor(factors.at(df));
-            ca->setDestinationAlphaBlendFactor(factors.at(df));
+            ca->setRgbBlendOperation(registers
+                ? engines::getBlendOperation(equation.rgb_op) : ops.at(op));
+            ca->setAlphaBlendOperation(registers
+                ? engines::getBlendOperation(equation.alpha_op) : ops.at(op));
+            ca->setSourceRGBBlendFactor(registers
+                ? engines::getBlendFactor(equation.src_rgb_factor) : factors.at(sf));
+            ca->setSourceAlphaBlendFactor(registers
+                ? engines::getBlendFactor(equation.src_alpha_factor) : factors.at(sf));
+            ca->setDestinationRGBBlendFactor(registers
+                ? engines::getBlendFactor(equation.dst_rgb_factor) : factors.at(df));
+            ca->setDestinationAlphaBlendFactor(registers
+                ? engines::getBlendFactor(equation.dst_alpha_factor) : factors.at(df));
             NS_STACK_SCOPED auto pipeline =
                 device->newRenderPipelineState(pd, &error);
             if (!pipeline)
