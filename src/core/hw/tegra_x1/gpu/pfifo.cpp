@@ -109,14 +109,15 @@ void Pfifo::shutdown() {
 
 void Pfifo::submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                           GpfifoFlags flags,
-                          std::function<void()> on_complete) {
+                          std::function<void()> on_complete,
+                          Fence wait_fence) {
     LOG_DEBUG(Gpu, "Flags: {}", flags);
 
     {
         std::scoped_lock lock(mutex);
         entry_lists.emplace(
             gmmu, std::vector<GpfifoEntry>(entries.begin(), entries.end()),
-            flags, submitted_count + 1, std::move(on_complete));
+            flags, submitted_count + 1, std::move(on_complete), wait_fence);
         submitted_count++;
         VisualDiagnostics::instance().submissionQueued(
             submitted_count, reinterpret_cast<uint64_t>(&gmmu), entries.size());
@@ -155,6 +156,19 @@ void Pfifo::threadFunc() {
             entry_lists.pop();
 
             lock.unlock();
+
+            // The GPU waits for the fence before it starts the entries, as the
+            // submission asked for with FENCE_WAIT. Bounded: a fence nobody
+            // increments must not stall the GPU for good
+            if (any(entry_list.flags & GpfifoFlags::FenceWait) &&
+                entry_list.wait_fence.id != 0 &&
+                !gpu.getVideoSyncpoints().waitFor(
+                    entry_list.wait_fence.id, entry_list.wait_fence.value,
+                    std::chrono::milliseconds(1000))) {
+                ONCE(LOG_WARN(Gpu, "Submission waited for fence {}:{} in vain",
+                              entry_list.wait_fence.id,
+                              entry_list.wait_fence.value));
+            }
 
             // Entries
             // TODO: flags

@@ -185,8 +185,14 @@ void Decoder::parseNextInstruction() {
                 const auto pred = static_cast<pred_t>(extractBits(inst, 16, 3));
         const auto pred_inv = static_cast<bool>(extractBits(inst, 19, 1));
 
-        ASSERT_DEBUG(!crnt_block->sync_point_stack.empty(), ShaderDecompiler,
-                     "No sync point in stack");
+        if (crnt_block->sync_point_stack.empty()) {
+            // Reading the top of an empty stack is undefined behavior
+            ONCE(LOG_ERROR(ShaderDecompiler, "No sync point in stack at {:#x}",
+                           pc));
+            context.builder.opExit();
+            endBlock();
+            return;
+        }
 
         const auto target = crnt_block->sync_point_stack.top();
         if (pred == PT && extractBits(inst, 0, 5) == 15) {
@@ -525,9 +531,15 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xe250000000000000, 0xfff0000000000000) {
         if (!emitIndirectBranch(inst, pc)) {
-            LOG_NOT_IMPLEMENTED(
-                ShaderDecompiler,
-                "BRX unbounded/unsupported target pattern at {:#x}", pc);
+            if (context.decomp_context.read_const_word)
+                LOG_NOT_IMPLEMENTED(
+                    ShaderDecompiler,
+                    "BRX unbounded/unsupported target pattern at {:#x}", pc);
+            else
+                // Offline tools have no constant buffers, so a jump table
+                // cannot be resolved there
+                LOG_WARN(ShaderDecompiler,
+                         "BRX at {:#x} needs a constant buffer reader", pc);
         }
     }
     INST(0xe240000000000020, 0xfff0000000000020) {

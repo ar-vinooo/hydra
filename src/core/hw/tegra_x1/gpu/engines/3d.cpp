@@ -1588,6 +1588,16 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             const bool is_1d =
                 type_it != resource_mapping.texture_types.end() &&
                 type_it->second == MTL::TextureType1D;
+            // A texture the shader only queries the size of has no sampling
+            // instruction that tells its type: use the descriptor's
+            if (resource_mapping.guessed_texture_types.contains(index) &&
+                tic.hdr_version != TicHdrVersion::_1DBuffer &&
+                type_it != resource_mapping.texture_types.end()) {
+                const auto tic_type = toTextureType(tic.texture_type);
+                if (tic_type != type_it->second)
+                    descriptor.state.texture_type_hints.emplace(index,
+                                                                tic_type);
+            }
             if (is_1d && tic.hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(index, format);
             else if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
@@ -1599,7 +1609,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             !descriptor.state.border_samplers.empty() ||
             !descriptor.state.unnormalized_textures.empty() ||
             !descriptor.state.buffer_texture_formats.empty() ||
-            !descriptor.state.integer_texture_formats.empty())
+            !descriptor.state.integer_texture_formats.empty() ||
+            !descriptor.state.texture_type_hints.empty())
             active_shader = gpu.getRenderer().getShaderCache().find(descriptor);
     }
 
@@ -1991,8 +2002,12 @@ ThreeD::getTexture(const TextureImageControl& tic,
         break;
     }
     if (shader_type && view_type != *shader_type)
-        LOG_WARN(Engines, "Texture type mismatch (TIC: {}, shader: {})", type,
-                 *shader_type);
+        LOG_WARN(Engines,
+                 "Texture type mismatch (TIC: {}, shader: {}) for {} "
+                 "texture at GPU address {:#x}, {}x{}x{}, {} layers, {} "
+                 "levels, format {}",
+                 type, *shader_type, is_image ? "image" : "sampled", gpu_addr,
+                 width, height, depth, layer_count, level_count, format);
 
     // Depth stencil textures can be sampled through their stencil plane
     const auto view_format =

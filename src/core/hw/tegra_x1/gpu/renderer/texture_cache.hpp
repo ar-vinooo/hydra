@@ -27,6 +27,82 @@ struct TextureStorage {
     TextureCacheTimePoint cpu_modified_timestamp;
     // Last GPU write that was copied back to guest memory
     TextureCacheTimePoint flushed_timestamp;
+    // Address ranges whose GPU data must not be written back to guest memory
+    // any more: written back already, or overwritten by the guest since (what
+    // the GPU holds there is stale). A partial write back leaves the rest of
+    // the texture unflushed, and a later write back of a range that the guest
+    // reused would put stale data over its newer contents. Reset by the next
+    // GPU write.
+    std::vector<ztd::Range<uptr>> flushed_ranges;
+
+    // Address ranges the guest overwrote since the GPU last wrote them: the
+    // GPU data there is stale, so it must neither be written back nor copied
+    // over other textures that alias the memory. Reset by the next GPU write.
+    std::vector<ztd::Range<uptr>> stale_ranges;
+
+    static void addRange(std::vector<ztd::Range<uptr>>& ranges,
+                         ztd::Range<uptr> range) {
+        if (range.getSize() == 0 || range.getBegin() > range.getEnd())
+            return;
+        ranges.push_back(range);
+        // Keep the list short: fold overlapping and adjacent entries
+        if (ranges.size() > 32) {
+            std::sort(ranges.begin(), ranges.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.getBegin() < b.getBegin();
+                      });
+            std::vector<ztd::Range<uptr>> folded;
+            for (const auto& entry : ranges) {
+                if (!folded.empty() &&
+                    entry.getBegin() <= folded.back().getEnd())
+                    folded.back() = folded.back().merged(entry);
+                else
+                    folded.push_back(entry);
+            }
+            ranges = std::move(folded);
+        }
+    }
+
+    void markFlushed(ztd::Range<uptr> range) { addRange(flushed_ranges, range); }
+    // The guest wrote over the range: nothing the GPU holds there is valid
+    void markStale(ztd::Range<uptr> range) {
+        addRange(stale_ranges, range);
+        addRange(flushed_ranges, range);
+    }
+
+    // Calls fn with the parts of the range that still hold fresh GPU data
+    template <typename Fn>
+    void forEachFresh(ztd::Range<uptr> range, Fn&& fn) const {
+        forEachOutside(stale_ranges, range, std::forward<Fn>(fn));
+    }
+
+    // Calls fn with the parts of the range that may still be written back
+    template <typename Fn>
+    void forEachUnflushed(ztd::Range<uptr> range, Fn&& fn) const {
+        forEachOutside(flushed_ranges, range, std::forward<Fn>(fn));
+    }
+
+    template <typename Fn>
+    static void forEachOutside(const std::vector<ztd::Range<uptr>>& excluded,
+                               ztd::Range<uptr> range, Fn&& fn) {
+        std::vector<ztd::Range<uptr>> pieces{range};
+        for (const auto& flushed : excluded) {
+            std::vector<ztd::Range<uptr>> next;
+            for (const auto& piece : pieces) {
+                if (!piece.intersects(flushed)) {
+                    next.push_back(piece);
+                    continue;
+                }
+                if (piece.getBegin() < flushed.getBegin())
+                    next.emplace_back(piece.getBegin(), flushed.getBegin());
+                if (flushed.getEnd() < piece.getEnd())
+                    next.emplace_back(flushed.getEnd(), piece.getEnd());
+            }
+            pieces = std::move(next);
+        }
+        for (const auto& piece : pieces)
+            fn(piece);
+    }
 
     void markUpdated() { update_timestamp = TextureCacheClock::now(); }
 };
@@ -173,6 +249,9 @@ class TextureCache {
     std::mutex mutex;
     std::map<uptr, TextureMem> entries;
     u64 epoch{0};
+    // DEBUG: set around the first decode of a new render target, which then
+    // uploads zeros instead of the guest memory contents (HYDRA_RT_ZERO_INIT)
+    bool zero_fill_decode{false};
 
     static void mergeMemories(TextureMem& mem, TextureMem& other);
     // Storage keys are hashes of the descriptor that created the storage

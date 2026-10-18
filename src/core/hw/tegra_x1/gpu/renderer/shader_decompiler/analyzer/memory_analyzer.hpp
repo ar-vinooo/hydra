@@ -8,6 +8,8 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::analyzer {
 struct TextureInfo {
     TextureType type;
     bool is_depth;
+    // The type is a default: only size queries access the texture
+    bool type_guessed{false};
 };
 
 struct ImageInfo {
@@ -23,7 +25,10 @@ struct StorageInfo {
 
 class MemoryAnalyzer {
   public:
-    void analyze(const ir::Module& modul);
+    // type_hints gives the types of textures that are only queried for their
+    // size, which no instruction of the shader tells
+    void analyze(const ir::Module& modul,
+                 const std::map<u32, TextureType>& type_hints = {});
 
   private:
     std::unordered_set<SvSemantic> input_svs;

@@ -10,15 +10,14 @@ DEFINE_SERVICE_COMMAND_TABLE(IHardwareOpusDecoderManager, 0,
 result_t IHardwareOpusDecoderManager::openHardwareOpusDecoder(
     RequestContext* ctx, i32 sample_rate, i32 channel_count,
     u32 work_buffer_size) {
-    // TODO: params
-    (void)sample_rate;
-    (void)channel_count;
+    // The decoder allocates its own state, not the guest's work buffer
     (void)work_buffer_size;
-    LOG_DEBUG(Services,
-              "Sample rate: {}, channel count: {}, work buffer size: 0x{:x}",
-              sample_rate, channel_count, work_buffer_size);
+    LOG_INFO(Services,
+             "Opening Opus decoder (sample rate: {}, channel count: {}, work "
+             "buffer size: 0x{:x})",
+             sample_rate, channel_count, work_buffer_size);
 
-    addService(*ctx, new IHardwareOpusDecoder());
+    addService(*ctx, new IHardwareOpusDecoder(sample_rate, channel_count));
     return RESULT_SUCCESS;
 }
 

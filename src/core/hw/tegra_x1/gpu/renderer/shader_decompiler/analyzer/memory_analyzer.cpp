@@ -16,7 +16,8 @@ SvAccess pushSv(std::unordered_set<SvSemantic>& svs,
 
 } // namespace
 
-void MemoryAnalyzer::analyze(const ir::Module& modul) {
+void MemoryAnalyzer::analyze(const ir::Module& modul,
+                             const std::map<u32, TextureType>& type_hints) {
     // Textures that are only queried still need a declaration. Their type is
     // unknown, so other accesses decide it.
     std::vector<u32> queried_textures;
@@ -143,15 +144,23 @@ void MemoryAnalyzer::analyze(const ir::Module& modul) {
         }
     }
 
-    for (const auto index : queried_textures)
-        textures.emplace(index, TextureInfo{.type = TextureType::_2D,
-                                            .is_depth = false});
+    for (const auto index : queried_textures) {
+        const auto hint = type_hints.find(index);
+        const bool hinted = hint != type_hints.end();
+        textures.emplace(index,
+                         TextureInfo{.type = hinted ? hint->second
+                                                    : TextureType::_2D,
+                                     .is_depth = false,
+                                     .type_guessed = !hinted});
+    }
 }
 
 void MemoryAnalyzer::handleAMemLoad(const AMem amem) {
     // TODO: support indexing with src
-    ASSERT_DEBUG(amem.reg == RZ, ShaderDecompiler,
-                 "Indexing not implemented (src: {})", amem.reg);
+    // Not an assertion: release builds must not translate this silently wrong
+    if (amem.reg != RZ)
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                                 "Indexed attribute load (src: {})", amem.reg));
     pushSv(input_svs, stage_inputs, amem.imm);
 }
 
@@ -161,8 +170,9 @@ void MemoryAnalyzer::handleCMemLoad(const CMem cmem) {
 
 void MemoryAnalyzer::handleAMemStore(const AMem amem) {
     // TODO: support indexing with src
-    ASSERT_DEBUG(amem.reg == RZ, ShaderDecompiler,
-                 "Indexing not implemented (src: {})", amem.reg);
+    if (amem.reg != RZ)
+        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                                 "Indexed attribute store (src: {})", amem.reg));
     const auto access = pushSv(output_svs, stage_outputs, amem.imm);
     if (access.sv.semantic == SvSemantic::ClipDistance)
         clip_distance_outputs |=

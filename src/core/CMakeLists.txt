@@ -767,6 +767,20 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
 endif ()
 
+# Opus decoding for the hardware Opus decoder service; optional
+find_path(HYDRA_OPUS_INCLUDE opus.h
+    HINTS "${Opus_ROOT}/include/opus" "${Opus_ROOT}/include"
+          /opt/homebrew/include/opus /usr/local/include/opus)
+find_library(HYDRA_OPUS_LIBRARY NAMES opus
+    HINTS "${Opus_ROOT}/lib" /opt/homebrew/lib /usr/local/lib)
+if (HYDRA_OPUS_INCLUDE AND HYDRA_OPUS_LIBRARY)
+    target_compile_definitions(hydra-core PRIVATE HYDRA_OPUS_ENABLED=1)
+    target_include_directories(hydra-core SYSTEM PRIVATE "${HYDRA_OPUS_INCLUDE}")
+    target_link_libraries(hydra-core PRIVATE "${HYDRA_OPUS_LIBRARY}")
+else ()
+    message(WARNING "libopus not found (set Opus_ROOT); Opus audio will be silent")
+endif ()
+
 # TODO: link luft if AIR shader backend is enabled
 if (HYDRA_FFMPEG_VIDEO)
     target_compile_definitions(hydra-core PRIVATE HYDRA_FFMPEG_VIDEO=1)

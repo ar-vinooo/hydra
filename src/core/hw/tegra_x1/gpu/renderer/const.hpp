@@ -3,6 +3,8 @@
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/metal_cpp.hpp"
 
+#include <set>
+
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
 class ITextureView;
@@ -552,6 +554,9 @@ struct ResourceMapping {
     std::map<u32, u32> textures;
     // Texture type the shader declares for each binding
     std::map<u32, MTL::TextureType> texture_types;
+    // Bindings whose declared type is a default: the shader only queries the
+    // size of the texture, so nothing in its code tells the type
+    std::set<u32> guessed_texture_types;
     u32 sampler_buffer_index{invalid<u32>()};
     // Fragment shader user inputs (bit per location)
     u32 stage_input_mask{0};

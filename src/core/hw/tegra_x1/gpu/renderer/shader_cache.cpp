@@ -282,6 +282,11 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
         hash.add(bias);
     }
 
+    for (const auto& [index, type] : descriptor.state.texture_type_hints) {
+        hash.add(index | 0x40000000u);
+        hash.add(static_cast<u32>(type));
+    }
+
     for (const auto& [index, sampler] : descriptor.state.border_samplers) {
         hash.add(index);
         hash.add(sampler.min_filter);

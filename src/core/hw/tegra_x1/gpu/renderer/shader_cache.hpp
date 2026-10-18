@@ -15,6 +15,9 @@ struct GuestShaderState {
     // Sampled (non-buffer) textures with integer formats
     std::map<u32, TextureFormat> integer_texture_formats;
     std::map<u32, f32> texture_lod_bias;
+    // Types of textures the shader only queries the size of. No sampling
+    // instruction tells their type, so the guest descriptor's type is used
+    std::map<u32, MTL::TextureType> texture_type_hints;
     // Textures whose sampler border handling Metal cannot express (custom
     // border colors, integer borders, mirror to border). The shader samples
     // them with its own samplers and blends the border in

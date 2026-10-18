@@ -500,6 +500,9 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
         out_resource_mapping.textures[const_buffer_index] = texture_index++;
         out_resource_mapping.texture_types[const_buffer_index] =
             toRendererTextureType(info.type);
+        if (info.type_guessed)
+            out_resource_mapping.guessed_texture_types.insert(
+                const_buffer_index);
     }
 
     if (context.type == ShaderType::Fragment) {

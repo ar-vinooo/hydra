@@ -100,7 +100,14 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
 }
 
 bool Gpu::reserveFence(Fence& out_fence) {
-    static const bool enabled = std::getenv("HYDRA_GPU_FENCES") != nullptr;
+    // On unless HYDRA_GPU_FENCES=0: PFIFO runs the submissions later on its own
+    // thread, so without fences the guest believes its work is done at once and
+    // reuses push buffers, uniform and vertex rings and textures that the host
+    // has not read yet
+    static const bool enabled = [] {
+        const char* env = std::getenv("HYDRA_GPU_FENCES");
+        return env == nullptr || std::string_view(env) != "0";
+    }();
     if (!enabled)
         return false;
     std::scoped_lock lock(fence_mutex);

@@ -13,6 +13,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/sampler.hpp"
 #include <cmath>
+#include <map>
 #include <iostream>
 #include <stdexcept>
 using namespace hydra;
@@ -2316,6 +2317,55 @@ void testTextureOffsetAndGather(MTL::Device* device) {
                  "offsets and per-texel gathers\n";
 }
 
+// A texture that is only queried for its size has no sampling instruction
+// that tells its type: it defaults to 2D unless the guest descriptor's type
+// is given as a hint
+void testQueryOnlyTextureType() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    constexpr u64 PT_GUARD = 7ull << 16;
+    const u64 txq = 0xdf48000000000000ull | 10 | (u64(1) << 8) | PT_GUARD |
+                    (1ull << 22) | (u64(0xf) << 31) | (u64(1) << 36);
+    const std::vector<u64> words{0, txq, 0xe30000000007000full,
+                                 0x50b0000000070f00ull};
+    const auto run = [&](const std::map<u32, MTL::TextureType>& hints) {
+        std::vector<u8> bytes(words.size() * 8);
+        std::memcpy(bytes.data(), words.data(), bytes.size());
+        ztd::io::MemoryStream stream(bytes);
+        GuestShaderState guest{};
+        guest.texture_type_hints = hints;
+        ShaderBackend backend;
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        decompile(stream, ShaderType::Compute, guest, backend, generated,
+                  mapping);
+        return std::pair{mapping,
+                         std::string(generated.begin(), generated.end())};
+    };
+
+    const auto [guessed, guessed_source] = run({});
+    check(guessed.texture_types.size() == 1,
+          "A TXQ-only shader has one texture binding");
+    const auto index = guessed.texture_types.begin()->first;
+    check(guessed.texture_types.at(index) == MTL::TextureType2D,
+          "A TXQ-only texture defaults to 2D");
+    check(guessed.guessed_texture_types.contains(index),
+          "A TXQ-only texture is marked as having a guessed type");
+    check(guessed_source.find("texture2d<float>") != std::string::npos,
+          "A TXQ-only texture is declared 2D by default");
+
+    const auto [hinted, hinted_source] = run({{index, MTL::TextureType3D}});
+    check(hinted.texture_types.at(index) == MTL::TextureType3D,
+          "A 3D hint changes the type of a TXQ-only texture");
+    check(hinted_source.find("texture3d<float>") != std::string::npos,
+          "A TXQ-only texture with a 3D hint is declared 3D");
+    check(hinted_source.find("get_depth(") != std::string::npos,
+          "A 3D TXQ reads the depth of the texture");
+    check(!hinted.guessed_texture_types.contains(index),
+          "A hinted TXQ-only texture is no longer a guess");
+    std::cout << "PASS: TXQ-only textures use the descriptor's type as a hint\n";
+}
+
 int main() {
     try {
         unsetenv("HYDRA_DISABLE_SHADER_CACHE");
@@ -2324,6 +2374,7 @@ int main() {
         testClearColor(device);
         testBindlessPredicateTracking();
         testBindlessControlFlowTracking();
+        testQueryOnlyTextureType();
         testBitOperations(device);
         testIntegerShifts(device);
         testSharedAtomics(device);

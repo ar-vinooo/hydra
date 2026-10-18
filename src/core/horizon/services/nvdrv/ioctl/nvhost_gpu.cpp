@@ -49,6 +49,8 @@ NvResult NvHostGpu::submitGpfifo(
     auto& gpu = system->getGpu();
     const hw::tegra_x1::gpu::GpfifoFlags flags =
         inout_flags_and_detailed_error;
+    // FENCE_WAIT: the fence the submission has to wait for comes in
+    const hw::tegra_x1::gpu::Fence wait_fence = inout_fence.get();
     // A fence is reached when the host finished the submission
     hw::tegra_x1::gpu::Fence fence{};
     std::function<void()> on_complete;
@@ -59,7 +61,7 @@ NvResult NvHostGpu::submitGpfifo(
     gpu.getPfifo().submitEntries(
         process->getGMmu(),
         std::span<const hw::tegra_x1::gpu::GpfifoEntry>(entries, num_entries),
-        flags, std::move(on_complete));
+        flags, std::move(on_complete), wait_fence);
 
     // No error is reported
     inout_flags_and_detailed_error = 0;

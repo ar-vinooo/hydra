@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
 #include "core/hot/table.hpp"
 
 #include <chrono>
@@ -462,6 +463,8 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 const auto old_descriptor = other_descriptor;
                 const auto old_gpu_written = storage.gpu_written_timestamp;
                 const auto old_cpu_modified = storage.cpu_modified_timestamp;
+                const auto old_flushed_ranges = storage.flushed_ranges;
+                const auto old_stale_ranges = storage.stale_ranges;
                 group.cache.remove(key);
 
                 // Create a new storage
@@ -472,14 +475,22 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 updateStorage(command_buffer, new_storage, mem, new_descriptor,
                               usage);
 
-                // Copy the old storage to the new one
-                new_storage.base->copyFrom(command_buffer, old_base, 0, 0, 0, 0,
-                                           old_descriptor.level_count,
-                                           old_descriptor.layer_count);
+                // Copy the old storage to the new one, unless the guest
+                // overwrote all of what the GPU held in it
+                bool old_fresh = false;
+                TextureStorage::forEachOutside(
+                    old_stale_ranges, old_descriptor.getRange(),
+                    [&](ztd::Range<uptr>) { old_fresh = true; });
+                if (old_fresh)
+                    new_storage.base->copyFrom(command_buffer, old_base, 0, 0, 0,
+                                               0, old_descriptor.level_count,
+                                               old_descriptor.layer_count);
                 new_storage.gpu_written_timestamp = std::max(
                     new_storage.gpu_written_timestamp, old_gpu_written);
                 new_storage.cpu_modified_timestamp = std::max(
                     new_storage.cpu_modified_timestamp, old_cpu_modified);
+                new_storage.flushed_ranges = old_flushed_ranges;
+                new_storage.stale_ranges = old_stale_ranges;
 
                 // TODO: destroy the old storage
 
@@ -565,6 +576,19 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     for (auto& overlapping_storage : overlapping_storages) {
         const auto other_base = overlapping_storage.storage.base;
         const auto& other_descriptor = other_base->getDescriptor();
+        // What the guest overwrote since the GPU wrote this storage is stale:
+        // the new storage was decoded from the guest's data already
+        bool fresh = false;
+        overlapping_storage.storage.forEachFresh(
+            other_descriptor.getRange(),
+            [&](ztd::Range<uptr>) { fresh = true; });
+        if (!fresh) {
+            logTextureEvent("copy_skipped_stale_storage", descriptor,
+                            fmt::format("old={:#x} {} {}", other_descriptor.ptr,
+                                        other_descriptor.type,
+                                        other_descriptor.format));
+            continue;
+        }
         storage.base->copyFrom(
             command_buffer, other_base, 0, 0, overlapping_storage.level,
             overlapping_storage.layer, other_descriptor.level_count,
@@ -583,7 +607,19 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
                                  TextureUsage usage) {
     if (storage.base == nullptr) {
         storage.base = renderer.createTexture(descriptor);
+        // DEBUG: HYDRA_RT_ZERO_INIT=1 starts render targets in memory the GPU
+        // never wrote with zeros. Decoding guest memory into them shows
+        // whatever other data (e.g. streamed textures) shares that memory.
+        static const bool zero_init =
+            std::getenv("HYDRA_RT_ZERO_INIT") != nullptr;
+        zero_fill_decode = zero_init && usage == TextureUsage::Write &&
+                           mem.info.written_timestamp == TextureCacheTimePoint{};
+        logTextureEvent(
+            "create", descriptor,
+            fmt::format("usage={} zero_fill={}", static_cast<u32>(usage),
+                        zero_fill_decode));
         decodeTexture(command_buffer, storage);
+        zero_fill_decode = false;
     }
     update(command_buffer, storage, mem, usage);
 }
@@ -814,7 +850,9 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
 
     const u8* in_data = reinterpret_cast<const u8*>(descriptor.ptr);
     u8* out_data = reinterpret_cast<u8*>(tmp_buffer->getPtr());
-    if (descriptor.is_linear) {
+    if (zero_fill_decode) {
+        std::memset(out_data, 0, size);
+    } else if (descriptor.is_linear) {
         const u32 stride =
             getTextureFormatStride(descriptor.format, descriptor.width);
         const u32 rows =

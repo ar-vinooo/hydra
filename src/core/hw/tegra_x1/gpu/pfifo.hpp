@@ -18,6 +18,9 @@ struct GpfifoEntryList {
     uint64_t correlation_id;
     // Runs when the host finished the work of the entries
     std::function<void()> on_complete;
+    // With GpfifoFlags::FenceWait the GPU does not start the entries before
+    // this fence is reached
+    Fence wait_fence{};
 };
 
 class Pfifo {
@@ -28,7 +31,8 @@ class Pfifo {
 
     void submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                        GpfifoFlags flags,
-                       std::function<void()> on_complete = {});
+                       std::function<void()> on_complete = {},
+                       Fence wait_fence = {});
 
     // Number of entry lists submitted so far
     u64 getSubmittedCount();

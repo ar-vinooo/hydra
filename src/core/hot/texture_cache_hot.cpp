@@ -17,6 +17,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -101,14 +102,36 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
         const auto now = TextureCacheClock::now();
         for (auto& [group_key, group] : mem.cache) {
             for (auto& [storage_key, storage] : group.cache) {
-                if (storage.base == nullptr ||
-                    storage.gpu_written_timestamp > storage.flushed_timestamp)
+                if (storage.base == nullptr)
                     continue;
+                if (storage.gpu_written_timestamp > storage.flushed_timestamp) {
+                    // The guest wrote over a part of this render target that
+                    // was never written back: what the GPU holds there is
+                    // stale and must not be written over the guest's data by
+                    // a later write back
+                    if (storage.base->getDescriptor().getRange().intersects(
+                            range))
+                        logTextureEvent(
+                            "guest_overwrote_unflushed_gpu_data",
+                            storage.base->getDescriptor(),
+                            fmt::format("range={:#x}+{:#x}", range.getBegin(),
+                                        range.getSize()));
+                    storage.markStale(
+                        storage.base->getDescriptor().getRange().clampedTo(
+                            range));
+                    continue;
+                }
                 if (debugFlag("s2_oldinval") &&
                     storage.gpu_written_timestamp != TextureCacheTimePoint{})
                     continue;
-                if (storage.base->getDescriptor().getRange().intersects(range))
+                if (storage.base->getDescriptor().getRange().intersects(range)) {
                     storage.cpu_modified_timestamp = now;
+                    logTextureEvent("guest_modified",
+                                    storage.base->getDescriptor(),
+                                    fmt::format("range={:#x}+{:#x}",
+                                                range.getBegin(),
+                                                range.getSize()));
+                }
             }
         }
     }
@@ -137,6 +160,28 @@ void TextureCache::markGpuWritesInGuestImpl(ztd::Range<uptr> range) {
 void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                           TextureStorage& storage, TextureMem& mem,
                           TextureUsage usage) {
+    // The guest overwrote parts of a render target since the GPU wrote it, and
+    // the texture is read now (for example through a view of another format
+    // of the same memory). What the GPU holds in those parts is stale: write
+    // back the parts that are still fresh, then load everything from guest
+    // memory. A render target that is rendered to again keeps its GPU data.
+    if (usage != TextureUsage::Write && !storage.stale_ranges.empty() &&
+        storage.gpu_written_timestamp > storage.flushed_timestamp) {
+        const auto storage_range = storage.base->getDescriptor().getRange();
+        bool fresh = false;
+        storage.forEachFresh(storage_range,
+                             [&](ztd::Range<uptr>) { fresh = true; });
+        logTextureEvent("reconcile_stale_render_target",
+                        storage.base->getDescriptor(),
+                        fmt::format("fresh_parts_written_back={}", fresh));
+        if (fresh)
+            encodeTexture(command_buffer, storage, storage_range);
+        storage.stale_ranges.clear();
+        storage.flushed_ranges.clear();
+        storage.flushed_timestamp = storage.gpu_written_timestamp;
+        // Everything is in guest memory now: load it
+        storage.cpu_modified_timestamp = TextureCacheClock::now();
+    }
     bool sync = false;
     bool uploaded_cpu = false;
     bool alias_sync_complete = true;
@@ -194,6 +239,13 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                          storage.gpu_written_timestamp !=
                              TextureCacheTimePoint{});
         }
+        logTextureEvent(
+            "reload_from_guest", storage.base->getDescriptor(),
+            fmt::format("forced={} mem_modified={} cpu_modified={} first={}",
+                        force_reload,
+                        storage.update_timestamp < mem.info.modified_timestamp,
+                        storage.update_timestamp < storage.cpu_modified_timestamp,
+                        storage.update_timestamp == TextureCacheTimePoint{}));
         decodeTexture(command_buffer, storage);
         uploaded_cpu = true;
         // CPU uploads establish a baseline, but newer GPU writes into aliases
@@ -223,6 +275,38 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         const auto base = storage.base;
         const auto& descriptor = base->getDescriptor();
         const auto range = descriptor.getRange();
+        // Aliases without a direct copy path (a texture buffer the GPU wrote
+        // and a compressed or mipped texture reading the same memory, as when
+        // streamed texture data is written through a buffer) are synchronized
+        // through guest memory: the GPU data of the source in the overlap is
+        // written back and this texture is decoded again. Only for textures
+        // without GPU data of their own, as decoding replaces all of their
+        // contents. Bytes the guest overwrote since are never written back
+        // (TextureStorage::flushed_ranges). A file named "no_alias_via_guest"
+        // in HYDRA_TRACE_DIR turns this off.
+        const auto sync_via_guest = [&](TextureStorage& source) {
+            if (debugFlag("no_alias_via_guest") ||
+                storage.gpu_written_timestamp > storage.flushed_timestamp)
+                return false;
+            if (source.gpu_written_timestamp > source.flushed_timestamp) {
+                const auto overlap = range.clampedTo(
+                    source.base->getDescriptor().getRange());
+                bool pending = false;
+                source.forEachUnflushed(
+                    overlap, [&](ztd::Range<uptr>) { pending = true; });
+                // The write back waits for the GPU: only when there is
+                // something to write back
+                if (pending)
+                    encodeTexture(command_buffer, source, overlap);
+            }
+            logTextureEvent("alias_via_guest", storage.base->getDescriptor(),
+                            fmt::format("source={:#x} {} {}",
+                                        source.base->getDescriptor().ptr,
+                                        source.base->getDescriptor().type,
+                                        source.base->getDescriptor().format));
+            decodeTexture(command_buffer, storage);
+            return true;
+        };
         // A shared memory interval can contain thousands of sampled textures
         // but only a few render targets. Avoid walking all storages when none
         // of those targets wrote to this texture's address range.
@@ -241,8 +325,28 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                             std::max(storage.update_timestamp, storage.gpu_written_timestamp) &&
                         range.intersects(
                             candidate.base->getDescriptor().getRange())) {
-                        sources.push_back(&candidate);
                         scan_timestamp = std::max(scan_timestamp, candidate.gpu_written_timestamp);
+                        // A render target the guest overwrote since it was
+                        // rendered to holds stale data in the overlap (its
+                        // memory was reused, e.g. by streamed textures): it
+                        // must not be copied over this texture
+                        bool fresh = false;
+                        candidate.forEachFresh(
+                            range.clampedTo(
+                                candidate.base->getDescriptor().getRange()),
+                            [&](ztd::Range<uptr>) { fresh = true; });
+                        if (!fresh) {
+                            logTextureEvent(
+                                "alias_sync_skipped_stale_source",
+                                storage.base->getDescriptor(),
+                                fmt::format(
+                                    "source={:#x} {} {}",
+                                    candidate.base->getDescriptor().ptr,
+                                    candidate.base->getDescriptor().type,
+                                    candidate.base->getDescriptor().format));
+                            continue;
+                        }
+                        sources.push_back(&candidate);
                     }
                 }
             }
@@ -260,6 +364,16 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                 const auto other_range = other_descriptor.getRange();
 
                 if (range.intersects(other_range)) {
+                    logTextureEvent(
+                        "alias_sync", descriptor,
+                        fmt::format("source={:#x} {} {} written_ms_after_update={}",
+                                    other_descriptor.ptr, other_descriptor.type,
+                                    other_descriptor.format,
+                                    std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+                                        other_storage.gpu_written_timestamp -
+                                        storage.update_timestamp)
+                                        .count()));
                     // Expanded texels have different host byte offsets. Raw
                     // alias copies cannot reinterpret them as guest bytes.
                     const bool expanded =
@@ -269,8 +383,11 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         (descriptor.format != other_descriptor.format ||
                          descriptor.type == MTL::TextureTypeTextureBuffer ||
                          other_descriptor.type == MTL::TextureTypeTextureBuffer)) {
-                        alias_sync_complete = false;
-                        reportUnsupportedAlias(descriptor, other_descriptor);
+                        if (!sync_via_guest(other_storage)) {
+                            alias_sync_complete = false;
+                            reportUnsupportedAlias(descriptor,
+                                                   other_descriptor);
+                        }
                         continue;
                     }
                     const auto type_class =
@@ -305,7 +422,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                             const auto end = std::min(range.getEnd(), other_range.getEnd());
                             storage.base->copyBufferBytes(command_buffer, other_storage.base,
                                 begin - other_range.getBegin(), begin - range.getBegin(), end - begin);
-                        } else {
+                        } else if (!sync_via_guest(other_storage)) {
                             alias_sync_complete = false;
                             reportUnsupportedAlias(descriptor, other_descriptor);
                         }
@@ -313,7 +430,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                                other_type_class == TextureTypeClass::_3D) {
                         synchronize3DWith3D(command_buffer, storage,
                                             other_storage);
-                    } else {
+                    } else if (!sync_via_guest(other_storage)) {
                         alias_sync_complete = false;
                         reportUnsupportedAlias(descriptor, other_descriptor);
                     }
@@ -358,6 +475,9 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
             tls_crnt_gmmu->getMmu()->protectGpuWritten(
                 storage.base->getDescriptor().getRange());
         storage.gpu_written_timestamp = TextureCacheClock::now();
+        // The GPU data is fresh everywhere again
+        storage.flushed_ranges.clear();
+        storage.stale_ranges.clear();
         mem.recordGpuWrite(storage.base->getDescriptor().getRange(),
                            storage.gpu_written_timestamp);
     }
@@ -405,6 +525,9 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                  TextureStorage& storage,
                                  ztd::Range<uptr> range) {
     const auto& descriptor = storage.base->getDescriptor();
+    logTextureEvent("writeback_to_guest", descriptor,
+                    fmt::format("range={:#x}+{:#x}", range.getBegin(),
+                                range.getSize()));
     // A partial readback does not make the rest of the GPU storage coherent.
     if (range.getBegin() <= descriptor.ptr &&
         range.getEnd() >= descriptor.ptr + descriptor.size)
@@ -474,10 +597,13 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
             const uptr end = std::min(row_begin + stride, range.getEnd());
             if (begin >= end)
                 continue;
-            std::memcpy(reinterpret_cast<u8*>(begin),
-                        in_data + static_cast<usize>(row) * stride +
-                            (begin - row_begin),
-                        end - begin);
+            storage.forEachUnflushed(
+                ztd::Range<uptr>(begin, end), [&](ztd::Range<uptr> piece) {
+                    std::memcpy(reinterpret_cast<u8*>(piece.getBegin()),
+                                in_data + static_cast<usize>(row) * stride +
+                                    (piece.getBegin() - row_begin),
+                                piece.getSize());
+                });
         }
     } else {
         const u32 layer_stride =
@@ -543,12 +669,18 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                         }
                     },
                     tiled.data());
-                std::memcpy(reinterpret_cast<void*>(begin),
-                            tiled.data() + (begin - level_begin), end - begin);
+                storage.forEachUnflushed(
+                    ztd::Range<uptr>(begin, end), [&](ztd::Range<uptr> piece) {
+                        std::memcpy(reinterpret_cast<void*>(piece.getBegin()),
+                                    tiled.data() + (piece.getBegin() - level_begin),
+                                    piece.getSize());
+                    });
                 offset += static_cast<u32>(dims.depth) * rows * stride;
             }
         }
     }
+    // What the GPU held in the range is in guest memory now
+    storage.markFlushed(range.clampedTo(descriptor.getRange()));
     renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);
 }
 

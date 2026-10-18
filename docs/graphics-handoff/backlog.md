@@ -55,7 +55,7 @@ traces. Another emulator alone never qualifies an item for [x].
   host-tested, but its guest-state rule needs NVIDIA documentation or hardware
   trace confirmation.
 
-- [x] DMA: semaphores (1/4 word releases), BL→BL, transfer NONE; puller semaphores + host fences behind `HYDRA_GPU_FENCES` (default off)
+- [x] DMA: semaphores (1/4 word releases), BL→BL, transfer NONE; puller semaphores + host fences (`HYDRA_GPU_FENCES=0` turns them off; on by default since 2026-10-18)
 - [x] Control flow CAL/RET/PRET/PCNT/CONT; TMML; SULD/SURED/SUST.D/SUATOM variants
 - [~] Local conditional rendering TRUE/FALSE/CONDITIONAL/EQ/NE and override is
   host-tested, including real query reports and split mappings. NVIDIA defines

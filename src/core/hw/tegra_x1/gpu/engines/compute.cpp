@@ -16,6 +16,30 @@ namespace hydra::hw::tegra_x1::gpu::engines {
 
 namespace {
 
+// Host type of a texture header's type, for shaders that only query the size
+// of a texture and so do not tell its type themselves
+MTL::TextureType toHostTextureType(TextureType type) {
+    switch (type) {
+    case TextureType::_1D:
+        return MTL::TextureType1D;
+    case TextureType::_1DArray:
+        return MTL::TextureType1DArray;
+    case TextureType::_1DBuffer:
+        return MTL::TextureTypeTextureBuffer;
+    case TextureType::_2DArray:
+        return MTL::TextureType2DArray;
+    case TextureType::_3D:
+        return MTL::TextureType3D;
+    case TextureType::Cubemap:
+        return MTL::TextureTypeCube;
+    case TextureType::CubeArray:
+        return MTL::TextureTypeCubeArray;
+    default:
+        return MTL::TextureType2D;
+    }
+}
+
+
 u32 getImageHandle(u32 handle) { return extractBits(handle, 0, 20); }
 u32 getSamplerHandle(u32 handle) { return extractBits(handle, 20, 12); }
 
@@ -182,6 +206,16 @@ void Compute::launch(const u32 index, const u32 arg) {
                 specializeShaderSampler(descriptor.state, binding_index,
                                         tsc_pool[getSamplerHandle(*handle)],
                                         format, getTicLodRange(*tic));
+            // A texture the shader only queries the size of has no sampling
+            // instruction that tells its type: use the descriptor's
+            if (resource_mapping.guessed_texture_types.contains(binding_index) &&
+                tic->hdr_version != TicHdrVersion::_1DBuffer &&
+                type_it != resource_mapping.texture_types.end()) {
+                const auto tic_type = toHostTextureType(tic->texture_type);
+                if (tic_type != type_it->second)
+                    descriptor.state.texture_type_hints.emplace(binding_index,
+                                                                tic_type);
+            }
             if (is_1d && tic->hdr_version == TicHdrVersion::_1DBuffer)
                 descriptor.state.buffer_texture_formats.emplace(binding_index,
                                                                 format);
@@ -203,6 +237,7 @@ void Compute::launch(const u32 index, const u32 arg) {
             !descriptor.state.unnormalized_textures.empty() ||
             !descriptor.state.buffer_texture_formats.empty() ||
             !descriptor.state.integer_texture_formats.empty() ||
+            !descriptor.state.texture_type_hints.empty() ||
             !descriptor.state.image_formats.empty())
             shader = renderer.getShaderCache().find(descriptor);
         if (shader == nullptr)

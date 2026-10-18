@@ -22,7 +22,7 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 #define COLOR_PIXEL_FORMAT_ENTRY_RGBA(format, pixel_format)                    \
     COLOR_PIXEL_FORMAT_ENTRY(format, pixel_format, ZTD_PASS({0, 1, 2, 3}))
 
-std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
+static const std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Unorm, R8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Snorm, R8Snorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Uint, R8Uint),
@@ -359,9 +359,14 @@ MTL::CullMode toMtlCullMode(const engines::CullFaceMode mode) {
     case engines::CullFaceMode::Back:
         return MTL::CullModeBack;
     case engines::CullFaceMode::FrontAndBack:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "Cull face mode front and back");
+        // Metal has no such mode: the engine skips draws of polygons when
+        // both faces are culled, so this value is never used for rasterizing
         return MTL::CullModeFront;
     }
+
+    LOG_ERROR(MetalRenderer, "Invalid cull face mode {:#x}",
+              static_cast<u32>(mode));
+    return MTL::CullModeNone;
 }
 
 MTL::Winding toMtlWinding(const engines::Winding winding) {
@@ -371,6 +376,10 @@ MTL::Winding toMtlWinding(const engines::Winding winding) {
     case engines::Winding::CounterClockwise:
         return MTL::WindingCounterClockwise;
     }
+
+    LOG_ERROR(MetalRenderer, "Invalid winding {:#x}",
+              static_cast<u32>(winding));
+    return MTL::WindingCounterClockwise;
 }
 
 MTL::PrimitiveType
@@ -585,7 +594,8 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for sint type", size);
+                      "Invalid vertex attribute size {} for sscaled type",
+                      size);
             return MTL::VertexFormatInvalid;
         }
     case engines::VertexAttribType::Uscaled:
@@ -619,7 +629,8 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for uint type", size);
+                      "Invalid vertex attribute size {} for uscaled type",
+                      size);
             return MTL::VertexFormatInvalid;
         }
     case engines::VertexAttribType::Float:
@@ -656,7 +667,7 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for uint type", size);
+                      "Invalid vertex attribute size {} for float type", size);
             return MTL::VertexFormatInvalid;
         }
     default:
@@ -716,11 +727,15 @@ MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle) {
 
 MTL::SamplerAddressMode
 toMtlSamplerAddressMode(const SamplerDescriptor& descriptor, u32 axis) {
+    if (axis >= 3) {
+        LOG_ERROR(MetalRenderer, "Invalid sampler axis {}", axis);
+        return descriptor.address_mode_s;
+    }
     const MTL::SamplerAddressMode modes[] = {descriptor.address_mode_s,
                                              descriptor.address_mode_t,
                                              descriptor.address_mode_r};
-    // Mirrored border addressing is emulated; the mirror-once edge mode is
-    // the closest host fallback
+    // Mirrored border addressing is emulated in the shader (see the MSL
+    // emitter); the host sampler only needs a mode that doesn't wrap
     if ((descriptor.mirror_to_border_mask >> axis) & 1u)
         return MTL::SamplerAddressModeMirrorClampToEdge;
     return modes[axis];

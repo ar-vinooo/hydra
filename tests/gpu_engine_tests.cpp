@@ -1391,6 +1391,24 @@ void testChannelMethodsAndFences() {
                                    std::chrono::milliseconds(10)),
            "A fence is reached by its own submission only");
 
+    // FENCE_WAIT: the GPU does not start a submission before the fence it
+    // waits for is reached
+    Fence awaited{};
+    expect(gpu.reserveFence(awaited) && awaited.id == fence.id &&
+               awaited.value == 3,
+           "A third fence reserves the next value");
+    std::promise<void> waited_ran;
+    gpu.getPfifo().submitEntries(gmmu, {}, GpfifoFlags::FenceWait,
+                                 [&] { waited_ran.set_value(); }, awaited);
+    auto waited_future = waited_ran.get_future();
+    expect(waited_future.wait_for(std::chrono::milliseconds(300)) !=
+               std::future_status::ready,
+           "A submission waits for its fence before it runs");
+    syncpoints.complete(awaited.id, 2);
+    expect(waited_future.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready,
+           "A submission runs once its fence is reached");
+
     tls_crnt_gmmu = nullptr;
     std::cout << "PASS: channel semaphores and GPU fences\n";
 }

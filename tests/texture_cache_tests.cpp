@@ -11,6 +11,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -32,6 +33,7 @@ int main() {
         // overlapping guest memory and contained mip levels from the CTR crash
         // path.
         setenv("HYDRA_GPU_SYNC", "1", 1);
+        setenv("HYDRA_TEXTURE_EVENTS", "off", 0);
         setenv("HYDRA_PERF_STATS", "1", 1);
         setenv("HYDRA_DISABLE_SHADER_CACHE", "1", 1);
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
@@ -1340,6 +1342,86 @@ int main() {
         check(recovered == small && pool_state->getCachedBytes() == 0,
               "Acquiring a ready buffer removes it from the budget");
         pool_state->recycle(recovered);
+
+        // A render target is only partly written back when the guest touches
+        // part of it. What the GPU holds in memory the guest reused since is
+        // stale, so a later write back must not put it over the guest's data
+        {
+            std::vector<u8> reuse_memory(0x8000, 0);
+            for (usize i = 0; i < reuse_memory.size(); ++i)
+                reuse_memory[i] = static_cast<u8>(i * 7 + 1);
+            const std::vector<u8> original = reuse_memory;
+            const auto reuse_base = reinterpret_cast<uptr>(reuse_memory.data());
+            std::unique_ptr<ICommandBuffer> target_commands(
+                renderer.createCommandBuffer());
+            const TextureDescriptor partial_target(reuse_base, MTL::TextureType2D,
+                                           TextureFormat::RGBA8Unorm, false, 0,
+                                           64, 64, 1, 1, 1, 0, 0, 0);
+            cache.find(target_commands.get(), partial_target, TextureUsage::Write);
+            // The guest reuses the start of the memory
+            std::memset(reuse_memory.data(), 0xcd, 0x1000);
+            cache.invalidateMemory(ztd::Range<uptr>::fromSize(reuse_base, 0x1000));
+            cache.flushMemory(target_commands.get(),
+                              ztd::Range<uptr>::fromSize(reuse_base, 0x4000));
+            bool reused_kept = true;
+            for (usize i = 0; i < 0x1000; ++i)
+                reused_kept &= reuse_memory[i] == 0xcd;
+            check(reused_kept,
+                  "A write back keeps memory the guest reused since");
+            bool rest_written = true;
+            for (usize i = 0x1000; i < 0x4000; ++i)
+                rest_written &= reuse_memory[i] == original[i];
+            check(rest_written,
+                  "A write back still writes the untouched rest of the target");
+            target_commands.reset();
+        }
+
+        // A render target the guest overwrote since it was rendered to holds
+        // stale data: a texture that aliases the same memory must read what
+        // the guest wrote, not a copy of the stale render target
+        {
+            std::vector<u8> stale_memory(0x8000, 0);
+            for (usize i = 0; i < stale_memory.size(); ++i)
+                stale_memory[i] = static_cast<u8>(i * 7 + 1);
+            const auto stale_base =
+                reinterpret_cast<uptr>(stale_memory.data());
+            std::unique_ptr<ICommandBuffer> stale_commands(
+                renderer.createCommandBuffer());
+            const TextureDescriptor stale_target(
+                stale_base, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
+                false, 0, 64, 64, 1, 1, 1, 0, 0, 0);
+            cache.find(stale_commands.get(), stale_target,
+                       TextureUsage::Write);
+            // The guest reuses the memory for a texture
+            std::memset(stale_memory.data(), 0x5a, 0x4000);
+            cache.invalidateMemory(
+                ztd::Range<uptr>::fromSize(stale_base, 0x4000));
+            const TextureDescriptor stale_alias(
+                stale_base, MTL::TextureType2D, TextureFormat::BGRA8Unorm,
+                false, 0, 64, 64, 1, 1, 1, 0, 0, 0);
+            auto* stale_view =
+                cache.find(stale_commands.get(), stale_alias, TextureUsage::Read);
+            auto* stale_readback = renderer.getDevice()->newBuffer(
+                4, MTL::ResourceStorageModeShared);
+            static_cast<metal::CommandBuffer*>(stale_commands.get())
+                ->getBlitCommandEncoder()
+                ->copyFromTexture(
+                    static_cast<metal::Texture*>(stale_view->getBase())
+                        ->getTexture(),
+                    0, 0, MTL::Origin(0, 0, 0), MTL::Size(1, 1, 1),
+                    stale_readback, 0, 4, 4);
+            stale_commands.reset();
+            const auto* stale_texel =
+                static_cast<const u8*>(stale_readback->contents());
+            const bool guest_data = stale_texel[0] == 0x5a &&
+                                    stale_texel[1] == 0x5a &&
+                                    stale_texel[2] == 0x5a &&
+                                    stale_texel[3] == 0x5a;
+            stale_readback->release();
+            check(guest_data,
+                  "An aliasing texture reads the guest's data, not a stale "
+                  "render target");
+        }
 
         // A completion handler must keep its pool alive after the owner exits.
         std::weak_ptr<metal::UploadBufferPool> weak_pool = pool_state;

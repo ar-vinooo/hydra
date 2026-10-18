@@ -97,9 +97,10 @@ void decompileHot(
     ShaderHeader header{};
     if (type != ShaderType::Compute) {
         header = code_stream.read<ShaderHeader>();
-        // HACK: just for testing
-        ASSERT_DEBUG(header.version == 3, ShaderDecompiler,
-                     "Invalid shader version {}", header.version);
+        const u32 version = header.version;
+        if (version != 3)
+            ONCE(LOG_WARN(ShaderDecompiler, "Unexpected shader version {}",
+                          version));
     }
 
     // Context
@@ -171,7 +172,35 @@ void decompileHot(
 
     // Memory
     analyzer::MemoryAnalyzer mem_analyzer;
-    mem_analyzer.analyze(modul);
+    std::map<u32, TextureType> texture_type_hints;
+    for (const auto& [index, hint_type] : state.texture_type_hints) {
+        switch (hint_type) {
+        case MTL::TextureType1D:
+            texture_type_hints[index] = TextureType::_1D;
+            break;
+        case MTL::TextureType1DArray:
+            texture_type_hints[index] = TextureType::_1DArray;
+            break;
+        case MTL::TextureType2D:
+            texture_type_hints[index] = TextureType::_2D;
+            break;
+        case MTL::TextureType2DArray:
+            texture_type_hints[index] = TextureType::_2DArray;
+            break;
+        case MTL::TextureType3D:
+            texture_type_hints[index] = TextureType::_3D;
+            break;
+        case MTL::TextureTypeCube:
+            texture_type_hints[index] = TextureType::Cube;
+            break;
+        case MTL::TextureTypeCubeArray:
+            texture_type_hints[index] = TextureType::CubeArray;
+            break;
+        default:
+            break;
+        }
+    }
+    mem_analyzer.analyze(modul, texture_type_hints);
     if (visual.shaderActive()) visual.shaderArtifact("analyzed.ir", fmt::format("{}", modul));
 
     // Debug

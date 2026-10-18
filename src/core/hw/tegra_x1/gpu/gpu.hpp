@@ -156,8 +156,9 @@ class Gpu {
     video::Syncpoints& getVideoSyncpoints() { return *video_syncpoints; }
 
     // GPU fences. A submission that asks for a fence gets a syncpoint value
-    // the host reaches when it finished the submission's work. Off by default
-    // (every fence then reads as reached): HYDRA_GPU_FENCES=1 enables them.
+    // the host reaches when the Metal command buffer of the submission
+    // completed. On by default; HYDRA_GPU_FENCES=0 turns them off (every fence
+    // then reads as reached at once, while PFIFO still runs the work later).
     bool reserveFence(Fence& out_fence);
     // Reaches the fence of a submission
     std::function<void()> makeFenceSignal(const Fence& fence) const {
