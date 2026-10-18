@@ -728,7 +728,7 @@ u32 ClearDepthPipelineCache::hash(
 #endif
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
-void TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
+bool TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     ::hydra::hot::Scope hot_scope;

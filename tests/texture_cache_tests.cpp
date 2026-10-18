@@ -10,6 +10,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -270,6 +271,80 @@ int main() {
             check(rgba[256] == 0 && rgba[259] == 0,
                   "Alias synchronization preserves the unrelated layer");
             std::cout << "PASS: nonzero mip/layer alias synchronization\n";
+        }
+
+        // Unreal streams a BC texture mip by mip through RGBA32 render targets
+        // whose texel is one block, placed at the address of the mip. The BC
+        // texture sampled afterwards must receive those blocks (this used to
+        // leave it stale: random coloured blocks on the streamed materials).
+        {
+            std::vector<u8> stream_memory(0x20000, 0);
+            const auto stream_ptr = reinterpret_cast<uptr>(stream_memory.data());
+            metal::Renderer stream_renderer;
+            auto& stream_cache = stream_renderer.getTextureCache();
+            std::unique_ptr<ICommandBuffer> stream_commands(
+                stream_renderer.createCommandBuffer());
+            const TextureDescriptor bc3(stream_ptr, MTL::TextureType2D,
+                                        TextureFormat::BC3_RGBA, false, 0, 64,
+                                        64, 1, 5, 1, 0, 0, 0);
+            struct Mip {
+                u32 level, blocks;
+                MTL::ClearColor color;
+            };
+            const std::array<Mip, 2> mips{{{1, 8, MTL::ClearColor(1, 0.5, 0.25, 0.125)},
+                                           {2, 4, MTL::ClearColor(2, 4, 8, 16)}}};
+            stream_cache.find(stream_commands.get(), bc3, TextureUsage::Read);
+            for (const auto& stream_mip : mips) {
+                const TextureDescriptor target(
+                    stream_ptr + bc3.getLevelOffset(stream_mip.level),
+                    MTL::TextureType2D, TextureFormat::RGBA32Float, false, 0,
+                    stream_mip.blocks, stream_mip.blocks, 1, 1, 1, 0, 0, 0);
+                auto* target_view = stream_cache.find(
+                    stream_commands.get(), target, TextureUsage::Read);
+                stream_cache.find(stream_commands.get(), target,
+                                  TextureUsage::Write);
+                auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+                auto* attachment = pass->colorAttachments()->object(0);
+                attachment->setTexture(
+                    static_cast<metal::Texture*>(target_view->getBase())
+                        ->getTexture());
+                attachment->setLoadAction(MTL::LoadActionClear);
+                attachment->setStoreAction(MTL::StoreActionStore);
+                attachment->setClearColor(stream_mip.color);
+                static_cast<metal::CommandBuffer*>(stream_commands.get())
+                    ->getRenderCommandEncoder(pass);
+            }
+            auto* bc3_view = stream_cache.find(stream_commands.get(), bc3,
+                                               TextureUsage::Read);
+            auto* bc3_texture =
+                static_cast<metal::Texture*>(bc3_view->getBase())->getTexture();
+            NS_STACK_SCOPED auto readback =
+                stream_renderer.getDevice()->newBuffer(
+                    0x2000, MTL::ResourceStorageModeShared);
+            auto* blit = static_cast<metal::CommandBuffer*>(stream_commands.get())
+                             ->getBlitCommandEncoder();
+            for (u32 i = 0; i < mips.size(); ++i) {
+                const u32 blocks = mips[i].blocks;
+                blit->copyFromTexture(
+                    bc3_texture, 0, mips[i].level, MTL::Origin(0, 0, 0),
+                    MTL::Size(blocks * 4, blocks * 4, 1), readback,
+                    i * 0x1000, blocks * 16, blocks * blocks * 16);
+            }
+            stream_commands.reset();
+            for (u32 i = 0; i < mips.size(); ++i) {
+                const f32 expected[4] = {static_cast<f32>(mips[i].color.red),
+                                         static_cast<f32>(mips[i].color.green),
+                                         static_cast<f32>(mips[i].color.blue),
+                                         static_cast<f32>(mips[i].color.alpha)};
+                const auto* bytes =
+                    static_cast<const u8*>(readback->contents()) + i * 0x1000;
+                bool all_match = true;
+                for (u32 block = 0; block < mips[i].blocks * mips[i].blocks; ++block)
+                    all_match &= std::memcmp(bytes + block * 16, expected, 16) == 0;
+                check(all_match,
+                      "BC3 mip written through RGBA32 blocks reaches the BC texture");
+            }
+            std::cout << "PASS: BC blocks written through RGBA32 render targets\n";
         }
 
         // A bridge merges initially separate intervals after a GPU write.

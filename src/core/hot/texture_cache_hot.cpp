@@ -285,6 +285,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         // contents. Bytes the guest overwrote since are never written back
         // (TextureStorage::flushed_ranges). A file named "no_alias_via_guest"
         // in HYDRA_TRACE_DIR turns this off.
+        bool decode_pending = false;
         const auto sync_via_guest = [&](TextureStorage& source) {
             if (debugFlag("no_alias_via_guest") ||
                 storage.gpu_written_timestamp > storage.flushed_timestamp)
@@ -305,8 +306,18 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                                         source.base->getDescriptor().ptr,
                                         source.base->getDescriptor().type,
                                         source.base->getDescriptor().format));
-            decodeTexture(command_buffer, storage);
+            // Decoding replaces all texels from guest memory: do it once after
+            // consecutive guest-memory aliases (a BC texture streamed through
+            // one render target per mip), and before any direct copy so the
+            // aliases still apply in time order
+            decode_pending = true;
             return true;
+        };
+        const auto flush_decode = [&] {
+            if (!decode_pending)
+                return;
+            decode_pending = false;
+            decodeTexture(command_buffer, storage);
         };
         // A shared memory interval can contain thousands of sampled textures
         // but only a few render targets. Avoid walking all storages when none
@@ -397,11 +408,21 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         getTextureTypeClass(other_descriptor.type);
                     if (type_class == TextureTypeClass::_2D &&
                         other_type_class == TextureTypeClass::_2D) {
-                        synchronize2DWith2D(command_buffer, storage,
-                                            other_storage);
+                        flush_decode();
+                        if (!synchronize2DWith2D(command_buffer, storage,
+                                                 other_storage) &&
+                            !sync_via_guest(other_storage)) {
+                            alias_sync_complete = false;
+                            // DEBUG: report textures that alias but cannot be synchronized
+                            static u32 debug_count = 0;
+                            if (debug_count++ < 20)
+                                LOG_WARN(Gpu, "DEBUG cannot synchronize 2D textures ({}) and ({})",
+                                         descriptor, other_descriptor);
+                        }
                     } else if (type_class == TextureTypeClass::_1DBuffer &&
                                other_type_class ==
                                    TextureTypeClass::_1DBuffer) {
+                        flush_decode();
                         const auto begin =
                             std::max(range.getBegin(), other_range.getBegin());
                         const auto end =
@@ -419,6 +440,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         if (surface.level_count == 1 && surface.layer_count == 1 &&
                             surface.depth == 1 && !isTextureFormatCompressed(surface.format) &&
                             !isTextureFormatDepthOrStencil(surface.format)) {
+                            flush_decode();
                             const auto begin = std::max(range.getBegin(), other_range.getBegin());
                             const auto end = std::min(range.getEnd(), other_range.getEnd());
                             storage.base->copyBufferBytes(command_buffer, other_storage.base,
@@ -429,6 +451,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         }
                     } else if (type_class == TextureTypeClass::_3D &&
                                other_type_class == TextureTypeClass::_3D) {
+                        flush_decode();
                         synchronize3DWith3D(command_buffer, storage,
                                             other_storage);
                     } else if (!sync_via_guest(other_storage)) {
@@ -440,6 +463,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         } else if (PerfStats::isEnabled()) {
             PerfStats::instance().texture_sync_skips++;
         }
+        flush_decode();
 
         if (alias_sync_complete) {
             failed_scans.erase(storage.base);

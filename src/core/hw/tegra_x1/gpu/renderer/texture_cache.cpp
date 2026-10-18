@@ -680,7 +680,48 @@ void TextureCache::update(ICommandBuffer* command_buffer,
     HYDRA_HOT_CALL(*this, texture_cache_update)(command_buffer, storage, mem, usage);
 }
 
-void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
+// Block compressed data written (or read) through texels of the size of a
+// block: NVN streams a BC texture mip by mip through RGBA32/RG32 render targets
+// whose texel is one block, placed at the mip's address. The texel texture's
+// dimensions are the compressed level's dimensions in blocks (padded up to the
+// GOB width), so the pixel dimension comparison of calculateLevelAndLayer never
+// matches. Finds the level of the compressed texture that the texel texture
+// covers, with the same memory layout.
+bool calculateBlockTexelAlias(const TextureDescriptor& compressed,
+                              const TextureDescriptor& texel, u32& out_level) {
+    const auto& compressed_info = getTextureFormatInfo(compressed.format);
+    const auto& texel_info = getTextureFormatInfo(texel.format);
+    if (compressed_info.block_width == 1 && compressed_info.block_height == 1)
+        return false;
+    if (texel_info.block_width != 1 || texel_info.block_height != 1 ||
+        texel_info.bytes_per_block != compressed_info.bytes_per_block ||
+        isTextureFormatDepthOrStencil(texel.format) ||
+        getHostTextureFormat(texel.format) != texel.format ||
+        texel.level_count != 1 || texel.layer_count != 1 ||
+        texel.type != MTL::TextureType2D ||
+        compressed.type != MTL::TextureType2D)
+        return false;
+
+    u32 layer;
+    if (!calculateLevelAndLayer(compressed, texel.ptr, out_level, layer) ||
+        layer != 0)
+        return false;
+
+    const auto dims = compressed.getLevelDimensions(out_level);
+    const u32 blocks_x = static_cast<u32>(
+        (static_cast<u32>(dims.width) + compressed_info.block_width - 1) /
+        compressed_info.block_width);
+    const u32 blocks_y = static_cast<u32>(
+        (static_cast<u32>(dims.height) + compressed_info.block_height - 1) /
+        compressed_info.block_height);
+    // A render target may be wider than the level (GOB width padding), never
+    // narrower
+    if (texel.width < blocks_x || texel.height < blocks_y)
+        return false;
+    return haveCompatibleLayout(compressed, out_level, texel, 0);
+}
+
+bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     const auto& descriptor = storage.base->getDescriptor();
@@ -695,6 +736,38 @@ void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
     if (!calculateLevelAndLayer(descriptor, other_descriptor,
                                 copy_range.getBegin(), level, layer,
                                 other_level, other_layer)) {
+        // Block data through texels of the size of a block (BC mips written
+        // through RGBA32/RG32 render targets): copy one level
+        {
+            u32 compressed_level = 0;
+            const bool to_compressed =
+                calculateBlockTexelAlias(descriptor, other_descriptor,
+                                         compressed_level);
+            const bool from_compressed =
+                !to_compressed &&
+                calculateBlockTexelAlias(other_descriptor, descriptor,
+                                         compressed_level);
+            if (to_compressed || from_compressed) {
+                const auto dst_level = to_compressed ? compressed_level : 0u;
+                const auto src_level = to_compressed ? 0u : compressed_level;
+                const auto& compressed_descriptor =
+                    to_compressed ? descriptor : other_descriptor;
+                const auto& texel_descriptor =
+                    to_compressed ? other_descriptor : descriptor;
+                const auto level_dims =
+                    compressed_descriptor.getLevelDimensions(compressed_level);
+                // Larger than both: the copy clamps to what each side has
+                const MTL::Size size(
+                    std::max(static_cast<u32>(level_dims.width), texel_descriptor.width),
+                    std::max(static_cast<u32>(level_dims.height), texel_descriptor.height),
+                    1);
+                storage.base->copyFrom(command_buffer, other_storage.base,
+                                       MTL::Origin(0, 0, 0), src_level, 0,
+                                       MTL::Origin(0, 0, 0), dst_level, 0,
+                                       size, 1);
+                return true;
+            }
+        }
         // Same memory layout, but different dimensions (e.g. a padded render
         // target): copy the overlapping region of a single level
         if (descriptor.ptr != other_descriptor.ptr ||
@@ -704,12 +777,12 @@ void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                                     other_level, other_layer) ||
             !haveCompatibleLayout(descriptor, level, other_descriptor,
                                   other_level)) {
-            // DEBUG: report textures that alias but cannot be synchronized
-            static u32 debug_count = 0;
-            if (debug_count++ < 20)
-                LOG_WARN(Gpu, "DEBUG cannot synchronize 2D textures ({}) and ({})",
-                         descriptor, other_descriptor);
-            return;
+            // The caller falls back to synchronizing through guest memory
+            // (e.g. block data written through an RGBA32 render target into
+            // the memory of a BC texture)
+            LOG_DEBUG(Gpu, "Cannot copy 2D textures directly ({}) and ({})",
+                      descriptor, other_descriptor);
+            return false;
         }
 
         const auto dims = descriptor.getLevelDimensions(level);
@@ -723,7 +796,7 @@ void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
             other_layer, MTL::Origin(0, 0, 0), level, layer, size,
             std::min(descriptor.layer_count - layer,
                      other_descriptor.layer_count - other_layer));
-        return;
+        return true;
     }
 
     storage.base->copyFrom(
@@ -733,6 +806,7 @@ void TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                  other_descriptor.level_count - other_level),
         std::min(descriptor.layer_count - layer,
                  other_descriptor.layer_count - other_layer));
+    return true;
 }
 
 void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
