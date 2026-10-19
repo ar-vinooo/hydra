@@ -266,6 +266,35 @@ def enc_flo(dst, b, sh=0, signed=0, inv=0):
 
 
 # ------------------------------------------------------------------- input pools
+def enc_bfe(dst, a, b, signed=0, brev=0):
+    return base(0x5c00, dst, a) | (b << 20) | (brev << 40) | (signed << 48)
+
+
+def enc_bfi(dst, insert, ctrl, base_reg):
+    return base(0x5bf0, dst, insert) | (ctrl << 20) | (base_reg << 39)
+
+
+def enc_sel(dst, a, b, pred, pred_inv=0):
+    return base(0x5ca0, dst, a) | (b << 20) | (pred << 39) | (pred_inv << 42)
+
+
+def enc_iset(dst, a, b, cmp_op, signed=0, bool_op=0, bf=0, pred=PT, pred_inv=0):
+    return (base(0x5b50, dst, a) | (b << 20) | (pred << 39) | (pred_inv << 42) | (bf << 44) |
+            (bool_op << 45) | (signed << 48) | (cmp_op << 49))
+
+
+def enc_fset(dst, a, b, cmp_op, bf=0, bool_op=0, pred=PT, pred_inv=0):
+    return (base(0x5800, dst, a) | (b << 20) | (pred << 39) | (pred_inv << 42) |
+            (bool_op << 45) | (cmp_op << 48) | (bf << 52))
+
+
+def enc_xmad(dst, a, b, c, hilo_a=0, hilo_b=0, a_signed=0, b_signed=0, cop=0, psl=0, mrg=0):
+    """XMAD, register operands (opcode 0x5b00; fields from the decoder / nvdisasm)."""
+    return ((0x5b00 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (hilo_b << 35) |
+            (psl << 36) | (mrg << 37) | (c << 39) | (a_signed << 48) | (b_signed << 49) |
+            (cop << 50) | (hilo_a << 53))
+
+
 def f(x):
     return f_bits(x)
 
@@ -536,6 +565,113 @@ def make_int_cases(rng):
     return cases
 
 
+def xmad_half(value, high, signed):
+    half = (value >> 16) & 0xffff if high else value & 0xffff
+    return half - 0x10000 if signed and half & 0x8000 else half
+
+
+def xmad_model(a, b, c, hilo_a, hilo_b, a_signed, b_signed, cop, psl, mrg):
+    """Maxwell XMAD: a 16x16 multiply with a selectable half and signedness per
+    operand, an optional <<16 of the product (PSL), one of the C operand modes
+    (full, low half, high half, c + (b << 16)) and an optional merge (MRG)."""
+    M = 0xffffffff
+    product = (xmad_half(a, hilo_a, a_signed) * xmad_half(b, hilo_b, b_signed)) & M
+    if psl:
+        product = (product << 16) & M
+    addend = {0: c, 1: c & 0xffff, 2: c >> 16, 4: (c + (b << 16)) & M}[cop]
+    result = (product + addend) & M
+    if mrg:
+        result = (result & 0xffff) | ((b << 16) & M)
+    return result
+
+
+def make_xmad_cases(rng):
+    cases = []
+    triples = int_triples(rng, 6)
+    for hilo_a in (0, 1):
+        for hilo_b in (0, 1):
+            for a_signed in (0, 1):
+                for b_signed in (0, 1):
+                    for cop in (0, 1, 2, 4):
+                        for psl in (0, 1):
+                            for mrg in (0, 1):
+                                inst = enc_xmad(3, 0, 1, 2, hilo_a, hilo_b, a_signed, b_signed, cop, psl, mrg)
+                                for a, b, c in triples:
+                                    cases.append(Case('xmad', inst, (a, b, c), xmad_model(
+                                        a, b, c, hilo_a, hilo_b, a_signed, b_signed, cop, psl, mrg), None))
+    # The compiler's 32-bit multiply (and multiply-add) sequences must give the
+    # low 32 bits of a * b (+ c): XMAD, XMAD.MRG, XMAD.PSL.CBCC with a scratch register
+    RZ = 255
+    for name, c_reg in (('xmad_mul32', RZ), ('xmad_mad32', 2)):
+        sequence = ','.join('%016x' % i for i in (
+            enc_xmad(3, 0, 1, c_reg),
+            enc_xmad(4, 0, 1, RZ, hilo_b=1, mrg=1),
+            enc_xmad(3, 0, 4, 3, hilo_a=1, hilo_b=1, cop=4, psl=1)))
+        # XMAD R4 above multiplies R0.L by R1.H1; the third multiplies R0.H1 by R4.H1
+        for a, b, c in int_triples(rng, 160):
+            want = (a * b + (c if c_reg == 2 else 0)) & 0xffffffff
+            cases.append(Case(name, sequence, (a, b, c), want, 'scratch'))
+    return cases
+
+
+def make_bit_cases(rng):
+    """BFE / BFI (well defined field positions), SEL, ISET and FSET."""
+    cases = []
+    M = 0xffffffff
+    triples = int_triples(rng, 48)
+    for signed in (0, 1):
+        inst = enc_bfe(3, 0, 1, signed)
+        for a, _, _ in triples:
+            for _ in range(4):
+                pos = rng.randrange(32)
+                length = rng.randrange(1, 33 - pos)
+                ctrl = pos | (length << 8) | (rng.getrandbits(16) << 16)
+                field = (a >> pos) & ((1 << length) - 1)
+                if signed and field >> (length - 1):
+                    field -= 1 << length
+                cases.append(Case('bfe' + ('_signed' if signed else ''), inst, (a, ctrl, 0), field & M, None))
+    inst = enc_bfi(3, 0, 1, 2)
+    for a, _, base_value in triples:
+        for _ in range(4):
+            pos = rng.randrange(32)
+            length = rng.randrange(1, 33 - pos)
+            ctrl = pos | (length << 8) | (rng.getrandbits(16) << 16)
+            mask = ((1 << length) - 1) << pos
+            cases.append(Case('bfi', inst, (a, ctrl, base_value),
+                              ((base_value & ~mask) | ((a << pos) & mask)) & M, None))
+    # P0 is false in the runner's initial state
+    for pred, inv, take_a in ((0, 0, False), (0, 1, True), (PT, 0, True), (PT, 1, False)):
+        inst = enc_sel(3, 0, 1, pred, inv)
+        for a, b, _ in triples[:16]:
+            cases.append(Case('sel', inst, (a, b, 0), a if take_a else b, None))
+    compare = {0: lambda x, y: False, 1: lambda x, y: x < y, 2: lambda x, y: x == y, 3: lambda x, y: x <= y,
+               4: lambda x, y: x > y, 5: lambda x, y: x != y, 6: lambda x, y: x >= y, 7: lambda x, y: True}
+    for signed in (0, 1):
+        for op in range(8):
+            for bf in (0, 1):
+                inst = enc_iset(3, 0, 1, op, signed, 0, bf)
+                for a, b, _ in triples[:24]:
+                    x, y = (s32(a), s32(b)) if signed else (a, b)
+                    true_value = 0x3f800000 if bf else M
+                    cases.append(Case('iset', inst, (a, b, 0), true_value if compare[op](x, y) else 0, None))
+    # ISET combines the comparison with a predicate: AND / OR / XOR with P0 (false) and PT
+    for bool_op, fn in ((0, lambda c, p: c and p), (1, lambda c, p: c or p), (2, lambda c, p: c != p)):
+        for pred, inv, p_value in ((0, 0, False), (0, 1, True), (PT, 0, True)):
+            inst = enc_iset(3, 0, 1, 5, 0, bool_op, 0, pred, inv)
+            for a, b, _ in triples[:16]:
+                cases.append(Case('iset_bool', inst, (a, b, 0), M if fn(a != b, p_value) else 0, None))
+    fcompare = {0: lambda x, y: False, 1: lambda x, y: x < y, 2: lambda x, y: x == y, 3: lambda x, y: x <= y,
+                4: lambda x, y: x > y, 5: lambda x, y: x != y, 6: lambda x, y: x >= y, 15: lambda x, y: True}
+    values = [f(v) for v in (0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 1e-3, 1e30, 3.0)]
+    for op, fn in fcompare.items():
+        for bf in (0, 1):
+            inst = enc_fset(3, 0, 1, op, bf)
+            for a in values:
+                for b in values:
+                    cases.append(Case('fset', inst, (a, b, 0), (0x3f800000 if bf else M) if fn(bits_f(a), bits_f(b)) else 0, None))
+    return cases
+
+
 def is_denormal(b):
     return (b & 0x7f800000) == 0 and (b & 0x7fffff) != 0
 
@@ -571,7 +707,8 @@ def run(binary, cases):
 
 def matches(case, row):
     regs, preds, cc = row[:8], row[8], row[9]
-    if regs[0:3] != list(case.regs) or regs[4:] != [0] * 4 or preds != 0:
+    scratch = case.tolerance == 'scratch'  # the sequence uses R4 and up
+    if regs[0:3] != list(case.regs) or (regs[4:] != [0] * 4 and not scratch) or preds != 0:
         return False, 'clobbered state'
     got = regs[3]
     exp = case.expected
@@ -603,7 +740,7 @@ def main():
     parser.add_argument('--show', type=int, default=3)
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng)
+    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng)
     cases = split_denormals(cases)
     if args.group:
         cases = [c for c in cases if c.group == args.group]

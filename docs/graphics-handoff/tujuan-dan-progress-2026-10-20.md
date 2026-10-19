@@ -147,3 +147,15 @@ Hydra tidak melakukannya; `emitTextureSample` kini menambahkannya pada
 trace hardware Switch. Dampak visual di game (Crash 4 memakai bias -1 untuk dynamic
 resolution) belum diuji. Pertanyaan terbuka tersisa: MIRROR_ONCE_BORDER di
 sambungan cermin dan satuan remap DMA tiled (butuh source NVK/hardware).
+
+## Tahap C: instruksi integer dan set-nilai (baru)
+
+Oracle ALU (`tests/maxwell_alu_reference.py`) bertambah menjadi 12.930 kasus, semua
+cocok, tanpa bug: **XMAD** (1536 kasus langsung: selektor H0/H1, bertanda/tidak,
+mode C penuh/low/high/CBCC, PSL, MRG; dan 320 urutan yang dipakai kompiler untuk
+perkalian 32-bit dan multiply-add, `XMAD`, `XMAD.MRG`, `XMAD.PSL.CBCC`, yang
+harus sama dengan a*b(+c) mod 2^32), **BFE/BFI** (posisi dan panjang valid;
+kasus tepi tidak dibandingkan karena semantik SASS belum tentu sama dengan PTX,
+`.BREV` tidak diuji), **SEL**, **ISET** (8 operasi, bertanda/tidak, hasil -1
+atau 1.0, kombinasi AND/OR/XOR dengan predikat), dan **FSET**. Semantik mode
+CSFU, X, dan CC pada XMAD tidak dibandingkan.
