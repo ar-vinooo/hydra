@@ -179,3 +179,11 @@ dari register, padahal Metal mensyaratkan LOD konstan pada tekstur 1D; shader ya
 memakainya gagal dibangun. Emitter kini memakai level 0 (dengan peringatan
 "not implemented" sekali); tekstur 1D praktis tidak punya mip. Kontrol: x/y
 tertukar pada 2D.LL menggagalkan tes. Fetch di luar batas tidak dibandingkan.
+
+## Tahap C: gather TLD4S (baru)
+
+`tests/gather_reference.py` (2400 gather, 300 konfigurasi): TLD4S melalui sampler TSC
+acak (mode alamat wrap/mirror/clamp) mengembalikan komponen yang dipilih dari
+footprint 2x2 dengan urutan standar (x0,y1),(x1,y1),(x1,y0),(x0,y0); semua cocok,
+tanpa bug. Kontrol: urutan footprint dari kiri-atas menggagalkan tes. Belum:
+offset (AOFFI/PTP), depth compare, border, TXQ, TMML, TXD.

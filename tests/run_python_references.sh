@@ -40,5 +40,6 @@ TAIL=2 run texture-types python3 "$T/texture_type_reference.py" "$BIN/hydra-maxw
 TAIL=2 run index-decode python3 "$T/index_decode_reference.py" "$BIN/hydra-index-decode-reference-tests" --header "$NV/clb197.h"
 TAIL=3 run viewport python3 "$T/viewport_reference.py" "$BIN/hydra-viewport-reference-tests" --header "$NV/clb197.h"
 TAIL=2 run texel-fetch python3 "$T/texel_fetch_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
+TAIL=2 run gather python3 "$T/gather_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail

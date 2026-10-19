@@ -4001,3 +4001,81 @@ void runMaxwellTexelFetchCaseFile(MTL::Device* device, const char* in_path,
             descriptor->release();
     }
 }
+
+
+// Python-driven gather reference (tests/gather_reference.py): TLD4S through a
+// guest sampler (TSC).
+// Grammar: CONFIG <w> <h> <component> <8 TSC words hex>, DATA <w*h*4 floats hex>,
+// CASE <u bits> <v bits>. Output: "<R10..R13 hex>" per CASE.
+void runMaxwellGatherCaseFile(MTL::Device* device, const char* in_path,
+                              const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "Gather case files open");
+    struct Config {
+        u32 width{}, height{}, component{};
+        std::array<u32, 8> tsc{};
+        std::vector<u32> data;
+        std::vector<std::array<u32, 2>> cases;
+    };
+    std::vector<Config> configs;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string tag;
+        row >> tag;
+        if (tag == "CONFIG") {
+            Config config;
+            row >> config.width >> config.height >> config.component;
+            for (auto& word : config.tsc) row >> std::hex >> word;
+            expect(bool(row), "Malformed gather CONFIG");
+            configs.push_back(std::move(config));
+        } else if (tag == "DATA") {
+            expect(!configs.empty(), "DATA before CONFIG");
+            for (u32 word; row >> std::hex >> word;) configs.back().data.push_back(word);
+        } else if (tag == "CASE") {
+            expect(!configs.empty(), "CASE before CONFIG");
+            std::array<u32, 2> values{};
+            for (auto& value : values) row >> std::hex >> value;
+            configs.back().cases.push_back(values);
+        }
+    }
+    constexpr u32 TEXTURE_INDEX = 1;
+    for (const auto& config : configs) {
+        auto* descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, config.width, config.height, false);
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr && config.data.size() == config.width * config.height * 4,
+               "Gather texture");
+        texture->replaceRegion(MTL::Region::Make2D(0, 0, config.width, config.height), 0,
+                               config.data.data(), config.width * 16);
+        hw::tegra_x1::gpu::engines::TextureSamplerControl tsc{};
+        std::memcpy(&tsc, config.tsc.data(), sizeof(tsc));
+        metal::Sampler sampler(device, hw::tegra_x1::gpu::engines::decodeSampler(
+                                           tsc, TextureFormat::RGBA32Float));
+        GuestShaderState state{};
+        hw::tegra_x1::gpu::engines::specializeShaderSampler(
+            state, TEXTURE_INDEX, tsc, TextureFormat::RGBA32Float, {});
+        // TLD4S, plain form: coordinates in R4 and R5, four f32 results in R10..R13
+        const u64 instruction = 0xdf00000000000000ull | 10 | (4ull << 8) | PT_GUARD |
+                                (5ull << 20) | (12ull << 28) |
+                                (u64(TEXTURE_INDEX) << 36) | (u64(config.component) << 52);
+        std::vector<AluState> inputs;
+        for (const auto& values : config.cases) {
+            AluState alu{};
+            alu.regs[4] = values[0];
+            alu.regs[5] = values[1];
+            inputs.push_back(alu);
+        }
+        const auto results = runTextureProgram(
+            device, {instruction}, inputs, {},
+            {{"texture2d<float>", texture, sampler.getSampler()}},
+            "Maxwell gather reference", state);
+        for (const auto& result : results) {
+            for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+            output << '\n';
+        }
+    }
+}
