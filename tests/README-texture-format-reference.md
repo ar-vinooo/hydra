@@ -40,7 +40,7 @@ or scaling the oracle, fails the run.
 
 ## Results (20 October 2026)
 
-- **PASS: 10,289,296/10,289,296** component values: 186,752 for linear texels and
+- **PASS: 10,347,712/10,347,712** component values: 186,752 for linear texels and
   single BC blocks, 2,058,960 for block-linear layout, 8,043,584 for mip chains
   and array layers. Metal API validation on.
 - **Found and fixed:** sampling the alpha of X8B8G8R8 (`XBGR8`) returned the
@@ -61,6 +61,21 @@ or scaling the oracle, fails the run.
   Apple GPUs return alpha 1. Not compared; not a meaningful encoding.
 - BC6H blocks use only the 14 defined modes; reserved modes decode to
   undefined values.
+
+## ASTC, ETC2 and EAC
+
+All 14 ASTC block sizes (4x4 to 12x12, Unorm and sRGB), ETC2 RGB (Unorm and sRGB),
+ETC2 RGBA and EAC R11 are checked with blocks that decode to a constant colour per
+block or ETC sub-block: ASTC void-extent blocks with random 16-bit colours, ETC2
+blocks in the ETC1-compatible individual and differential modes (both flip
+orientations, all modifier tables, every pixel index 0) and EAC blocks with random
+base and multiplier. 3x2 blocks per texture. The model only needs the block size
+and block order, so a wrong ASTC block size, a transposed block grid or a wrong
+host format shows up (modelling ASTC 5x4 as 4x5 fails the run). 58,416 values.
+
+Not covered: ASTC and ETC2 blocks that interpolate, HDR ASTC, the ETC2 T, H and
+planar modes, punch-through alpha, EAC R11 Snorm and RG11. The decoders themselves
+are Apple's hardware decoders, not Hydra's; this checks Hydra's mapping and layout.
 
 ## Block-linear layout
 

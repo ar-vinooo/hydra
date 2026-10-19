@@ -501,6 +501,132 @@ def run_mips(runner, rng):
     return total, mismatches
 
 
+ASTC_FORMATS = [  # name, image format id, block width, block height
+    ('ASTC_2D_4X4', 0x40, 4, 4), ('ASTC_2D_5X4', 0x50, 5, 4), ('ASTC_2D_5X5', 0x41, 5, 5),
+    ('ASTC_2D_6X5', 0x51, 6, 5), ('ASTC_2D_6X6', 0x42, 6, 6), ('ASTC_2D_8X5', 0x55, 8, 5),
+    ('ASTC_2D_8X6', 0x52, 8, 6), ('ASTC_2D_8X8', 0x44, 8, 8), ('ASTC_2D_10X5', 0x56, 10, 5),
+    ('ASTC_2D_10X6', 0x57, 10, 6), ('ASTC_2D_10X8', 0x53, 10, 8), ('ASTC_2D_10X10', 0x45, 10, 10),
+    ('ASTC_2D_12X10', 0x54, 12, 10), ('ASTC_2D_12X12', 0x46, 12, 12),
+]
+EAC_R11_MODIFIERS = [-3, -6, -9, -10, 2, 5, 8, 11]  # table 0, index 0 is used
+
+
+def astc_void_extent(rgba16):
+    """A 16 byte LDR void-extent block: one constant colour, no extent."""
+    low = 0xfffffffffffffdfc  # block mode 0x1fc, LDR, reserved bits set, extent all ones
+    high = rgba16[0] | (rgba16[1] << 16) | (rgba16[2] << 32) | (rgba16[3] << 48)
+    return struct.pack('<QQ', low, high)
+
+
+def etc1_block(rng):
+    """An ETC1-compatible block with every pixel index 0; returns bytes and per-pixel RGB."""
+    diff = rng.random() < 0.5
+    flip = rng.randrange(2)
+    table1, table2 = rng.randrange(8), rng.randrange(8)
+    tables = [[2, 8, -2, -8], [5, 17, -5, -17], [9, 29, -9, -29], [13, 42, -13, -42],
+              [18, 60, -18, -60], [24, 80, -24, -80], [33, 106, -33, -106], [47, 183, -47, -183]]
+    if diff:
+        base = [rng.randrange(4, 28) for _ in range(3)]
+        delta = [rng.randrange(-4, 4) for _ in range(3)]
+        second = [b + d for b, d in zip(base, delta)]
+        colors = [[(c << 3) | (c >> 2) for c in base], [(c << 3) | (c >> 2) for c in second]]
+        head = bytes([base[0] << 3 | (delta[0] & 7), base[1] << 3 | (delta[1] & 7), base[2] << 3 | (delta[2] & 7)])
+    else:
+        a = [rng.randrange(16) for _ in range(3)]
+        b = [rng.randrange(16) for _ in range(3)]
+        colors = [[(c << 4) | c for c in a], [(c << 4) | c for c in b]]
+        head = bytes([a[0] << 4 | b[0], a[1] << 4 | b[1], a[2] << 4 | b[2]])
+    flags = (table1 << 5) | (table2 << 2) | (int(diff) << 1) | flip
+    block = head + bytes([flags]) + bytes(4)
+    texels = {}
+    for y in range(4):
+        for x in range(4):
+            sub = (0 if y < 2 else 1) if flip else (0 if x < 2 else 1)
+            modifier = tables[(table1, table2)[sub]][0]
+            texels[(x, y)] = [min(max(c + modifier, 0), 255) / 255 for c in colors[sub]]
+    return block, texels
+
+
+def eac_block(rng):
+    """An EAC R11 block with every index 0; returns bytes and the value."""
+    base, multiplier = rng.randrange(256), rng.randrange(1, 16)
+    block = bytes([base, (multiplier << 4) | 0]) + bytes(6)
+    value = base * 8 + 4 + EAC_R11_MODIFIERS[0] * multiplier * 8
+    return block, min(max(value, 0), 2047) / 2047
+
+
+def run_compressed_extra(runner, rng):
+    """ASTC void-extent blocks, ETC2 RGB / RGBA (ETC1 subset) and EAC R11 blocks.
+
+    The blocks decode to a constant colour per block (or per ETC sub-block), which
+    makes the model trivial while still checking the block size, the block order
+    and the host format of every compressed texture format."""
+    cases, lines = [], []
+    for name, ident, bw, bh in ASTC_FORMATS:
+        for srgb in (False, True):
+            blocks_x, blocks_y = 3, 2
+            blocks = [[rng.randrange(65536) for _ in range(4)] for _ in range(blocks_x * blocks_y)]
+            data = b''.join(astc_void_extent(b) for b in blocks)
+            lines.append('S %x %x %x %x %x %x 2 3 4 5 %x %x 0 0 0 1 1 %s' % (
+                ident, UNORM, UNORM, UNORM, UNORM, int(srgb), blocks_x * bw, blocks_y * bh, data.hex()))
+            expected = {}
+            for y in range(blocks_y * bh):
+                for x in range(blocks_x * bw):
+                    c = blocks[(y // bh) * blocks_x + x // bw]
+                    rgb = [srgb_to_linear((v >> 8) / 255) if srgb else v / 65535 for v in c[:3]]
+                    expected[(x, y)] = rgb + [c[3] / 65535]
+            cases.append((name + (' sRGB' if srgb else ''), blocks_x * bw, blocks_y * bh, expected, 4e-3 if srgb else 2e-3))
+    for ident, name, kind, srgb in ((0x06, 'ETC2_RGB', 'rgb', False), (0x06, 'ETC2_RGB sRGB', 'rgb', True),
+                                   (0x0b, 'ETC2_RGBA', 'rgba', False), (0x19, 'EAC R11', 'r11', False)):
+        for _ in range(12):
+            blocks_x, blocks_y = 3, 2
+            data, expected = b'', {}
+            for by in range(blocks_y):
+                for bx in range(blocks_x):
+                    if kind == 'r11':
+                        block, value = eac_block(rng)
+                        data += block
+                        for y in range(4):
+                            for x in range(4):
+                                expected[(bx * 4 + x, by * 4 + y)] = [value, 0.0, 0.0, 1.0]
+                    else:
+                        alpha = None
+                        if kind == 'rgba':
+                            alpha_block, alpha = eac_block(rng)
+                            data += alpha_block
+                        block, texels = etc1_block(rng)
+                        data += block
+                        for (x, y), rgb in texels.items():
+                            if srgb:
+                                rgb = [srgb_to_linear(v) for v in rgb]
+                            expected[(bx * 4 + x, by * 4 + y)] = rgb + [alpha if alpha is not None else 1.0]
+            lines.append('S %x %x %x %x %x %x 2 3 4 5 %x %x 0 0 0 1 1 %s' % (
+                ident, UNORM, UNORM, UNORM, UNORM, int(srgb), blocks_x * 4, blocks_y * 4, data.hex()))
+            cases.append((name, blocks_x * 4, blocks_y * 4, expected, 4e-3 if srgb else 2e-3))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / 'extra.in').write_text('\n'.join(lines) + '\n')
+        subprocess.run([runner, str(tmp / 'extra.in'), str(tmp / 'extra.out')], check=True,
+                       env=dict(os.environ, MTL_DEBUG_LAYER='1'))
+        results = (tmp / 'extra.out').read_text().strip().split('\n')
+    assert len(results) == len(cases)
+    mismatches, total = {}, 0
+    for (name, width, height, expected, tolerance), line in zip(cases, results):
+        parts = line.split()
+        words = [int(w, 16) for w in parts[1:]]
+        for y in range(height):
+            for x in range(width):
+                for channel in range(4):
+                    total += 1
+                    if not words_equal('F', words[(y * width + x) * 4 + channel], expected[(x, y)][channel], False, tolerance):
+                        entry = mismatches.setdefault(name, {'count': 0, 'example': None})
+                        entry['count'] += 1
+                        entry['example'] = entry['example'] or {
+                            'x': x, 'y': y, 'channel': channel, 'expected': expected[(x, y)][channel],
+                            'actual': bits_f32(words[(y * width + x) * 4 + channel])}
+    return total, mismatches
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('runner')
@@ -636,6 +762,12 @@ def main():
         print('MISMATCH mips %s: %d, e.g. %s' % (key, entry['count'], entry['example']))
     mismatches.update({'mips ' + k: v for k, v in mip_mismatches.items()})
     total += mip_total
+    extra_total, extra_mismatches = run_compressed_extra(args.runner, random.Random(args.seed + 3))
+    print('ASTC / ETC2 / EAC blocks: compared %d component values' % extra_total)
+    for key, entry in sorted(extra_mismatches.items()):
+        print('MISMATCH %s: %d, e.g. %s' % (key, entry['count'], entry['example']))
+    mismatches.update({'compressed ' + k: v for k, v in extra_mismatches.items()})
+    total += extra_total
     if mismatches:
         print('FAIL')
         sys.exit(1)

@@ -92,3 +92,11 @@ cocok, tidak ada bug. Kontrol: membalik winding fan menggagalkan kasus fan dan
 polygon. Detail:
 [README-index-decode-reference.md](../../tests/README-index-decode-reference.md).
 Belum: adjacency/patch, base vertex dan instancing.
+
+## Tahap B: ASTC, ETC2, EAC (baru)
+
+Tes format menambah blok ASTC void-extent (14 ukuran blok, Unorm/sRGB), ETC2 RGB/RGBA
+(subset ETC1) dan EAC R11: 58.416 nilai cocok, tanpa bug. Memverifikasi pemetaan
+ID TIC → ukuran blok → format Metal dan urutan blok. Kontrol: ASTC 5x4 yang
+dimodelkan 4x5 menggagalkan tes. Belum: blok yang berinterpolasi, ASTC HDR, mode
+T/H/planar ETC2, punch-through.
