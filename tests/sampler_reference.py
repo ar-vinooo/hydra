@@ -48,7 +48,7 @@ FIELDS = {  # name -> (word, low bit, high bit)
 WRAP, MIRROR, EDGE, BORDER, OGL, MIRROR_ONCE_EDGE, MIRROR_ONCE_BORDER, MIRROR_ONCE_OGL = range(8)
 POINT, LINEAR = 1, 2
 MIP_NONE, MIP_POINT, MIP_LINEAR = 1, 2, 3
-APPLY_BIAS_TO_EXPLICIT_LOD = False
+APPLY_BIAS_TO_EXPLICIT_LOD = True
 
 
 def audit(header):
@@ -154,8 +154,7 @@ def model(levels, sizes, tsc, u, v, lod):
         return (tsc[word] >> low) & ((1 << (high - low + 1)) - 1)
     bias = signed(field('MIP_LOD_BIAS'), 13) / 256
     min_lod, max_lod = field('MIN_LOD_CLAMP') / 256, field('MAX_LOD_CLAMP') / 256
-    # Hydra adds the sampler bias to implicit LODs only; an explicit LOD (TEXS.LL)
-    # is used as given. The header does not say which hardware does (open question)
+    # The sampler bias is added to an explicit LOD too (Vulkan / OpenGL LOD equations)
     lam = min(max(lod + (bias if APPLY_BIAS_TO_EXPLICIT_LOD else 0.0), min_lod), max_lod)
     border = [bits_f32(field('BORDER_COLOR_' + c)) for c in 'RGBA']
     modes = (field('ADDRESS_U'), field('ADDRESS_V'))

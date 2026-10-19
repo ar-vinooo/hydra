@@ -26,17 +26,23 @@ python3 tests/sampler_reference.py build/swiftui-release/bin/hydra-maxwell-alu-r
 - Point and bilinear magnification and minification (chosen by the clamped LOD),
   mip filter none / nearest level / trilinear, sampler min and max LOD clamps,
   textures of 8x8, 8x4, 4x8, 7x5 and 16x2 texels with 3-5 levels.
-- Controls: choosing the wrong filter side fails 279 samples; applying the bias
+- Controls: choosing the wrong filter side fails 279 samples; not applying the bias
   to explicit LODs fails 386.
 
 ## Findings and open questions
 
-- **LOD bias and explicit LOD (open question).** Hydra adds the sampler's
-  MIP_LOD_BIAS to implicit LODs, gradients and the TEX.LB bias only; an explicit
-  LOD (TEXS.LL, level(x)) is used as given. The header does not say whether
-  hardware adds the bias to an explicit LOD (OpenGL's texture-object bias does).
-  The test encodes Hydra's behaviour; the flag `APPLY_BIAS_TO_EXPLICIT_LOD` flips
-  the model. Needs a hardware trace or documentation to settle.
+- **LOD bias and explicit LOD (fixed).** Hydra used to add the sampler's
+  MIP_LOD_BIAS to implicit LODs, gradients and the TEX.LB bias only, and used an
+  explicit LOD (TEXS.LL, `level(x)`) as given. The Vulkan specification's LOD
+  equation is lambda' = lambda_base + clamp(sampler.bias + shaderOp.bias) with
+  lambda_base the explicit LOD when the instruction has one, and OpenGL's
+  `textureLod` adds the texture object's bias the same way, so the bias applies to
+  explicit LODs. `emitTextureSample` now adds it to `level(...)`. `LZ` (level zero)
+  is unchanged: no source says whether hardware adds the bias there. Evidence is the
+  API specifications NVIDIA's drivers implement, not a Switch hardware trace.
+  Controls: the previous behaviour (`APPLY_BIAS_TO_EXPLICIT_LOD = False`) fails 386
+  samples. This changes how dynamic-resolution bias (Crash 4 uses -1) affects
+  explicit-LOD samples.
 - **MIRROR_ONCE_BORDER seam (known gap, 44 samples).** Hydra emulates this mode
   by mirroring the continuous coordinate and sampling with a border sampler, so
   a bilinear tap at index -1 beside the mirror seam reads the border colour

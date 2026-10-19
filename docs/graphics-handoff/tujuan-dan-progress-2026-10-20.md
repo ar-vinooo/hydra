@@ -136,3 +136,14 @@ adjacency/patch, dan MSAA/alpha-to-coverage (belum diimplementasikan, menunggu d
 `HYDRA_PERF_STATS=1`). Uniform buffer dari backing tak-contiguous ternyata sudah
 digather (`gathered_const_buffers`); catatan 18 Oktober usang. Gameplay: belum
 diuji; prop hitam Crash 4 butuh capture frame.
+
+## Sampler: bias LOD pada LOD eksplisit (diperbaiki)
+
+Dari spesifikasi Vulkan (bagian "LOD Operation": lambda' = lambda_base +
+clamp(sampler.bias + shaderOp.bias), lambda_base = LOD eksplisit bila ada) dan
+aturan `textureLod` OpenGL, bias sampler ikut ditambahkan pada LOD eksplisit.
+Hydra tidak melakukannya; `emitTextureSample` kini menambahkannya pada
+`level(...)` (bukan `LZ`, tidak ada sumber). Bukti dari spesifikasi API, bukan
+trace hardware Switch. Dampak visual di game (Crash 4 memakai bias -1 untuk dynamic
+resolution) belum diuji. Pertanyaan terbuka tersisa: MIRROR_ONCE_BORDER di
+sambungan cermin dan satuan remap DMA tiled (butuh source NVK/hardware).

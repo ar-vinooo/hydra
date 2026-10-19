@@ -1739,6 +1739,11 @@ void MslEmitter::emitTextureSample(
             args += int_coords ? ", 0u" : ", level(0.0)";
         else if (int_coords)
             args += fmt::format(", as_type<uint>({})", getValueStr(lod));
+        else if (sampler_bias != 0.0f)
+            // The sampler's LOD bias is added to an explicit LOD as well (the
+            // Vulkan and OpenGL level-of-detail equations; LZ stays at zero)
+            args += fmt::format(", level(({}) + {})", getValueStr(lod),
+                                getValueStr(ir::Value::createConstantF(sampler_bias)));
         else
             args += fmt::format(", level({})", getValueStr(lod));
     } else if (!int_coords && any(flags & TextureSampleFlags::Bias) &&
