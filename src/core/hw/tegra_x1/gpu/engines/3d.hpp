@@ -612,6 +612,9 @@ inline BlendEquation getBlendEquation(const Blend& blend) {
 class ThreeD : public EngineWithRegsBase<Regs3D>,
                public InlineBase,
                public macro::MacroHost {
+    // Lets tests read the viewport and scissor conversions
+    friend struct ThreeDTestAccess;
+
   public:
     explicit ThreeD(Gpu& gpu_);
 

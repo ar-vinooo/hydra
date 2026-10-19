@@ -100,3 +100,14 @@ Tes format menambah blok ASTC void-extent (14 ukuran blok, Unorm/sRGB), ETC2 RGB
 ID TIC → ukuran blok → format Metal dan urutan blok. Kontrol: ASTC 5x4 yang
 dimodelkan 4x5 menggagalkan tes. Belum: blok yang berinterpolasi, ASTC HDR, mode
 T/H/planar ETC2, punch-through.
+
+## Tahap B: viewport, scissor, window origin (baru)
+
+`tests/viewport_reference.py` (500 konfigurasi, 75 titik NDC masing-masing):
+register viewport/swizzle/window origin/clip Z/scissor ditulis ke engine 3D,
+`getViewport`/`getScissor` membangun state Metal, dibandingkan dengan transformasi
+viewport NVIDIA di model Python (posisi x, baris dari atas, kedalaman). Semua
+cocok, tidak ada bug. Kontrol: model yang mengabaikan origin lower-left
+menggagalkan setiap kasus lower-left. Perubahan kode produksi: hanya
+`friend struct ThreeDTestAccess` di `ThreeD`. Detail:
+[README-viewport-reference.md](../../tests/README-viewport-reference.md).
