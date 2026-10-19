@@ -1737,7 +1737,13 @@ void MslEmitter::emitTextureSample(
     } else if (has_lod && !is_buffer) {
         if (any(flags & TextureSampleFlags::LodZero))
             args += int_coords ? ", 0u" : ", level(0.0)";
-        else if (int_coords)
+        else if (int_coords && is_1d) {
+            // texture1d::read takes a level of detail known at compile time,
+            // and a 1D texture has a single level in practice
+            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
+                                     "1D texel fetch with a level of detail"));
+            args += ", 0u";
+        } else if (int_coords)
             args += fmt::format(", as_type<uint>({})", getValueStr(lod));
         else if (sampler_bias != 0.0f)
             // The sampler's LOD bias is added to an explicit LOD as well (the

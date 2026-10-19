@@ -169,3 +169,13 @@ khusus: nol bertanda, denormal, max, infinity, NaN) semuanya cocok. Kontrol: HFM
 yang dimodelkan sebagai mul+add dibulatkan terpisah menggagalkan sejumlah kasus.
 Belum: output F32 (maknanya tidak terdefinisi di sumber), bentuk C/I/32I,
 FMZ, FTZ, HSET2/HSETP2.
+
+## Tahap C: texel fetch TLDS (baru)
+
+`tests/texel_fetch_reference.py` (2880 fetch): TLDS 1D.LZ/1D.LL, 2D.LZ, 2D.LL (rantai
+mip), 3D.LZ dan 2D array LZ terhadap lookup array Python; semua cocok.
+**Bug nyata:** `TLDS 1D.LL` menghasilkan `texture1d::read(coord, lod)` dengan LOD
+dari register, padahal Metal mensyaratkan LOD konstan pada tekstur 1D; shader yang
+memakainya gagal dibangun. Emitter kini memakai level 0 (dengan peringatan
+"not implemented" sekali); tekstur 1D praktis tidak punya mip. Kontrol: x/y
+tertukar pada 2D.LL menggagalkan tes. Fetch di luar batas tidak dibandingkan.

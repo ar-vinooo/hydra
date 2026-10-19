@@ -3878,3 +3878,126 @@ void runMaxwellTextureTypeCaseFile(MTL::Device* device, const char* in_path,
             descriptor->release();
     }
 }
+
+
+// Python-driven texel fetch reference (tests/texel_fetch_reference.py): TLDS
+// reads texels with integer coordinates; no sampler is involved.
+// Grammar, one record per line:
+//   TYPE <1d|2d|2darray|3d> <w> <h> <depth or layers> <levels> <target>
+//   DATA <slice> <level> <w*h*4 float words hex>
+//   CASE <R4> <R5> <R6> <R7 hex>
+// Output: "<R10..R13 hex>" per CASE.
+void runMaxwellTexelFetchCaseFile(MTL::Device* device, const char* in_path,
+                                  const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "Texel fetch case files open");
+    struct Config {
+        std::string kind;
+        u32 width{}, height{}, depth{}, levels{}, target{};
+        std::map<std::pair<u32, u32>, std::vector<u32>> data;
+        std::vector<std::array<u32, 4>> cases;
+    };
+    std::vector<Config> configs;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string tag;
+        row >> tag;
+        if (tag == "TYPE") {
+            Config config;
+            row >> config.kind >> config.width >> config.height >> config.depth >>
+                config.levels >> config.target;
+            expect(bool(row), "Malformed TYPE");
+            configs.push_back(std::move(config));
+        } else if (tag == "DATA") {
+            expect(!configs.empty(), "DATA before TYPE");
+            u32 slice, level;
+            row >> slice >> level;
+            auto& words = configs.back().data[{slice, level}];
+            for (u32 word; row >> std::hex >> word;) words.push_back(word);
+        } else if (tag == "CASE") {
+            expect(!configs.empty(), "CASE before TYPE");
+            std::array<u32, 4> values{};
+            for (auto& value : values) row >> std::hex >> value;
+            expect(bool(row), "Malformed CASE");
+            configs.back().cases.push_back(values);
+        }
+    }
+    const auto tlds = [](u32 target, u32 dst0, u32 dst1, u32 a, u32 b, u32 mask) {
+        return 0xd200000000000000ull | dst0 | (u64(a) << 8) | PT_GUARD |
+               (u64(b) << 20) | (u64(dst1) << 28) | (1ull << 36) |
+               (u64(mask) << 50) | (u64(target) << 53) | (1ull << 59);
+    };
+    for (const auto& config : configs) {
+        const auto format = MTL::PixelFormatRGBA32Float;
+        MTL::TextureDescriptor* descriptor = nullptr;
+        bool owns_descriptor = false;
+        std::string declaration;
+        if (config.kind == "2d") {
+            descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+                format, config.width, config.height, config.levels > 1);
+            descriptor->setMipmapLevelCount(config.levels);
+            declaration = "texture2d<float>";
+        } else if (config.kind == "2darray") {
+            descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+                format, config.width, config.height, false);
+            descriptor->setTextureType(MTL::TextureType2DArray);
+            descriptor->setArrayLength(config.depth);
+            declaration = "texture2d_array<float>";
+        } else if (config.kind == "3d") {
+            descriptor = MTL::TextureDescriptor::alloc()->init();
+            owns_descriptor = true;
+            descriptor->setTextureType(MTL::TextureType3D);
+            descriptor->setPixelFormat(format);
+            descriptor->setWidth(config.width);
+            descriptor->setHeight(config.height);
+            descriptor->setDepth(config.depth);
+            declaration = "texture3d<float>";
+        } else {
+            expect(config.kind == "1d", "Unknown texture kind");
+            descriptor = MTL::TextureDescriptor::alloc()->init();
+            owns_descriptor = true;
+            descriptor->setTextureType(MTL::TextureType1D);
+            descriptor->setPixelFormat(format);
+            descriptor->setWidth(config.width);
+            declaration = "texture1d<float>";
+        }
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr, "Texel fetch texture creation");
+        for (const auto& [key, words] : config.data) {
+            const auto [slice, level] = key;
+            const u32 w = std::max(config.width >> level, 1u);
+            const u32 h = std::max(config.height >> level, 1u);
+            if (config.kind == "1d") {
+                texture->replaceRegion(MTL::Region::Make1D(0, w), level, words.data(), 0);
+            } else if (config.kind == "3d") {
+                texture->replaceRegion(MTL::Region::Make3D(0, 0, slice, w, h, 1), level, 0,
+                                       words.data(), w * 16, 0);
+            } else {
+                texture->replaceRegion(MTL::Region::Make2D(0, 0, w, h), level, slice,
+                                       words.data(), w * 16, 0);
+            }
+        }
+        NS_STACK_SCOPED auto sampler_descriptor = MTL::SamplerDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_descriptor);
+        std::vector<AluState> inputs;
+        for (const auto& values : config.cases) {
+            AluState alu{};
+            for (u32 i = 0; i < 4; ++i)
+                alu.regs[4 + i] = values[i];
+            inputs.push_back(alu);
+        }
+        const auto results = runTextureProgram(
+            device, {tlds(config.target, 10, 12, 4, 6, 4)}, inputs, {},
+            {{declaration, texture, sampler}}, "Maxwell texel fetch reference");
+        for (const auto& result : results) {
+            for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+            output << '\n';
+        }
+        if (owns_descriptor)
+            descriptor->release();
+    }
+}
