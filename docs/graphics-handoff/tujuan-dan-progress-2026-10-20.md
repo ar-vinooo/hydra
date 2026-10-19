@@ -111,3 +111,28 @@ cocok, tidak ada bug. Kontrol: model yang mengabaikan origin lower-left
 menggagalkan setiap kasus lower-left. Perubahan kode produksi: hanya
 `friend struct ThreeDTestAccess` di `ThreeD`. Detail:
 [README-viewport-reference.md](../../tests/README-viewport-reference.md).
+
+## Tahap B: status penutupan (20 Oktober 2026)
+
+Semua oracle dijalankan satu perintah: `bash tests/run_python_references.sh`
+(`ALL PASS`, sekitar 2,7 menit). Cakupan tahap B yang kini punya model Python
+lawan Hydra: format TIC tak terkompresi, BC1-7, ASTC/ETC2/EAC, layout
+block-linear, mip dan array; sampler TSC; tipe tekstur 1D/array/3D/cube; DMA copy,
+blit 2D, inline-to-memory; dekode primitif dan index; viewport/scissor/window
+origin; plus oracle lama (blend, vertex, depth/stencil, format RT, ALU).
+
+Bug nyata yang ditemukan dan diperbaiki pada tahap B: alpha XBGR8 saat sampling,
+remap komponen DMA pada salinan tiled, sampling nearest 2D di batas texel,
+shader tekstur 1D yang tidak bisa dikompilasi, dereferensi MMU null di texture
+cache. Pertanyaan terbuka yang dicatat (butuh bukti hardware): bias sampler pada
+LOD eksplisit; emulasi MIRROR_ONCE_BORDER di sambungan cermin; semantik remap DMA
+tiled dan blit 2D yang berupa konvensi driver.
+
+Belum, dengan alasan: tekstur depth/stencil sebagai sampel (nilai, bukan hanya
+layout; ada tes bentuk), dispatch compute (butuh shader dengan akses global),
+blit 2D ORIGIN_CORNER/bilinear/color key/blend, reduksi semaphore DMA, blending ke
+format RT 0x40-0x47, culling/winding (konvensi ditentukan empiris dari dua game),
+adjacency/patch, dan MSAA/alpha-to-coverage (belum diimplementasikan, menunggu data
+`HYDRA_PERF_STATS=1`). Uniform buffer dari backing tak-contiguous ternyata sudah
+digather (`gathered_const_buffers`); catatan 18 Oktober usang. Gameplay: belum
+diuji; prop hitam Crash 4 butuh capture frame.
