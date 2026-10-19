@@ -327,6 +327,31 @@ TextureFormat toSampledTextureFormat(const ImageFormatWord image_format_word,
     return reads_stencil ? TextureFormat::S8Uint : format;
 }
 
+namespace {
+
+// Guest formats whose fourth component is unused (X8B8G8R8 and friends). The
+// host stores them in RGBA formats, where that component holds whatever the
+// guest wrote.
+bool hasUnusedAlpha(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::RGBX8Unorm:
+    case TextureFormat::RGBX8Unorm_sRGB:
+    case TextureFormat::RGBX8Snorm:
+    case TextureFormat::RGBX8Uint:
+    case TextureFormat::RGBX8Sint:
+    case TextureFormat::RGBX16Float:
+    case TextureFormat::RGBX16Unorm:
+    case TextureFormat::RGBX16Snorm:
+    case TextureFormat::RGBX16Uint:
+    case TextureFormat::RGBX16Sint:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
 SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word,
                                          bool is_srgb) {
     const auto view_format = toSampledTextureFormat(image_format_word, is_srgb);
@@ -334,6 +359,14 @@ SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word
     auto y = image_format_word.swizzle_y;
     auto z = image_format_word.swizzle_z;
     auto w = image_format_word.swizzle_w;
+    // Sampling a component the format does not have reads one, not the bytes
+    // the guest left there
+    if (hasUnusedAlpha(view_format)) {
+        for (auto* swizzle : {&x, &y, &z, &w}) {
+            if (*swizzle == ImageSwizzle::A)
+                *swizzle = ImageSwizzle::OneFloat;
+        }
+    }
     // Stencil views expose the stencil through R, Z24S8's is its G component
     if (view_format == TextureFormat::S8Uint &&
         toTextureFormat(image_format_word, is_srgb) ==

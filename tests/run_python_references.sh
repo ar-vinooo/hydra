@@ -9,11 +9,12 @@ BASE=https://raw.githubusercontent.com/NVIDIA/open-gpu-doc/master/classes
 
 mkdir -p "$NV"
 [ -s "$NV/clb197.h" ] || curl -fsSL -o "$NV/clb197.h" "$BASE/3d/clb197.h" || { echo "download clb197.h failed"; exit 2; }
+[ -s "$NV/clb197tex.h" ] || curl -fsSL -o "$NV/clb197tex.h" "$BASE/3d/clb197tex.h" || { echo "download clb197tex.h failed"; exit 2; }
 [ -s "$NV/clb1c0.h" ] || curl -fsSL -o "$NV/clb1c0.h" "$BASE/compute/clb1c0.h" || { echo "download clb1c0.h failed"; exit 2; }
 
 ninja -C "$BUILD" hydra-shader-cache-reference-tests hydra-maxwell-alu-reference-tests \
   hydra-color-target-format-tests hydra-blend-reference-tests hydra-vertex-reference-tests \
-  hydra-depth-stencil-reference-tests hydra-timezone-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
+  hydra-depth-stencil-reference-tests hydra-timezone-tests hydra-texture-format-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
 
 BIN="$BUILD/bin"; T="$ROOT/tests"; fail=0
 run() { echo "== $1"; shift; "$@" 2>&1 | grep -v "Context leak" | tail -${TAIL:-3}; [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1; }
@@ -26,5 +27,6 @@ TAIL=1 run timezone python3 "$T/timezone_reference.py" "$BIN/hydra-timezone-test
 TAIL=1 run blend python3 "$T/blend_reference.py" "$BIN/hydra-blend-reference-tests"
 TAIL=1 run vertex python3 "$T/vertex_reference.py" "$BIN/hydra-vertex-reference-tests"
 TAIL=1 run depth-stencil python3 "$T/depth_stencil_reference.py" "$BIN/hydra-depth-stencil-reference-tests"
+TAIL=2 run texture-formats python3 "$T/texture_format_reference.py" "$BIN/hydra-texture-format-reference-tests" --header "$NV/clb197tex.h"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail
