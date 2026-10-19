@@ -2,6 +2,8 @@
 // image plus a script of (method, value) writes; the memory after the script is
 // written back for tests/copy_engine_reference.py to compare with its model.
 //
+// An optional third argument selects the class bound to the subchannel (hex,
+// default b0b5); the inline-to-memory registers are driven through class b197.
 // Binary input (little endian), repeated:
 //   u32 memory size, u32 write count, count x (u32 method, u32 value), memory
 // Binary output: the memory of every case, in order.
@@ -29,8 +31,11 @@ bool read(std::ifstream& in, void* data, usize size) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 3)
-            throw std::runtime_error("usage: cases.bin results.bin");
+        if (argc != 3 && argc != 4)
+            throw std::runtime_error("usage: cases.bin results.bin [class]");
+        const u32 class_id =
+            argc == 4 ? static_cast<u32>(std::stoul(argv[3], nullptr, 16))
+                      : 0xb0b5u;
         setenv("HYDRA_HOT_RELOAD", "0", 1);
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
         Gpu gpu;
@@ -41,7 +46,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<renderer::ICommandBuffer> commands(
             gpu.getRenderer().createCommandBuffer());
         tls_crnt_command_buffer = commands.get();
-        gpu.subchannelMethod(0, 0, 0xb0b5);
+        gpu.subchannelMethod(0, 0, class_id);
 
         std::ifstream input(argv[1], std::ios::binary);
         std::ofstream output(argv[2], std::ios::binary);

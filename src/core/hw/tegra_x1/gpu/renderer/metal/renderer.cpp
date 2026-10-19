@@ -374,9 +374,15 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
     const auto extent_y =
         options.src_height != 0.0f ? options.src_height
                                    : static_cast<f32>(src_size.height);
+    // The 2D engine floors exact fixed point positions. Sample positions on a
+    // texel boundary (downscaling by an integer factor from pixel centres)
+    // would fall on either side of it with float rounding of the normalised
+    // coordinates, so nearest sampling nudges them towards the exact result.
+    constexpr f32 NEAREST_BIAS = 1.0f / 512.0f;
+    const f32 bias = options.nearest ? NEAREST_BIAS : 0.0f;
     BlitParams params = {
-        .src_offset = {static_cast<f32>(src_origin.x) / src_width,
-                       static_cast<f32>(src_origin.y) / src_height},
+        .src_offset = {(static_cast<f32>(src_origin.x) + bias) / src_width,
+                       (static_cast<f32>(src_origin.y) + bias) / src_height},
         .src_scale = {extent_x / src_width, extent_y / src_height},
         .opacity = 1.0f,
     };

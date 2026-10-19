@@ -192,7 +192,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
     // copy once the CPU rewrites it.
     const bool gpu_dirty =
         storage.gpu_written_timestamp > storage.flushed_timestamp &&
-        tls_crnt_gmmu != nullptr &&
+        tls_crnt_gmmu != nullptr && tls_crnt_gmmu->getMmu() != nullptr &&
         tls_crnt_gmmu->getMmu()->protectsGpuWrites();
     // DEBUG: "reload_buffers" reloads buffer textures on every use
     const auto& reload_descriptor = storage.base->getDescriptor();
@@ -500,7 +500,8 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         // Guest memory no longer holds the contents: make CPU accesses fault
         // so they are written back first
         if (storage.gpu_written_timestamp <= storage.flushed_timestamp &&
-            tls_crnt_gmmu != nullptr && !debugFlag("s2_noprotect"))
+            tls_crnt_gmmu != nullptr && tls_crnt_gmmu->getMmu() != nullptr &&
+            !debugFlag("s2_noprotect"))
             tls_crnt_gmmu->getMmu()->protectGpuWritten(
                 storage.base->getDescriptor().getRange());
         storage.gpu_written_timestamp = TextureCacheClock::now();

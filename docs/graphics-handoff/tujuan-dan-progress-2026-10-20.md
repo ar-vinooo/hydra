@@ -39,3 +39,22 @@ konvensi driver, bukan teks NVIDIA; lihat
 [README-copy-engine-reference.md](../../tests/README-copy-engine-reference.md).
 Belum: blit 2D dan inline-to-memory. Regresi: dma-slice, gpu-engine 39,
 texture-cache 40 lulus. Belum diuji di game.
+
+## Tahap B: blit 2D dan inline-to-memory (baru)
+
+`tests/blit_2d_reference.py` (500 kasus: blit GPU Metal SRCCOPY pitch/tiled,
+skala 1/2/0.5/-1/-2/0.25/1.5/0.75, clip; jalur CPU ROP dan volume) dan
+`tests/inline_to_memory_reference.py` (200 kasus, tujuan pitch dan block-linear):
+model Python lawan engine Hydra, register diaudit terhadap `cl902d.h`/`cla140.h`.
+**Bug nyata:** blit 2D nearest dengan downscale faktor bulat menjatuhkan titik
+sampel tepat di batas texel; koordinat float ternormalisasi di shader Metal
+kadang memilih texel bawah (sekitar 40% kasus, 120 dari 300). Sumber sampel
+nearest kini digeser 1/512 texel di `Renderer::blitTexture`. Juga: `GMmu::getMmu()`
+dianggap selalu ada di texture cache; sekarang dicek null. Semua lulus setelah
+perbaikan. Kontrol: model yang memakai sudut piksel gagal; inline off-by-one
+baris gagal. Detail dan batas:
+[README-blit-2d-and-inline-reference.md](../../tests/README-blit-2d-and-inline-reference.md).
+Dengan ini butir 3 tahap B (DMA, 2D, inline) selesai untuk yang bisa dibuktikan
+dengan model; sampling terfilter, ORIGIN_CORNER, color key, dan blend 2D belum.
+Regresi gpu-engine 39, texture-cache 40, shader-library 59, raster-state,
+render-hash, dma-slice, frame-trace lulus. Belum diuji di game.
