@@ -14,7 +14,7 @@ mkdir -p "$NV"
 
 ninja -C "$BUILD" hydra-shader-cache-reference-tests hydra-maxwell-alu-reference-tests \
   hydra-color-target-format-tests hydra-blend-reference-tests hydra-vertex-reference-tests \
-  hydra-depth-stencil-reference-tests hydra-timezone-tests hydra-texture-format-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
+  hydra-depth-stencil-reference-tests hydra-timezone-tests hydra-texture-format-reference-tests hydra-copy-engine-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
 
 BIN="$BUILD/bin"; T="$ROOT/tests"; fail=0
 run() { echo "== $1"; shift; "$@" 2>&1 | grep -v "Context leak" | tail -${TAIL:-3}; [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1; }
@@ -28,5 +28,7 @@ TAIL=1 run blend python3 "$T/blend_reference.py" "$BIN/hydra-blend-reference-tes
 TAIL=1 run vertex python3 "$T/vertex_reference.py" "$BIN/hydra-vertex-reference-tests"
 TAIL=1 run depth-stencil python3 "$T/depth_stencil_reference.py" "$BIN/hydra-depth-stencil-reference-tests"
 TAIL=2 run texture-formats python3 "$T/texture_format_reference.py" "$BIN/hydra-texture-format-reference-tests" --header "$NV/clb197tex.h"
+[ -s "$NV/clb0b5.h" ] || curl -fsSL -o "$NV/clb0b5.h" "$BASE/dma-copy/clb0b5.h" || { echo "download clb0b5.h failed"; exit 2; }
+TAIL=3 run copy-engine python3 "$T/copy_engine_reference.py" "$BIN/hydra-copy-engine-reference-tests" --header "$NV/clb0b5.h"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail

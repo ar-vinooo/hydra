@@ -21,3 +21,21 @@ Dokumen: [README-texture-format-reference.md](../../tests/README-texture-format-
 Belum: ETC/EAC/ASTC, depth/stencil, 3D, cube, sampling terfilter. Block height lebih besar dari kebutuhan tinggi gambar dikecilkan Hydra (konvensi mip), tidak diuji.
 Regresi: texture-cache 40, gpu-engine 39, shader-library 59, raster-state,
 render-hash lulus. Belum diuji di game. Tidak stage/commit.
+
+## Tahap B: engine DMA copy (baru)
+
+`tests/copy_engine_reference.py` + `hydra-copy-engine-reference-tests`: model
+Python dari engine copy (B0B5) lawan engine Hydra lewat antarmuka method, 592
+kasus acak, 45 offset/field register diaudit terhadap `clb0b5.h`. Pitch ke pitch
+(plain dan remap), semaphore, dan salinan tiled (pitch, block-linear) lulus.
+**Bug nyata:** remap komponen umum (pemilihan komponen, konstanta, jumlah komponen
+berbeda) pada salinan tiled diabaikan Hydra (hanya `ASSERT_DEBUG`, jadi build
+release menyalin byte biasa); game yang mengisi tekstur block-linear dengan
+konstanta lewat DMA akan salah tanpa peringatan. 120 kasus gagal sebelumnya;
+`Copy::executeCopy` kini me-remap elemen demi elemen dan semuanya lulus.
+Kontrol: menukar konstanta di model menggagalkan 95 dari 150 kasus remap.
+Semantik remap pada salinan tiled (satuan elemen, lebar dalam elemen) adalah
+konvensi driver, bukan teks NVIDIA; lihat
+[README-copy-engine-reference.md](../../tests/README-copy-engine-reference.md).
+Belum: blit 2D dan inline-to-memory. Regresi: dma-slice, gpu-engine 39,
+texture-cache 40 lulus. Belum diuji di game.

@@ -247,31 +247,27 @@ void Copy::executeCopy(const LaunchDMAData data) {
         return;
     }
 
-    // TODO: implement component remapping
-    // HACK
+    // Without REMAP_ENABLE an element is a byte. With it, an element has
+    // NUM_SRC_COMPONENTS (source) or NUM_DST_COMPONENTS (destination)
+    // components of COMPONENT_SIZE bytes, and the surface widths count elements.
     u32 src_stride = regs.src.stride;
     u32 dst_stride = regs.dst.stride;
-    u32 bytes_per_pixel = 1;
+    u32 bytes_per_pixel = 1;     // destination element
+    u32 src_bytes_per_pixel = 1; // source element
+    bool generic_remap = false;  // a remap that is not a plain copy of bytes
     if (data.remap_enable) {
         const auto& c = regs.remap_components;
-        ASSERT_DEBUG(
-            c.dst_x == 0 && c.dst_y == 1 && c.dst_z == 2 && c.dst_w == 3,
-            Engines, "Component remapping not implemented ({}, {}, {}, {})",
-            c.dst_x, c.dst_y, c.dst_z, c.dst_w);
-
         const u32 component_size = c.component_size_minus_one + 1;
-        bytes_per_pixel =
-            (c.dst_component_count_minus_one + 1u) * component_size;
-        {
-            const u32 component_count = c.src_component_count_minus_one + 1;
-            u32 bytes_per_block = component_count * component_size;
-            src_stride *= bytes_per_block;
-        }
-        {
-            const u32 component_count = c.dst_component_count_minus_one + 1;
-            u32 bytes_per_block = component_count * component_size;
-            dst_stride *= bytes_per_block;
-        }
+        const u32 src_components = c.src_component_count_minus_one + 1u;
+        const u32 dst_components = c.dst_component_count_minus_one + 1u;
+        src_bytes_per_pixel = src_components * component_size;
+        bytes_per_pixel = dst_components * component_size;
+        src_stride *= src_bytes_per_pixel;
+        dst_stride *= bytes_per_pixel;
+        const std::array<u32, 4> selects{c.dst_x, c.dst_y, c.dst_z, c.dst_w};
+        generic_remap = src_components != dst_components;
+        for (u32 i = 0; i < dst_components; i++)
+            generic_remap |= selects[i] != i;
     }
 
     // DEBUG: log copies
@@ -312,7 +308,8 @@ void Copy::executeCopy(const LaunchDMAData data) {
     // Bound the rectangle to the valid Z slices before calculating host
     // pointers. A line that would cross the X edge is invalid, not a wrap.
     u32 copy_lines = data.multi_line_enable ? regs.line_count : 1;
-    const auto valid_surface = [&](const TextureCopyInfo& info, u32 width) {
+    const auto valid_surface = [&](const TextureCopyInfo& info, u32 width,
+                                   u32 element_size) {
         if (getBlockSizeLog2(info.block_size.height) < 0 ||
             getBlockSizeLog2(info.block_size.depth) < 0 ||
             static_cast<u32>(info.block_size.height) > 5 ||
@@ -330,13 +327,13 @@ void Copy::executeCopy(const LaunchDMAData data) {
                                       std::numeric_limits<u64>::max() / aligned_depth)
             return false;
         copy_lines = std::min(copy_lines, availableLines(info));
-        return u64(info.origin.x) * bytes_per_pixel +
-                   u64(regs.line_length_in) * bytes_per_pixel <= width;
+        return u64(info.origin.x) * element_size +
+                   u64(regs.line_length_in) * element_size <= width;
     };
     if ((data.src_memory_layout == MemoryLayout::BlockLinear &&
-         !valid_surface(regs.src, src_stride)) ||
+         !valid_surface(regs.src, src_stride, src_bytes_per_pixel)) ||
         (data.dst_memory_layout == MemoryLayout::BlockLinear &&
-         !valid_surface(regs.dst, dst_stride))) {
+         !valid_surface(regs.dst, dst_stride, bytes_per_pixel))) {
         ONCE(LOG_WARN(Engines, "DMA rectangle outside block-linear surface"));
         return;
     }
@@ -379,7 +376,7 @@ void Copy::executeCopy(const LaunchDMAData data) {
                     ? pitchRow(regs.dst, copy_lines - 1)
                     : copy_lines - 1;
             src_size = u64(regs.stride_in) * last_row +
-                       u64(regs.line_length_in) * bytes_per_pixel;
+                       u64(regs.line_length_in) * src_bytes_per_pixel;
         } else {
             const u32 stride = align(src_stride, GOB_WIDTH);
             const u32 rows = align(
@@ -450,7 +447,67 @@ void Copy::executeCopy(const LaunchDMAData data) {
         texture_cache.flushMemory(tls_crnt_command_buffer,
                                   ztd::Range<uptr>::fromSize(dst_ptr, dst_size));
     }
-    if (data.src_memory_layout == MemoryLayout::Pitch) {
+    if (generic_remap) {
+        // Element by element: select source components, constants or leave the
+        // destination component alone, for any mix of pitch and block linear
+        enum : u32 { ConstA = 4, ConstB = 5 };
+        const auto& c = regs.remap_components;
+        const u32 component_size = c.component_size_minus_one + 1u;
+        const u32 src_components = c.src_component_count_minus_one + 1u;
+        const u32 dst_components = c.dst_component_count_minus_one + 1u;
+        const std::array<u32, 4> selects{c.dst_x, c.dst_y, c.dst_z, c.dst_w};
+        const auto log2 = [](BlockDim size) {
+            return static_cast<u32>(std::max(getBlockSizeLog2(size), 0));
+        };
+        const auto* src_bytes = reinterpret_cast<const u8*>(src_ptr);
+        auto* dst_bytes = reinterpret_cast<u8*>(dst_ptr);
+        // Pitch rows of a tiled copy follow the slices of the tiled side
+        const bool src_tiled = data.src_memory_layout == MemoryLayout::BlockLinear;
+        const bool dst_tiled = data.dst_memory_layout == MemoryLayout::BlockLinear;
+        const auto tiled_offset = [&](const TextureCopyInfo& info, u32 width,
+                                      u32 element_size, u32 line, u32 e,
+                                      u32 i) {
+            const auto [y, z] = sliceRow(info, line);
+            return getBlockLinearOffset(
+                (info.origin.x + e) * element_size + i, y, z, width,
+                info.height, log2(info.block_size.height),
+                log2(info.block_size.depth));
+        };
+        for (u32 line = 0; line < copy_lines; line++) {
+            for (u32 e = 0; e < regs.line_length_in; e++) {
+                std::array<u8, 16> in{};
+                for (u32 i = 0; i < src_bytes_per_pixel; i++) {
+                    in[i] = src_tiled
+                                ? src_bytes[tiled_offset(regs.src, src_stride,
+                                                         src_bytes_per_pixel,
+                                                         line, e, i)]
+                                : src_bytes[u64(regs.stride_in) *
+                                                (dst_tiled ? pitchRow(regs.dst, line)
+                                                           : line) +
+                                            u64(e) * src_bytes_per_pixel + i];
+                }
+                for (u32 k = 0; k < dst_components; k++) {
+                    for (u32 i = 0; i < component_size; i++) {
+                        const u32 byte = k * component_size + i;
+                        u8* out = dst_tiled
+                                      ? &dst_bytes[tiled_offset(
+                                            regs.dst, dst_stride,
+                                            bytes_per_pixel, line, e, byte)]
+                                      : &dst_bytes[u64(regs.stride_out) *
+                                                       (src_tiled ? pitchRow(regs.src, line)
+                                                                  : line) +
+                                                   u64(e) * bytes_per_pixel + byte];
+                        if (selects[k] == ConstA)
+                            *out = reinterpret_cast<const u8*>(&regs.remap_const1)[i];
+                        else if (selects[k] == ConstB)
+                            *out = reinterpret_cast<const u8*>(&regs.remap_const2)[i];
+                        else if (selects[k] < 4 && selects[k] < src_components)
+                            *out = in[selects[k] * component_size + i];
+                    }
+                }
+            }
+        }
+    } else if (data.src_memory_layout == MemoryLayout::Pitch) {
         if (data.dst_memory_layout == MemoryLayout::Pitch) {
             const u32 lines = data.multi_line_enable ? regs.line_count : 1;
             for (u32 i = 0; i < lines; i++) {
