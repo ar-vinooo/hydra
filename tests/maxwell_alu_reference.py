@@ -288,6 +288,21 @@ def enc_fset(dst, a, b, cmp_op, bf=0, bool_op=0, pred=PT, pred_inv=0):
             (bool_op << 45) | (cmp_op << 48) | (bf << 52))
 
 
+def enc_hadd2(dst, a, b, sw_a=0, sw_b=0, neg_a=0, neg_b=0, abs_a=0, abs_b=0, sat=0, out=0):
+    return ((0x5d10 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (sw_b << 28) | (abs_b << 30) |
+            (neg_b << 31) | (sat << 32) | (neg_a << 43) | (abs_a << 44) | (sw_a << 47) | (out << 49))
+
+
+def enc_hmul2(dst, a, b, sw_a=0, sw_b=0, neg_b=0, abs_a=0, abs_b=0, sat=0, out=0):
+    return ((0x5d08 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (sw_b << 28) | (abs_b << 30) |
+            (neg_b << 31) | (sat << 32) | (abs_a << 44) | (sw_a << 47) | (out << 49))
+
+
+def enc_hfma2(dst, a, b, c, sw_a=0, sw_b=0, sw_c=0, neg_b=0, neg_c=0, sat=0, out=0):
+    return ((0x5d00 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (sw_b << 28) | (neg_c << 30) |
+            (neg_b << 31) | (sat << 32) | (sw_c << 35) | (c << 39) | (sw_a << 47) | (out << 49))
+
+
 def enc_xmad(dst, a, b, c, hilo_a=0, hilo_b=0, a_signed=0, b_signed=0, cop=0, psl=0, mrg=0):
     """XMAD, register operands (opcode 0x5b00; fields from the decoder / nvdisasm)."""
     return ((0x5b00 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (hilo_b << 35) |
@@ -672,6 +687,187 @@ def make_bit_cases(rng):
     return cases
 
 
+def half_to_fraction(h):
+    """('nan'|'inf'|'fin', value, sign) of a binary16 pattern."""
+    sign, exponent, mantissa = h >> 15, (h >> 10) & 31, h & 0x3ff
+    if exponent == 31:
+        return ('nan', None, 0) if mantissa else ('inf', None, sign)
+    if exponent == 0:
+        value = Fraction(mantissa, 1 << 24)
+    else:
+        value = Fraction(mantissa | 0x400) * Fraction(2) ** (exponent - 25)
+    return ('fin', -value if sign else value, sign)
+
+
+def fraction_to_half(fr, sign_if_zero=0):
+    """Round an exact rational to binary16 (RN-even), overflow to infinity."""
+    if fr == 0:
+        return sign_if_zero << 15
+    sign = 1 if fr < 0 else 0
+    a = abs(fr)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if a < Fraction(2) ** e:
+        e -= 1
+    e_eff = max(e, -14)
+    q = a / (Fraction(2) ** (e_eff - 10))
+    m = q.numerator // q.denominator
+    rem = q - m
+    if rem > Fraction(1, 2) or (rem == Fraction(1, 2) and (m & 1)):
+        m += 1
+    if m >= 0x800:
+        m >>= 1
+        e_eff += 1
+    if e_eff > 15:
+        return (sign << 15) | 0x7c00
+    if m < 0x400:  # subnormal (e_eff == -14)
+        return (sign << 15) | m
+    return (sign << 15) | ((e_eff + 15) << 10) | (m & 0x3ff)
+
+
+HALF_NAN = 0x7e00
+
+
+def half_add(x, y):
+    kx, vx, sx = half_to_fraction(x)
+    ky, vy, sy = half_to_fraction(y)
+    if kx == 'nan' or ky == 'nan':
+        return HALF_NAN
+    if kx == 'inf' and ky == 'inf':
+        return HALF_NAN if sx != sy else x
+    if kx == 'inf':
+        return x
+    if ky == 'inf':
+        return y
+    return fraction_to_half(vx + vy, 1 if (sx and sy) else 0)
+
+
+def half_mul(x, y):
+    kx, vx, sx = half_to_fraction(x)
+    ky, vy, sy = half_to_fraction(y)
+    if kx == 'nan' or ky == 'nan':
+        return HALF_NAN
+    if (kx == 'inf' and ky == 'fin' and vy == 0) or (ky == 'inf' and kx == 'fin' and vx == 0):
+        return HALF_NAN
+    if kx == 'inf' or ky == 'inf':
+        return ((sx ^ sy) << 15) | 0x7c00
+    return fraction_to_half(vx * vy, sx ^ sy)
+
+
+def half_fma(x, y, z):
+    kx, vx, sx = half_to_fraction(x)
+    ky, vy, sy = half_to_fraction(y)
+    kz, vz, sz = half_to_fraction(z)
+    if 'nan' in (kx, ky, kz):
+        return HALF_NAN
+    product_inf = kx == 'inf' or ky == 'inf'
+    if product_inf and ((kx == 'fin' and vx == 0) or (ky == 'fin' and vy == 0)):
+        return HALF_NAN
+    if product_inf:
+        product = ((sx ^ sy) << 15) | 0x7c00
+        if kz == 'inf' and (sz != (sx ^ sy)):
+            return HALF_NAN
+        return product
+    if kz == 'inf':
+        return z
+    return fraction_to_half(vx * vy + vz, (sx ^ sy) & sz)
+
+
+def half_saturate(h):
+    kind, value, _ = half_to_fraction(h)
+    if kind == 'nan':
+        return 0
+    if kind == 'inf':
+        return 0x3c00 if h >> 15 == 0 else 0
+    if value <= 0:
+        return 0
+    return 0x3c00 if value >= 1 else h
+
+
+def half_operand(register, swizzle):
+    """The two lanes an operand swizzle presents (F16, F32, H0H0, H1H1)."""
+    lo, hi = register & 0xffff, register >> 16
+    if swizzle == 0:
+        return lo, hi
+    if swizzle == 1:  # an f32 register converted to half
+        kind, value, sign = classify(register)
+        if kind == 'nan':
+            lane = HALF_NAN
+        elif kind == 'inf':
+            lane = (sign << 15) | 0x7c00
+        else:
+            lane = fraction_to_half(value, sign)
+        return lane, lane
+    return (lo, lo) if swizzle == 2 else (hi, hi)
+
+
+def half_modify(lane, neg_flag, abs_flag):
+    if abs_flag:
+        lane &= 0x7fff
+    if neg_flag:
+        lane ^= 0x8000
+    return lane
+
+
+def half_output(lanes, out, previous):
+    if out == 0:
+        return lanes[0] | (lanes[1] << 16)
+    if out == 2:  # MrgH0: the destination keeps its high half
+        return lanes[0] | (previous & 0xffff0000)
+    return (previous & 0xffff) | (lanes[1] << 16)  # MrgH1
+
+
+def make_half_cases(rng):
+    cases = []
+    specials = [0x0000, 0x8000, 0x3c00, 0xbc00, 0x3800, 0x4000, 0x7bff, 0xfbff, 0x0400, 0x0001, 0x8001,
+                0x03ff, 0x7c00, 0xfc00, 0x7e00, 0x3555, 0x5640, 0x2e66]
+
+    def lane():
+        if rng.random() < 0.4:
+            return rng.choice(specials)
+        return rng.getrandbits(16)
+
+    def operand():
+        return lane() | (lane() << 16)
+    previous = 0xa5c3
+    prev_word = 0x1234_5678
+    for index in range(1500):
+        sw_a, sw_b, sw_c = (rng.randrange(4) for _ in range(3))
+        neg_a, neg_b, abs_a, abs_b, neg_c, sat = (rng.randrange(2) for _ in range(6))
+        out = rng.choice([0, 0, 2, 3])
+        kind = index % 3
+        a, b, c = operand(), operand(), operand()
+        if sw_a == 1:
+            a = rng.choice([f_bits(rng.uniform(-70000, 70000)), f_bits(rng.uniform(-1, 1)), a])
+        if sw_b == 1:
+            b = rng.choice([f_bits(rng.uniform(-70000, 70000)), f_bits(rng.uniform(-1, 1)), b])
+        if sw_c == 1:
+            c = rng.choice([f_bits(rng.uniform(-70000, 70000)), f_bits(rng.uniform(-1, 1)), c])
+        la = [half_modify(x, neg_a if kind == 0 else 0, abs_a if kind != 2 else 0) for x in half_operand(a, sw_a)]
+        lb = [half_modify(x, neg_b, abs_b if kind != 2 else 0) for x in half_operand(b, sw_b)]
+        if kind == 0:
+            name, inst = 'hadd2', enc_hadd2(3, 0, 1, sw_a, sw_b, neg_a, neg_b, abs_a, abs_b, sat, out)
+            lanes = [half_add(x, y) for x, y in zip(la, lb)]
+            regs = (a, b, 0)
+        elif kind == 1:
+            name, inst = 'hmul2', enc_hmul2(3, 0, 1, sw_a, sw_b, neg_b, abs_a, abs_b, sat, out)
+            la = [half_modify(x, 0, abs_a) for x in half_operand(a, sw_a)]
+            lanes = [half_mul(x, y) for x, y in zip(la, lb)]
+            regs = (a, b, 0)
+        else:
+            name, inst = 'hfma2', enc_hfma2(3, 0, 1, 2, sw_a, sw_b, sw_c, neg_b, neg_c, sat, out)
+            lc = [half_modify(x, neg_c, 0) for x in half_operand(c, sw_c)]
+            lanes = [half_fma(x, y, z) for x, y, z in zip(la, lb, lc)]
+            regs = (a, b, c)
+        if sat:
+            lanes = [half_saturate(x) for x in lanes]
+        sequence = '%016x' % inst
+        if out != 0:  # the merge forms keep half of the previous destination
+            sequence = '%016x,%s' % (enc_iadd32i(3, 255, prev_word), sequence)
+        group = name + ('_merge' if out else '') + ('_f32in' if 1 in (sw_a, sw_b) else '')
+        cases.append(Case(group, sequence, regs, ('half', half_output(lanes, out, prev_word if out else 0)), 'half'))
+    return cases
+
+
 def is_denormal(b):
     return (b & 0x7f800000) == 0 and (b & 0x7fffff) != 0
 
@@ -712,6 +908,15 @@ def matches(case, row):
         return False, 'clobbered state'
     got = regs[3]
     exp = case.expected
+    if case.tolerance == 'half':
+        want = case.expected[1]
+        for shift in (0, 16):
+            g, w = (got >> shift) & 0xffff, (want >> shift) & 0xffff
+            if (g & 0x7c00) == 0x7c00 and (g & 0x3ff) and (w & 0x7c00) == 0x7c00 and (w & 0x3ff):
+                continue  # both NaN
+            if g != w and not ((g & 0x7fff) == 0 and (w & 0x7fff) == 0):
+                return False, None
+        return True, None
     if case.tolerance == 'mufu':
         kind, y, tol = exp
         if y != y:
@@ -740,7 +945,7 @@ def main():
     parser.add_argument('--show', type=int, default=3)
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng)
+    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng)
     cases = split_denormals(cases)
     if args.group:
         cases = [c for c in cases if c.group == args.group]

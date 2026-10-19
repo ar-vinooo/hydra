@@ -159,3 +159,13 @@ kasus tepi tidak dibandingkan karena semantik SASS belum tentu sama dengan PTX,
 `.BREV` tidak diuji), **SEL**, **ISET** (8 operasi, bertanda/tidak, hasil -1
 atau 1.0, kombinasi AND/OR/XOR dengan predikat), dan **FSET**. Semantik mode
 CSFU, X, dan CC pada XMAD tidak dibandingkan.
+
+## Tahap C: half precision (baru)
+
+Oracle ALU bertambah ke 14.430 kasus: **HADD2/HMUL2/HFMA2** (1500 kasus acak;
+model fp16 eksak dengan pembulatan RN-even; swizzle input F16/F32/H0H0/H1H1,
+neg/abs, saturasi, output F16/MrgH0/MrgH1 dengan sisa setengah tujuan; nilai
+khusus: nol bertanda, denormal, max, infinity, NaN) semuanya cocok. Kontrol: HFMA2
+yang dimodelkan sebagai mul+add dibulatkan terpisah menggagalkan sejumlah kasus.
+Belum: output F32 (maknanya tidak terdefinisi di sumber), bentuk C/I/32I,
+FMZ, FTZ, HSET2/HSETP2.
