@@ -303,6 +303,19 @@ def enc_hfma2(dst, a, b, c, sw_a=0, sw_b=0, sw_c=0, neg_b=0, neg_c=0, sat=0, out
             (neg_b << 31) | (sat << 32) | (sw_c << 35) | (c << 39) | (sw_a << 47) | (out << 49))
 
 
+def enc_iadd3(dst, a, b, c, half_a=0, half_b=0, half_c=0, shift=0, neg_a=0, neg_b=0, neg_c=0):
+    return ((0x5cc0 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (half_c << 31) | (half_b << 33) |
+            (half_a << 35) | (shift << 37) | (c << 39) | (neg_c << 49) | (neg_b << 50) | (neg_a << 51))
+
+
+def enc_lea_lo(dst, a, b, shift, neg_a=0):
+    return (base(0x5bd0, dst, a) | (b << 20) | (shift << 39) | (neg_a << 45) | (PT << 48))
+
+
+def enc_lea_hi(dst, a_lo, b, a_hi, shift, neg_a=0):
+    return (base(0x5bd8, dst, a_lo) | (b << 20) | (shift << 28) | (neg_a << 37) | (a_hi << 39) | (PT << 48))
+
+
 def enc_xmad(dst, a, b, c, hilo_a=0, hilo_b=0, a_signed=0, b_signed=0, cop=0, psl=0, mrg=0):
     """XMAD, register operands (opcode 0x5b00; fields from the decoder / nvdisasm)."""
     return ((0x5b00 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (hilo_b << 35) |
@@ -868,6 +881,47 @@ def make_half_cases(rng):
     return cases
 
 
+def make_arith_cases(rng):
+    """IADD3 (half selects, negation, the +-16 bit shifts) and LEA.LO / LEA.HI."""
+    cases = []
+    M = 0xffffffff
+    triples = int_triples(rng, 40)
+
+    def half(value, mode):
+        return value if mode == 0 else (value & 0xffff if mode == 1 else value >> 16)
+
+    for _ in range(160):
+        ha, hb, hc = (rng.randrange(3) for _ in range(3))
+        shift = rng.choice([0, 0, 1, 2])
+        na, nb, nc = (rng.randrange(2) for _ in range(3))
+        inst = enc_iadd3(3, 0, 1, 2, ha, hb, hc, shift, na, nb, nc)
+        for a, b, c in rng.sample(triples, 4):
+            x = (-half(a, ha) if na else half(a, ha)) & M
+            y = (-half(b, hb) if nb else half(b, hb)) & M
+            z = (-half(c, hc) if nc else half(c, hc)) & M
+            total = (x + y) & M
+            if shift == 1:
+                total >>= 16
+            elif shift == 2:
+                total = (total << 16) & M
+            group = 'iadd3' + ('_shift' if shift else '')
+            cases.append(Case(group, inst, (a, b, c), (total + z) & M, None))
+    for shift in range(32):
+        for neg in (0, 1):
+            inst = enc_lea_lo(3, 0, 1, shift, neg)
+            for a, b, _ in triples[:6]:
+                x = (-a if neg else a) & M
+                cases.append(Case('lea_lo', inst, (a, b, 0), ((x << shift) + b) & M, None))
+            inst = enc_lea_hi(3, 0, 1, 2, shift, neg)
+            for a_lo, b, a_hi in triples[:6]:
+                value = (a_hi << 32) | a_lo
+                if neg:
+                    value = (-value) & ((1 << 64) - 1)
+                high = ((value << shift) >> 32) & M
+                cases.append(Case('lea_hi', inst, (a_lo, b, a_hi), (high + b) & M, None))
+    return cases
+
+
 def is_denormal(b):
     return (b & 0x7f800000) == 0 and (b & 0x7fffff) != 0
 
@@ -945,7 +999,7 @@ def main():
     parser.add_argument('--show', type=int, default=3)
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng)
+    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng) + make_arith_cases(rng)
     cases = split_denormals(cases)
     if args.group:
         cases = [c for c in cases if c.group == args.group]

@@ -187,3 +187,13 @@ acak (mode alamat wrap/mirror/clamp) mengembalikan komponen yang dipilih dari
 footprint 2x2 dengan urutan standar (x0,y1),(x1,y1),(x1,y0),(x0,y0); semua cocok,
 tanpa bug. Kontrol: urutan footprint dari kiri-atas menggagalkan tes. Belum:
 offset (AOFFI/PTP), depth compare, border, TXQ, TMML, TXD.
+
+## Tahap C: IADD3, LEA.LO, LEA.HI (baru)
+
+Oracle ALU menjadi 15.838 kasus, semua cocok: IADD3 (pilihan setengah-kata, negasi
+per operand, shift kanan/kiri 16 pada jumlah a+b; semantik shift mengikuti
+konvensi komunitas, bukan teks NVIDIA), LEA.LO (shift 0-31, negasi) dan LEA.HI
+(kata tinggi dari nilai 64-bit yang digeser, termasuk negasi 64-bit). Tidak ada
+bug. Kontrol: shift tambahan menggagalkan tes. X/CC/predikat keluaran tidak diuji
+(Hydra belum mengimplementasikannya). ICMP/FCMP/I2I/PSET tidak diuji karena
+semantiknya tidak terdefinisi di sumber yang ada.
