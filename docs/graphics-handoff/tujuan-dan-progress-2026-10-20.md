@@ -81,3 +81,14 @@ TEXS yang sama dengan tes sampler, model Python lawan Hydra. Semua lulus.
 yang men-sample tekstur 1D gagal dibangun. Diperbaiki di `emitTextureSample`
 (`(coords).x`). Kontrol: membalik satu sumbu face +Y cube menggagalkan 98 sampel.
 Detail: [README-texture-type-reference.md](../../tests/README-texture-type-reference.md).
+
+## Tahap B: dekode primitif dan index buffer (baru)
+
+`tests/index_decode_reference.py` (2500 kasus): semua tipe primitif (point, line,
+line loop/strip, triangle, strip, fan, quad, quad strip, polygon) dengan index
+8/16/32-bit atau tanpa index, restart mati, pada nilai kecil, atau pada nilai
+maksimum; model Python dekomposisi standar lawan `IndexCache::decode`. Semua
+cocok, tidak ada bug. Kontrol: membalik winding fan menggagalkan kasus fan dan
+polygon. Detail:
+[README-index-decode-reference.md](../../tests/README-index-decode-reference.md).
+Belum: adjacency/patch, base vertex dan instancing.

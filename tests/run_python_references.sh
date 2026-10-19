@@ -14,7 +14,7 @@ mkdir -p "$NV"
 
 ninja -C "$BUILD" hydra-shader-cache-reference-tests hydra-maxwell-alu-reference-tests \
   hydra-color-target-format-tests hydra-blend-reference-tests hydra-vertex-reference-tests \
-  hydra-depth-stencil-reference-tests hydra-timezone-tests hydra-texture-format-reference-tests hydra-copy-engine-reference-tests hydra-blit-2d-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
+  hydra-depth-stencil-reference-tests hydra-timezone-tests hydra-texture-format-reference-tests hydra-copy-engine-reference-tests hydra-blit-2d-reference-tests hydra-index-decode-reference-tests >/dev/null || { echo "build failed: run ninja -C $BUILD"; exit 2; }
 
 BIN="$BUILD/bin"; T="$ROOT/tests"; fail=0
 run() { echo "== $1"; shift; "$@" 2>&1 | grep -v "Context leak" | tail -${TAIL:-3}; [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1; }
@@ -37,5 +37,6 @@ TAIL=2 run inline-to-memory python3 "$T/inline_to_memory_reference.py" "$BIN/hyd
 [ -s "$NV/clb197tex.h" ] || curl -fsSL -o "$NV/clb197tex.h" "$BASE/3d/clb197tex.h"
 TAIL=3 run sampler python3 "$T/sampler_reference.py" "$BIN/hydra-maxwell-alu-reference-tests" --header "$NV/clb197tex.h"
 TAIL=2 run texture-types python3 "$T/texture_type_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
+TAIL=2 run index-decode python3 "$T/index_decode_reference.py" "$BIN/hydra-index-decode-reference-tests" --header "$NV/clb197.h"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail
