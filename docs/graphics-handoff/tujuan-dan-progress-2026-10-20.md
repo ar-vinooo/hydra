@@ -58,3 +58,16 @@ Dengan ini butir 3 tahap B (DMA, 2D, inline) selesai untuk yang bisa dibuktikan
 dengan model; sampling terfilter, ORIGIN_CORNER, color key, dan blend 2D belum.
 Regresi gpu-engine 39, texture-cache 40, shader-library 59, raster-state,
 render-hash, dma-slice, frame-trace lulus. Belum diuji di game.
+
+## Tahap B: sampler TSC (baru)
+
+`tests/sampler_reference.py` (3000 sampel, 500 konfigurasi TSC acak): TSC melewati
+`decodeSampler` + `specializeShaderSampler` + sampler Metal, shader TEXS 2D.LL
+mengambil sampel tekstur bermip, dibandingkan dengan model Python. Lulus untuk
+semua 8 mode alamat, filter min/mag, mip none/point/linear, clamp LOD, dan warna
+border kustom (emulasi shader). Dua temuan, keduanya dicatat, belum diubah:
+(1) bias LOD sampler tidak ditambahkan pada LOD eksplisit (TEXS.LL); header tidak
+menjelaskan perilaku hardware, pertanyaan terbuka; (2) MIRROR_ONCE_BORDER dengan
+filter linear: tap di indeks -1 dekat sambungan cermin membaca warna border, bukan
+texel 0 (44 sampel; mode sangat jarang). Detail:
+[README-sampler-reference.md](../../tests/README-sampler-reference.md).

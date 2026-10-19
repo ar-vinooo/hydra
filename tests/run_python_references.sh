@@ -34,5 +34,7 @@ TAIL=3 run copy-engine python3 "$T/copy_engine_reference.py" "$BIN/hydra-copy-en
 [ -s "$NV/cla140.h" ] || curl -fsSL -o "$NV/cla140.h" "$BASE/inline-to-memory/cla140.h" || { echo "download cla140.h failed"; exit 2; }
 TAIL=2 run blit-2d python3 "$T/blit_2d_reference.py" "$BIN/hydra-blit-2d-reference-tests" --header "$NV/cl902d.h"
 TAIL=2 run inline-to-memory python3 "$T/inline_to_memory_reference.py" "$BIN/hydra-copy-engine-reference-tests" --header "$NV/cla140.h"
+[ -s "$NV/clb197tex.h" ] || curl -fsSL -o "$NV/clb197tex.h" "$BASE/3d/clb197tex.h"
+TAIL=3 run sampler python3 "$T/sampler_reference.py" "$BIN/hydra-maxwell-alu-reference-tests" --header "$NV/clb197tex.h"
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail

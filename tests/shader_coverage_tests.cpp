@@ -1,7 +1,9 @@
 // GPU tests for shader stage I/O, special registers and instruction families.
 // Shaders are built from decoded guest instructions (or IR for the parts that
 // are not under test), emitted as MSL and executed on Metal.
+#include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/sampler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
@@ -3633,6 +3635,104 @@ void runMaxwellTextureCaseFile(MTL::Device* device, const char* in_path,
             device, {instruction}, inputs, {},
             {{depth ? "depth2d<float>" : "texture2d<float>", texture, sampler}},
             "Maxwell texture reference");
+        for (const auto& result : results) {
+            for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+            output << '\n';
+        }
+    }
+}
+
+
+// Python-driven sampler reference (tests/sampler_reference.py). A guest sampler
+// (TSC, 8 words) goes through the same decodeSampler / specializeShaderSampler /
+// Metal sampler path as a draw; a TEXS 2D.LL shader samples a mip mapped
+// RGBA32Float texture with an explicit LOD.
+// Grammar, one record per line:
+//   CONFIG <w> <h> <levels> <8 TSC words hex>
+//   DATA   <level> <w*h*4 float words hex>
+//   CASE   <u bits hex> <v bits hex> <lod bits hex>
+// Output: "<R10..R13 hex>" per CASE.
+void runMaxwellSamplerCaseFile(MTL::Device* device, const char* in_path,
+                               const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "Sampler case files open");
+    struct Config {
+        u32 width{}, height{}, levels{};
+        std::array<u32, 8> tsc{};
+        std::map<u32, std::vector<u32>> data;
+        std::vector<std::array<u32, 3>> cases;
+    };
+    std::vector<Config> configs;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string tag;
+        row >> tag;
+        if (tag == "CONFIG") {
+            Config config;
+            row >> config.width >> config.height >> config.levels;
+            for (auto& word : config.tsc) row >> std::hex >> word;
+            expect(bool(row), "Malformed sampler CONFIG");
+            configs.push_back(std::move(config));
+        } else if (tag == "DATA") {
+            expect(!configs.empty(), "DATA before CONFIG");
+            u32 level;
+            row >> level;
+            auto& words = configs.back().data[level];
+            for (u32 word; row >> std::hex >> word;) words.push_back(word);
+        } else if (tag == "CASE") {
+            expect(!configs.empty(), "CASE before CONFIG");
+            std::array<u32, 3> values{};
+            for (auto& value : values) row >> std::hex >> value;
+            expect(bool(row), "Malformed sampler CASE");
+            configs.back().cases.push_back(values);
+        }
+    }
+    constexpr u32 TEXTURE_INDEX = 1; // the texture handle of the TEXS below
+    const auto texs = [](u32 encoding, u32 dst0, u32 dst1, u32 a, u32 b, u32 mask) {
+        return 0xd000000000000000ull | dst0 | (u64(a) << 8) | PT_GUARD |
+               (u64(b) << 20) | (u64(dst1) << 28) | (u64(TEXTURE_INDEX) << 36) |
+               (u64(mask) << 50) | (u64(encoding) << 53) | (1ull << 59);
+    };
+    for (const auto& config : configs) {
+        auto* descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, config.width, config.height,
+            config.levels > 1);
+        descriptor->setMipmapLevelCount(config.levels);
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr, "Sampler texture creation");
+        for (u32 level = 0; level < config.levels; ++level) {
+            const u32 w = std::max(config.width >> level, 1u);
+            const u32 h = std::max(config.height >> level, 1u);
+            const auto& words = config.data.at(level);
+            expect(words.size() == w * h * 4, "Sampler DATA size");
+            texture->replaceRegion(MTL::Region::Make2D(0, 0, w, h), level,
+                                   words.data(), w * 16);
+        }
+        hw::tegra_x1::gpu::engines::TextureSamplerControl tsc{};
+        static_assert(sizeof(tsc) == 32);
+        std::memcpy(&tsc, config.tsc.data(), sizeof(tsc));
+        const auto sampler_descriptor =
+            hw::tegra_x1::gpu::engines::decodeSampler(tsc, TextureFormat::RGBA32Float);
+        metal::Sampler sampler(device, sampler_descriptor);
+        GuestShaderState state{};
+        hw::tegra_x1::gpu::engines::specializeShaderSampler(state, TEXTURE_INDEX, tsc,
+                                         TextureFormat::RGBA32Float, {});
+        std::vector<AluState> inputs;
+        for (const auto& values : config.cases) {
+            AluState alu{};
+            alu.regs[4] = values[0];
+            alu.regs[5] = values[1];
+            alu.regs[6] = values[2];
+            inputs.push_back(alu);
+        }
+        const auto results = runTextureProgram(
+            device, {texs(3, 10, 12, 4, 6, 4)}, inputs, {}, // 2D.LL
+            {{"texture2d<float>", texture, sampler.getSampler()}},
+            "Maxwell sampler reference", state);
         for (const auto& result : results) {
             for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
             output << '\n';
