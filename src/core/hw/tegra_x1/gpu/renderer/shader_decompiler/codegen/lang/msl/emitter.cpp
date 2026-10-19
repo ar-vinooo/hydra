@@ -1705,7 +1705,11 @@ void MslEmitter::emitTextureSample(
         func_name = "sample";
         if (depth_compare)
             func_name += "_compare";
-        args = fmt::format("{}, {}", SAMPLER_MARK, sample_coords);
+        // texture1d samples with a scalar; the coordinate is a vector of one
+        args = fmt::format("{}, {}", SAMPLER_MARK,
+                           is_1d && !is_buffer
+                               ? fmt::format("({}).x", sample_coords)
+                               : sample_coords);
     }
 
     // Args

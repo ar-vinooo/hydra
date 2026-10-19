@@ -71,3 +71,13 @@ menjelaskan perilaku hardware, pertanyaan terbuka; (2) MIRROR_ONCE_BORDER dengan
 filter linear: tap di indeks -1 dekat sambungan cermin membaca warna border, bukan
 texel 0 (44 sampel; mode sangat jarang). Detail:
 [README-sampler-reference.md](../../tests/README-sampler-reference.md).
+
+## Tahap B: tipe tekstur 1D, array, 3D, cube (baru)
+
+`tests/texture_type_reference.py`: 2400 sampel (600 per tipe) lewat jalur TSC +
+TEXS yang sama dengan tes sampler, model Python lawan Hydra. Semua lulus.
+**Bug nyata:** `TEXS 1D.LZ` menghasilkan MSL yang tidak bisa dikompilasi
+(koordinat `vec<f32,1>` ke `texture1d::sample` yang butuh `float`); shader apa pun
+yang men-sample tekstur 1D gagal dibangun. Diperbaiki di `emitTextureSample`
+(`(coords).x`). Kontrol: membalik satu sumbu face +Y cube menggagalkan 98 sampel.
+Detail: [README-texture-type-reference.md](../../tests/README-texture-type-reference.md).

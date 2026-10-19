@@ -3739,3 +3739,142 @@ void runMaxwellSamplerCaseFile(MTL::Device* device, const char* in_path,
         }
     }
 }
+
+
+// Python-driven texture type reference (tests/texture_type_reference.py):
+// 1D, 2D array, 3D and cube textures sampled by a guest TEXS through a guest
+// sampler (TSC).
+// Grammar, one record per line:
+//   TYPE <1d|2darray|3d|cube> <w> <h> <depth or layers> <8 TSC words hex>
+//   DATA <slice> <w*h*4 float words hex>   (z slice, array layer or cube face)
+//   CASE <R4> <R5> <R6> <R7 hex>
+// Output: "<R10..R13 hex>" per CASE.
+void runMaxwellTextureTypeCaseFile(MTL::Device* device, const char* in_path,
+                                   const char* out_path) {
+    std::ifstream input(in_path);
+    std::ofstream output(out_path);
+    expect(input.good() && output.good(), "Texture type case files open");
+    struct Config {
+        std::string kind;
+        u32 width{}, height{}, depth{};
+        std::array<u32, 8> tsc{};
+        std::map<u32, std::vector<u32>> data;
+        std::vector<std::array<u32, 4>> cases;
+    };
+    std::vector<Config> configs;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string tag;
+        row >> tag;
+        if (tag == "TYPE") {
+            Config config;
+            row >> config.kind >> config.width >> config.height >> config.depth;
+            for (auto& word : config.tsc) row >> std::hex >> word;
+            expect(bool(row), "Malformed TYPE");
+            configs.push_back(std::move(config));
+        } else if (tag == "DATA") {
+            expect(!configs.empty(), "DATA before TYPE");
+            u32 slice;
+            row >> slice;
+            auto& words = configs.back().data[slice];
+            for (u32 word; row >> std::hex >> word;) words.push_back(word);
+        } else if (tag == "CASE") {
+            expect(!configs.empty(), "CASE before TYPE");
+            std::array<u32, 4> values{};
+            for (auto& value : values) row >> std::hex >> value;
+            expect(bool(row), "Malformed type CASE");
+            configs.back().cases.push_back(values);
+        }
+    }
+    constexpr u32 TEXTURE_INDEX = 1;
+    const auto texs = [](u32 target, u32 dst0, u32 dst1, u32 a, u32 b, u32 mask) {
+        return 0xd000000000000000ull | dst0 | (u64(a) << 8) | PT_GUARD |
+               (u64(b) << 20) | (u64(dst1) << 28) | (u64(TEXTURE_INDEX) << 36) |
+               (u64(mask) << 50) | (u64(target) << 53) | (1ull << 59);
+    };
+    for (const auto& config : configs) {
+        MTL::TextureDescriptor* descriptor = nullptr;
+        bool owns_descriptor = false; // alloc/init, not an autoreleased factory
+        std::string declaration;
+        u32 target = 0;
+        const auto format = MTL::PixelFormatRGBA32Float;
+        if (config.kind == "1d") {
+            descriptor = MTL::TextureDescriptor::alloc()->init();
+            owns_descriptor = true;
+            descriptor->setTextureType(MTL::TextureType1D);
+            descriptor->setPixelFormat(format);
+            descriptor->setWidth(config.width);
+            declaration = "texture1d<float>";
+            target = 0;
+        } else if (config.kind == "2darray") {
+            descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+                format, config.width, config.height, false);
+            descriptor->setTextureType(MTL::TextureType2DArray);
+            descriptor->setArrayLength(config.depth);
+            declaration = "texture2d_array<float>";
+            target = 8;
+        } else if (config.kind == "3d") {
+            descriptor = MTL::TextureDescriptor::alloc()->init();
+            owns_descriptor = true;
+            descriptor->setTextureType(MTL::TextureType3D);
+            descriptor->setPixelFormat(format);
+            descriptor->setWidth(config.width);
+            descriptor->setHeight(config.height);
+            descriptor->setDepth(config.depth);
+            declaration = "texture3d<float>";
+            target = 11;
+        } else {
+            expect(config.kind == "cube", "Unknown texture kind");
+            descriptor = MTL::TextureDescriptor::textureCubeDescriptor(
+                format, config.width, false);
+            declaration = "texturecube<float>";
+            target = 13;
+        }
+        descriptor->setUsage(MTL::TextureUsageShaderRead);
+        descriptor->setStorageMode(MTL::StorageModeShared);
+        NS_STACK_SCOPED auto texture = device->newTexture(descriptor);
+        expect(texture != nullptr, "Texture type creation");
+        for (const auto& [slice, words] : config.data) {
+            if (config.kind == "1d") {
+                texture->replaceRegion(MTL::Region::Make1D(0, config.width), 0,
+                                       words.data(), 0);
+            } else if (config.kind == "3d") {
+                texture->replaceRegion(
+                    MTL::Region::Make3D(0, 0, slice, config.width, config.height, 1),
+                    0, 0, words.data(), config.width * 16, 0);
+            } else {
+                texture->replaceRegion(
+                    MTL::Region::Make2D(0, 0, config.width, config.height), 0, slice,
+                    words.data(), config.width * 16, 0);
+            }
+        }
+        hw::tegra_x1::gpu::engines::TextureSamplerControl tsc{};
+        std::memcpy(&tsc, config.tsc.data(), sizeof(tsc));
+        const auto sampler_descriptor = hw::tegra_x1::gpu::engines::decodeSampler(
+            tsc, TextureFormat::RGBA32Float);
+        metal::Sampler sampler(device, sampler_descriptor);
+        GuestShaderState state{};
+        hw::tegra_x1::gpu::engines::specializeShaderSampler(
+            state, TEXTURE_INDEX, tsc, TextureFormat::RGBA32Float, {});
+        std::vector<AluState> inputs;
+        for (const auto& values : config.cases) {
+            AluState alu{};
+            alu.regs[4] = values[0];
+            alu.regs[5] = values[1];
+            alu.regs[6] = values[2];
+            alu.regs[7] = values[3];
+            inputs.push_back(alu);
+        }
+        const auto results = runTextureProgram(
+            device, {texs(target, 10, 12, 4, 6, 4)}, inputs, {},
+            {{declaration, texture, sampler.getSampler()}},
+            "Maxwell texture type reference", state);
+        for (const auto& result : results) {
+            for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+            output << '\n';
+        }
+        if (owns_descriptor)
+            descriptor->release();
+    }
+}
