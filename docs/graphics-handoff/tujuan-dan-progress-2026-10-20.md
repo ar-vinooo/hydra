@@ -197,3 +197,16 @@ konvensi komunitas, bukan teks NVIDIA), LEA.LO (shift 0-31, negasi) dan LEA.HI
 bug. Kontrol: shift tambahan menggagalkan tes. X/CC/predikat keluaran tidak diuji
 (Hydra belum mengimplementasikannya). ICMP/FCMP/I2I/PSET tidak diuji karena
 semantiknya tidak terdefinisi di sumber yang ada.
+
+## Tahap D: konversi tulis render target (baru)
+
+`tests/color_target_format_reference.py` kini mencakup 33 format RT lagi yang
+keluarannya float (selain 0x40-0x47 yang sudah ada): RGBA32F/RGBX32F, RGBA16
+unorm/snorm/float, RG32F, RGBX16F, A8R8G8B8 (+sRGB), A2B10G10R10, A2R10G10B10,
+A8B8G8R8 sRGB/snorm, RG16 unorm/snorm/float, BF10GF11RF11, R32F, X8R8G8B8 (+sRGB),
+R5G6B5, A1R5G5B5, G8R8 unorm/snorm, R16 unorm/snorm, R8 unorm/snorm, X1R5G5B5,
+X8B8G8R8 (+sRGB). Tata letak diturunkan dari nama format di `clb197.h` (garis bawah
+= urutan memori, nama rapat = bit tertinggi dahulu), 24 warna per format, toleransi
+satu langkah kuantisasi (float32 eksak, bit X diabaikan). Semua cocok, tanpa bug;
+kontrol: kanal R/B tertukar pada A2B10G10R10 dan R5G6B5 menggagalkan tes. Format
+integer, Z/O, dan blending ke format-format ini tidak diuji.
