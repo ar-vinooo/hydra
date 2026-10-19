@@ -13,6 +13,8 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <vector>
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -46,6 +48,8 @@ struct ComputeDispatch {
     struct StorageBufferBinding {
         u32 index;
         BufferView buffer;
+        // The shader may write it, and it aliases guest memory
+        bool written{false};
     };
     std::vector<StorageBufferBinding> storage_buffers;
     struct TextureBinding {
@@ -103,6 +107,26 @@ class IRenderer {
         }
     }
 
+    // The caches are locked by the GPU thread for whole draws: other threads
+    // queue their invalidations for it, it applies them between its entries
+    void queueMemoryInvalidation(ztd::Range<uptr> range) {
+        std::scoped_lock lock(queued_invalidation_mutex);
+        queued_invalidations.push_back(range);
+        has_queued_invalidations.store(true, std::memory_order_release);
+    }
+    void applyQueuedMemoryInvalidations() {
+        if (!has_queued_invalidations.load(std::memory_order_acquire))
+            return;
+        std::vector<ztd::Range<uptr>> ranges;
+        {
+            std::scoped_lock lock(queued_invalidation_mutex);
+            ranges.swap(queued_invalidations);
+            has_queued_invalidations.store(false, std::memory_order_relaxed);
+        }
+        for (const auto& range : ranges)
+            invalidateMemory(range);
+    }
+
     // Writes GPU-rendered textures in the range back to guest memory, from a
     // CPU thread that is about to access it (memory tracking faults)
     void flushMemoryForCpu(ztd::Range<uptr> range) {
@@ -154,12 +178,46 @@ class IRenderer {
     virtual bool synchronize([[maybe_unused]] ICommandBuffer* command_buffer) {
         return true;
     }
+    // Like synchronize, but only waits if commands which may write guest
+    // memory were encoded since the last checkpoint. Shader code is read from
+    // guest memory by the CPU.
+    virtual bool synchronizeGuestWrites(ICommandBuffer* command_buffer) {
+        return synchronize(command_buffer);
+    }
     virtual void setOcclusionCounterEnabled([[maybe_unused]] bool enabled) {}
     virtual void resetOcclusionCounter() {}
-    virtual std::optional<u64>
-    getOcclusionCounter([[maybe_unused]] ICommandBuffer* command_buffer) {
-        return 0;
+    // Reports the ZPASS counter as it is at this point of the command stream.
+    // `publish` runs once the GPU finished the draws before the report and
+    // the reports queued earlier: on a thread of the renderer, not on the
+    // caller's. `writes` are the host ranges it writes, see flushReports. The
+    // callbacks of the command buffer follow the report.
+    virtual void queueOcclusionReport([[maybe_unused]] ICommandBuffer* command_buffer,
+                                      ReportPublisher publish,
+                                      [[maybe_unused]] std::vector<ztd::Range<uptr>> writes) {
+        publish(0);
     }
+    // Runs `write` once the GPU finished the commands encoded so far, after
+    // the reports and writes queued before it. It runs on a thread of the
+    // renderer, not on the caller's, and `succeeded` is false if the commands
+    // failed. `writes` are the host ranges it writes, see flushReports. This is
+    // how a semaphore release or a syncpoint increment reaches the guest
+    // without the GPU thread waiting for the GPU.
+    virtual void queueGuestWrite([[maybe_unused]] ICommandBuffer* command_buffer,
+                                 std::function<void(bool succeeded)> write,
+                                 [[maybe_unused]] std::vector<ztd::Range<uptr>> writes) {
+        write(true);
+    }
+    // Makes sure that no queued report is going to write to the range
+    // anymore, submitting the command buffer and waiting for the GPU if one
+    // still does. Anything which reads or writes guest memory in the stream
+    // order has to call it for the memory that a report may have targeted.
+    virtual void flushReports([[maybe_unused]] ICommandBuffer* command_buffer,
+                              [[maybe_unused]] ztd::Range<uptr> range) {}
+    // Waits until all queued reports reached guest memory or were dropped.
+    // Whatever tells the guest that earlier work is done (a fence, a released
+    // semaphore) calls it after waiting for the GPU, so that the guest finds
+    // the reports of that work.
+    virtual void drainReports() {}
 
     // Render pass
     virtual RenderPassBase*
@@ -300,6 +358,10 @@ class IRenderer {
     std::string capture_draw_label;
 
   private:
+    std::mutex queued_invalidation_mutex;
+    std::vector<ztd::Range<uptr>> queued_invalidations;
+    std::atomic<bool> has_queued_invalidations{false};
+
     // Caches
     BufferCache buffer_cache;
     TextureCache texture_cache;

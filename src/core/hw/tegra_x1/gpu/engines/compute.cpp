@@ -296,8 +296,9 @@ void Compute::launch(const u32 index, const u32 arg) {
                           storage.cbuf_slot, storage.cbuf_offset));
             continue;
         }
-        dispatch.storage_buffers.push_back(
-            {storage.host_index, renderer.getGuestMemoryBuffer(*range)});
+        dispatch.storage_buffers.push_back({storage.host_index,
+                                            renderer.getGuestMemoryBuffer(*range),
+                                            storage.written});
         if (renderer.getTextureCache().hasUnflushedGpuWrites(*range))
             renderer.getTextureCache().flushMemory(tls_crnt_command_buffer,
                                                    *range);

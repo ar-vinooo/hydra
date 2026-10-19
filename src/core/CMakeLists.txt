@@ -637,6 +637,10 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/impl.cpp
     hw/tegra_x1/gpu/renderer/metal/command_buffer.cpp
     hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp
+    hw/tegra_x1/gpu/renderer/metal/completion_queue.cpp
+    hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp
+    hw/tegra_x1/gpu/renderer/metal/occlusion.cpp
+    hw/tegra_x1/gpu/renderer/metal/occlusion.hpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.cpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.hpp
     hw/tegra_x1/gpu/renderer/metal/buffer.cpp

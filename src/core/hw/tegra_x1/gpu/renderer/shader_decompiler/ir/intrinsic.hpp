@@ -39,7 +39,8 @@ enum class Intrinsic : u32 {
     // rounding (even, floor, ceil, trunc), 2 signed, 3 16-bit, 6 abs, 7 neg,
     // 9 high word, 10 64-bit result. F64FromInt: (integer words, control) as
     // Int64ToFloat plus bit 9 for the high word. F64Round: (double, control)
-    // bits 0-2 mode (none, even, floor, ceil, trunc), 3 abs, 4 neg, 5 high word
+    // bits 0-2 mode (none, even, floor, ceil, trunc), 3 abs, 4 neg, 5 high word,
+    // 6 saturate
     F64ToInt,
     F64FromInt,
     F64Round,

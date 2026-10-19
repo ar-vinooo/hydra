@@ -37,6 +37,8 @@ Renderer::Renderer()
     : device{MTL::CreateSystemDefaultDevice()},
       command_queue{device->newCommandQueue()},
       upload_buffer_pool(std::make_shared<UploadBufferPool>(device)),
+      completions(std::make_shared<CompletionQueue>()),
+      occlusion(std::make_unique<OcclusionCounter>(device, completions)),
       binary_archive_cache(device), shader_library_cache(device),
       depth_stencil_state_cache(device),
       blit_pipeline_cache(device), clear_color_pipeline_cache(device),
@@ -395,7 +397,7 @@ SamplerBase* Renderer::createSamplerHot10(const SamplerDescriptor& descriptor) {
 }
 
 ICommandBuffer* Renderer::createCommandBufferHot11() {
-    return new CommandBuffer(command_queue);
+    return new CommandBuffer(command_queue, completions);
 }
 
 RenderPassBase*
@@ -1083,76 +1085,67 @@ bool Renderer::synchronize(ICommandBuffer* command_buffer) {
     return commands->lastSubmissionSucceeded();
 }
 
-void Renderer::recycleOcclusionPages(std::vector<OcclusionPage>& pages) {
-    for (auto& page : pages) {
-        if (free_occlusion_pages.size() >= MAX_POOLED_OCCLUSION_PAGES)
-            break;
-        // The GPU only wrote the entries that were handed out
-        std::memset(page.buffer->contents(), 0, page.count * sizeof(u64));
-        free_occlusion_pages.push_back(std::move(page.buffer));
-    }
-    pages.clear();
+bool Renderer::synchronizeGuestWrites(ICommandBuffer* command_buffer) {
+    if (!CommandBuffer::hasUnsynchronizedGuestWrites())
+        return true;
+    return synchronize(command_buffer);
 }
 
-void Renderer::resetOcclusionCounter() {
-    occlusion_count = 0;
-    occlusion_valid = true;
-    // The pages may still be used by submitted work: retire, do not reuse yet
-    for (auto& page : occlusion_pages) {
-        if (retired_occlusion_pages.size() >= MAX_POOLED_OCCLUSION_PAGES)
-            break;
-        retired_occlusion_pages.push_back(std::move(page));
-    }
-    occlusion_pages.clear();
+void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
+                                    ReportPublisher publish,
+                                    std::vector<ztd::Range<uptr>> writes) {
+    if (PerfStats::isEnabled())
+        PerfStats::instance().reports_queued++;
+    occlusion->queueReport(*static_cast<CommandBuffer*>(command_buffer),
+                           std::move(publish), std::move(writes));
 }
 
-std::optional<u64> Renderer::getOcclusionCounter(ICommandBuffer* command_buffer) {
-    if (!occlusion_valid)
-        return std::nullopt;
-    if (!synchronize(command_buffer)) {
-        occlusion_valid = false;
-        return std::nullopt;
+void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
+                               std::function<void(bool succeeded)> write,
+                               std::vector<ztd::Range<uptr>> writes) {
+    auto* impl = static_cast<CommandBuffer*>(command_buffer);
+    // The callbacks of the submission follow the write
+    impl->noteQueuedCompletionWork();
+    completions->push(impl->shareCompletionToken(), std::move(write),
+                      std::move(writes), true);
+}
+
+void Renderer::flushReports(ICommandBuffer* command_buffer,
+                            ztd::Range<uptr> range) {
+    if (!completions->hasPendingWrites())
+        return;
+    const auto sequence = completions->lastWriteTo(range);
+    if (sequence == 0 || completions->wait(sequence, std::chrono::milliseconds(0)))
+        return;
+    if (PerfStats::isEnabled())
+        PerfStats::instance().report_waits++;
+    // The report waits for the commands of the submission it was queued in
+    if (command_buffer != nullptr) {
+        // The consumer that asked for the wait is named if it did
+        ScopedCheckpointReason reason(
+            command_buffer,
+            command_buffer->checkpoint_reason == CheckpointReason::Other
+                ? CheckpointReason::ReportFlush
+                : command_buffer->checkpoint_reason);
+        synchronize(command_buffer);
     }
-    for (const auto& page : occlusion_pages) {
-        const auto* counts = static_cast<const u64*>(page.buffer->contents());
-        for (u32 i = 0; i < page.count; i++)
-            occlusion_count += counts[i];
-    }
-    // The checkpoint waited for everything this thread submitted, including
-    // the pages of earlier resets
-    recycleOcclusionPages(occlusion_pages);
-    recycleOcclusionPages(retired_occlusion_pages);
-    return occlusion_count;
+    if (!completions->wait(sequence, std::chrono::seconds(2)))
+        LOG_WARN(MetalRenderer, "A queued report did not reach guest memory "
+                                "within 2 seconds");
+}
+
+void Renderer::drainReports() {
+    if (!completions->hasPendingOrdered())
+        return;
+    // A marker behind everything queued so far
+    const auto sequence = completions->push(nullptr, [](bool) {});
+    if (!completions->wait(sequence, std::chrono::seconds(5)))
+        LOG_WARN(MetalRenderer, "Queued reports did not finish within 5 seconds");
 }
 
 std::optional<u64> Renderer::prepareOcclusionQuery(CommandBuffer* command_buffer) {
-    if (!occlusion_enabled || !occlusion_valid)
-        return std::nullopt;
-    if (occlusion_pages.empty() ||
-        occlusion_pages.back().count == OCCLUSION_PAGE_SIZE ||
-        !command_buffer->hasRenderPass(state.render_pass->getRenderPassDescriptor()) ||
-        command_buffer->getVisibilityResultBuffer() != occlusion_pages.back().buffer.get()) {
-        // Queries can stay enabled indefinitely without a report/reset.
-        if (occlusion_pages.size() >= MAX_OCCLUSION_PAGES &&
-            !getOcclusionCounter(command_buffer))
-            return std::nullopt;
-        if (!free_occlusion_pages.empty()) {
-            occlusion_pages.push_back({std::move(free_occlusion_pages.back()), 0});
-            free_occlusion_pages.pop_back();
-        } else {
-            auto* buffer = device->newBuffer(OCCLUSION_PAGE_SIZE * sizeof(u64),
-                                              MTL::ResourceStorageModeShared);
-            ASSERT(buffer != nullptr, MetalRenderer, "Cannot allocate visibility buffer");
-            std::memset(buffer->contents(), 0, OCCLUSION_PAGE_SIZE * sizeof(u64));
-            occlusion_pages.push_back(
-                {std::shared_ptr<MTL::Buffer>(buffer, [](MTL::Buffer* value) {
-                     value->release();
-                 }), 0});
-        }
-    }
-    auto& page = occlusion_pages.back();
-    command_buffer->setVisibilityResultBuffer(page.buffer.get());
-    return static_cast<u64>(page.count++) * sizeof(u64);
+    return occlusion->prepareDraw(*command_buffer,
+                                  state.render_pass->getRenderPassDescriptor());
 }
 
 void Renderer::drawHot38(ICommandBuffer* command_buffer,
@@ -1318,6 +1311,8 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     for (const auto& binding : dispatch.storage_buffers) {
         if (binding.buffer.getBase() == nullptr)
             continue;
+        if (binding.written)
+            command_buffer_impl->noteGuestMemoryWrites();
         encoder->setBuffer(
             static_cast<Buffer*>(binding.buffer.getBase())->getBuffer(),
             binding.buffer.getOffset(), binding.index);
@@ -1494,11 +1489,16 @@ void Renderer::setUniformBufferHot48(CommandBuffer* command_buffer,
 }
 
 void Renderer::setStorageBuffer(CommandBuffer* command_buffer,
-                                ShaderType shader_type, u32 index) {
+                                ShaderType shader_type, u32 index,
+                                bool written) {
     const auto& buffer =
         state.storage_buffers[static_cast<u32>(shader_type)][index];
     if (buffer.getBase() == nullptr)
         return;
+    // Storage buffers alias guest memory: what the shader writes reaches the
+    // CPU after the next checkpoint
+    if (written)
+        command_buffer->noteGuestMemoryWrites();
     command_buffer->setBuffer(
         static_cast<Buffer*>(buffer.getBase())->getBuffer(), buffer.getOffset(),
         shader_type, index);
@@ -1663,7 +1663,7 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
         }
         for (const auto& storage : mapping.storage_buffers)
             setStorageBuffer(command_buffer, ShaderType(shader_type),
-                             storage.host_index);
+                             storage.host_index, storage.written);
         for (const auto& [binding, index] : mapping.textures) {
             (void)binding;
             setTexture(command_buffer, ShaderType(shader_type), index);

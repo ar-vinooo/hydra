@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 
 #include "core/horizon/kernel/const.hpp"
 #include "core/hw/tegra_x1/cpu/memory.hpp"
@@ -15,6 +16,12 @@ struct MemoryRegion {
     vaddr_t va;
     uptr size;
     horizon::kernel::MemoryState state;
+};
+
+struct DeviceMappingState {
+    struct Span { vaddr_t guest; uptr host; u64 size; };
+    std::mutex mutex;
+    std::map<const void*, std::vector<Span>> spaces;
 };
 
 // This class doesn't really represent a real MMU, but rather the page table, as
@@ -44,6 +51,7 @@ class IMmu {
                                     horizon::kernel::MemoryAttribute value) = 0;
 
     horizon::kernel::MemoryInfo queryMemory(vaddr_t va) const;
+    const std::shared_ptr<DeviceMappingState>& getDeviceMappings() const { return device_mappings; }
     vaddr_t findFreeMemory(ztd::Range<vaddr_t> region, u64 size) const;
 
     // Write tracking
@@ -123,6 +131,7 @@ class IMmu {
 
   private:
     System& system;
+    std::shared_ptr<DeviceMappingState> device_mappings = std::make_shared<DeviceMappingState>();
 
     std::mutex write_tracking_mutex;
     std::vector<ztd::Range<vaddr_t>> tracked_pages;

@@ -8,8 +8,9 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_)
-    : command_queue{command_queue_} {
+CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_,
+                             std::shared_ptr<CompletionQueue> completions_)
+    : command_queue{command_queue_}, completions{std::move(completions_)} {
     TMP_AUTORELEASE_POOL_BEGIN();
     command_buffer = command_queue->commandBuffer()->retain();
     TMP_AUTORELEASE_POOL_END();
@@ -46,11 +47,29 @@ CommandBuffer::~CommandBuffer() {
         });
     }
     if (!completion_callbacks.empty()) {
-        command_buffer->addCompletedHandler(
-            [callbacks = std::move(completion_callbacks)](MTL::CommandBuffer*) {
-                for (const auto& callback : callbacks)
-                    callback();
-            });
+        if (completions &&
+            (queued_completion_work || completions->hasPendingOrdered())) {
+            // Reports queued through this buffer reach guest memory first, and
+            // the callbacks of earlier submissions (their fences) come before
+            // these: a fence only counts, so a later one would satisfy the
+            // wait for an earlier one
+            completions->push(
+                shareCompletionToken(),
+                [callbacks = std::move(completion_callbacks)](bool succeeded) {
+                    for (const auto& callback : callbacks)
+                        callback(succeeded);
+                },
+                {}, true);
+        } else {
+            command_buffer->addCompletedHandler(
+                [callbacks = std::move(completion_callbacks)](
+                    MTL::CommandBuffer* cb) {
+                    const bool succeeded =
+                        cb->status() == MTL::CommandBufferStatusCompleted;
+                    for (const auto& callback : callbacks)
+                        callback(succeeded);
+                });
+        }
         completion_callbacks.clear();
     }
     // GPU faults and timeouts are otherwise silent. This runs on a Metal
@@ -82,6 +101,28 @@ void CommandBuffer::retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> poo
            "An upload command buffer cannot mix buffer pools");
     upload_pool = std::move(pool);
     retired_upload_buffers.push_back(buffer);
+}
+
+const std::shared_ptr<CompletionToken>& CommandBuffer::shareCompletionToken() {
+    if (!completion_token) {
+        completion_token = std::make_shared<CompletionToken>();
+        // The work depending on the token needs the buffer to be committed,
+        // even if nothing else was encoded
+        has_commands = true;
+        command_buffer->addCompletedHandler(
+            [token = completion_token,
+             queue = completions](MTL::CommandBuffer* cb) {
+                token->complete(cb->status() ==
+                                MTL::CommandBufferStatusCompleted);
+                if (queue)
+                    queue->notify();
+            });
+    }
+    return completion_token;
+}
+
+CompletionToken* CommandBuffer::getCompletionToken() {
+    return shareCompletionToken().get();
 }
 
 void CommandBuffer::setVisibilityResultBuffer(MTL::Buffer* buffer) {
@@ -171,14 +212,18 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
         submitted_buffers.load(std::memory_order_acquire) ==
             completed_buffers.load(std::memory_order_acquire)) {
         last_submission_succeeded = true;
+        guest_write_synced.store(guest_write_epoch.load(std::memory_order_acquire),
+                                 std::memory_order_release);
         if (profile)
             PerfStats::instance().checkpoint_skips++;
         return 0.0;
     }
+    const u64 write_epoch = guest_write_epoch.load(std::memory_order_acquire);
     submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
     command_buffer->commit();
     command_buffer->waitUntilCompleted();
     completed_buffers.fetch_add(1, std::memory_order_acq_rel);
+    checkpoint_total.fetch_add(1, std::memory_order_acq_rel);
     has_commands = false;
     last_submission_succeeded =
         command_buffer->status() == MTL::CommandBufferStatusCompleted;
@@ -186,6 +231,21 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
         const auto error = command_buffer->error();
         LOG_ERROR(MetalRenderer, "GPU checkpoint failed: {}",
                   error ? error->localizedDescription()->utf8String() : "unknown error");
+    }
+    // Everything encoded before the commit finished (queue order), so its
+    // writes to guest memory are visible
+    for (u64 synced = guest_write_synced.load(std::memory_order_acquire);
+         synced < write_epoch &&
+         !guest_write_synced.compare_exchange_weak(
+             synced, write_epoch, std::memory_order_acq_rel);) {
+    }
+    if (completion_token) {
+        // Metal calls the handler registered for the token later on; the work
+        // waiting for it does not have to wait for that
+        completion_token->complete(last_submission_succeeded);
+        completion_token.reset();
+        if (completions)
+            completions->notify();
     }
     for (auto* buffer : retired_upload_buffers) {
         if (last_submission_succeeded)
@@ -204,11 +264,16 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
         static thread_local f64 wall_ms = 0.0;
         static thread_local f64 gpu_ms = 0.0;
         ++checkpoints;
-        wall_ms += std::chrono::duration<f64, std::milli>(now - start).count();
+        const auto blocked = std::chrono::duration<f64, std::milli>(now - start);
+        wall_ms += blocked.count();
         gpu_ms += std::max(ms, 0.0);
-        PerfStats::instance().command_buffers++;
+        auto& stats = PerfStats::instance();
+        const auto reason = static_cast<usize>(checkpoint_reason);
+        stats.checkpoint_count[reason]++;
+        stats.checkpoint_ns[reason] += static_cast<u64>(blocked.count() * 1e6);
+        stats.command_buffers++;
         if (ms > 0.0)
-            PerfStats::instance().gpu_ns += static_cast<u64>(ms * 1'000'000.0);
+            stats.gpu_ns += static_cast<u64>(ms * 1'000'000.0);
         const auto elapsed = std::chrono::duration<f64>(now - last).count();
         if (elapsed >= 2.0) {
             LOG_INFO(MetalRenderer, "CHECKPOINT: {} in {:.2f}s, {:.2f} ms CPU blocking, "

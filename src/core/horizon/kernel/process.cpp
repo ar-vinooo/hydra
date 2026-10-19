@@ -6,6 +6,7 @@
 
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/kernel/guest_thread.hpp"
+#include "core/horizon/kernel/shared_memory.hpp"
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
@@ -112,8 +113,10 @@ u64 Process::getUsedUserMemorySize() const {
         used += memory->getSize();
     if (main_thread_stack_mem)
         used += main_thread_stack_mem->getSize();
-    if (heap_mem)
-        used += heap_mem->getSize();
+    {
+        std::scoped_lock lock(heap_mutex);
+        used += heap_size;
+    }
     {
         std::scoped_lock lock(physical_mem_mutex);
         used += physical_mem_size;
@@ -122,56 +125,69 @@ u64 Process::getUsedUserMemorySize() const {
 }
 
 void Process::resizeHeap(u64 size) {
-    const auto map_heap = [&] {
-        mmu->map(HEAP_REGION.getBegin(), heap_mem.get(),
-                 {.type = MemoryType::Normal_1_0_0,
-                  .attr = MemoryAttribute::None,
-                  .perm = MemoryPermission::ReadWrite});
-    };
-    if (heap_mem == nullptr) {
-        heap_mem.reset(system.getCpu().allocateMemory(size));
-        map_heap();
-        return;
+    // The heap lives in one lazily committed host reservation and is resized in
+    // place. Its host pointer never changes, so there is no copy that can lose
+    // concurrent guest or GPU writes, and GPU mappings and pointers already
+    // encoded in Metal stay valid.
+    std::scoped_lock lock(heap_mutex);
+    if (heap_host_base == 0x0) {
+        void* ptr = mmap(nullptr, HEAP_REGION.getSize(), PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        ASSERT(ptr != MAP_FAILED, Kernel, "Failed to reserve heap memory");
+        heap_host_base = reinterpret_cast<uptr>(ptr);
     }
+    ASSERT(size <= HEAP_REGION.getSize(), Kernel, "Heap size {:#x} too big", size);
 
-    // The old host memory may be referenced by GPU mappings and by queued GPU
-    // work, so it is never freed here: the heap moves to new memory with its
-    // contents, GPU mappings follow it, and the old block is kept until the
-    // process is cleaned up.
-    auto old_heap = std::move(heap_mem);
-    const uptr old_ptr = old_heap->getPtr();
-    const u64 old_size = old_heap->getSize();
-    const auto old_range = ztd::Range<uptr>::fromSize(old_ptr, old_size);
-    system.getGpu().getRenderer().flushMemoryForCpu(old_range);
+    const u64 old_size = heap_size;
+    if (size > old_size) {
+        // Grown memory reads as zero, even if the pages were used before
+        std::memset(reinterpret_cast<void*>(heap_host_base + old_size), 0,
+                    size - old_size);
 
-    heap_mem.reset(system.getCpu().allocateMemory(size));
-    std::memcpy(reinterpret_cast<void*>(heap_mem->getPtr()),
-                reinterpret_cast<const void*>(old_ptr),
-                std::min(old_size, heap_mem->getSize()));
-    mmu->unmap(ztd::Range<vaddr_t>::fromSize(HEAP_REGION.getBegin(), old_size));
-    map_heap();
+        // A guest mapping may not cross a slab, as each slab is a separate CPU
+        // memory object
+        for (u64 offset = old_size; offset < size;) {
+            const u64 slab_index = offset / HEAP_SLAB_SIZE;
+            const u64 slab_begin = slab_index * HEAP_SLAB_SIZE;
+            auto& slab = heap_slabs[slab_index];
+            if (slab == nullptr)
+                slab.reset(system.getCpu().wrapMemory(heap_host_base + slab_begin,
+                                                      HEAP_SLAB_SIZE));
+            const u64 run_end = std::min(size, slab_begin + HEAP_SLAB_SIZE);
+            mmu->map(HEAP_REGION.getBegin() + offset,
+                     ztd::Range<uptr>(heap_host_base + offset,
+                                      heap_host_base + run_end),
+                     {.type = MemoryType::Normal_1_0_0,
+                      .attr = MemoryAttribute::None,
+                      .perm = MemoryPermission::ReadWrite});
+            offset = run_end;
+        }
+        heap_size = size;
+    } else if (size < old_size) {
+        const uptr tail_begin = heap_host_base + size;
+        const uptr tail_end = heap_host_base + old_size;
+        const auto tail = ztd::Range<uptr>(tail_begin, tail_end);
+        system.getGpu().getRenderer().flushMemoryForCpu(tail);
+        mmu->unmap(ztd::Range<vaddr_t>::fromSize(HEAP_REGION.getBegin() + size,
+                                                 old_size - size));
+        heap_size = size;
 
-    std::vector<std::shared_ptr<hw::tegra_x1::gpu::GMmu>> spaces;
-    {
-        std::scoped_lock lock(gpu_spaces_mutex);
-        for (const auto& weak : gpu_spaces)
-            if (auto space = weak.lock())
-                spaces.push_back(std::move(space));
+        // GPU mappings beyond the new end are dropped; the rest stay in place
+        std::vector<std::shared_ptr<hw::tegra_x1::gpu::GMmu>> spaces;
+        {
+            std::scoped_lock gpu_lock(gpu_spaces_mutex);
+            for (const auto& weak : gpu_spaces)
+                if (auto space = weak.lock())
+                    spaces.push_back(std::move(space));
+        }
+        const auto drop_tail = [&](hw::tegra_x1::gpu::GMmu& space) {
+            space.rebaseHostRange(tail_begin, tail_end, tail_begin, 0);
+        };
+        for (const auto& space : spaces)
+            drop_tail(*space);
+        drop_tail(gmmu);
+        system.getGpu().getRenderer().invalidateMemory(tail);
     }
-    const auto rebase = [&](hw::tegra_x1::gpu::GMmu& space) {
-        for (const auto& range : space.rebaseHostRange(
-                 old_ptr, old_ptr + old_size, heap_mem->getPtr(), heap_mem->getSize()))
-            mmu->enableWriteTracking(ztd::Range<vaddr_t>(
-                alignDown(range.getBegin(), hw::tegra_x1::cpu::GUEST_PAGE_SIZE),
-                align(range.getEnd(), hw::tegra_x1::cpu::GUEST_PAGE_SIZE)));
-    };
-    for (const auto& space : spaces)
-        rebase(*space);
-    rebase(gmmu);
-    system.getGpu().getRenderer().invalidateMemory(old_range);
-
-    std::scoped_lock lock(retired_mutex);
-    retired_heaps.push_back(std::move(old_heap));
 }
 
 void Process::mapAliasRun(vaddr_t begin, vaddr_t end) {
@@ -215,6 +231,16 @@ void Process::mapAliasRun(vaddr_t begin, vaddr_t end) {
     physical_mem_size += end - begin;
 }
 
+void Process::releaseHeapMemory() {
+    std::scoped_lock lock(heap_mutex);
+    heap_slabs.clear();
+    if (heap_host_base != 0x0) {
+        munmap(reinterpret_cast<void*>(heap_host_base), HEAP_REGION.getSize());
+        heap_host_base = 0x0;
+    }
+    heap_size = 0;
+}
+
 void Process::releaseAliasMemory() {
     std::scoped_lock lock(physical_mem_mutex);
     alias_slabs.clear();
@@ -223,6 +249,61 @@ void Process::releaseAliasMemory() {
         alias_host_base = 0x0;
     }
     physical_mem_size = 0;
+}
+
+result_t Process::mapSharedMemory(SharedMemory* memory, vaddr_t addr, u64 size,
+                                  MemoryPermission perm) {
+    if (!memory)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+    if (size == 0 || size != memory->getSize())
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    if (addr % hw::tegra_x1::cpu::GUEST_PAGE_SIZE != 0 ||
+        addr >= ADDRESS_SPACE.getEnd() || size > ADDRESS_SPACE.getEnd() - addr)
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+    std::scoped_lock lock(shared_memory_mutex);
+    if (shared_memory_stopped)
+        return MAKE_RESULT(Svc, Error::InvalidState);
+    for (u64 va = addr; va < addr + size;) {
+        const auto region = mmu->queryRegion(va);
+        if (region.state.type != MemoryType::Free)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        const auto step = std::min(size - (va - addr), region.size - (va - region.va));
+        if (step == 0)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+        va += step;
+    }
+    try {
+        shared_backings.try_emplace(memory->getPtr(), memory->memory);
+        const auto [mapping, inserted] = shared_mappings.emplace(addr, SharedMapping{memory, size});
+        if (!inserted)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        memory->retain();
+        try {
+            memory->mapToRange(mmu.get(), ztd::Range<vaddr_t>::fromSize(addr, size), perm);
+        } catch (...) {
+            shared_mappings.erase(mapping);
+            memory->release();
+            throw;
+        }
+    } catch (const std::bad_alloc&) {
+        return MAKE_RESULT(Svc, Error::OutOfMemory);
+    }
+    return RESULT_SUCCESS;
+}
+
+result_t Process::unmapSharedMemory(SharedMemory* memory, vaddr_t addr, u64 size) {
+    std::scoped_lock lock(shared_memory_mutex);
+    if (shared_memory_stopped)
+        return MAKE_RESULT(Svc, Error::InvalidState);
+    const auto mapping = shared_mappings.find(addr);
+    if (mapping == shared_mappings.end() || mapping->second.object != memory)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    if (size != mapping->second.size)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    mmu->unmap(ztd::Range<vaddr_t>::fromSize(addr, size));
+    shared_mappings.erase(mapping);
+    memory->release();
+    return RESULT_SUCCESS;
 }
 
 result_t Process::mapPhysicalMemory(vaddr_t addr, u64 size) {
@@ -360,6 +441,10 @@ std::shared_ptr<hw::tegra_x1::gpu::GMmu> Process::createGpuAddressSpace() {
 
 void Process::cleanUp() {
     joinThreads();
+    {
+        std::scoped_lock lock(shared_memory_mutex);
+        shared_memory_stopped = true;
+    }
     std::vector<std::shared_ptr<hw::tegra_x1::gpu::GMmu>> spaces;
     {
         std::scoped_lock lock(gpu_spaces_mutex);
@@ -378,10 +463,16 @@ void Process::cleanUp() {
     for (const auto& space : spaces)
         system.getGpu().getPfifo().cancel(*space);
     system.getGpu().getPfifo().cancel(gmmu);
+    {
+        std::scoped_lock lock(shared_memory_mutex);
+        for (const auto& [addr, mapping] : shared_mappings)
+            mapping.object->release();
+        shared_mappings.clear();
+        shared_backings.clear();
+    }
     executable_mems.clear();
     main_thread_stack_mem = nullptr;
-    heap_mem = nullptr;
-    retired_heaps.clear();
+    releaseHeapMemory();
     releaseAliasMemory();
 
     // Main thread

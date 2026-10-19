@@ -276,40 +276,42 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         const auto base = storage.base;
         const auto& descriptor = base->getDescriptor();
         const auto range = descriptor.getRange();
-        // Aliases without a direct copy path (a texture buffer the GPU wrote
-        // and a compressed or mipped texture reading the same memory, as when
-        // streamed texture data is written through a buffer) are synchronized
-        // through guest memory: the GPU data of the source in the overlap is
-        // written back and this texture is decoded again. Only for textures
-        // without GPU data of their own, as decoding replaces all of their
-        // contents. Bytes the guest overwrote since are never written back
-        // (TextureStorage::flushed_ranges). A file named "no_alias_via_guest"
-        // in HYDRA_TRACE_DIR turns this off.
+        // Replay incompatible aliases through guest bytes in write order.
+        // Preserve this destination's GPU data before decoding it again.
         bool decode_pending = false;
+        bool aliases_replayed = false;
         const auto sync_via_guest = [&](TextureStorage& source) {
-            if (debugFlag("no_alias_via_guest") ||
-                storage.gpu_written_timestamp > storage.flushed_timestamp)
+            if (debugFlag("no_alias_via_guest"))
                 return false;
-            if (source.gpu_written_timestamp > source.flushed_timestamp) {
-                const auto overlap = range.clampedTo(
-                    source.base->getDescriptor().getRange());
-                bool pending = false;
-                source.forEachUnflushed(
-                    overlap, [&](ztd::Range<uptr>) { pending = true; });
-                // The write back waits for the GPU: only when there is
-                // something to write back
-                if (pending)
-                    encodeTexture(command_buffer, source, overlap);
+            std::vector<TextureStorage*> replay;
+            for (auto& [group_key, group] : mem.cache) {
+                for (auto& [storage_key, candidate] : group.cache) {
+                    if (candidate.base != nullptr &&
+                        candidate.gpu_written_timestamp != TextureCacheTimePoint{} &&
+                        range.intersects(candidate.base->getDescriptor().getRange()))
+                        replay.push_back(&candidate);
+                }
             }
-            logTextureEvent("alias_via_guest", storage.base->getDescriptor(),
+            std::sort(replay.begin(), replay.end(), [](const auto* a, const auto* b) {
+                return a->gpu_written_timestamp < b->gpu_written_timestamp;
+            });
+            for (auto* candidate : replay) {
+                // A newer alias already flushed to guest must be replayed too:
+                // an older unflushed destination could otherwise overwrite it.
+                // CPU-written bytes remain excluded, including tiled padding.
+                auto flushed = std::move(candidate->flushed_ranges);
+                candidate->flushed_ranges = candidate->stale_ranges;
+                encodeTexture(command_buffer, *candidate,
+                    range.clampedTo(candidate->base->getDescriptor().getRange()));
+                for (const auto& previous : flushed)
+                    candidate->markFlushed(previous);
+            }
+            logTextureEvent("alias_via_guest", descriptor,
                             fmt::format("source={:#x} {} {}",
                                         source.base->getDescriptor().ptr,
                                         source.base->getDescriptor().type,
                                         source.base->getDescriptor().format));
-            // Decoding replaces all texels from guest memory: do it once after
-            // consecutive guest-memory aliases (a BC texture streamed through
-            // one render target per mip), and before any direct copy so the
-            // aliases still apply in time order
+            aliases_replayed = true;
             decode_pending = true;
             return true;
         };
@@ -370,6 +372,8 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                                  b->gpu_written_timestamp;
                       });
             for (auto* source : sources) {
+                if (aliases_replayed)
+                    break;
                 auto& other_storage = *source;
                 const auto& other_descriptor =
                     other_storage.base->getDescriptor();
@@ -602,7 +606,11 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
             seen.clear();
         }
     }
-    renderer.debugSyncCommandBuffer(command_buffer);
+    {
+        ScopedCheckpointReason reason(command_buffer,
+                                      CheckpointReason::TextureReadback);
+        renderer.debugSyncCommandBuffer(command_buffer);
+    }
 
     // Write the data in the guest layout
     const u8* in_data = reinterpret_cast<const u8*>(tmp_buffer->getPtr());

@@ -32,8 +32,11 @@ struct MemoryMap {
     // Creating process; null means unowned (tests). Guest addresses only
     // resolve in that process, so other processes cannot map the handle.
     const void* owner = nullptr;
-    // TODO: alignment
-    // TODO: kind
+    u32 alignment = 0;
+    u32 kind = 0;
+    u32 allocation_flags = 0;
+    std::shared_ptr<std::atomic<u32>> references = std::make_shared<std::atomic<u32>>(1);
+    std::shared_ptr<const void> owner_identity;
 };
 
 constexpr usize SUBCHANNEL_COUNT = 8;
@@ -61,33 +64,47 @@ class Gpu {
     ZTD_MAKE_NON_MOVABLE(Gpu);
 
     // Memory map
-    std::expected<Handle, ztd::mem::IAllocator::Error> createMap(u64 size, const void* owner = nullptr) {
+    std::expected<Handle, ztd::mem::IAllocator::Error> createMap(u64 size, const void* owner = nullptr,
+        std::shared_ptr<const void> owner_identity = {}) {
         std::scoped_lock lock(map_mutex);
         try {
-            const auto raw = free_map_handles.empty() ? next_map_handle
-                                                      : free_map_handles.back();
+            const auto raw = next_map_handle;
             if (raw == 0)
                 return std::unexpected(
                     ztd::mem::IAllocator::Error::OutOfMemory);
             memory_maps.emplace(
-                raw, MemoryMap{.addr = 0, .size = size, .write = false, .owner = owner});
-            if (free_map_handles.empty())
-                ++next_map_handle;
-            else
-                free_map_handles.pop_back();
+                raw, std::make_shared<const MemoryMap>(MemoryMap{
+                    .addr = 0, .size = size, .write = false, .owner = owner,
+                    .owner_identity = std::move(owner_identity)}));
+            ++next_map_handle;
             return Handle(raw);
         } catch (const std::bad_alloc&) {
             return std::unexpected(ztd::mem::IAllocator::Error::OutOfMemory);
         }
     }
 
-    bool allocateMap(Handle handle, uptr addr, bool write) {
+    bool allocateMap(Handle handle, uptr addr, bool write,
+                     u32 alignment = 0x1000, u32 kind = 0, u32 flags = 0) {
         std::scoped_lock lock(map_mutex);
         auto memory_map = findMap(handle);
         if (!memory_map)
             return false;
-        memory_map.value()->addr = addr;
-        memory_map.value()->write = write;
+        auto updated = std::make_shared<MemoryMap>(**memory_map);
+        updated->addr = addr;
+        updated->write = write;
+        updated->alignment = alignment;
+        updated->kind = kind;
+        updated->allocation_flags = flags;
+        memory_maps[handle.getRaw()] = std::move(updated);
+        return true;
+    }
+
+    bool retainMap(Handle handle) {
+        std::scoped_lock lock(map_mutex);
+        const auto map = findMap(handle);
+        if (!map || (*map)->references->load() == invalid<u32>())
+            return false;
+        ++*(*map)->references;
         return true;
     }
 
@@ -95,13 +112,15 @@ class Gpu {
         std::scoped_lock maps_lock(map_mutex);
         if (!memory_maps.contains(handle.getRaw()))
             return false;
-        free_map_handles.push_back(handle.getRaw());
         const auto& map = memory_maps.at(handle.getRaw());
+        if (map->references->fetch_sub(1) > 1) {
+            return true;
+        }
         {
             std::scoped_lock lock(video_frames_mutex);
             std::erase_if(video_frames, [&](const auto& item) {
-                if (!map.host1x_address || item.first < map.host1x_address ||
-                    item.first - map.host1x_address >= map.size)
+                if (!map->host1x_address || item.first < map->host1x_address ||
+                    item.first - map->host1x_address >= map->size)
                     return false;
                 video_frame_bytes -= item.second->pixels.size();
                 return true;
@@ -111,9 +130,8 @@ class Gpu {
         return true;
     }
 
-    // The pointer stays valid until the handle is freed; table changes
-    // themselves are serialized.
-    std::optional<MemoryMap*> getMap(Handle handle) {
+    // Readers retain immutable metadata across concurrent free/reallocation.
+    std::optional<std::shared_ptr<const MemoryMap>> getMap(Handle handle) {
         std::scoped_lock lock(map_mutex);
         return findMap(handle);
     }
@@ -131,8 +149,11 @@ class Gpu {
             if (size > 0xffff0000ull ||
                 next_host1x_address + size > 0x100000000ull)
                 return std::nullopt;
-            (*map)->host1x_address = static_cast<u32>(next_host1x_address);
+            auto updated = std::make_shared<MemoryMap>(**map);
+            updated->host1x_address = static_cast<u32>(next_host1x_address);
+            memory_maps[handle.getRaw()] = updated;
             next_host1x_address += (size + 0xffff) & ~0xffffull;
+            return updated->host1x_address;
         }
         return (*map)->host1x_address;
     }
@@ -140,12 +161,12 @@ class Gpu {
     std::optional<u64> resolveHost1x(u64 address, u64 size) const {
         std::scoped_lock lock(map_mutex);
         for (const auto& [handle, map] : memory_maps) {
-            if (!map.host1x_address || address < map.host1x_address)
+            if (!map->host1x_address || address < map->host1x_address)
                 continue;
-            const auto offset = address - map.host1x_address;
-            if (offset <= map.size && size <= map.size - offset &&
-                map.addr + offset >= map.addr)
-                return map.addr + offset;
+            const auto offset = address - map->host1x_address;
+            if (offset <= map->size && size <= map->size - offset &&
+                map->addr + offset >= map->addr)
+                return map->addr + offset;
         }
         return std::nullopt;
     }
@@ -239,14 +260,13 @@ class Gpu {
     // TODO: move to nvmap
     // Stable addresses while the table grows; no fixed 2048-map limit.
     mutable std::mutex map_mutex;
-    std::map<u32, MemoryMap> memory_maps;
-    std::optional<MemoryMap*> findMap(Handle handle) {
+    std::map<u32, std::shared_ptr<const MemoryMap>> memory_maps;
+    std::optional<std::shared_ptr<const MemoryMap>> findMap(Handle handle) {
         auto it = memory_maps.find(handle.getRaw());
         if (it == memory_maps.end())
             return std::nullopt;
-        return &it->second;
+        return it->second;
     }
-    std::vector<u32> free_map_handles;
     u32 next_map_handle = 1;
     u64 next_host1x_address = 0x10000;
     std::mutex video_frames_mutex;

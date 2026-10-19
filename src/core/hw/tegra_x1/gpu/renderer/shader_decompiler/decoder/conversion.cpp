@@ -75,7 +75,7 @@ u32 getFloatCode(FloatFormat format) {
     return format == FloatFormat::F16 ? 1u : 2u;
 }
 
-// TODO: ftz on F64, write_cc, rounding direction of size changes
+// TODO: write_cc
 void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
                       const Source& src) {
     auto& b = context.builder;
@@ -113,6 +113,7 @@ void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
                 {src.lo, src.hi,
                  ir::Value::createConstantU(rounding | (inst.abs ? 8u : 0u) |
                                             (inst.neg ? 0x10u : 0u) |
+                                            (inst.sat ? 0x40u : 0u) |
                                             (high ? 0x20u : 0u))});
         };
         const auto lo = word(false);
@@ -120,14 +121,16 @@ void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
         writePair(b, inst.dst, lo, hi);
     } else if (src_fmt == FloatFormat::F64) {
         const u32 control = (inst.abs ? 1u : 0u) | (inst.neg ? 2u : 0u) |
-                            (inst.sat ? 4u : 0u) | (getFloatCode(dst_fmt) << 3);
+                            (inst.sat ? 4u : 0u) | (getFloatCode(dst_fmt) << 3) |
+                            (inst.round_mode_0.get() << 5) | (inst.ftz ? 0x80u : 0u);
         writeWord(b, inst.dst,
                   callIntrinsic(b, ir::Intrinsic::F64ToF32,
                                 {src.lo, src.hi,
                                  ir::Value::createConstantU(control)}));
     } else if (dst_fmt == FloatFormat::F64) {
         const u32 control = getFloatCode(src_fmt) | (inst.sh ? 4u : 0u) |
-                            (inst.abs ? 8u : 0u) | (inst.neg ? 0x10u : 0u);
+                            (inst.abs ? 8u : 0u) | (inst.neg ? 0x10u : 0u) |
+                            (inst.ftz ? 0x40u : 0u) | (inst.sat ? 0x80u : 0u);
         const auto convert = [&](bool high) {
             return callIntrinsic(
                 b, ir::Intrinsic::F32ToF64,
@@ -143,7 +146,8 @@ void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
                             (inst.sh ? 0x10u : 0u) | (rounding << 5) |
                             (inst.abs ? 0x100u : 0u) |
                             (inst.neg ? 0x200u : 0u) |
-                            (inst.sat ? 0x400u : 0u) | (inst.ftz ? 0x800u : 0u);
+                            (inst.sat ? 0x400u : 0u) | (inst.ftz ? 0x800u : 0u) |
+                            (inst.round_mode_0.get() << 12);
         writeWord(b, inst.dst,
                   callIntrinsic(b, ir::Intrinsic::FloatToFloat,
                                 {src.lo, ir::Value::createConstantU(control)}));
@@ -251,7 +255,7 @@ void emitIntToInt(DecoderContext& context, InstI2iBase inst,
         b.opEndIf();
 }
 
-// TODO: rounding direction, write_cc
+// TODO: write_cc
 void emitIntToFloat(DecoderContext& context, InstI2fBase inst,
                     const Source& src) {
     auto& b = context.builder;
@@ -268,7 +272,8 @@ void emitIntToFloat(DecoderContext& context, InstI2fBase inst,
                                           : dst_fmt)
                          << 3) |
                         (is_64 ? 0u : inst.byte_sel.get() << 5) |
-                        (inst.abs ? 0x80u : 0u) | (inst.neg ? 0x100u : 0u);
+                        (inst.abs ? 0x80u : 0u) | (inst.neg ? 0x100u : 0u) |
+                        (static_cast<u32>(inst.round_mode.get()) << 10);
     if (dst_fmt == FloatFormat::F64) {
         const auto word = [&](bool high) {
             return callIntrinsic(

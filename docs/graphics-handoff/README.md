@@ -1,7 +1,10 @@
 # Hydra graphics work: handoff
 
-**Titik masuk untuk melanjutkan percakapan (2026-10-18):**
-[Tujuan, alur render, progress, dan langkah berikutnya](tujuan-dan-progress-2026-10-18.md).
+**Titik masuk untuk melanjutkan percakapan (2026-10-19):**
+[Progres terbaru dan validasi Python/Metal](tujuan-dan-progress-2026-10-19.md)
+(bagian terakhir: lifetime SharedMemory dan teardown page table, dengan tes Python–Metal).
+[Tujuan, alur render, dan aturan urutan tahap](tujuan-dan-progress-2026-10-18.md)
+tetap berlaku.
 Jalur instruksi masih **OPEN**; status teknis terbarunya ada di
 [README PFIFO](../../tests/README-pfifo.md). Bagian historis di bawah perlu
 dibaca bersama catatan lanjutan tersebut.

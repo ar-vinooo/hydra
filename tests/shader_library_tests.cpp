@@ -2366,12 +2366,67 @@ void testQueryOnlyTextureType() {
     std::cout << "PASS: TXQ-only textures use the descriptor's type as a hint\n";
 }
 
+void testConstantBufferReadSizes() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    ir::Module module;
+    ir::Builder builder(module);
+    const auto read = [&](u32 slot, reg_t reg, u64 offset) {
+        builder.opCopy(ir::Value::createRegister(0),
+                       ir::Value::createConstMemory(CMem(slot, reg, offset)));
+    };
+    read(1, RZ, 0);
+    read(1, RZ, 0x34);
+    read(2, RZ, 8);
+    read(2, 3, 0);
+    read(2, RZ, 0x80);
+    read(3, 4, 0);
+    read(3, RZ, 0x20);
+    const auto limited = builder.opMin(ir::Value::createRegister(5),
+        builder.opCast(ir::Value::createConstantI(4), ir::ScalarType::U32));
+    const auto selected = builder.opSelect(ir::Value::createPredicate(PT),
+        limited, builder.opMax(ir::Value::createRegister(5),
+                               ir::Value::createConstantU(4)));
+    builder.opCopy(ir::Value::createRegister(4),
+                   builder.opShiftLeft(selected, ir::Value::createConstantU(2)));
+    read(4, 4, 0x20);
+    builder.opBeginIf(ir::Value::createPredicate(0));
+    builder.opCopy(ir::Value::createRegister(8), ir::Value::createConstantU(0));
+    builder.opEndIf();
+    read(5, 8, 0);
+    builder.opCopy(ir::Value::createRegister(8), ir::Value::createConstantU(0));
+    builder.opCopy(ir::Value::createRegister(8, ir::ScalarType::F32),
+                   ir::Value::createConstantF(1));
+    read(6, 8, 0);
+    builder.opCopy(ir::Value::createRegister(8), builder.opAdd(
+        ir::Value::createConstantU(0xffffffffu), ir::Value::createConstantU(1)));
+    read(7, 8, 0);
+    analyzer::MemoryAnalyzer memory;
+    memory.analyze(module);
+    DecompilerContext context{};
+    context.type = ShaderType::Compute;
+    GuestShaderState state{};
+    ResourceMapping mapping;
+    std::vector<u8> source;
+    codegen::lang::msl::MslEmitter emitter(context, memory, state, source, mapping);
+    check(mapping.uniform_buffer_sizes[1] == 0x38 &&
+              mapping.uniform_buffer_sizes[2] == 0 &&
+              mapping.uniform_buffer_sizes[3] == 0 &&
+              mapping.uniform_buffer_sizes[4] == 0x34 &&
+              mapping.uniform_buffer_sizes[5] == 0 &&
+              mapping.uniform_buffer_sizes[6] == 0 &&
+              mapping.uniform_buffer_sizes[7] == 0,
+          "Direct cbuf reads bound the prefix; indexed reads retain full validation");
+    std::cout << "PASS: constant buffer read extents preserve direct and indexed access bounds\n";
+}
+
 int main() {
     try {
         unsetenv("HYDRA_DISABLE_SHADER_CACHE");
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
         NS_STACK_SCOPED auto device = MTL::CreateSystemDefaultDevice();
         testClearColor(device);
+        testConstantBufferReadSizes();
         testBindlessPredicateTracking();
         testBindlessControlFlowTracking();
         testQueryOnlyTextureType();

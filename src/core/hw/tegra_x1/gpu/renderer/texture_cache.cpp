@@ -164,7 +164,11 @@ void TextureCache::synchronizeStorageWrites(
         return;
     // Texture uploads decode guest bytes on the CPU. Finish the shader's
     // writes before a later lookup can snapshot those bytes.
-    renderer.debugSyncCommandBuffer(command_buffer);
+    {
+        ScopedCheckpointReason reason(command_buffer,
+                                      CheckpointReason::StorageWrite);
+        renderer.debugSyncCommandBuffer(command_buffer);
+    }
     for (const auto& range : ranges)
         invalidateMemory(range);
 }
@@ -726,6 +730,12 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                                        TextureStorage& other_storage) {
     const auto& descriptor = storage.base->getDescriptor();
     const auto& other_descriptor = other_storage.base->getDescriptor();
+    const auto& format = getTextureFormatInfo(descriptor.format);
+    const auto& other_format = getTextureFormatInfo(other_descriptor.format);
+    // Different byte widths have different texel coordinates. Synchronize
+    // their shared guest bytes instead of reporting an unperformed GPU copy.
+    if (format.bytes_per_block != other_format.bytes_per_block)
+        return false;
     const auto copy_range =
         descriptor.getRange().clampedTo(other_descriptor.getRange());
 
@@ -768,9 +778,15 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                 return true;
             }
         }
-        // Same memory layout, but different dimensions (e.g. a padded render
-        // target): copy the overlapping region of a single level
-        if (descriptor.ptr != other_descriptor.ptr ||
+        // Same memory layout, but different dimensions: copy the overlapping
+        // region of a single level. A padded render target starts at the same
+        // address. A level of a mip chain written as a texture of its own (the
+        // small levels are written GOB wide) starts inside the other texture;
+        // that is only copied for uncompressed formats, whose regions need no
+        // block alignment.
+        if ((descriptor.ptr != other_descriptor.ptr &&
+             (isTextureFormatCompressed(descriptor.format) ||
+              isTextureFormatCompressed(other_descriptor.format))) ||
             !calculateLevelAndLayer(descriptor, copy_range.getBegin(), level,
                                     layer) ||
             !calculateLevelAndLayer(other_descriptor, copy_range.getBegin(),
@@ -791,11 +807,15 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
         const MTL::Size size(std::min(static_cast<u32>(dims.width), static_cast<u32>(other_dims.width)),
                              std::min(static_cast<u32>(dims.height), static_cast<u32>(other_dims.height)),
                              std::min(static_cast<u32>(dims.depth), static_cast<u32>(other_dims.depth)));
+        // Layers are only comparable at the same stride
+        const u32 layers =
+            descriptor.layer_size == other_descriptor.layer_size
+                ? std::min(descriptor.layer_count - layer,
+                           other_descriptor.layer_count - other_layer)
+                : 1u;
         storage.base->copyFrom(
             command_buffer, other_storage.base, MTL::Origin(0, 0, 0), other_level,
-            other_layer, MTL::Origin(0, 0, 0), level, layer, size,
-            std::min(descriptor.layer_count - layer,
-                     other_descriptor.layer_count - other_layer));
+            other_layer, MTL::Origin(0, 0, 0), level, layer, size, layers);
         return true;
     }
 
@@ -869,6 +889,9 @@ u32 TextureCache::getDataHash(const ITexture* texture) {
 
 void TextureCache::flushMemory(ICommandBuffer* command_buffer,
                                ztd::Range<uptr> range) {
+    // Whoever flushes is about to read or overwrite the memory in the order of
+    // the command stream: reports queued earlier have to land first
+    renderer.flushReports(command_buffer, range);
     epoch++;
     ::hydra::hot::Scope hot_scope;
     HYDRA_HOT_CALL(*this, texture_cache_flush_memory)(command_buffer, range);
@@ -876,6 +899,8 @@ void TextureCache::flushMemory(ICommandBuffer* command_buffer,
 
 void TextureCache::discardGpuWrites(ICommandBuffer* command_buffer,
                                     ztd::Range<uptr> range) {
+    // The memory is overwritten, a report queued before must not land after
+    renderer.flushReports(command_buffer, range);
     epoch++;
     bool partial = false;
     auto it = entries.upper_bound(range.getBegin());

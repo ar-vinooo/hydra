@@ -193,6 +193,7 @@ struct PixelImap {
 constexpr u32 PIXEL_IMAP_COUNT = 32;
 
 struct DecompilerContext {
+    u64* code_read_size{nullptr};
     std::function<std::optional<u32>(u32, u32)> read_const_word;
     std::map<std::pair<u32, u32>, u32>* branch_constants{nullptr};
     ShaderType type;

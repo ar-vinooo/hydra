@@ -191,8 +191,9 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[0] = waitSynchronization(
             crnt_thread, std::span(sync_objs, static_cast<usize>(num_handles)),
             std::bit_cast<i64>(state.r[3]), tmp_u32);
-        if (std::chrono::steady_clock::now() - wait_start >
-            std::chrono::seconds(2)) {
+        if (state.r[0] != MAKE_RESULT(Svc, Error::Cancelled) &&
+            std::chrono::steady_clock::now() - wait_start >
+                std::chrono::seconds(2)) {
             std::string names;
             for (auto i = 0; i < num_handles; i++)
                 names += fmt::format(
@@ -660,28 +661,26 @@ result_t Kernel::clearEvent(Event* event) {
 
 result_t Kernel::mapSharedMemory(Process* crnt_process, SharedMemory* shmem,
                                  uptr addr, u64 size, MemoryPermission perm) {
+    if (!crnt_process || !shmem)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel,
               "MapSharedMemory called (handle: {}, addr: 0x{:08x}, size: "
               "0x{:08x}, perm: {})",
               shmem->getDebugName(), addr, size, perm);
 
-    shmem->mapToRange(crnt_process->getMmu(),
-                      ztd::Range(addr, static_cast<uptr>(addr + size)), perm);
-
-    return RESULT_SUCCESS;
+    return crnt_process->mapSharedMemory(shmem, addr, size, perm);
 }
 
 result_t Kernel::unmapSharedMemory(Process* crnt_process, SharedMemory* shmem,
                                    uptr addr, u64 size) {
-    (void)shmem;
-
+    if (!crnt_process || !shmem)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel,
               "UnmapSharedMemory called (shmem: {}, addr: 0x{:08x}, size: "
               "0x{:08x})",
               shmem->getDebugName(), addr, size);
 
-    crnt_process->getMmu()->unmap(ztd::Range<vaddr_t>::fromSize(addr, size));
-    return RESULT_SUCCESS;
+    return crnt_process->unmapSharedMemory(shmem, addr, size);
 }
 
 result_t Kernel::createTransferMemory(uptr addr, u64 size,

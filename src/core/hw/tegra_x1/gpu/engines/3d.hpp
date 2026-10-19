@@ -625,8 +625,10 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     const Regs3D& getRegs() const { return regs; }
     // Resolves a binding against the current GPU address space, gathering
     // separate host mappings into owned CPU memory when necessary.
-    ztd::Range<uptr> getConstBuffer(u32 stage_index, u32 slot) const;
-    renderer::BufferView getConstBufferUpload(u32 stage_index, u32 slot);
+    ztd::Range<uptr> getConstBuffer(u32 stage_index, u32 slot,
+                                   u64 required_size = 0) const;
+    renderer::BufferView getConstBufferUpload(u32 stage_index, u32 slot,
+                                             u64 required_size = 0);
     // Conditional rendering applies to draws and clears.
     bool shouldExecute() const;
     const std::vector<u32>& getInlineIndices() const { return inline_indices; }
@@ -750,6 +752,12 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     // HACK
     void resetCounter(const u32 index, const u32 data);
     void setReportSemaphore(const u32 index, const u32 data);
+    // Reports the ZPASS counter without waiting for the GPU
+    void queueCounterReport(u64 address, bool short_query);
+    // Checks that the memory of a report exists and settles what the GPU
+    // wrote there. Returns the host ranges of the report.
+    bool prepareReportWrite(u64 address, usize size,
+                            std::vector<ztd::Range<uptr>>& writes);
 
     void firmwareCall4(const u32 index, const u32 data);
 

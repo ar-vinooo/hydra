@@ -343,7 +343,8 @@ endif ()
 
 option(HYDRA_METAL_CACHE_TESTS "Build Metal binary archive integration tests" OFF)
 if (HYDRA_METAL_CACHE_TESTS)
-    add_executable(hydra-shutdown-tests MACOSX_BUNDLE tests/shutdown_tests.cpp res/images/default_avatar_image.png)
+    add_executable(hydra-shutdown-tests MACOSX_BUNDLE tests/shutdown_tests.cpp
+        tests/shared_memory_lifetime_tests.cpp tests/stage_a_memory_tests.cpp res/images/default_avatar_image.png)
     set_source_files_properties(res/images/default_avatar_image.png PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     target_include_directories(hydra-shutdown-tests PRIVATE src src/ztd/src)
     target_link_libraries(hydra-shutdown-tests PRIVATE hydra-core hydra-common hydra_compile_options)

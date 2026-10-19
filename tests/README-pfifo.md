@@ -4,6 +4,21 @@ The instruction stage remains **open**. Passing the tests below establishes
 specific behavior; it does not establish complete Maxwell/NVN compatibility.
 No game or GUI is launched by these tests.
 
+SharedMemory lifetime continuation (2026-10-19): CPU shared mappings retain
+their kernel object, and their allocations stay pinned through process GPU
+cancellation/drain even after CPU unmap. Python ownership model: 200 programs,
+10,064 steps with actual gated Metal reads; dedicated cleanup tests cover
+active and retired mappings. See [scope and reproduction](README-shared-memory-lifetime.md).
+Early reclamation and concurrent handle-table races remain outside this fix.
+
+Latest fault-policy continuation (2026-10-19): unsupported MEM_OP_D operations,
+unsupported channel methods (including ILLEGAL), engine methods without a
+binding, and B06F-as-engine binding now fault with Hydra error 25 instead of
+silently continuing. See [Python/Metal validation](README-channel-method-reference.md)
+for 352 cases, actual MEMBAR visibility checks and PFIFO tail suppression.
+This rejection policy does not implement the unsupported features or close
+the remaining gates below.
+
 ## Implemented and tested
 
 - GPFIFO submission validates the header, output and complete entry array.
@@ -538,25 +553,23 @@ overlap rejection, unmap restoring sparse, repeated/unknown unmap, FreeSpace
 mismatches and double free, buffers outliving their reservation, automatic
 placement around reservations with reuse, and record splitting.
 
-### Heap backing pinning (resizeHeap)
+### Heap backing (resizeHeap)
 
-`Process::resizeHeap` was the only path that freed host memory under live GPU
-mappings (it unmapped and reallocated the heap, also discarding its contents).
-It now flushes GPU-written textures of the old range, allocates the new block,
-copies the contents, remaps the guest, repoints every live GMMU
-(`GMmu::rebaseHostRange`; mappings past a shrunk end become unmapped,
-write tracking is re-enabled), invalidates the old range in the caches, and
-keeps the old block alive in `retired_heaps` until process cleanup. Queued or
-in-flight work that already holds old pointers therefore reads valid memory.
-`--check-gpu-heap-resize` covers growth, content copy, mapping follow-up,
-shrink, and the retired block staying readable.
+`Process::resizeHeap` used to reallocate and copy the heap, which lost any
+write (guest thread or GPU) that landed in the old block after the copy. The
+heap is now one lazily committed 4 GiB host reservation resized in place, using
+the same slab mechanism as the alias region. The host pointer never changes, so
+there is no copy, GPU mappings and Metal-encoded pointers stay valid on growth,
+and nothing needs retiring. Grown memory is zeroed; on shrink the tail is
+flushed, unmapped from the guest, dropped from every GMMU (`rebaseHostRange`
+with an empty target) and invalidated in the caches. `--check-gpu-heap-resize`
+covers growth, unchanged host pointer, zero tail, GPU mapping follow-up, shrink
+and a writer thread racing 64 resizes without losing a write.
 
-Residual limits: GPU writes performed after the copy but before the repoint
-land in the retired block and are lost (no quiesce; blocking on PFIFO could
-deadlock on a semaphore the stalled CPU would release). Other guest unmap SVCs
-only change the guest page table and keep the host memory alive, so they do not
-dangle; SharedMemory destruction while GPU mapped, and nvmap handle ownership
-across processes, remain unreviewed.
+Residual limits: the writer-race test was not run against the old copying
+implementation as a negative control. Other guest unmap SVCs only change the
+guest page table and keep the host memory alive, so they do not dangle;
+nvmap handle ownership across processes remains unsupported.
 
 ### Subdevice masks and conditional fetch
 
@@ -634,13 +647,16 @@ Selesai dan diuji: binding/isolasi AS, reservasi/freeSpace/unmapBuffer, pinning
 heap, subdevice mask + conditional fetch, reduction semaphore, report terbelah,
 daur ulang syncpoint, batas heap SetHeapSize, ownership nvmap.
 
-Tidak dapat diselesaikan tanpa sumber: INC/DEC reduction, END_SUBDEVICE_MASK
+INC/DEC reduction telah dilanjutkan pada 2026-10-19 dengan batas bukti dan
+tes Python–Metal di [README-semaphore-reduction-reference.md](README-semaphore-reduction-reference.md).
+Masih memerlukan sumber: END_SUBDEVICE_MASK
 (tidak ada di clb06f.h), skip_buffer_refcounting, error code AS_GPU di Switch.
 Ditunda dengan alasan: atribut DeviceShared (hanya terlihat lewat QueryMemory;
 perlu hitungan referensi termasuk remap dan lintas AS), getVaRegions/Modify
 (stub, tanpa sumber), recovery channel setelah fault (tanpa ioctl pendukung di
-sumber yang dibaca), SharedMemory yang dilepas saat ter-map GPU (bug umur objek
-kernel yang lebih luas), FROM_ID per-klien. Validasi gameplay/hardware dan
+sumber yang dibaca), FROM_ID per-klien. SharedMemory kini memiliki mapping refs
+dan retirement backing sampai drain proses; batasnya ada pada catatan 2026-10-19
+di atas. Validasi gameplay/hardware dan
 performa belum ada, maka tahap A **belum boleh dinyatakan tertutup**.
 
 ### Regression: nvmap bound vs NVN big-page mappings (gameplay, 2026-10-18)
@@ -664,3 +680,19 @@ Restoring the strict bound makes the test fail, so it guards this regression.
 Also a lesson recorded: a size-alignment check for MapBufferEx (Switchbrew
 "panic") was tried first and removed, since the required alignment is not
 documented.
+
+## Submission completion follows queued reports (2026-10-19)
+
+The completion callback of a submission (the nvhost fence in
+`Pfifo::threadFunc`) is now registered with `ICommandBuffer::onCompletedChecked`
+instead of a native Metal handler. For a submission that queued ZPASS reports
+(`IRenderer::queueOcclusionReport`) the callbacks run on the renderer's
+completion thread after those reports reached guest memory, so a guest that
+waits for the fence reads final values; for any other submission they still run
+from the Metal completion handler of its last command buffer, unchanged. A
+failed command buffer reports `succeeded == false` (the channel faults with 25,
+as before) and publishes no report. `Pfifo::cancel` waits for the queued
+reports after draining the GPU, and `submitEntry` applies the cache
+invalidations the completion thread queued. Tests: `testReportCallbackOrdering`,
+`testOcclusionReports`, `--check-gpu-process-cancel` and the other PFIFO
+selectors, all with Metal validation.

@@ -93,6 +93,7 @@ void decompileHot(
     const GuestShaderState& state, ShaderBackend& out_backend,
     std::vector<u8>& out_code, ResourceMapping& out_resource_mapping,
     const std::function<std::optional<u32>(u32, u32)>& read_const_word) {
+    out_resource_mapping.code_read_size = 0;
     // Header (compute shaders don't have one)
     ShaderHeader header{};
     if (type != ShaderType::Compute) {
@@ -105,6 +106,8 @@ void decompileHot(
 
     // Context
     DecompilerContext context;
+    u64 code_read_size = 0;
+    context.code_read_size = &code_read_size;
     context.type = type;
     // The header often reports 0 even for shaders that use local memory, so
     // keep a sensible minimum. Compute shaders have no header at all.
@@ -147,6 +150,9 @@ void decompileHot(
                                   .code_offset = static_cast<u64>(state.program_offset) +
                                                  code_stream.getSeek()});
         decoder.decode();
+        if (code_read_size != invalid<u64>())
+            out_resource_mapping.code_read_size = code_read_size +
+                (type == ShaderType::Compute ? 0 : sizeof(ShaderHeader));
     }
 
 #define DUMP_CFG 0

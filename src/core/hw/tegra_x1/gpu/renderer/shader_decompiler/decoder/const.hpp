@@ -276,17 +276,47 @@ inline ir::Value getHalfConstMemory(ir::Builder& builder, u32 slot,
 }
 
 inline ir::Value getFloatCmp(DecoderContext& context, FloatCmpOp op,
-                             ir::Value a, ir::Value b) {
+                             ir::Value a, ir::Value b, bool ftz = false) {
     if (op == FloatCmpOp::F)
         return ir::Value::createConstantB(false);
     if (op == FloatCmpOp::T)
         return ir::Value::createConstantB(true);
-    const auto nan = context.builder.opBitwiseOr(context.builder.opIsNan(a),
-                                                 context.builder.opIsNan(b));
+    // Integer ordering preserves subnormals even on hosts that flush fp32
+    // comparisons. Normalize signed zeros before constructing monotonic keys.
+    auto& builder = context.builder;
+    const auto a_bits = builder.opBitCast(a, ir::ScalarType::U32);
+    const auto b_bits = builder.opBitCast(b, ir::ScalarType::U32);
+    const auto magnitude = [&](ir::Value bits) {
+        return builder.opBitwiseAnd(bits,
+                                    ir::Value::createConstantU(0x7fffffffu));
+    };
+    const auto nan = builder.opBitwiseOr(
+        builder.opCompareGreater(magnitude(a_bits),
+                                 ir::Value::createConstantU(0x7f800000u)),
+        builder.opCompareGreater(magnitude(b_bits),
+                                 ir::Value::createConstantU(0x7f800000u)));
     if (op == FloatCmpOp::Num)
         return context.builder.opNot(nan);
     if (op == FloatCmpOp::Nan)
         return nan;
+
+    const auto key = [&](ir::Value bits) {
+        const auto zero =
+            ftz ? builder.opCompareLess(magnitude(bits),
+                                        ir::Value::createConstantU(0x00800000u))
+                : builder.opCompareEqual(magnitude(bits),
+                                         ir::Value::createConstantU(0u));
+        bits = builder.opSelect(zero, ir::Value::createConstantU(0u), bits);
+        const auto negative = builder.opCompareNotEqual(
+            builder.opBitwiseAnd(bits, ir::Value::createConstantU(0x80000000u)),
+            ir::Value::createConstantU(0u));
+        return builder.opSelect(
+            negative, builder.opBitwiseNot(bits),
+            builder.opBitwiseXor(bits,
+                                 ir::Value::createConstantU(0x80000000u)));
+    };
+    a = key(a_bits);
+    b = key(b_bits);
 
     auto comparison = ir::Value::createConstantB(false);
     switch (op) {

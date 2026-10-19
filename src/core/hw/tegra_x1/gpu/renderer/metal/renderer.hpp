@@ -5,8 +5,10 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_depth_pipeline_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/occlusion.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 
@@ -153,11 +155,20 @@ class Renderer : public IRenderer {
 
     f64 debugSyncCommandBuffer(ICommandBuffer* command_buffer) override;
     bool synchronize(ICommandBuffer* command_buffer) override;
+    bool synchronizeGuestWrites(ICommandBuffer* command_buffer) override;
     void setOcclusionCounterEnabled(bool enabled) override {
-        occlusion_enabled = enabled;
+        occlusion->setEnabled(enabled);
     }
-    void resetOcclusionCounter() override;
-    std::optional<u64> getOcclusionCounter(ICommandBuffer* command_buffer) override;
+    void resetOcclusionCounter() override { occlusion->reset(); }
+    void queueOcclusionReport(ICommandBuffer* command_buffer,
+                              ReportPublisher publish,
+                              std::vector<ztd::Range<uptr>> writes) override;
+    void queueGuestWrite(ICommandBuffer* command_buffer,
+                         std::function<void(bool succeeded)> write,
+                         std::vector<ztd::Range<uptr>> writes) override;
+    void flushReports(ICommandBuffer* command_buffer,
+                      ztd::Range<uptr> range) override;
+    void drainReports() override;
 
     // Compute
     void dispatchCompute(ICommandBuffer* command_buffer,
@@ -191,7 +202,7 @@ class Renderer : public IRenderer {
     void setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
                     u32 index);
     void setStorageBuffer(CommandBuffer* command_buffer, ShaderType shader_type,
-                          u32 index);
+                          u32 index, bool written);
 
   protected:
     // Capture
@@ -211,23 +222,9 @@ class Renderer : public IRenderer {
     std::mutex guest_memory_buffers_mutex;
     std::map<uptr, GuestMemoryBuffer> guest_memory_buffers;
 
-    static constexpr u32 OCCLUSION_PAGE_SIZE = 4096;
-    static constexpr usize MAX_OCCLUSION_PAGES = 128;
-    struct OcclusionPage {
-        std::shared_ptr<MTL::Buffer> buffer;
-        u32 count{0};
-    };
-    std::vector<OcclusionPage> occlusion_pages;
-    // Pages of a reset counter may still be in flight; they return to the
-    // free list only after a checkpoint on this thread waited for them.
-    std::vector<OcclusionPage> retired_occlusion_pages;
-    // Fully zeroed pages: creating a Metal buffer is a kernel call
-    std::vector<std::shared_ptr<MTL::Buffer>> free_occlusion_pages;
-    static constexpr usize MAX_POOLED_OCCLUSION_PAGES = 256;
-    void recycleOcclusionPages(std::vector<OcclusionPage>& pages);
-    u64 occlusion_count{0};
-    bool occlusion_enabled{false};
-    bool occlusion_valid{true};
+    // Work which runs once the GPU finished the command buffer it depends on
+    std::shared_ptr<CompletionQueue> completions;
+    std::unique_ptr<OcclusionCounter> occlusion;
     std::optional<u64> prepareOcclusionQuery(CommandBuffer* command_buffer);
 
     // Caches

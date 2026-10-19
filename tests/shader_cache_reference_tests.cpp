@@ -82,6 +82,7 @@ vertex float4 main_(uint i [[vertex_id]]) {
         descriptor.gpu_addr = address;
         descriptor.code_ptr = reinterpret_cast<uptr>(a.data()); // deliberately stale after remap
         descriptor.state.color_target_data_types[0] = MTL::DataTypeFloat;
+        std::map<ShaderBase*, PipelineBase*> resident_pipelines;
         const auto draw = [&](ShaderBase* fragment) {
             check(fragment != nullptr, "Missing shader");
             PipelineDescriptor pd{};
@@ -91,6 +92,9 @@ vertex float4 main_(uint i [[vertex_id]]) {
             pd.color_target_states[0].write_mask = engines::ColorWriteMask::All;
             auto* pipeline = static_cast<metal::Pipeline*>(renderer.getPipelineCache().find(pd));
             check(pipeline->getPipeline() != nullptr, "Pipeline compilation failed");
+            const auto [previous_pipeline, inserted] = resident_pipelines.emplace(fragment, pipeline);
+            check(inserted || previous_pipeline->second == pipeline,
+                  "An unchanged shader recreated its resident pipeline");
             auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
             auto* att = pass->colorAttachments()->object(0);
             att->setTexture(texture); att->setLoadAction(MTL::LoadActionClear);
@@ -186,6 +190,9 @@ kernel void patch(device ulong* code [[buffer(0)]], constant ulong* words [[buff
                 encoder->setBuffer(buffer, 0, 0);
                 encoder->setBytes(words.data(), sizeof(words), 1);
                 encoder->dispatchThreads(MTL::Size(1, 1, 1), MTL::Size(1, 1, 1));
+                // The kernel writes a buffer which aliases guest memory, like
+                // the storage buffers the engines bind as written
+                static_cast<metal::CommandBuffer*>(commands.get())->noteGuestMemoryWrites();
                 // Not committed by the test: the production invalidate handler
                 // must submit/wait before the CPU translates GPU-written code.
                 tls_crnt_command_buffer = commands.get();
@@ -214,13 +221,60 @@ kernel void patch(device ulong* code [[buffer(0)]], constant ulong* words [[buff
         for (auto* backing : {&a, &b, &c})
             std::copy(saved_code.begin(), saved_code.end(), backing->begin());
         check(cache.find(descriptor) == saved_shader, "A -> B -> A duplicated shader artifacts");
+        const auto saved_pixels = draw(saved_shader);
+        for (u32 iteration = 0; iteration < 64; ++iteration) {
+            for (auto* backing : {&a, &b, &c})
+                (*backing)[0xff00 + iteration] ^= 0x5a;
+            check(cache.find(descriptor) == saved_shader,
+                  "Data after the decoded program duplicated a shader");
+            check(draw(cache.find(descriptor)) == saved_pixels,
+                  "Unrelated tail writes changed Metal pixels");
+        }
+        const auto resources = saved_shader->getDescriptor().resource_mapping;
+        check(resources.code_read_size >= 88 && resources.code_read_size < 0x10000,
+              "Decoded shader prefix was not recorded");
         const auto start = std::chrono::steady_clock::now();
         for (u32 i = 0; i < 1000; ++i)
             check(cache.find(descriptor) == saved_shader, "Warm lookup changed identity");
         std::cout << "Warm shader lookup: "
                   << std::chrono::duration<double, std::micro>(
                          std::chrono::steady_clock::now() - start).count() / 1000
-                  << " us/lookup (full 64 KiB validation)\n";
+                  << " us/lookup (decoded prefix validation)\n";
+        // Changing a compile-time cbuf jump target must select a new artifact
+        // even when no instruction bytes change.
+        std::vector<u64> jump_words(10);
+        jump_words[0] = 3u << 5;
+        jump_words[9] = 0xf;
+        u32 instruction_count = 0;
+        const auto emit_jump = [&](u64 instruction) {
+            if (instruction_count++ % 3 == 0) jump_words.push_back(0);
+            jump_words.push_back(instruction);
+        };
+        emit_jump(0xe21000000007002full | (2ull << 36) | (16ull << 20));
+        for (const u32 color : {0x3e800000u, 0x3f000000u}) {
+            for (u32 reg = 0; reg < 4; ++reg)
+                emit_jump(0x010000000000f000ull | reg | (u64(color) << 20));
+            emit_jump(0xe30000000007000full);
+        }
+        for (auto* backing : {&a, &b, &c}) {
+            std::fill(backing->begin(), backing->end(), 0);
+            std::memcpy(backing->data(), jump_words.data(), jump_words.size() * 8);
+        }
+        u32 target = 96;
+        descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
+            return slot == 2 && word == 4 ? std::optional(target) : std::nullopt;
+        };
+        auto* jump_first = cache.find(descriptor);
+        check(draw(jump_first) == std::array<u32, 4>{0x3e800000, 0x3e800000, 0x3e800000, 0x3e800000},
+              "First cbuf jump target produces its Metal color");
+        target = 152;
+        auto* jump_second = cache.find(descriptor);
+        check(jump_second != jump_first &&
+              draw(jump_second) == std::array<u32, 4>{0x3f000000, 0x3f000000, 0x3f000000, 0x3f000000},
+              "Changed cbuf target invalidates the shader without a code write");
+        target = 96;
+        check(cache.find(descriptor) == jump_first,
+              "Restored cbuf target reuses its resident shader and pipeline");
         tls_crnt_gmmu = nullptr;
         std::cout << "PASS: live shader identities, remaps, invalidation methods, old pipelines and Metal pixels\n";
     } catch (const std::exception& error) {

@@ -209,6 +209,10 @@ void Pfifo::cancel(GMmu& gmmu) {
     // work before the process frees its guest allocations.
     std::unique_ptr<renderer::ICommandBuffer> commands(gpu.getRenderer().createCommandBuffer());
     gpu.getRenderer().debugSyncCommandBuffer(commands.get());
+    // Reports of the process write to its memory once the GPU produced them:
+    // none may be left when the allocations are freed (they are dropped, the
+    // address space is cancelled)
+    gpu.getRenderer().drainReports();
 }
 
 void Pfifo::shutdown() {
@@ -393,23 +397,18 @@ void Pfifo::threadFunc() {
 #endif
                 if (!stop && !entry_list.gmmu->gpuWorkCancelled() &&
                     !yielded && !decode.failed) {
-#ifdef ZTD_PLATFORM_APPLE
-                    if (CONFIG_INSTANCE.getGpuRenderer() == GpuRenderer::Metal) {
-                        static_cast<renderer::metal::CommandBuffer*>(tls_crnt_command_buffer)
-                            ->getCommandBuffer()->addCompletedHandler(
-                                [complete = entry_list.on_complete,
-                                 state = entry_list.decode_state](MTL::CommandBuffer* completed) {
-                                    if (completed->status() == MTL::CommandBufferStatusCompleted &&
-                                        (!state || !state->failed)) {
-                                        if (complete)
-                                            complete();
-                                    } else if (state)
-                                        state->fail(25);
-                                });
-                    } else
-#endif
-                        if (entry_list.on_complete)
-                            tls_crnt_command_buffer->onCompleted(entry_list.on_complete);
+                    // Runs after the reports queued by this submission reached
+                    // guest memory, the guest reads them once the fence is
+                    // reached
+                    tls_crnt_command_buffer->onCompletedChecked(
+                        [complete = entry_list.on_complete,
+                         state = entry_list.decode_state](bool succeeded) {
+                            if (succeeded && (!state || !state->failed)) {
+                                if (complete)
+                                    complete();
+                            } else if (state)
+                                state->fail(25);
+                        });
                 }
                 delete tls_crnt_command_buffer;
                 tls_crnt_command_buffer = nullptr;
@@ -443,8 +442,10 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
     // otherwise it behaves as a NOP entry (dev_pbdma.ref, GP_ENTRY0_FETCH).
     if ((entry.gpu_addr_lo & 1u) != 0 && !state.subdevice_active)
         return true;
-    // CPU writes queued by write tracking must reach the caches first
+    // CPU writes queued by write tracking must reach the caches first, and so
+    // must the guest reports written by the renderer's completion thread
     tls_crnt_gmmu->getMmu()->applyPendingInvalidations();
+    gpu.getRenderer().applyQueuedMemoryInvalidations();
     LOG_DEBUG(
         Gpu,
         "Gpfifo entry (addr lo: {:#x}, addr hi: {:#x}, size: {:#x}, allow "

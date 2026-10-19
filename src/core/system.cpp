@@ -644,9 +644,41 @@ void System::progressFrame(u32 width, u32 height,
                     std::max(frames, 1.0),
                 static_cast<f64>(stats.blit_encoders.exchange(0)) /
                     std::max(frames, 1.0));
-            LOG_INFO(Other, "CHECKPOINTS skipped (nothing in flight): {:.1f}/frame",
-                     static_cast<f64>(stats.checkpoint_skips.exchange(0)) /
-                         std::max(frames, 1.0));
+            {
+                // Waits of the GPU thread for the host GPU, by what asked
+                // for them
+                const auto per_frame = [&](u64 value) {
+                    return static_cast<f64>(value) / std::max(frames, 1.0);
+                };
+                u64 waits = 0;
+                u64 wait_ns = 0;
+                std::string reasons;
+                for (usize i = 0; i < hw::tegra_x1::gpu::CHECKPOINT_REASON_COUNT;
+                     i++) {
+                    const auto count = stats.checkpoint_count[i].exchange(0);
+                    const auto ns = stats.checkpoint_ns[i].exchange(0);
+                    if (count == 0)
+                        continue;
+                    waits += count;
+                    wait_ns += ns;
+                    reasons += fmt::format(
+                        " | {} {:.1f} ({:.2f} ms)",
+                        hw::tegra_x1::gpu::getCheckpointReasonName(
+                            static_cast<hw::tegra_x1::gpu::CheckpointReason>(i)),
+                        per_frame(count), static_cast<f64>(ns) / 1e6 /
+                                              std::max(frames, 1.0));
+                }
+                LOG_INFO(Other,
+                         "CHECKPOINTS waited {:.1f}/frame ({:.2f} ms/frame){} | "
+                         "skipped (nothing in flight) {:.1f}/frame",
+                         per_frame(waits),
+                         static_cast<f64>(wait_ns) / 1e6 / std::max(frames, 1.0),
+                         reasons, per_frame(stats.checkpoint_skips.exchange(0)));
+                LOG_INFO(Other,
+                         "REPORTS: {:.1f} queued/frame, {} forced a wait",
+                         per_frame(stats.reports_queued.exchange(0)),
+                         stats.report_waits.exchange(0));
+            }
             LOG_INFO(Other,
                      "UNIMPLEMENTED draw state: {} MSAA, {} alpha-to-coverage, {} "
                      "alpha-to-one draws",

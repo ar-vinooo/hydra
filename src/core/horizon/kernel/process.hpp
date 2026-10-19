@@ -16,6 +16,8 @@ class IMmu;
 
 namespace hydra::horizon::kernel {
 
+class SharedMemory;
+
 enum class ProcessState {
     Created = 0,
     CreatedAttached = 1,
@@ -51,6 +53,9 @@ class Process : public SynchronizationObject {
     void resizeHeap(u64 size);
     result_t mapPhysicalMemory(vaddr_t addr, u64 size);
     result_t unmapPhysicalMemory(vaddr_t addr, u64 size);
+    result_t mapSharedMemory(SharedMemory* memory, vaddr_t addr, u64 size,
+                             MemoryPermission perm);
+    result_t unmapSharedMemory(SharedMemory* memory, vaddr_t addr, u64 size);
 
     // Thread
     Handle setMainThread(GuestThread* thread) {
@@ -168,7 +173,11 @@ class Process : public SynchronizationObject {
     }
 
     hw::tegra_x1::cpu::IMmu* getMmu() const { return mmu.get(); }
-    hw::tegra_x1::cpu::IMemory* getHeapMemory() const { return heap_mem.get(); }
+    uptr getHeapHostPtr() const { return heap_host_base; }
+    u64 getHeapSize() const {
+        std::scoped_lock lock(heap_mutex);
+        return heap_size;
+    }
     u64 getUsedUserMemorySize() const;
     std::shared_ptr<hw::tegra_x1::gpu::GMmu> createGpuAddressSpace();
 
@@ -192,10 +201,23 @@ class Process : public SynchronizationObject {
     // Memory
     std::vector<std::unique_ptr<hw::tegra_x1::cpu::IMemory>> executable_mems;
     std::unique_ptr<hw::tegra_x1::cpu::IMemory> main_thread_stack_mem;
-    std::unique_ptr<hw::tegra_x1::cpu::IMemory> heap_mem;
-    // Replaced heap blocks stay alive while the GPU may still use them
-    std::mutex retired_mutex;
-    std::vector<std::unique_ptr<hw::tegra_x1::cpu::IMemory>> retired_heaps;
+    // The heap is one lazily committed host reservation that is resized in
+    // place (see resizeHeap), exposed to the CPU in slabs on first use.
+    static constexpr u64 HEAP_SLAB_SIZE = 32ull * 1024 * 1024;
+    mutable std::mutex heap_mutex;
+    uptr heap_host_base{0};
+    u64 heap_size{0};
+    std::map<u64, std::unique_ptr<hw::tegra_x1::cpu::IMemory>> heap_slabs;
+    void releaseHeapMemory();
+    std::mutex shared_memory_mutex;
+    struct SharedMapping {
+        SharedMemory* object;
+        u64 size;
+    };
+    std::map<vaddr_t, SharedMapping> shared_mappings;
+    // CPU unmap does not retire GPU mappings or pointers encoded in Metal.
+    std::map<uptr, std::shared_ptr<hw::tegra_x1::cpu::IMemory>> shared_backings;
+    bool shared_memory_stopped{false};
 
     // Memory mapped with svcMapPhysicalMemory. The whole alias region is
     // backed by one lazily committed host reservation, so memory that is

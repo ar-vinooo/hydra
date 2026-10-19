@@ -65,6 +65,11 @@ inline uint hydra_imul_hi(uint a, uint b, uint signs) {
 // Results saturate to the destination range, NaN converts to 0.
 constexpr std::string_view FLOAT_TO_INT_SOURCE = R"(
 inline uint hydra_f2i(uint src, uint control) {
+    // Only the sign of a subnormal affects integer rounding. Use a normal
+    // magnitude below 0.5 so host FTZ cannot change floor/ceil.
+    if ((control & 0x10u) == 0u && (src & 0x7fffffffu) < 0x00800000u)
+        src = (src & 0x80000000u) |
+              ((src & 0x7fffffu) != 0u && (control & 0x100u) == 0u ? 0x3e800000u : 0u);
     float x = (control & 0x10u) != 0u
                   ? float(as_type<half2>(src)[(control >> 5) & 1u])
                   : as_type<float>(src);
@@ -103,6 +108,9 @@ inline uint hydra_f2i(uint src, uint control) {
 // word. NaN converts to 0x8000000000000000.
 constexpr std::string_view FLOAT_TO_INT64_SOURCE = R"(
 inline uint hydra_f2i64(uint src, uint control) {
+    if ((control & 0x10u) == 0u && (src & 0x7fffffffu) < 0x00800000u)
+        src = (src & 0x80000000u) |
+              ((src & 0x7fffffu) != 0u && (control & 0x100u) == 0u ? 0x3e800000u : 0u);
     float x = (control & 0x10u) != 0u
                   ? float(as_type<half2>(src)[(control >> 5) & 1u])
                   : as_type<float>(src);
@@ -133,119 +141,127 @@ inline uint hydra_f2i64(uint src, uint control) {
 }
 )";
 
-// F2F between F16 and F32. Control: bits 0-1 source and 2-3 destination
-// format (1 F16, 2 F32), 4 upper half of an F16 source, 5-7 integer rounding
-// (1 even, 2 floor, 3 ceil, 4 trunc), 8 abs, 9 neg, 10 saturate, 11 FTZ.
-// F16 results are in the low half, the high half is 0.
+// Bitwise conversion keeps subnormals and rounds once to the destination.
+constexpr std::string_view FLOAT_CONVERT_SOURCE = R"(
+#ifndef HYDRA_FLOAT_CONVERT
+#define HYDRA_FLOAT_CONVERT
+inline uint hydra_float_fraction(uint format) {
+    return format == 1u ? 10u : format == 2u ? 23u : 52u;
+}
+inline uint hydra_float_bias(uint format) {
+    return format == 1u ? 15u : format == 2u ? 127u : 1023u;
+}
+inline ulong hydra_float_shift(ulong value, int shift, uint mode, bool negative) {
+    if (shift <= 0)
+        return value << uint(-shift);
+    const ulong result = shift < 64 ? value >> uint(shift) : 0ul;
+    const ulong remainder = shift < 64 ? value & ((1ul << uint(shift)) - 1ul) : value;
+    bool increment;
+    if (mode == 0u) {
+        const ulong halfway = shift <= 64 ? 1ul << uint(shift - 1) : 0ul;
+        increment = shift <= 64 && (remainder > halfway ||
+                    (remainder == halfway && (result & 1ul) != 0ul));
+    } else {
+        increment = remainder != 0ul && ((mode == 1u && negative) || (mode == 2u && !negative));
+    }
+    return result + (increment ? 1ul : 0ul);
+}
+// flags: abs, neg, sat, FTZ. integer_mode: none/even/floor/ceil/trunc.
+inline ulong hydra_float_convert(ulong bits, uint source, uint destination,
+                                 uint mode, uint integer_mode, uint flags) {
+    const uint sf = hydra_float_fraction(source), sb = hydra_float_bias(source);
+    const uint df = hydra_float_fraction(destination), db = hydra_float_bias(destination);
+    const ulong source_sign = (2ul * (ulong(sb) + 1ul)) << sf;
+    if ((flags & 1u) != 0u) bits &= ~source_sign;
+    if ((flags & 2u) != 0u) bits ^= source_sign;
+    const bool negative = (bits & source_sign) != 0ul;
+    const ulong sign = negative ? (2ul * (ulong(db) + 1ul)) << df : 0ul;
+    const uint exponent = uint((bits >> sf) & ulong(2u * sb + 1u));
+    ulong mantissa = bits & ((1ul << sf) - 1ul);
+    const bool sat = (flags & 4u) != 0u;
+    const bool ftz = (flags & 8u) != 0u;
+    ulong result = sign;
+    if (exponent == 2u * sb + 1u) {
+        result |= ulong(2u * db + 1u) << df;
+        if (mantissa != 0ul) {
+            if (source == destination) result |= mantissa;
+            else {
+                result |= sf > df ? mantissa >> (sf - df) : mantissa << (df - sf);
+                result |= 1ul << (df - 1u);
+            }
+        }
+        if (sat) return mantissa != 0ul || negative ? 0ul : ulong(db) << df;
+        return result;
+    }
+    if (exponent != 0u) mantissa |= 1ul << sf;
+    if (ftz && source == 2u && exponent == 0u) mantissa = 0ul;
+    int power = int(exponent == 0u ? 1u : exponent) - int(sb) - int(sf);
+    if (integer_mode != 0u && power < 0) {
+        mantissa = hydra_float_shift(mantissa, -power, integer_mode - 1u, negative);
+        power = 0;
+    }
+    if (mantissa != 0ul) {
+        int top = 63 - int(clz(mantissa)) + power;
+        const int minimum = 1 - int(db);
+        const int step = max(top, minimum) - int(df);
+        ulong significand = hydra_float_shift(mantissa, step - power, mode, negative);
+        if (top < minimum) {
+            result |= significand;
+        } else {
+            if (significand == (1ul << (df + 1u))) {
+                significand >>= 1;
+                top++;
+            }
+            if (top > int(db)) {
+                const bool infinity = mode == 0u || (mode == 1u && negative) || (mode == 2u && !negative);
+                result |= infinity ? ulong(2u * db + 1u) << df
+                                   : (ulong(2u * db) << df) | ((1ul << df) - 1ul);
+            } else {
+                result |= (ulong(top + int(db)) << df) | (significand & ((1ul << df) - 1ul));
+            }
+        }
+    }
+    if (sat) {
+        if (negative) return 0ul;
+        result = min(result, ulong(db) << df);
+    }
+    if (ftz && destination == 2u && (result & 0x7f800000ul) == 0ul)
+        result &= 0x80000000ul;
+    return result;
+}
+#endif
+)";
+
+// F16/F32: source 0-1, destination 2-3, upper half 4, integer rounding
+// 5-7, abs 8, neg 9, sat 10, FTZ 11, precision rounding 12-13.
 constexpr std::string_view FLOAT_TO_FLOAT_SOURCE = R"(
 inline uint hydra_f2f(uint src, uint control) {
-    float x = (control & 3u) == 1u
-                  ? float(as_type<half2>(src)[(control >> 4) & 1u])
-                  : as_type<float>(src);
-    if ((control & 0x800u) != 0u && fabs(x) < 1.17549435e-38f)
-        x = copysign(0.0f, x);
-    if ((control & 0x100u) != 0u)
-        x = fabs(x);
-    if ((control & 0x200u) != 0u)
-        x = -x;
-    switch ((control >> 5) & 7u) {
-    case 1u: x = rint(x); break;
-    case 2u: x = floor(x); break;
-    case 3u: x = ceil(x); break;
-    case 4u: x = trunc(x); break;
-    default: break;
-    }
-    if ((control & 0x400u) != 0u)
-        x = clamp(x, 0.0f, 1.0f);
-    if (((control >> 2) & 3u) == 1u)
-        return uint(as_type<ushort>(half(x)));
-    return as_type<uint>(x);
+    const uint source = control & 3u;
+    const ulong bits = source == 1u ? (src >> (((control >> 4) & 1u) * 16u)) & 0xffffu : src;
+    return uint(hydra_float_convert(bits, source, (control >> 2) & 3u,
+        (control >> 12) & 3u, (control >> 5) & 7u, (control >> 8) & 15u));
 }
 )";
 
-// Double (lo, hi words) to F32 or F16, rounding to nearest even. Control:
-// bit 0 abs, 1 neg, 2 saturate, 3-4 destination format (1 F16, 2 F32).
+// F64 -> F16/F32: abs 0, neg 1, sat 2, destination 3-4,
+// rounding 5-6, FTZ 7.
 constexpr std::string_view F64_TO_F32_SOURCE = R"(
 inline uint hydra_f64_to_f32(uint lo, uint hi, uint control) {
-    if ((control & 1u) != 0u)
-        hi &= 0x7fffffffu;
-    if ((control & 2u) != 0u)
-        hi ^= 0x80000000u;
-    const uint sign = hi & 0x80000000u;
-    const int exponent = int((hi >> 20) & 0x7ffu);
-    const ulong mantissa = (ulong(hi & 0xfffffu) << 32) | ulong(lo);
-    uint bits;
-    if (exponent == 0x7ff) {
-        bits = sign | 0x7f800000u | (mantissa != 0ul ? 0x400000u : 0u);
-    } else if (exponent == 0) {
-        bits = sign;
-    } else {
-        const int e = exponent - 1023 + 127;
-        // Subnormal results lose the bits below the smallest exponent
-        const uint shift = e > 0 ? 29u : 29u + uint(min(1 - e, 64));
-        if (e >= 255) {
-            bits = sign | 0x7f800000u;
-        } else if (shift >= 64u) {
-            bits = sign;
-        } else {
-            const ulong m = mantissa | (1ul << 52);
-            uint result = uint(m >> shift);
-            const ulong remainder = m & ((1ul << shift) - 1ul);
-            const ulong halfway = 1ul << (shift - 1u);
-            if (remainder > halfway ||
-                (remainder == halfway && (result & 1u) != 0u))
-                result++;
-            // The implicit bit of a normal result (or a rounding carry out of
-            // it) lands in the exponent
-            if (e > 0)
-                result += (uint(e) << 23) - 0x800000u;
-            bits = sign | min(result, 0x7f800000u);
-        }
-    }
-    float x = as_type<float>(bits);
-    if ((control & 4u) != 0u)
-        x = clamp(x, 0.0f, 1.0f);
-    if (((control >> 3) & 3u) == 1u)
-        return uint(as_type<ushort>(half(x)));
-    return as_type<uint>(x);
+    return uint(hydra_float_convert(ulong(lo) | (ulong(hi) << 32), 3u,
+        (control >> 3) & 3u, (control >> 5) & 3u, 0u,
+        (control & 7u) | ((control >> 4) & 8u)));
 }
 )";
 
-// F32 or F16 to a double (exact). Control: bits 0-1 source format (1 F16,
-// 2 F32), 2 upper half of an F16 source, 3 abs, 4 neg, 5 high word.
+// F16/F32 -> F64: source 0-1, upper half 2, abs 3, neg 4, high word 5,
+// FTZ 6, sat 7.
 constexpr std::string_view F32_TO_F64_SOURCE = R"(
 inline uint hydra_f32_to_f64(uint src, uint control) {
-    float x = (control & 3u) == 1u
-                  ? float(as_type<half2>(src)[(control >> 2) & 1u])
-                  : as_type<float>(src);
-    uint bits = as_type<uint>(x);
-    if ((control & 8u) != 0u)
-        bits &= 0x7fffffffu;
-    if ((control & 0x10u) != 0u)
-        bits ^= 0x80000000u;
-    const uint sign = bits & 0x80000000u;
-    const uint exponent = (bits >> 23) & 0xffu;
-    uint mantissa = bits & 0x7fffffu;
-    uint hi;
-    uint lo;
-    if (exponent == 0xffu) {
-        hi = sign | 0x7ff00000u | (mantissa >> 3) | (mantissa != 0u ? 0x80000u : 0u);
-        lo = mantissa << 29;
-    } else if (exponent == 0u && mantissa == 0u) {
-        hi = sign;
-        lo = 0u;
-    } else {
-        int e = int(exponent) - 127 + 1023;
-        if (exponent == 0u) {
-            // Normalize a subnormal input
-            const uint leading = 31u - clz(mantissa);
-            e = int(leading) - 149 + 1023;
-            mantissa = (mantissa << (23u - leading)) & 0x7fffffu;
-        }
-        hi = sign | (uint(e) << 20) | (mantissa >> 3);
-        lo = mantissa << 29;
-    }
-    return (control & 0x20u) != 0u ? hi : lo;
+    const uint source = control & 3u;
+    const ulong bits = source == 1u ? (src >> (((control >> 2) & 1u) * 16u)) & 0xffffu : src;
+    const uint flags = ((control >> 3) & 3u) | ((control >> 5) & 4u) | ((control >> 3) & 8u);
+    const ulong result = hydra_float_convert(bits, source, 3u, 0u, 0u, flags);
+    return (control & 0x20u) != 0u ? uint(result >> 32) : uint(result);
 }
 )";
 
@@ -282,9 +298,49 @@ inline uint hydra_i2i(uint src, uint control) {
 }
 )";
 
+// Round the integer directly to the destination precision, avoiding a second
+// rounding through host float for F16 or F64 results.
+constexpr std::string_view INTEGER_FLOAT_BITS_SOURCE = R"(
+#ifndef HYDRA_INTEGER_FLOAT_BITS
+#define HYDRA_INTEGER_FLOAT_BITS
+inline ulong hydra_integer_float_bits(ulong magnitude, bool negative,
+                                     uint fraction_bits, uint bias, uint mode) {
+    const ulong sign = negative ? (2ul * (ulong(bias) + 1ul)) << fraction_bits : 0ul;
+    if (magnitude == 0ul)
+        return sign;
+    uint exponent = 63u - uint(clz(magnitude));
+    const uint shift = exponent > fraction_bits ? exponent - fraction_bits : 0u;
+    ulong significand = magnitude >> shift;
+    if (shift != 0u) {
+        const ulong remainder = magnitude & ((1ul << shift) - 1ul);
+        const ulong halfway = 1ul << (shift - 1u);
+        const bool increment = mode == 0u
+            ? remainder > halfway || (remainder == halfway && (significand & 1ul) != 0ul)
+            : remainder != 0ul && ((mode == 1u && negative) || (mode == 2u && !negative));
+        significand += increment ? 1ul : 0ul;
+        if (significand == (1ul << (fraction_bits + 1u))) {
+            significand >>= 1;
+            exponent++;
+        }
+    } else {
+        significand <<= fraction_bits - exponent;
+    }
+    const ulong fraction_mask = (1ul << fraction_bits) - 1ul;
+    const uint exponent_limit = 2u * bias + 1u;
+    if (exponent + bias >= exponent_limit) {
+        const bool infinity = mode == 0u || (mode == 1u && negative) || (mode == 2u && !negative);
+        return sign | (infinity ? ulong(exponent_limit) << fraction_bits
+                                : (ulong(exponent_limit - 1u) << fraction_bits) | fraction_mask);
+    }
+    return sign | (ulong(exponent + bias) << fraction_bits) | (significand & fraction_mask);
+}
+#endif
+)";
+
 // I2F. Control: bits 0-1 source width (0 8-bit, 1 16-bit, 2 32-bit),
 // 2 signed, 3-4 destination format (1 F16, 2 F32), 5-6 source byte, 7 abs,
-// 8 neg. The most negative value keeps its sign under abs and neg.
+// 8 neg, 10-11 rounding (RN/RM/RP/RZ). The most negative value keeps its
+// sign under abs and neg.
 constexpr std::string_view INT_TO_FLOAT_SOURCE = R"(
 inline uint hydra_i2f(uint src, uint control) {
     const uint bits = 8u << min(control & 3u, 2u);
@@ -297,12 +353,13 @@ inline uint hydra_i2f(uint src, uint control) {
     const bool absolute = (control & 0x80u) != 0u;
     if (absolute && is_signed && !is_least)
         value = as_type<uint>(abs(as_type<int>(value)));
-    float x = is_signed ? float(as_type<int>(value)) : float(value);
+    bool negative = is_signed && as_type<int>(value) < 0;
+    const ulong magnitude = negative ? ulong(0u - value) : ulong(value);
     if ((control & 0x100u) != 0u && (absolute || !is_least))
-        x = -x;
-    if (((control >> 3) & 3u) == 1u)
-        return uint(as_type<ushort>(half(x)));
-    return as_type<uint>(x);
+        negative = !negative;
+    const bool half_result = ((control >> 3) & 3u) == 1u;
+    return uint(hydra_integer_float_bits(magnitude, negative,
+                half_result ? 10u : 23u, half_result ? 15u : 127u, (control >> 10) & 3u));
 }
 )";
 
@@ -316,12 +373,14 @@ inline uint hydra_i2f64(uint lo, uint hi, uint control) {
     long signed_value = as_type<long>(value);
     if (absolute && is_signed && !is_least && signed_value < 0)
         signed_value = -signed_value;
-    float x = is_signed ? float(signed_value) : float(value);
+    bool negative = is_signed && signed_value < 0;
+    const ulong raw = is_signed ? as_type<ulong>(signed_value) : value;
+    const ulong magnitude = negative ? 0ul - raw : raw;
     if ((control & 0x100u) != 0u && (absolute || !is_least))
-        x = -x;
-    if (((control >> 3) & 3u) == 1u)
-        return uint(as_type<ushort>(half(x)));
-    return as_type<uint>(x);
+        negative = !negative;
+    const bool half_result = ((control >> 3) & 3u) == 1u;
+    return uint(hydra_integer_float_bits(magnitude, negative,
+                half_result ? 10u : 23u, half_result ? 15u : 127u, (control >> 10) & 3u));
 }
 )";
 
@@ -710,36 +769,19 @@ inline uint hydra_f64_from_int(uint lo, uint hi, uint control) {
     }
     if ((control & 0x100u) != 0u && (absolute || !is_least))
         negative = !negative;
-    ulong result = negative ? HYDRA_F64_SIGN : 0ul;
-    if (magnitude != 0ul) {
-        const int msb = 63 - int(clz(magnitude));
-        ulong mantissa;
-        int exponent = msb;
-        if (msb <= 52) {
-            mantissa = magnitude << uint(52 - msb);
-        } else {
-            const uint shift = uint(msb - 52);
-            mantissa = magnitude >> shift;
-            const ulong rest = magnitude & ((1ul << shift) - 1ul);
-            const ulong halfway = 1ul << (shift - 1u);
-            if (rest > halfway || (rest == halfway && (mantissa & 1ul) != 0ul)) mantissa += 1ul;
-            if (mantissa == (1ul << 53)) {
-                mantissa >>= 1;
-                exponent += 1;
-            }
-        }
-        result |= (ulong(exponent + 1023) << 52) | (mantissa & HYDRA_F64_FRAC);
-    }
+    const ulong result = hydra_integer_float_bits(magnitude, negative, 52u, 1023u,
+                                                  (control >> 10) & 3u);
     return hydra_f64_word(result, (control >> 9) & 1u);
 }
 )";
 
+// F64 integer rounding: mode 0-2, abs 3, neg 4, high word 5, sat 6.
 constexpr std::string_view F64_ROUND_SOURCE = R"(
 inline uint hydra_f64_round(uint lo, uint hi, uint control) {
-    ulong x = ulong(lo) | (ulong(hi) << 32);
-    if ((control & 8u) != 0u) x &= ~HYDRA_F64_SIGN;
-    if ((control & 0x10u) != 0u) x ^= HYDRA_F64_SIGN;
-    return hydra_f64_word(hydra_f64_round_int(x, control & 7u), (control >> 5) & 1u);
+    const uint flags = ((control >> 3) & 3u) | ((control >> 4) & 4u);
+    const ulong result = hydra_float_convert(ulong(lo) | (ulong(hi) << 32),
+        3u, 3u, 0u, control & 7u, flags);
+    return (control & 0x20u) != 0u ? uint(result >> 32) : uint(result);
 }
 )";
 
@@ -814,18 +856,33 @@ std::string_view getIntrinsicSource(ir::Intrinsic intrinsic) {
         return FLOAT_TO_INT_SOURCE;
     case ir::Intrinsic::FloatToInt64:
         return FLOAT_TO_INT64_SOURCE;
-    case ir::Intrinsic::FloatToFloat:
-        return FLOAT_TO_FLOAT_SOURCE;
-    case ir::Intrinsic::F64ToF32:
-        return F64_TO_F32_SOURCE;
-    case ir::Intrinsic::F32ToF64:
-        return F32_TO_F64_SOURCE;
+    case ir::Intrinsic::FloatToFloat: {
+        static const std::string source =
+            std::string(FLOAT_CONVERT_SOURCE) + std::string(FLOAT_TO_FLOAT_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F64ToF32: {
+        static const std::string source =
+            std::string(FLOAT_CONVERT_SOURCE) + std::string(F64_TO_F32_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::F32ToF64: {
+        static const std::string source =
+            std::string(FLOAT_CONVERT_SOURCE) + std::string(F32_TO_F64_SOURCE);
+        return source;
+    }
     case ir::Intrinsic::IntToInt:
         return INT_TO_INT_SOURCE;
-    case ir::Intrinsic::IntToFloat:
-        return INT_TO_FLOAT_SOURCE;
-    case ir::Intrinsic::Int64ToFloat:
-        return INT64_TO_FLOAT_SOURCE;
+    case ir::Intrinsic::IntToFloat: {
+        static const std::string source =
+            std::string(INTEGER_FLOAT_BITS_SOURCE) + std::string(INT_TO_FLOAT_SOURCE);
+        return source;
+    }
+    case ir::Intrinsic::Int64ToFloat: {
+        static const std::string source =
+            std::string(INTEGER_FLOAT_BITS_SOURCE) + std::string(INT64_TO_FLOAT_SOURCE);
+        return source;
+    }
     case ir::Intrinsic::Rcp64H:
         return RCP64H_SOURCE;
     case ir::Intrinsic::Rsq64H:
@@ -854,12 +911,13 @@ std::string_view getIntrinsicSource(ir::Intrinsic intrinsic) {
     }
     case ir::Intrinsic::F64FromInt: {
         static const std::string source =
-            std::string(F64_SOURCE) + std::string(F64_FROM_INT_SOURCE);
+            std::string(F64_SOURCE) + std::string(INTEGER_FLOAT_BITS_SOURCE) +
+            std::string(F64_FROM_INT_SOURCE);
         return source;
     }
     case ir::Intrinsic::F64Round: {
         static const std::string source =
-            std::string(F64_SOURCE) + std::string(F64_ROUND_SOURCE);
+            std::string(FLOAT_CONVERT_SOURCE) + std::string(F64_ROUND_SOURCE);
         return source;
     }
     }

@@ -1,3 +1,5 @@
+#include "core/horizon/services/socket/resolver/resolver.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl_gpu.hpp"
 #include "core/horizon/kernel/hipc/client_session.hpp"
 #include "core/horizon/kernel/hipc/cmif.hpp"
 #include "core/horizon/kernel/host_thread.hpp"
@@ -22,9 +24,11 @@
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include <atomic>
 #include <future>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 using namespace hydra;
 using namespace hydra::horizon;
 class Ui final : public ui::IHandler {
@@ -547,6 +551,49 @@ void testAudioMixUpdates(System& system, kernel::Process* process) {
     }
 }
 
+void testResolverAndCharacteristics(System& system, kernel::Process* process) {
+    namespace hipc = kernel::hipc;
+    services::socket::resolver::IResolver resolver;
+    for (const u32 command : {6u, 12u}) {
+        alignas(16) std::array<u8, 0x2000> tls{};
+        const auto request = hipc::makeRequest(tls.data(),
+            {.type = static_cast<u32>(hipc::cmif::CommandType::Request),
+             .num_data_words = 16});
+        auto* data = hipc::cmif::alignDataStart(request.data_words);
+        const hipc::cmif::InHeader input{hipc::cmif::IN_HEADER_MAGIC, 0, command, 0};
+        std::memcpy(data, &input, sizeof(input));
+        resolver.handleRequest(system, process, reinterpret_cast<uptr>(tls.data()));
+        const auto response = hipc::parseRequest(tls.data());
+        const auto* output_data = reinterpret_cast<const u8*>(
+            hipc::cmif::alignDataStart(response.data.data_words));
+        hipc::cmif::OutHeader header;
+        std::memcpy(&header, output_data, sizeof(header));
+        check(header.result == RESULT_SUCCESS, "Resolver IPC command was handled");
+        std::array<u32, 4> values{};
+        std::memcpy(values.data(), output_data + sizeof(header), command == 6 ? 12 : 16);
+        check(command == 6 ? values[0] == 11 && values[1] == 2 && values[2] == 0
+                          : values == std::array<u32, 4>{0, 2, 2, 11},
+              "Offline resolver returns ABI-ordered errors and no addresses");
+    }
+    namespace nv = services::nvdrv;
+    nv::ioctl::NvHostCtrlGpu control;
+    std::array<u8, 16> input{}, output{};
+    nv::ioctl::GpuCharacteristics characteristics{};
+    nv::ioctl::IoctlContext context{
+        .system = system, .process = process,
+        .in_stream = ztd::io::MemoryStream(input),
+        .out_stream = ztd::io::MemoryStream(output),
+        .out_buffer_stream = ztd::io::MemoryStream(
+            std::span(reinterpret_cast<u8*>(&characteristics), sizeof(characteristics)))};
+    check(control.ioctl3(context, 0x47, 5) == nv::NvResult::Success,
+          "Inline characteristics accepts a zero ignored address");
+    u64 size;
+    std::memcpy(&size, output.data(), sizeof(size));
+    check(size == 0xa0 && characteristics.arch == 0x120 && characteristics.impl == 0xb,
+          "Characteristics returns the GM20B payload and full required size");
+    std::cout << "PASS: resolver IPC failures and inline GPU characteristics\n";
+}
+
 void testAddOnContentEvent(System& system, kernel::Process* process) {
     namespace hipc = kernel::hipc;
     std::array<hydra::Handle, 2> handles;
@@ -937,6 +984,19 @@ void testGpuAddressSpaceLifecycle(System& system, kernel::Process* process) {
     u64 address = 0x80000000;
     check(map(FIXED, 0, PAGE, address) == nv::NvResult::Success && bytes(address) == twelve,
           "Map a buffer inside a sparse reservation");
+    {
+        constexpr u32 MODIFY = 0x100;
+        u64 modify_address = 0x80000000;
+        u64 shifted = 0x80010000, other_size = 0x80000000;
+        check(map(FIXED | MODIFY, 0, PAGE, modify_address) == nv::NvResult::Success &&
+                  modify_address == 0x80000000 && bytes(address) == twelve,
+              "Modify of an existing mapping succeeds and leaves it unchanged");
+        modify_address = 0x80000000;
+        check(map(FIXED | MODIFY, 0, 0x8000, other_size) == nv::NvResult::Success &&
+                  map(FIXED | MODIFY, 0, PAGE, shifted) == nv::NvResult::BadParameter &&
+                  bytes(address) == twelve,
+              "Modify accepts ranges inside an existing mapping and rejects unmapped addresses");
+    }
     check(unmap(0x80000000) == nv::NvResult::Success && bytes(0x80000000) == zeros &&
               bytes(0x8000fff0) == zeros,
           "UnmapBuffer removes the mapping and restores sparse zeros");
@@ -965,7 +1025,7 @@ void testGpuAddressSpaceLifecycle(System& system, kernel::Process* process) {
 
     // Automatic placement respects reservations and reuses released space.
     u64 fixed_low = 0x20000;
-    check(alloc(1, 0x20000, FIXED, fixed_low, fixed_low) == nv::NvResult::Success,
+    check(alloc(2, PAGE, FIXED, fixed_low, fixed_low) == nv::NvResult::Success,
           "Reserve the start of the automatic range");
     u64 auto_a = 0, auto_b = 0;
     check(map(0, 0, PAGE, auto_a) == nv::NvResult::Success && auto_a >= 0x40000 &&
@@ -1016,6 +1076,13 @@ void testGpuAddressSpaceLifecycle(System& system, kernel::Process* process) {
               "The rounded-up padding past the nvmap needs no guest backing");
         check(unmap(0xb0300000) == nv::NvResult::Success, "Unmap the padded mapping");
         check(unmap(0xb0000000) == nv::NvResult::Success, "Unmap the rounded mapping");
+        u64 replaced = 0xb0400000;
+        check(map(FIXED, 0, 0x10000, replaced) == nv::NvResult::Success &&
+                  bytes(replaced + 0x9000).size() == 16 &&
+                  small_map(guest + 0x18000, 0, 0x10000, replaced) == nv::NvResult::Success &&
+                  bytes(replaced).size() == 16 && bytes(replaced + 0x9000).empty(),
+              "Replacing a full mapping with padded backing removes the old mapped tail");
+        check(unmap(replaced) == nv::NvResult::Success, "Unmap the replacement regression fixture");
     }
 
     // SET_TIMESLICE (0xc004481d) is accepted and echoes the value
@@ -1069,7 +1136,7 @@ void testGpuBackingFollowsHeapResize(System& system, kernel::Process* process) {
 
     process->resizeHeap(0x20000);
     const auto heap = kernel::HEAP_REGION.getBegin();
-    auto* first = reinterpret_cast<u8*>(process->getHeapMemory()->getPtr());
+    auto* first = reinterpret_cast<u8*>(process->getHeapHostPtr());
     std::memset(first, 0x21, 0x20000);
     const auto handle = system.getGpu().createMap(0x20000).value();
     check(system.getGpu().allocateMap(handle, heap, true), "Allocate heap nvmap");
@@ -1083,25 +1150,46 @@ void testGpuBackingFollowsHeapResize(System& system, kernel::Process* process) {
               gmmu.readMappedBytes(0x70000000, 16) == std::vector<u8>(16, 0x21),
           "Map the guest heap into the GPU address space");
 
-    const auto old_ptr = process->getHeapMemory()->getPtr();
+    const auto old_ptr = process->getHeapHostPtr();
     process->resizeHeap(0x40000);
-    auto* grown = reinterpret_cast<u8*>(process->getHeapMemory()->getPtr());
-    check(process->getHeapMemory()->getPtr() != old_ptr && grown[0x1fff0] == 0x21 &&
-              grown[0x20000] == 0,
-          "Growing the heap keeps its contents and zero-fills the new tail");
-    // The old block must still be valid memory for work that was queued before
-    check(first[0x100] == 0x21, "Replaced heap memory stays alive while pinned");
+    auto* grown = reinterpret_cast<u8*>(process->getHeapHostPtr());
+    check(process->getHeapHostPtr() == old_ptr && process->getHeapSize() == 0x40000 &&
+              grown[0x1fff0] == 0x21 && grown[0x20000] == 0 && grown[0x3ffff] == 0,
+          "Growing the heap keeps its host pointer and contents and zero-fills the new tail");
     grown[0x10] = 0x66;
     check(gmmu.readMappedBytes(0x70000010, 1) == std::vector<u8>(1, 0x66) &&
               gmmu.readMappedBytes(0x70000000, 16)[1] == 0x21,
-          "GPU mapping follows the heap to its new host memory");
+          "GPU mapping stays valid across growth");
+
+    // Writers that run while the heap is resized must not lose a single write
+    {
+        std::memset(grown + 0x100, 0, sizeof(u64));
+        std::atomic<bool> stop{false};
+        std::atomic<u64> counter{0};
+        std::thread writer([&] {
+            auto* word = reinterpret_cast<std::atomic<u64>*>(grown + 0x100);
+            while (!stop.load(std::memory_order_acquire)) {
+                word->fetch_add(1, std::memory_order_relaxed);
+                counter.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        for (u64 i = 0; i < 64; i++)
+            process->resizeHeap(0x40000 + (i % 8) * 0x20000);
+        stop.store(true, std::memory_order_release);
+        writer.join();
+        check(reinterpret_cast<std::atomic<u64>*>(
+                  reinterpret_cast<u8*>(process->getHeapHostPtr()) + 0x100)->load() ==
+                  counter.load(),
+              "Writes racing with heap resizes are never lost");
+        process->resizeHeap(0x40000);
+    }
 
     process->resizeHeap(0x10000);
     check(gmmu.readMappedBytes(0x70000000, 16).size() == 16 &&
               gmmu.readMappedBytes(0x70010000, 16).empty(),
           "Shrinking drops GPU mappings beyond the new heap size");
     check(system.getGpu().freeMap(handle), "Release heap nvmap");
-    std::cout << "PASS: GPU backing follows and pins heap memory across resize\n";
+    std::cout << "PASS: GPU backing and writes survive in-place heap resize\n";
 }
 
 void testGpuAddressSpaceBinding(System& system, kernel::Process* process) {
@@ -1739,6 +1827,11 @@ void testPfifoDecode(System& system, kernel::Process* process) {
     submit_channel(channel_a, native_second, gpu::GpfifoFlags::HwFormat, true);
     check(a_engine.getReg(0xd0b) == 0x123 && a_engine.getReg(0xd0c) == 0x234,
           "Ioctl1 and inline ioctl2 execute native HW_FORMAT words including flags 0x4");
+    submit_channel(channel_a, native_first, gpu::GpfifoFlags::SkipBufferRefcounting |
+                   gpu::GpfifoFlags::FenceGet);
+    submit_channel(channel_a, native_second, gpu::GpfifoFlags::SkipBufferRefcounting, true);
+    check(a_engine.getReg(0xd0b) == 0x123 && a_engine.getReg(0xd0c) == 0x234,
+          "SKIP_BUFFER_REFCOUNTING keeps command execution and completion-fence behavior");
     auto level_entry = entry(map_words(channel_first), 2);
     level_entry.level_subroutine = 1;
     auto level_tail = entry(map_words(channel_last), 1);
@@ -2068,6 +2161,34 @@ void testChannelFaults(System& system, kernel::Process* process) {
     check(skipped_ready.wait_for(std::chrono::seconds(2)) == std::future_status::ready &&
               !inactive_state->failed,
           "A conditional entry is skipped as a NOP while the subdevice is inactive");
+    for (const auto& [method, argument] : std::array<std::pair<u32, u32>, 5>{
+             {{0xd, 0}, {1, 0}, {0x1f, 0}, {0, 0xb06f}, {0x40, 0}}}) {
+        auto rejected = std::make_shared<gpu::PfifoDecodeState>();
+        std::atomic<bool> completed{false};
+        // Keep a valid binding before an unsupported rebind. The unbound
+        // engine case intentionally starts without one.
+        const u32 header = (1u << 29) | (1u << 16);
+        std::vector<u32> commands;
+        if (method != 0x40)
+            commands = {header, 0xb197};
+        commands.insert(commands.end(), {header | method, argument,
+                                        header, 0xb197,
+                                        header | 0xd01, 0x12345678});
+        constexpr uptr COMMANDS = 0x6200000;
+        process->getGMmu().map(COMMANDS, {
+            reinterpret_cast<uptr>(commands.data()), commands.size() * sizeof(u32)});
+        const auto rejected_entry = std::bit_cast<gpu::GpfifoEntry>(
+            static_cast<u64>(COMMANDS) | (static_cast<u64>(commands.size()) << 42));
+        check(system.getGpu().getPfifo().submitEntries(process->getGMmu(), {&rejected_entry, 1},
+                  gpu::GpfifoFlags::None, [&] { completed = true; }, {}, rejected),
+              "Queue an unsupported method followed by a valid engine write");
+        check(system.getGpu().getPfifo().waitForCompletion(
+                  system.getGpu().getPfifo().getSubmittedCount()) &&
+                  rejected->failed && rejected->error == 25 && !completed &&
+                  rejected->context && rejected->context->three_d.getReg(0xd01) == 0,
+              "Unsupported methods fault before the tail and cannot publish successful completion");
+        process->getGMmu().unmap(COMMANDS);
+    }
     while (system.getGpu().getVideoSyncpoints().allocate()) {}
     nv::ioctl::NvHostGpu exhausted;
     bindTestChannel(exhausted, process);
@@ -2174,9 +2295,39 @@ void testSemaphoreShutdown(System& system, kernel::Process* process) {
     std::cout << "PASS: semaphore acquire cancellation and no execution after shutdown\n";
 }
 
+int runSharedMemoryCases(System& system, const char* input_path, const char* output_path);
+void testSharedMemoryCleanup(System& system);
+void testStageAMemory(System& system);
+int runDeviceSharedCases(System& system, const char* input_path, const char* output_path);
+
 int main(int argc, char** argv) {
     try {
         Ui ui;
+        if (argc == 2 && std::string_view(argv[1]) == "--check-stage-a-memory") {
+            System system(ui);
+            testStageAMemory(system);
+            return 0;
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--device-shared-cases") {
+            System system(ui);
+            return runDeviceSharedCases(system, argv[2], argv[3]);
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-shared-memory-lifetime") {
+            System system(ui);
+            testSharedMemoryCleanup(system);
+            return 0;
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--shared-memory-cases") {
+            System system(ui);
+            return runSharedMemoryCases(system, argv[2], argv[3]);
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-log-services") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("Log service regression test");
+            testResolverAndCharacteristics(system, process);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--check-channel-faults") {
             System system(ui);
             auto* process = system.getOs().getKernel().getProcessManager()

@@ -52,6 +52,7 @@ class NvHostAsGpu : public FdBase {
   private:
     NvResult ioctlUnchecked(IoctlContext& context, u32 type, u32 nr);
     NvResult ensureAddressSpace(kernel::Process* process);
+    NvResult queryVaRegions(IoctlContext& context, bool separate);
     // Ioctls
     NvResult bindChannel(IoctlContext& context, u32 fd_id);
     NvResult allocSpace(kernel::Process* process, u32 pages, u32 page_size,
@@ -65,10 +66,6 @@ class NvHostAsGpu : public FdBase {
                          Handle nvmap_handle, [[maybe_unused]] u32 reserved,
                          u64 buffer_offset, u64 mapping_size,
                          InOutSingle<gpu_vaddr_t> inout_addr);
-    NvResult getVaRegions(gpu_vaddr_t buffer_addr,
-                          InOutSingle<u32> inout_buffer_size,
-                          [[maybe_unused]] u32 reserved,
-                          std::array<VaRegion, 2>* out_va_regions);
     NvResult allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
                        u32 big_page_size, [[maybe_unused]] u32 reserved,
                        u64 va_range_start, u64 va_range_end,
@@ -89,25 +86,17 @@ class NvHostAsGpu : public FdBase {
     };
     // AllocSpace reservations, by GPU address
     std::map<gpu_vaddr_t, Reservation> reservations;
-    u64 as_va_begin{0};
-    u64 as_va_end{0}; // 0: unbounded
+    u64 as_va_begin{hw::tegra_x1::gpu::GPU_PAGE_SIZE};
+    u64 as_va_end{1ull << 40};
+    u64 as_va_split{0}; // 0: unified allocator
 
     bool vaRangeUsed(gpu_vaddr_t begin, u64 size, gpu_vaddr_t& next) const;
-    std::optional<gpu_vaddr_t> findFreeVa(u64 size, u64 alignment) const;
+    std::optional<gpu_vaddr_t> findFreeVa(u64 size, u64 alignment, u64 page_size = 0) const;
     // Forgets (splitting as needed) the buffer mappings overlapping a range
     void dropMappingRecords(gpu_vaddr_t begin, gpu_vaddr_t end);
     // Sparse zero backing for the part of a range inside sparse reservations
     void restoreSparse(gpu_vaddr_t begin, gpu_vaddr_t end);
 
-  public:
-    NvResult getVaRegions3(gpu_vaddr_t buffer_addr,
-                           InOutSingle<u32> inout_buffer_size,
-                           [[maybe_unused]] u32 reserved) {
-        // TODO: does this just throw the out_va_regions away?
-        std::array<VaRegion, 2> out_va_regions;
-        return getVaRegions(buffer_addr, inout_buffer_size, reserved,
-                            &out_va_regions);
-    }
 };
 
 } // namespace hydra::horizon::services::nvdrv::ioctl

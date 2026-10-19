@@ -554,10 +554,14 @@ constexpr u32 getConstantTextureHandle(u32 index) {
 }
 
 struct ResourceMapping {
+    // Validated decoder prefix, including the graphics header; zero is unknown.
+    u64 code_read_size{0};
     u32 fragment_output_mask{0xffffffffu};
     // Constant-buffer jump table words used to enumerate indirect branches.
     std::map<std::pair<u32, u32>, u32> branch_constants;
     u32 uniform_buffers[CONST_BUFFER_BINDING_COUNT];
+    // Required prefix for direct reads; zero requires the complete binding.
+    u64 uniform_buffer_sizes[CONST_BUFFER_BINDING_COUNT]{};
     // Global memory buffers. Their address and size are read from the NVN
     // descriptor at `cbuf_offset` in constant buffer `cbuf_slot`
     struct StorageBuffer {

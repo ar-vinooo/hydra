@@ -112,6 +112,11 @@ class ShaderCache
         std::vector<std::pair<std::shared_ptr<const std::vector<u8>>, u64>> history;
     };
     std::map<std::tuple<uptr, uptr, engines::ShaderStage>, SourceVersion> sources;
+    struct CompiledVersion {
+        std::shared_ptr<const std::vector<u8>> bytes;
+        ShaderBase* shader;
+    };
+    std::map<std::vector<u32>, std::vector<CompiledVersion>> compiled_versions;
     u64 next_code_revision{0};
     std::atomic<u64> instruction_epoch{0};
     std::mutex lookup_mutex;

@@ -67,10 +67,6 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
         case 0xb0b5:
             engine = &context.copy;
             break;
-        case 0xb06f:
-            // TODO: implement
-            LOG_NOT_IMPLEMENTED(Gpu, "GPFIFO engine");
-            break;
         default:
             // Keep the current binding: dropping the engine would discard
             // every later method sent to this subchannel
@@ -107,6 +103,8 @@ void Gpu::subchannelMethod(u32 subchannel, u32 method, u32 arg) {
     if (!engine) {
         ONCE(LOG_WARN(Gpu, "No engine bound to subchannel {} (method: {:#x})",
                       subchannel, method));
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
         return;
     }
 
@@ -165,7 +163,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     constexpr u32 SYNCPOINT_OPERATION = 0x1d;
     constexpr u32 WAIT_FOR_IDLE = 0x1e;
     auto& puller_regs = channelContext().puller_regs;
-    puller_regs[method] = arg;
+    if (method != 0x14)
+        puller_regs[method] = arg;
 
     const auto semaphore_address = [&] {
         return (static_cast<u64>(puller_regs[SEMAPHORE_ADDRESS_HIGH] & 0xff)
@@ -189,7 +188,12 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                 tls_crnt_decode_state->fail(31);
             return nullptr;
         }
-        return reinterpret_cast<u8*>(as->ptr + (address - base));
+        auto* ptr = reinterpret_cast<u8*>(as->ptr + (address - base));
+        // A report queued earlier in the stream may still be on its way here
+        renderer->flushReports(
+            tls_crnt_command_buffer,
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
+        return ptr;
     };
     const auto invalidate = [&](u8* ptr, u64 size) {
         renderer->invalidateMemory(
@@ -198,9 +202,15 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     const auto wait_for_gpu = [&] {
         if (tls_crnt_command_buffer == nullptr)
             return true;
+        renderer::ScopedCheckpointReason reason(
+            tls_crnt_command_buffer, CheckpointReason::PullerOther);
         const bool succeeded = renderer->synchronize(tls_crnt_command_buffer);
         if (!succeeded && tls_crnt_decode_state)
             tls_crnt_decode_state->fail(25);
+        // What the guest is told next (semaphore, reference) includes the
+        // reports of the work it waited for
+        if (succeeded)
+            renderer->drainReports();
         return succeeded;
     };
     // Submit prior work before polling: it may produce the semaphore itself.
@@ -224,6 +234,10 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     };
 
     switch (method) {
+    case 0x14: // NVB06F_SET_REFERENCE (byte offset 0x50)
+        if (wait_for_gpu())
+            puller_regs[method] = arg;
+        break;
     case 0x2: // NVB06F_NOP
         break;
     case SEMAPHORE_ADDRESS_HIGH:
@@ -254,6 +268,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             break;
         default:
             ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Memory operation {:#x}", arg >> 27));
+            if (tls_crnt_decode_state)
+                tls_crnt_decode_state->fail(25);
             break;
         }
         break;
@@ -288,9 +304,10 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
         case 0x10: { // REDUCTION: atomic read-modify-write of the 4-byte word
             const u32 reduction = (arg >> 27) & 0xf;
             const bool is_signed = (arg & (1u << 31)) == 0; // FORMAT_SIGNED = 0
-            // INC/DEC wrap semantics are not defined by clb06f.h
-            if (reduction > 5) {
-                ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Semaphore reduction {}", reduction));
+            // Maxwell defines INC/DEC encodings; NVIDIA's Turing dev_pbdma
+            // table supplies their unsigned-only equations (see test README).
+            if (reduction > 7 || (reduction >= 6 && is_signed)) {
+                ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Semaphore reduction {} (signed={})", reduction, is_signed));
                 if (tls_crnt_decode_state)
                     tls_crnt_decode_state->fail(25);
                 break;
@@ -316,6 +333,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                 case 2: value = old ^ payload; break;
                 case 3: value = old & payload; break;
                 case 4: value = old | payload; break;
+                case 6: value = old >= payload ? 0u : old + 1; break;
+                case 7: value = old == 0 || old > payload ? payload : old - 1; break;
                 default: value = old + payload; break; // ADD wraps
                 }
                 if (word.compare_exchange_weak(old, value, std::memory_order_acq_rel))
@@ -379,6 +398,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     }
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Channel method {:#x}", method));
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
         break;
     }
 }
@@ -403,6 +424,8 @@ Gpu::getTexture(renderer::ICommandBuffer* command_buffer, cpu::IMmu* mmu,
         ONCE(LOG_WARN(Gpu, "Present buffer refers to a missing nvmap"));
         return nullptr;
     }
+    if ((*map)->owner_identity && (!mmu || (*map)->owner_identity != mmu->getDeviceMappings()))
+        return nullptr;
     // TODO: pin the nvmap across queued/acquired buffer ownership.
     const auto guest_address = (*map)->addr + plane.offset;
     if (!mmu || guest_address < (*map)->addr)

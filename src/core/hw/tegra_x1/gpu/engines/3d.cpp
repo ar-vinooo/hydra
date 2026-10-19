@@ -304,12 +304,17 @@ void invalidateShaderInstructions(Gpu& gpu, u32 flags) {
     // clb197.h / clb1c0.h: INSTRUCTION bit 0. Data/constant cache behavior
     // remains handled by the buffer/texture coherence paths, not this epoch.
     if ((flags & 1u) == 0) return;
-    // Translation reads code on the CPU. A conservative checkpoint makes
-    // earlier GPU code writes visible, also for the NO_WFI method variant.
-    if (tls_crnt_command_buffer &&
-        !gpu.getRenderer().synchronize(tls_crnt_command_buffer)) {
-        if (tls_crnt_decode_state) tls_crnt_decode_state->fail(25);
-        return;
+    // Translation reads code on the CPU. Commands which may write guest memory
+    // (kernels, storage buffers) have to finish first, also for the NO_WFI
+    // method variant. Plain draws cannot write shader code, so they are not
+    // waited for: NVN invalidates many times per frame.
+    if (tls_crnt_command_buffer) {
+        renderer::ScopedCheckpointReason reason(tls_crnt_command_buffer,
+                                      CheckpointReason::ShaderInvalidate);
+        if (!gpu.getRenderer().synchronizeGuestWrites(tls_crnt_command_buffer)) {
+            if (tls_crnt_decode_state) tls_crnt_decode_state->fail(25);
+            return;
+        }
     }
     gpu.getRenderer().getShaderCache().invalidateInstructions();
 }
@@ -329,15 +334,19 @@ void ThreeD::incrementSyncPoint(u32 index, u32 arg) {
             tls_crnt_decode_state->fail(25);
         return;
     }
-    // Conservatively wait for both stream-out and ROP completion. Metal shared
-    // buffer writes are visible to the CPU after this checkpoint.
-    if (tls_crnt_command_buffer &&
-        !gpu.getRenderer().synchronize(tls_crnt_command_buffer)) {
-        if (tls_crnt_decode_state)
-            tls_crnt_decode_state->fail(25);
+    // Reached once the GPU completed the preceding work (stream-out and ROP
+    // both, conservatively), after the reports queued before it
+    if (tls_crnt_command_buffer == nullptr) {
+        syncpoints.complete(id, 1);
         return;
     }
-    syncpoints.complete(id, 1);
+    gpu.getRenderer().queueGuestWrite(
+        tls_crnt_command_buffer,
+        [syncpoints = gpu.shareVideoSyncpoints(), id](bool succeeded) {
+            if (succeeded)
+                syncpoints->complete(id, 1);
+        },
+        {});
 }
 
 ThreeD::ThreeD(Gpu& gpu_) : gpu{gpu_}, macro_driver{createMacroDriver(*this)} {
@@ -437,7 +446,8 @@ bool ThreeD::shouldExecute() const {
         return true;
     }
 
-    // Reports have already published completion-ordered guest data.
+    // The comparison data comes from reports, which reach guest memory when
+    // the GPU finished them
     const u64 address = (static_cast<u64>(regs_raw[0x554] & 0xff) << 32) |
                         regs_raw[0x555];
     std::array<u32, 6> compare{};
@@ -454,9 +464,14 @@ bool ThreeD::shouldExecute() const {
         }
         const auto bytes = std::min<u64>(sizeof(compare) - offset,
                                           as->size - (address + offset - base));
-        std::memcpy(data + offset,
-                    reinterpret_cast<const void*>(as->ptr + address + offset - base),
-                    bytes);
+        const auto source = as->ptr + address + offset - base;
+        {
+            renderer::ScopedCheckpointReason reason(tls_crnt_command_buffer,
+                                          CheckpointReason::ConditionalRender);
+            gpu.getRenderer().flushReports(
+                tls_crnt_command_buffer, ztd::Range<uptr>::fromSize(source, bytes));
+        }
+        std::memcpy(data + offset, reinterpret_cast<const void*>(source), bytes);
         offset += bytes;
     }
     switch (mode) {
@@ -863,6 +878,191 @@ void ThreeD::resetCounter(const u32 index, const u32 data) {
         gpu.getRenderer().resetOcclusionCounter();
 }
 
+namespace {
+
+// Host memory of a 4 or 16 byte report, which may span several mappings
+struct ReportSpan {
+    u8* ptr;
+    usize offset;
+    usize size;
+};
+
+struct ReportSpans {
+    std::array<ReportSpan, 16> spans{};
+    usize count{0};
+};
+
+// Fails if any part of the report is unmapped
+std::optional<ReportSpans> resolveReportSpans(GMmu& gmmu, u64 address,
+                                              usize size, bool warn) {
+    ReportSpans report;
+    usize offset = 0;
+    while (offset < size) {
+        uptr base;
+        const auto as = gmmu.findAddr(address + offset, base);
+        if (!as || as->ptr == 0) {
+            if (warn)
+                ONCE(LOG_WARN(Engines, "Report to unmapped GPU address {:#x}",
+                              address));
+            return std::nullopt;
+        }
+        const auto bytes = std::min<u64>(size - offset,
+                                          as->size - (address + offset - base));
+        report.spans[report.count++] = {
+            reinterpret_cast<u8*>(as->ptr + address + offset - base), offset,
+            static_cast<usize>(bytes)};
+        offset += bytes;
+    }
+    return report;
+}
+
+ztd::Range<uptr> getReportSpanRange(const ReportSpan& span) {
+    return ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(span.ptr),
+                                      span.size);
+}
+
+// The timestamp goes first and the result last, a reader which sees the
+// result sees the timestamp too
+void writeReport(const ReportSpans& report, bool short_query, u64 value) {
+    const auto write = [&](usize begin, const void* data, usize bytes) {
+        for (usize i = 0; i < report.count; i++) {
+            const auto& span = report.spans[i];
+            const auto first = std::max(begin, span.offset);
+            const auto end = std::min(begin + bytes, span.offset + span.size);
+            if (first < end)
+                std::memcpy(span.ptr + first - span.offset,
+                            static_cast<const u8*>(data) + first - begin,
+                            end - first);
+        }
+    };
+    if (!short_query) {
+        const auto timestamp = getGpuTimestamp();
+        write(8, &timestamp, sizeof(timestamp));
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    write(0, &value, short_query ? sizeof(u32) : sizeof(u64));
+}
+
+// The reductions of the report semaphore methods (bits 9-11), on a word
+u32 reduceReportWord(u32 operation, bool is_signed, u32 old, u32 payload) {
+    switch (operation) {
+    case 0:
+        return old + payload;
+    case 1:
+        return is_signed ? static_cast<u32>(std::min(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::min(old, payload);
+    case 2:
+        return is_signed ? static_cast<u32>(std::max(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::max(old, payload);
+    case 3:
+        return old >= payload ? 0u : old + 1;
+    case 4:
+        return (old == 0 || old > payload) ? payload : old - 1;
+    case 5:
+        return old & payload;
+    case 6:
+        return old | payload;
+    default:
+        return old ^ payload;
+    }
+}
+
+// Where a report goes. It is kept until the GPU produced it, so the mapping
+// is resolved then, like the GPU would, and the address space stays alive for
+// it. The caches belong to the GPU thread: they are told through its queue.
+struct ReportDestination {
+    renderer::IRenderer* renderer;
+    GMmu* gmmu;
+    std::shared_ptr<GMmu> owner;
+    u64 address;
+    usize size;
+    bool short_query;
+
+    // None when the memory is gone or the process stopped
+    std::optional<ReportSpans> resolve() const {
+        if (gmmu->gpuWorkCancelled())
+            return std::nullopt;
+        auto report = resolveReportSpans(*gmmu, address, size, false);
+        if (!report)
+            ONCE(LOG_WARN(Engines,
+                          "Report destination {:#x} was unmapped before the "
+                          "GPU produced it",
+                          address));
+        return report;
+    }
+    void write(u64 value) const {
+        const auto report = resolve();
+        if (!report)
+            return;
+        writeReport(*report, short_query, value);
+        for (usize i = 0; i < report->count; i++)
+            renderer->queueMemoryInvalidation(getReportSpanRange(report->spans[i]));
+    }
+    // Atomic read-modify-write of the first word, no timestamp
+    void reduce(u32 operation, bool is_signed, u32 payload) const {
+        const auto report = resolve();
+        if (!report)
+            return;
+        if (report->spans[0].size < sizeof(u32)) {
+            ONCE(LOG_WARN(Engines, "Report reduction at {:#x} spans two mappings",
+                          address));
+            return;
+        }
+        std::atomic_ref<u32> word(*reinterpret_cast<u32*>(report->spans[0].ptr));
+        u32 old = word.load(std::memory_order_relaxed);
+        while (!word.compare_exchange_weak(
+            old, reduceReportWord(operation, is_signed, old, payload),
+            std::memory_order_acq_rel)) {
+        }
+        renderer->queueMemoryInvalidation(ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(report->spans[0].ptr), sizeof(u32)));
+    }
+};
+
+} // namespace
+
+bool ThreeD::prepareReportWrite(u64 address, usize size,
+                                std::vector<ztd::Range<uptr>>& writes) {
+    // The memory has to be there now, what is written is only known later
+    const auto report = resolveReportSpans(*tls_crnt_gmmu, address, size, true);
+    if (!report)
+        return false;
+    writes.reserve(report->count);
+    // GPU written textures in the memory reach it before the report does,
+    // they would overwrite it otherwise. This also waits for reports queued
+    // earlier to the same memory.
+    auto& cache = gpu.getRenderer().getTextureCache();
+    std::scoped_lock lock(cache.getMutex());
+    for (usize i = 0; i < report->count; i++) {
+        writes.push_back(getReportSpanRange(report->spans[i]));
+        cache.flushMemory(tls_crnt_command_buffer, writes.back());
+    }
+    return true;
+}
+
+void ThreeD::queueCounterReport(u64 address, bool short_query) {
+    const usize size = short_query ? 4 : 16;
+    std::vector<ztd::Range<uptr>> writes;
+    if (!prepareReportWrite(address, size, writes))
+        return;
+    const ReportDestination destination{
+        &gpu.getRenderer(), tls_crnt_gmmu,
+        tls_crnt_decode_state ? tls_crnt_decode_state->address_space
+                              : std::shared_ptr<GMmu>{},
+        address, size, short_query};
+    // The queue calls this on a thread of its own, once the GPU produced the
+    // result. A failed submission has no result.
+    gpu.getRenderer().queueOcclusionReport(
+        tls_crnt_command_buffer,
+        [destination](std::optional<u64> value) {
+            if (value)
+                destination.write(*value);
+        },
+        std::move(writes));
+}
+
 void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
     // Query control word
     const u32 operation = extractBits(data, 0, 2);
@@ -905,6 +1105,16 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
             return;
         }
         auto* word = reinterpret_cast<u32*>(as->ptr + semaphore_address - base);
+        {
+            // A report queued earlier in the stream may release it; its
+            // submission has to be committed for that
+            renderer::ScopedCheckpointReason reason(tls_crnt_command_buffer,
+                                          CheckpointReason::SemaphoreAcquire);
+            gpu.getRenderer().flushReports(
+                tls_crnt_command_buffer,
+                ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(word),
+                                           sizeof(u32)));
+        }
         const u32 payload = regs.report_semaphore_payload;
         const bool greater_equal = extractBits(data, 16, 1) != 0;
         const auto start = std::chrono::steady_clock::now();
@@ -932,12 +1142,8 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
             break;
         case 0x2:  // ZPassPixelCount
         case 0x15: // ZPassPixelCount64
-            if (const auto count = gpu.getRenderer().getOcclusionCounter(
-                    tls_crnt_command_buffer))
-                value = *count;
-            else
-                return;
-            break;
+            queueCounterReport(semaphore_address, short_query);
+            return;
         default:
             value = 0;
             break;
@@ -948,114 +1154,37 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
         return;
     }
 
-    // Counters already synchronized while reading their visibility buffers.
-    const bool counter = operation == 2 &&
-                         (counter_type == 0x2 || counter_type == 0x15);
-    if (!counter && !gpu.getRenderer().synchronize(tls_crnt_command_buffer))
-        return;
-
-    struct Span {
-        u8* ptr;
-        usize offset;
-        usize size;
-    };
-    std::array<Span, 16> spans{};
-    usize span_count = 0;
+    // The value reaches memory once the preceding GPU work completed, which
+    // the GPU thread does not wait for
     const usize size = short_query ? 4 : 16;
-    const u64 address = semaphore_address;
-    usize offset = 0;
-    while (offset < size) {
-        uptr base;
-        const auto as = tls_crnt_gmmu->findAddr(address + offset, base);
-        if (!as || as->ptr == 0) {
-            ONCE(LOG_WARN(Engines, "Report to unmapped GPU address {:#x}", address));
-            return;
-        }
-        const auto bytes = std::min<u64>(size - offset,
-                                          as->size - (address + offset - base));
-        spans[span_count++] = {
-            reinterpret_cast<u8*>(as->ptr + address + offset - base),
-            offset, static_cast<usize>(bytes)};
-        offset += bytes;
-    }
-    {
-        auto& cache = gpu.getRenderer().getTextureCache();
-        std::scoped_lock lock(cache.getMutex());
-        for (usize i = 0; i < span_count; i++)
-            cache.flushMemory(tls_crnt_command_buffer,
-                              ztd::Range<uptr>::fromSize(
-                                  reinterpret_cast<uptr>(spans[i].ptr), spans[i].size));
-    }
+    std::vector<ztd::Range<uptr>> writes;
+    if (!prepareReportWrite(semaphore_address, size, writes))
+        return;
+    const ReportDestination destination{
+        &gpu.getRenderer(), tls_crnt_gmmu,
+        tls_crnt_decode_state ? tls_crnt_decode_state->address_space
+                              : std::shared_ptr<GMmu>{},
+        semaphore_address, size, short_query};
     if (reduction) {
-        // Atomic read-modify-write of the first word, no timestamp
         const u32 payload = regs.report_semaphore_payload;
         const u32 reduction_op = static_cast<u32>(extractBits(data, 9, 3));
         const bool is_signed = extractBits(data, 17, 2) == 1;
-        std::atomic_ref<u32> word(*reinterpret_cast<u32*>(spans[0].ptr));
-        u32 old = word.load(std::memory_order_relaxed);
-        while (true) {
-            u32 next;
-            switch (reduction_op) {
-            case 0:
-                next = old + payload;
-                break;
-            case 1:
-                next = is_signed ? static_cast<u32>(std::min(
-                                       static_cast<i32>(old),
-                                       static_cast<i32>(payload)))
-                                 : std::min(old, payload);
-                break;
-            case 2:
-                next = is_signed ? static_cast<u32>(std::max(
-                                       static_cast<i32>(old),
-                                       static_cast<i32>(payload)))
-                                 : std::max(old, payload);
-                break;
-            case 3:
-                next = old >= payload ? 0u : old + 1;
-                break;
-            case 4:
-                next = (old == 0 || old > payload) ? payload : old - 1;
-                break;
-            case 5:
-                next = old & payload;
-                break;
-            case 6:
-                next = old | payload;
-                break;
-            default:
-                next = old ^ payload;
-                break;
-            }
-            if (word.compare_exchange_weak(old, next,
-                                           std::memory_order_acq_rel))
-                break;
-        }
-        gpu.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
-            reinterpret_cast<uptr>(spans[0].ptr), sizeof(u32)));
+        gpu.getRenderer().queueGuestWrite(
+            tls_crnt_command_buffer,
+            [destination, reduction_op, is_signed, payload](bool succeeded) {
+                if (succeeded)
+                    destination.reduce(reduction_op, is_signed, payload);
+            },
+            std::move(writes));
         return;
     }
-    const auto write = [&](usize begin, const void* data, usize bytes) {
-        for (usize i = 0; i < span_count; i++) {
-            const auto& span = spans[i];
-            const auto first = std::max(begin, span.offset);
-            const auto end = std::min(begin + bytes, span.offset + span.size);
-            if (first < end)
-                std::memcpy(span.ptr + first - span.offset,
-                            static_cast<const u8*>(data) + first - begin,
-                            end - first);
-        }
-    };
-    if (!short_query) {
-        const auto timestamp = getGpuTimestamp();
-        write(8, &timestamp, sizeof(timestamp));
-    }
-    // Publish the result after its timestamp and preceding GPU work.
-    std::atomic_thread_fence(std::memory_order_release);
-    write(0, &value, short_query ? sizeof(u32) : sizeof(u64));
-    for (usize i = 0; i < span_count; i++)
-        gpu.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
-            reinterpret_cast<uptr>(spans[i].ptr), spans[i].size));
+    gpu.getRenderer().queueGuestWrite(
+        tls_crnt_command_buffer,
+        [destination, value](bool succeeded) {
+            if (succeeded)
+                destination.write(value);
+        },
+        std::move(writes));
 }
 
 void ThreeD::firmwareCall4(const u32 index, const u32 data) {
@@ -1604,7 +1733,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     descriptor.read_const_word = [&](u32 slot, u32 word) -> std::optional<u32> {
         if (slot >= CONST_BUFFER_BINDING_COUNT)
             return std::nullopt;
-        const auto range = getConstBuffer(static_cast<u32>(stage) - 1, slot);
+        const auto range = getConstBuffer(static_cast<u32>(stage) - 1, slot,
+                                          (u64(word) + 1) * sizeof(u32));
         if (range.getBegin() == 0 || word >= range.getSize() / sizeof(u32))
             return std::nullopt;
         u32 value;
@@ -1722,7 +1852,7 @@ renderer::PipelineBase* ThreeD::getPipeline() {
 
     // DEBUG: report enabled stages that are not supported
     for (const auto stage : {ShaderStage::VertexA, ShaderStage::TessCtrl,
-                             ShaderStage::TessEval, ShaderStage::Geometry}) {
+                             ShaderStage::TessEval}) {
         const auto& program = regs.shader_programs[static_cast<usize>(stage)];
         if (!program.config.enable)
             continue;
@@ -2342,9 +2472,23 @@ void ThreeD::configureShaderStage(
             continue;
 
         // TODO: analyze the shader to get the max possible size
-        const auto buffer = getConstBufferUpload(stage_index, i);
+        const auto buffer = getConstBufferUpload(
+            stage_index, i, resource_mapping.uniform_buffer_sizes[i]);
         if (!buffer.isValid()) {
-            LOG_WARN(Engines, "Uniform buffer at index {} is not bound", index);
+            static thread_local u64 failures = 0;
+            static const bool verbose =
+                std::getenv("HYDRA_LOG_UNBOUND_UNIFORMS") != nullptr;
+            ++failures;
+            if (verbose || failures <= 32 || (failures & 0xffffu) == 0) {
+                const auto range = bound_const_buffers[stage_index][i];
+                LOG_WARN(Engines,
+                         "Uniform buffer unavailable: stage={} slot={} binding={} "
+                         "gpu={:#x}+{:#x} shader={:#x} ({} failures)",
+                         stage_index, i, index, range.getBegin(), range.getSize(),
+                         static_cast<u64>(regs.shader_program_region) +
+                             regs.shader_programs[static_cast<usize>(stage)].offset,
+                         failures);
+            }
             continue;
         }
         gpu.getRenderer().bindUniformBuffer(buffer, shader_type, index);
@@ -2354,7 +2498,8 @@ void ThreeD::configureShaderStage(
     gpu.getRenderer().unbindStorageBuffers(shader_type);
     for (const auto& storage : resource_mapping.storage_buffers) {
         const auto range = resolveStorageBuffer(
-            getConstBuffer(stage_index, storage.cbuf_slot),
+            getConstBuffer(stage_index, storage.cbuf_slot,
+                           u64(storage.cbuf_offset) + 12),
             storage.cbuf_offset);
         if (!range) {
             ONCE(LOG_WARN(Engines,
@@ -2632,7 +2777,8 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
             if (mapping.uniform_buffers[i] == invalid<u32>() ||
                 i == regs.bindless_texture_const_buffer_slot)
                 continue;
-            const auto range = getConstBuffer(stage_index, i);
+            const auto range = getConstBuffer(stage_index, i,
+                                              mapping.uniform_buffer_sizes[i]);
             if (range.getBegin() == 0x0) {
                 str += fmt::format("    {} c{}: NOT BOUND\n",
                                    stage == ShaderStage::VertexB ? "VS" : "FS",
@@ -2840,22 +2986,41 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
     }
 }
 
-ztd::Range<uptr> ThreeD::getConstBuffer(u32 stage_index, u32 slot) const {
+ztd::Range<uptr> ThreeD::getConstBuffer(u32 stage_index, u32 slot,
+                                      u64 required_size) const {
     if (stage_index >= static_cast<u32>(ShaderStage::Count) - 1 ||
         slot >= CONST_BUFFER_BINDING_COUNT || tls_crnt_gmmu == nullptr)
         return {};
     // Bindings retain GPU addresses: remapping or rebasing the heap must be
     // visible without another BIND_GROUP_CONSTANT_BUFFER method.
-    const auto range = bound_const_buffers[stage_index][slot];
+    auto range = bound_const_buffers[stage_index][slot];
     if (range.getSize() == 0 || range.getEnd() < range.getBegin())
         return {};
+    // The selector can advertise 64 KiB for constants appended to a much
+    // smaller shader allocation. Validate the bytes the consumer reads.
+    if (required_size != 0) {
+        if (required_size > range.getSize())
+            return {};
+        range = ztd::Range<uptr>::fromSize(range.getBegin(), required_size);
+    }
     uptr host_begin = 0;
     bool contiguous = true;
     for (uptr address = range.getBegin(); address < range.getEnd();) {
         uptr base;
         const auto mapping = tls_crnt_gmmu->findAddr(address, base);
-        if (!mapping || mapping->ptr == 0)
+        if (!mapping || mapping->ptr == 0) {
+            static const bool trace =
+                std::getenv("HYDRA_TRACE_CONST_BUFFERS") != nullptr;
+            static thread_local u32 reports = 0;
+            if (trace && reports++ < 64)
+                LOG_WARN(Engines,
+                         "Constant buffer mapping failure: stage={} slot={} "
+                         "gpu={:#x}+{:#x} at={:#x} mapped={} base={:#x} size={:#x}",
+                         stage_index, slot, range.getBegin(), range.getSize(),
+                         address, mapping.has_value(), mapping ? base : 0u,
+                         mapping ? mapping->size : 0u);
             return {};
+        }
         const auto offset = address - base;
         const auto ptr = mapping->ptr + offset;
         if (address == range.getBegin())
@@ -2886,8 +3051,9 @@ ztd::Range<uptr> ThreeD::getConstBuffer(u32 stage_index, u32 slot) const {
                                      bytes.size());
 }
 
-renderer::BufferView ThreeD::getConstBufferUpload(u32 stage_index, u32 slot) {
-    const auto range = getConstBuffer(stage_index, slot);
+renderer::BufferView ThreeD::getConstBufferUpload(u32 stage_index, u32 slot,
+                                                 u64 required_size) {
+    const auto range = getConstBuffer(stage_index, slot, required_size);
     if (range.getSize() == 0)
         return {};
     auto& gathered = gathered_const_buffers[stage_index][slot];
@@ -2922,7 +3088,10 @@ std::optional<u32> ThreeD::readTextureHandle(u32 stage_index,
     if (slot >= CONST_BUFFER_BINDING_COUNT)
         return std::nullopt;
 
-    const auto range = getConstBuffer(stage_index, slot);
+    const auto last_word = sampler_word == renderer::TRACKED_TEXTURE_NO_SAMPLER
+                               ? word : std::max(word, sampler_word);
+    const auto range = getConstBuffer(stage_index, slot,
+                                      (u64(last_word) + 1) * sizeof(u32));
     const auto read_word = [&](u32 index) -> std::optional<u32> {
         if (range.getBegin() == 0x0 ||
             (static_cast<u64>(index) + 1) * sizeof(u32) > range.getSize())
@@ -3062,7 +3231,8 @@ void ThreeD::captureVisualDraw(bool after) {
             {"sampler_buffer", std::to_string(mapping.sampler_buffer_index)}});
         for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; ++i) {
             if (mapping.uniform_buffers[i] == invalid<u32>()) continue;
-            const auto range = getConstBuffer(static_cast<u32>(stage) - 1, i);
+            const auto range = getConstBuffer(static_cast<u32>(stage) - 1, i,
+                                              mapping.uniform_buffer_sizes[i]);
             visual.event("uniform_binding", {{"stage", fmt::format("{}", stage)},
                 {"guest_slot", std::to_string(i)}, {"host_slot", std::to_string(mapping.uniform_buffers[i])},
                 {"host_address", std::to_string(range.getBegin())}, {"size", std::to_string(range.getSize())}});
@@ -3216,7 +3386,8 @@ bool ThreeD::drawInternal() {
         for (const auto& storage :
              shader->getDescriptor().resource_mapping.storage_buffers) {
             const auto range = resolveStorageBuffer(
-                getConstBuffer(stage_index, storage.cbuf_slot),
+                getConstBuffer(stage_index, storage.cbuf_slot,
+                               u64(storage.cbuf_offset) + 12),
                 storage.cbuf_offset);
             if (range && texture_cache.hasUnflushedGpuWrites(*range))
                 texture_cache.flushMemory(tls_crnt_command_buffer, *range);

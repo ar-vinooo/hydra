@@ -493,6 +493,8 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
     for (auto index : memory_analyzer.getConstBuffers()) {
         out_resource_mapping.uniform_buffers[index] = index;
     }
+    for (const auto& [index, size] : memory_analyzer.getConstBufferSizes())
+        out_resource_mapping.uniform_buffer_sizes[index] = size;
 
     u32 texture_index = 0;
     for (const auto& [const_buffer_index, info] :

@@ -224,8 +224,11 @@ NvResult NvHostGpu::submitGpfifo(
         hw::tegra_x1::gpu::GpfifoFlags::FenceGet |
         hw::tegra_x1::gpu::GpfifoFlags::HwFormat |
         hw::tegra_x1::gpu::GpfifoFlags::SuppressWfi |
+        hw::tegra_x1::gpu::GpfifoFlags::SkipBufferRefcounting |
         hw::tegra_x1::gpu::GpfifoFlags::IncrementWithValue;
     // HW_FORMAT entries already use the native two-word layout consumed by PFIFO.
+    // NVIDIA common/fifo/channel.c skips the per-job buffer scan for bit 5.
+    // Hydra already retains backing outside submission, so no scan is needed.
     if (any(flags & ~supported)) {
         LOG_WARN(Services, "Unsupported GPFIFO submit flags {:#x}", static_cast<u32>(flags));
         return NvResult::NotSupported;

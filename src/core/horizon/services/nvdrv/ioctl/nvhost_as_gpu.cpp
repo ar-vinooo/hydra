@@ -9,7 +9,7 @@ namespace hydra::horizon::services::nvdrv::ioctl {
 DEFINE_IOCTL_TABLE_IMPL(NvHostAsGpu, Unchecked,
                    DEFINE_IOCTL_TABLE_ENTRY(NvHostAsGpu, 0x41, 0x02, allocSpace, 0x03,
                                             freeSpace, 0x05, unmapBuffer, 0x06,
-                                            mapBufferEx, 0x08, getVaRegions,
+                                            mapBufferEx,
                                             0x09, allocAsEx))
 
 NvResult NvHostAsGpu::ioctl(IoctlContext& context, u32 type, u32 nr) {
@@ -19,7 +19,10 @@ NvResult NvHostAsGpu::ioctl(IoctlContext& context, u32 type, u32 nr) {
     const auto initialized = ensureAddressSpace(context.process);
     if (initialized != NvResult::Success)
         return initialized;
-    if (nr != 0x01 && nr != 0x06 && nr != 0x14)
+    if (nr == 0x08)
+        return queryVaRegions(context, false);
+    if (nr != 0x01 && nr != 0x02 && nr != 0x03 && nr != 0x05 &&
+        nr != 0x06 && nr != 0x09 && nr != 0x14)
         return ioctlUnchecked(context, type, nr);
     if (!context.process || !context.in_stream)
         return NvResult::BadParameter;
@@ -45,31 +48,68 @@ NvResult NvHostAsGpu::ioctl(IoctlContext& context, u32 type, u32 nr) {
         }
         if (size != 0)
             std::memcpy(entries.data(), input.getPtr() + input.getSeek(), size);
-        return remap(&context, entries);
+        try {
+            return remap(&context, entries);
+        } catch (const std::bad_alloc&) {
+            return NvResult::InsufficientMemory;
+        }
     }
-    constexpr usize MAP_BUFFER_SIZE = 40;
-    if (!context.out_stream)
+    const usize request_size = nr == 2 ? 24 : nr == 3 ? 16 : nr == 5 ? 8 : 40;
+    if ((nr == 2 || nr == 6) && !context.out_stream)
         return NvResult::BadParameter;
-    auto& output = *context.out_stream;
-    if (size < MAP_BUFFER_SIZE || output.getSeek() > output.getSize() ||
-        output.getSize() - output.getSeek() < MAP_BUFFER_SIZE)
+    if (size < request_size || (context.out_stream &&
+        (context.out_stream->getSeek() > context.out_stream->getSize() ||
+         context.out_stream->getSize() - context.out_stream->getSeek() < request_size)))
         return NvResult::InvalidSize;
     // The generic ioctl argument reader requires aligned buffers.
-    alignas(8) std::array<u8, MAP_BUFFER_SIZE> request{}, response{};
-    std::memcpy(request.data(), input.getPtr() + input.getSeek(), request.size());
+    alignas(8) std::array<u8, 40> request{}, response{};
+    std::memcpy(request.data(), input.getPtr() + input.getSeek(), request_size);
     IoctlContext checked{
         .system = context.system, .process = context.process,
         .in_stream = ztd::io::MemoryStream(request),
         .out_stream = ztd::io::MemoryStream(response)};
     std::memcpy(response.data(), request.data(), response.size());
     const auto result = ioctlUnchecked(checked, type, nr);
-    if (result == NvResult::Success)
-        std::memcpy(output.getPtr() + output.getSeek(), response.data(), response.size());
+    if (result == NvResult::Success && context.out_stream)
+        std::memcpy(context.out_stream->getPtr() + context.out_stream->getSeek(),
+                    response.data(), request_size);
     return result;
 }
 
-DEFINE_IOCTL3_TABLE(NvHostAsGpu, DEFINE_IOCTL3_TABLE_ENTRY(NvHostAsGpu, 0x41,
-                                                           0x08, getVaRegions))
+NvResult NvHostAsGpu::ioctl3(IoctlContext& context, u32 type, u32 nr) {
+    std::scoped_lock lock(address_space_mutex);
+    if (type != 0x41 || nr != 8)
+        return NvResult::NotSupported;
+    const auto result = ensureAddressSpace(context.process);
+    return result == NvResult::Success ? queryVaRegions(context, true) : result;
+}
+
+NvResult NvHostAsGpu::queryVaRegions(IoctlContext& context, bool separate) {
+    const auto has = [](const auto& stream, u64 size) {
+        return stream && stream->getSeek() <= stream->getSize() &&
+            size <= stream->getSize() - stream->getSeek();
+    };
+    constexpr u32 REGIONS_SIZE = 2 * sizeof(VaRegion);
+    if (!has(context.in_stream, 16) || !has(context.out_stream, separate ? 16 : 16 + REGIONS_SIZE) ||
+        (separate && !has(context.out_buffer_stream, REGIONS_SIZE)))
+        return NvResult::InvalidSize;
+    std::array<u8, 16> header;
+    std::memcpy(header.data(), context.in_stream->getPtr() + context.in_stream->getSeek(), header.size());
+    std::memcpy(header.data() + 8, &REGIONS_SIZE, sizeof(REGIONS_SIZE));
+    const u64 small_end = as_va_split ? as_va_split : as_va_end;
+    const u64 big_begin = as_va_split ? as_va_split : std::min(align(as_va_begin, as_big_page_size), as_va_end);
+    const std::array<VaRegion, 2> regions{{
+        {.addr = as_va_begin, .page_size = hw::tegra_x1::cpu::GUEST_PAGE_SIZE,
+         .pages = (small_end - as_va_begin) / hw::tegra_x1::cpu::GUEST_PAGE_SIZE},
+        {.addr = big_begin, .page_size = static_cast<u32>(as_big_page_size),
+         .pages = (as_va_end - big_begin) / as_big_page_size}}};
+    auto& output = *context.out_stream;
+    std::memcpy(output.getPtr() + output.getSeek(), header.data(), header.size());
+    auto* destination = separate ? context.out_buffer_stream->getPtr() + context.out_buffer_stream->getSeek()
+                                : output.getPtr() + output.getSeek() + header.size();
+    std::memcpy(destination, regions.data(), sizeof(regions));
+    return NvResult::Success;
+}
 
 NvResult NvHostAsGpu::ensureAddressSpace(kernel::Process* process) {
     if (!process)
@@ -135,11 +175,12 @@ bool NvHostAsGpu::vaRangeUsed(gpu_vaddr_t begin, u64 size,
 }
 
 std::optional<gpu_vaddr_t> NvHostAsGpu::findFreeVa(u64 size,
-                                                   u64 alignment) const {
-    alignment = std::max<u64>(alignment, hw::tegra_x1::gpu::GPU_PAGE_SIZE);
-    const u64 limit = as_va_end != 0 ? as_va_end : invalid<u64>();
+                                                   u64 alignment, u64 page_size) const {
+    alignment = std::max<u64>(alignment, hw::tegra_x1::cpu::GUEST_PAGE_SIZE);
+    const bool big = page_size == as_big_page_size;
+    const u64 limit = as_va_split && page_size && !big ? as_va_split : as_va_end;
     gpu_vaddr_t candidate = align(
-        std::max<u64>(as_va_begin, hw::tegra_x1::gpu::GPU_PAGE_SIZE), alignment);
+        as_va_split && page_size && big ? as_va_split : as_va_begin, alignment);
     while (candidate <= limit && size <= limit - candidate) {
         gpu_vaddr_t next;
         if (!vaRangeUsed(candidate, size, next))
@@ -192,15 +233,19 @@ NvResult NvHostAsGpu::allocSpace(kernel::Process* process, u32 pages,
                                  InOut<u64, gpu_vaddr_t> align_and_offset) {
     (void)process;
     constexpr auto KNOWN = AllocSpaceFlags::FixedOffset | AllocSpaceFlags::Sparse;
-    if (any(flags & ~KNOWN) || !validPageSize(page_size) || pages == 0)
+    if (any(flags & ~KNOWN) || !validPageSize(page_size) || pages == 0 ||
+        (page_size != hw::tegra_x1::cpu::GUEST_PAGE_SIZE && page_size != as_big_page_size))
         return NvResult::BadValue;
     const u64 size = static_cast<u64>(pages) * page_size;
 
     gpu_vaddr_t gpu_addr;
     if (any(flags & AllocSpaceFlags::FixedOffset)) {
         gpu_addr = align_and_offset;
-        if (gpu_addr % page_size != 0 || size > invalid<u64>() - gpu_addr ||
+        if (gpu_addr < as_va_begin || gpu_addr % page_size != 0 || size > invalid<u64>() - gpu_addr ||
             gpu_addr + size > (as_va_end != 0 ? as_va_end : invalid<u64>()))
+            return NvResult::BadValue;
+        if (as_va_split && (page_size == as_big_page_size
+                ? gpu_addr < as_va_split : gpu_addr + size > as_va_split))
             return NvResult::BadValue;
         // Reservations never overlap each other. Buffers already mapped
         // there stay mapped.
@@ -215,7 +260,7 @@ NvResult NvHostAsGpu::allocSpace(kernel::Process* process, u32 pages,
             return NvResult::BadValue;
     } else {
         // The alignment is the flag union's input; the VA is page aligned
-        const auto found = findFreeVa(size, std::max<u64>(page_size, align_and_offset));
+        const auto found = findFreeVa(size, std::max<u64>(page_size, align_and_offset), page_size);
         if (!found)
             return NvResult::InsufficientMemory;
         gpu_addr = *found;
@@ -259,6 +304,8 @@ NvResult resolveNvmapRange(System& system, kernel::Process& process,
         return NvResult::BadParameter;
     // The guest address only resolves in the process that created the handle
     if ((*map)->owner != nullptr && (*map)->owner != &process)
+        return NvResult::BadParameter;
+    if ((*map)->owner_identity && (*map)->owner_identity != process.getMmu()->getDeviceMappings())
         return NvResult::BadParameter;
     if (size == 0)
         size = (*map)->size;
@@ -368,11 +415,25 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
     (void)kind;
 
     if (any(flags & MapBufferFlags::Modify)) {
-        // Changes the PTE kind (compression) of an existing mapping, which the
-        // host does not model: the mapping stays as it is
-        LOG_DEBUG(Services,
-                  "Address space modifying (Gpu addr: {:#x}, size: {:#x})",
-                  *inout_addr.data, mapping_size);
+        // Modify only changes the kind of a mapping that already exists (NVN
+        // passes a null nvmap handle for it). Hydra keeps guest memory
+        // uncompressed and does not use the kind to lay out GPU accesses, so a
+        // valid request has no effect on the mapping; the address range must
+        // lie inside an existing mapping.
+        const gpu_vaddr_t addr_in = static_cast<gpu_vaddr_t>(inout_addr);
+        // The request must lie inside a mapping that already exists
+        auto it = buffer_mappings.upper_bound(addr_in);
+        const bool found = it != buffer_mappings.begin() &&
+                           (--it, addr_in >= it->first &&
+                                      addr_in - it->first < it->second.second &&
+                                      mapping_size <= it->second.second - (addr_in - it->first));
+        if (!found) {
+            LOG_WARN(Services,
+                     "MapBufferEx Modify of unmapped address {:#x}: flags {:#x}, handle {}, offset {:#x}, size {:#x}",
+                     addr_in, static_cast<u32>(flags), nvmap_handle, buffer_offset, mapping_size);
+            return NvResult::BadParameter;
+        }
+        LOG_DEBUG(Services, "MapBufferEx Modify of {:#x} accepted (kind only)", addr_in);
         return NvResult::Success;
     }
 
@@ -392,7 +453,7 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
     gpu_vaddr_t addr;
     if (any(flags & MapBufferFlags::FixedOffset)) {
         addr = inout_addr;
-        if (range.getSize() > invalid<u64>() - addr)
+        if (addr < as_va_begin || addr > as_va_end || range.getSize() > as_va_end - addr)
             return NvResult::InvalidAddress;
     } else {
         const auto found = findFreeVa(range.getSize(), 0);
@@ -405,28 +466,10 @@ NvResult NvHostAsGpu::mapBufferEx(System* system, kernel::Process* process,
     dropMappingRecords(addr, addr + range.getSize());
     // The whole requested range of GPU addresses stays reserved, only the
     // part with guest memory behind it is mapped
-    if (backed.getSize() != 0)
-        inout_addr = address_space->mapBufferToAddressSpace(backed, addr);
-    else
-        inout_addr = addr;
+    inout_addr = address_space->mapBufferToAddressSpace(backed, addr, range.getSize());
+    restoreSparse(addr, addr + range.getSize());
     buffer_mappings[*inout_addr.data] = {range.getBegin(), range.getSize()};
     invalidateGuestRange(system, process, backed.getBegin(), backed.getSize());
-    return NvResult::Success;
-}
-
-NvResult NvHostAsGpu::getVaRegions(gpu_vaddr_t buffer_addr,
-                                   InOutSingle<u32> inout_buffer_size,
-                                   [[maybe_unused]] u32 reserved,
-                                   std::array<VaRegion, 2>* out_va_regions) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services,
-                               "buffer address: {:#x}, buffer size: {}",
-                               buffer_addr, inout_buffer_size);
-
-    inout_buffer_size = 2 * sizeof(VaRegion);
-    // HACK
-    (*out_va_regions)[0] =
-        VaRegion{.addr = 0x0, .page_size = hw::tegra_x1::gpu::GPU_PAGE_SIZE};
-    (*out_va_regions)[1] = (*out_va_regions)[0];
     return NvResult::Success;
 }
 
@@ -436,14 +479,24 @@ NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
                                 [[maybe_unused]] u32 reserved,
                                 u64 va_range_start, u64 va_range_end,
                                 u64 va_range_split) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services,
+    LOG_DEBUG(Services,
                                "big page size: {:#x}, as fd: {}, flags: {:#x}, "
                                "start: {:#x}, end: {:#x}, split: {:#x}",
                                big_page_size, as_fd, flags, va_range_start,
                                va_range_end, va_range_split);
 
+    const u64 page_size = big_page_size ? big_page_size : as_big_page_size;
+    const u64 begin = va_range_start ? va_range_start : hw::tegra_x1::gpu::GPU_PAGE_SIZE;
+    const u64 end = va_range_end ? va_range_end : 1ull << 40;
+    if (begin >= end || end > (1ull << 40) || begin % hw::tegra_x1::gpu::GPU_PAGE_SIZE ||
+        end % hw::tegra_x1::gpu::GPU_PAGE_SIZE ||
+        (va_range_split && (va_range_split <= begin || va_range_split >= end ||
+                           va_range_split % page_size != 0)))
+        return NvResult::BadValue;
+    if (!buffer_mappings.empty() || !reservations.empty())
+        return NvResult::InvalidState;
     if (big_page_size != 0) {
-        if (!std::has_single_bit(big_page_size)) {
+        if (!validPageSize(big_page_size)) {
             LOG_ERROR(Services, "Big page size {:#x} is not a power of two",
                       big_page_size);
             return NvResult::BadValue;
@@ -454,11 +507,11 @@ NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
     // Callers (libnx, nouveau) usually pass zero, meaning the default range.
     // Nothing is backed: unmapped addresses fault like on hardware.
     (void)process;
-    (void)va_range_split;
-    if (va_range_end != 0 && va_range_end <= va_range_start)
-        return NvResult::BadValue;
-    as_va_begin = va_range_start;
-    as_va_end = va_range_end;
+    (void)flags;
+    (void)as_fd;
+    as_va_begin = begin;
+    as_va_end = end;
+    as_va_split = va_range_split;
     return NvResult::Success;
 }
 
@@ -466,7 +519,13 @@ NvResult NvHostAsGpu::allocAsEx(kernel::Process* process, u32 flags, i32 as_fd,
 // allocSpace
 NvResult NvHostAsGpu::remap(IoctlContext* context, std::span<const RemapOp> entries) {
     // Validate every backing range before replacing any mapping in the batch.
-    for (const auto& entry : entries) {
+    std::vector<ztd::Range<vaddr_t>> backings(entries.size());
+    for (usize index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        const u64 gpu_addr = u64(entry.virt_offset_in_pages) * as_big_page_size;
+        const u64 size = u64(entry.num_pages) * as_big_page_size;
+        if (size && (gpu_addr < as_va_begin || gpu_addr > as_va_end || size > as_va_end - gpu_addr))
+            return NvResult::InvalidAddress;
         if (entry.num_pages == 0 || entry.mem_handle == 0)
             continue;
         ztd::Range<vaddr_t> range, backed;
@@ -475,9 +534,11 @@ NvResult NvHostAsGpu::remap(IoctlContext* context, std::span<const RemapOp> entr
             u64(entry.num_pages) * as_big_page_size, range, as_big_page_size, &backed);
         if (result != NvResult::Success)
             return result;
+        backings[index] = backed;
     }
     auto& gmmu = *address_space;
-    for (const auto& entry : entries) {
+    for (usize index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
         LOG_DEBUG(Services, "Remap: {}", entry);
 
         const gpu_vaddr_t gpu_addr =
@@ -492,21 +553,8 @@ NvResult NvHostAsGpu::remap(IoctlContext* context, std::span<const RemapOp> entr
             continue;
         }
 
-        ZTD_ASSIGN_OR(
-            const auto map, context->system.getGpu().getMap(entry.mem_handle),
-            ZTD_PASS({
-                LOG_WARN(Services, "Invalid nvmap handle {}", entry.mem_handle);
-                return NvResult::BadParameter;
-            }));
-        const u64 offset =
-            static_cast<u64>(entry.mem_offset_in_pages) * as_big_page_size;
-        // Alignment padding past the nvmap allocation has no guest memory
-        const u64 backed_size =
-            offset >= map->size ? 0 : std::min<u64>(size, map->size - offset);
-        if (backed_size != 0)
-            gmmu.mapBufferToAddressSpace(
-                ztd::Range<vaddr_t>::fromSize(map->addr + offset, backed_size),
-                gpu_addr);
+        gmmu.mapBufferToAddressSpace(backings[index], gpu_addr, size);
+        restoreSparse(gpu_addr, gpu_addr + size);
     }
 
     return NvResult::Success;

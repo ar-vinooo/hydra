@@ -1,5 +1,14 @@
 # Occlusion queries and report completion — 2026-10-17
 
+> **Pembaruan 2026-10-19:** report ZPASS kini asinkron. Pernyataan di bawah bahwa
+> report menyinkronkan CPU/GPU saat publikasi berlaku untuk versi 17 Oktober.
+> Sekarang report masuk antrean berurutan dan ditulis ke memori guest saat GPU
+> selesai; konsumen CPU (render kondisional, acquire, DMA/2D/inline, release)
+> menunggu lewat `flushReports`. Payload release dan reduction masih sinkron.
+> Lihat bagian "Crash 4: FPS rendah" di
+> [tujuan-dan-progress-2026-10-19.md](tujuan-dan-progress-2026-10-19.md) dan
+> [tests/README-occlusion-reference.md](../../tests/README-occlusion-reference.md).
+
 Implemented as the next continuation. No staging, commits, game launches or GUI actions. The full graphics backlog remains open. NVIDIA documents the report and render-enable methods; the in-memory comparison structure and EQ/NE interpretation are host-tested but remain guest-semantics unverified pending NVIDIA hardware/NVN traces.
 
 ## Behavior

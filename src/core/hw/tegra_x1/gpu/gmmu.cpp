@@ -7,7 +7,34 @@
 
 namespace hydra::hw::tegra_x1::gpu {
 
+GMmu::GMmu(cpu::IMmu* mmu_) : mmu(mmu_),
+    device_mappings(mmu ? mmu->getDeviceMappings() : nullptr) {}
+
+void GMmu::publishDeviceMappings(uptr excluded) {
+    if (!device_mappings)
+        return;
+    std::vector<cpu::DeviceMappingState::Span> spans;
+    spans.reserve(mapped_ranges.size());
+    for (const auto& [base, as] : mapped_ranges)
+        if (as.guest != 0 && base != excluded)
+            spans.push_back({as.guest, as.ptr, as.size});
+    std::scoped_lock lock(device_mappings->mutex);
+    if (spans.empty())
+        device_mappings->spaces.erase(this);
+    else
+        device_mappings->spaces[this] = std::move(spans);
+}
+
+void GMmu::unmapImpl(uptr base, AddressSpace as) {
+    if (as.guest != 0)
+        publishDeviceMappings(base);
+}
+
 GMmu::~GMmu() {
+    if (device_mappings) {
+        std::scoped_lock lock(device_mappings->mutex);
+        device_mappings->spaces.erase(this);
+    }
     // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
     for (const auto block : zero_blocks)
         free(reinterpret_cast<void*>(block));
@@ -68,7 +95,7 @@ uptr GMmu::unmapAddr(uptr gpu_addr) const {
     return ptr;
 }
 
-uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
+uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr, u64 replace_size) {
     std::unique_lock lock(mutex);
     if (range.getBegin() != 0x0) {
         if (gpu_addr == invalid<uptr>()) {
@@ -76,10 +103,14 @@ uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
             address_space_base += align(range.getSize(), GPU_PAGE_SIZE);
         }
 
+        carveOut(gpu_addr, gpu_addr + std::max(range.getSize(), replace_size));
+        if (range.getSize() == 0) {
+            publishDeviceMappings();
+            return gpu_addr;
+        }
         mmu->enableWriteTracking(ztd::Range<vaddr_t>(
             alignDown(range.getBegin(), cpu::GUEST_PAGE_SIZE),
             align(range.getEnd(), cpu::GUEST_PAGE_SIZE)));
-        carveOut(gpu_addr, gpu_addr + range.getSize());
 
         // Guest virtual memory can span separate physical allocations. Resolve
         // each page instead of treating the first host pointer as the backing
@@ -123,6 +154,7 @@ uptr GMmu::createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
                              other.guest, other.size);
             }
         }
+        publishDeviceMappings();
         return gpu_addr;
     }
 
@@ -197,6 +229,7 @@ void GMmu::unbindToSparse(uptr gpu_addr, u64 size) {
     std::unique_lock lock(mutex);
     carveOut(gpu_addr, gpu_addr + size);
     mapLocked(gpu_addr, allocateZeroBlock(size));
+    publishDeviceMappings();
 }
 
 void GMmu::reserveSparse(uptr gpu_addr, u64 size) {
@@ -213,6 +246,7 @@ void GMmu::unmapRange(uptr gpu_addr, u64 size, bool restore_sparse) {
     carveOut(gpu_addr, gpu_addr + size);
     if (restore_sparse)
         mapIntoGaps(gpu_addr, allocateZeroBlock(size));
+    publishDeviceMappings();
 }
 
 std::vector<ztd::Range<vaddr_t>> GMmu::rebaseHostRange(uptr old_begin, uptr old_end,
@@ -248,6 +282,7 @@ std::vector<ztd::Range<vaddr_t>> GMmu::rebaseHostRange(uptr old_begin, uptr old_
     for (const auto& [gpu, as] : pieces)
         mapLocked(gpu, as);
     generation.fetch_add(1, std::memory_order_release);
+    publishDeviceMappings();
     return guest_ranges;
 }
 

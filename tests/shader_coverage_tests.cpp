@@ -1209,16 +1209,10 @@ void testHalfCompare(MTL::Device* device) {
         }
     }
     const auto results = runAlu(device, insts, inputs, cbuf, 2, "Half compares run");
-    // Metal flushes subnormal F32 operands of comparisons even without fast
-    // math (a host limitation); converted halves are always normal F32 values
-    const auto host_f32 = [](u32 word) {
-        return (word & 0x7f800000u) == 0 ? std::bit_cast<f32>(word & 0x80000000u)
-                                         : std::bit_cast<f32>(word);
-    };
     const auto extract = [&](u32 word, u32 swizzle) -> std::pair<f32, f32> {
         switch (swizzle) {
         case 0: return {halfToFloat(u16(word)), halfToFloat(u16(word >> 16))};
-        case 1: return {host_f32(word), host_f32(word)};
+        case 1: return {std::bit_cast<f32>(word), std::bit_cast<f32>(word)};
         case 2: return {halfToFloat(u16(word)), halfToFloat(u16(word))};
         default: return {halfToFloat(u16(word >> 16)), halfToFloat(u16(word >> 16))};
         }
@@ -2921,9 +2915,9 @@ void testConversions(MTL::Device* device) {
     const auto f2f_results = runAlu(
         device,
         {f2f(10, 1, 2, 2, 4), f2f(11, 1, 2, 2, 5), f2f(12, 1, 2, 2, 6),
-         f2f(13, 1, 2, 2, 7), f2f(14, 1, 1, 2, 1), f2f(15, 3, 2, 1, 1),
-         f2f(16, 3, 2, 1, 1, true), f2f(17, 1, 2, 2, 1, false, true),
-         f2f(18, 4, 2, 3, 1), f2f(20, 1, 3, 2, 1)},
+         f2f(13, 1, 2, 2, 7), f2f(14, 1, 1, 2, 0), f2f(15, 3, 2, 1, 0),
+         f2f(16, 3, 2, 1, 0, true), f2f(17, 1, 2, 2, 1, false, true),
+         f2f(18, 4, 2, 3, 0), f2f(20, 1, 3, 2, 0)},
         inputs, {}, 2, "F2F runs");
     for (usize i = 0; i < inputs.size(); i++) {
         const float x = floats[i];
@@ -3500,9 +3494,21 @@ void runMaxwellAluCaseFile(MTL::Device* device, const char* in_path,
     std::map<std::vector<u64>, std::vector<std::pair<AluState, usize>>> groups;
     std::vector<std::vector<u64>> programs;
     std::vector<AluState> states;
+    std::vector<u32> constant_words;
     std::string line;
     while (std::getline(input, line)) {
         if (line.empty()) continue;
+        if (line.starts_with("CBUF ")) {
+            expect(programs.empty() && constant_words.empty(),
+                   "Constant buffer precedes ALU cases");
+            std::istringstream words(line.substr(5));
+            u32 word;
+            while (words >> std::hex >> word)
+                constant_words.push_back(word);
+            expect(words.eof() && !constant_words.empty(),
+                   "Malformed ALU constant buffer");
+            continue;
+        }
         std::istringstream row(line);
         std::string insts_text;
         row >> insts_text;
@@ -3522,7 +3528,8 @@ void runMaxwellAluCaseFile(MTL::Device* device, const char* in_path,
     for (const auto& [insts, cases] : groups) {
         std::vector<AluState> inputs;
         for (const auto& item : cases) inputs.push_back(item.first);
-        const auto out = runAlu(device, insts, inputs, {}, 2, "Maxwell ALU reference");
+        const auto out = runAlu(device, insts, inputs, constant_words, 2,
+                                "Maxwell ALU reference");
         for (usize i = 0; i < cases.size(); ++i) results[cases[i].second] = out[i];
     }
     for (const auto& r : results) {

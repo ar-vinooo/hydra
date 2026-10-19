@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include <atomic>
 #include <memory>
@@ -54,7 +55,11 @@ struct EncoderState {
 
 class CommandBuffer final : public ICommandBuffer {
   public:
-    explicit CommandBuffer(MTL::CommandQueue* command_queue);
+    // `completions_` runs the work that depends on this buffer finishing
+    // (queued guest reports, see Renderer::queueOcclusionReport). Without it
+    // nothing can depend on the buffer.
+    explicit CommandBuffer(MTL::CommandQueue* command_queue_,
+                           std::shared_ptr<CompletionQueue> completions_ = {});
     ~CommandBuffer() override;
 
     MTL::RenderCommandEncoder* getRenderCommandEncoderUnchecked() {
@@ -79,6 +84,29 @@ class CommandBuffer final : public ICommandBuffer {
     void endEncoding();
     // Submit, wait and continue with a new command buffer
     f64 debugCommitAndWait();
+    // Checkpoints which waited for the host GPU, all threads
+    static u64 getCheckpointCount() {
+        return checkpoint_total.load(std::memory_order_acquire);
+    }
+    // Commands encoded since the last checkpoint on any thread write guest
+    // memory (a shader writing a storage buffer, which aliases it). Their
+    // results are only visible to the CPU after a checkpoint.
+    void noteGuestMemoryWrites() {
+        guest_write_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+    static bool hasUnsynchronizedGuestWrites() {
+        return guest_write_epoch.load(std::memory_order_acquire) !=
+               guest_write_synced.load(std::memory_order_acquire);
+    }
+
+    // Completion of the Metal command buffer being encoded. Creating it
+    // registers the work that must run once the host finished it, so the
+    // command buffer is always committed eventually.
+    CompletionToken* getCompletionToken();
+    const std::shared_ptr<CompletionToken>& shareCompletionToken();
+    // Work depending on this buffer was queued: its completion callbacks have
+    // to follow that work
+    void noteQueuedCompletionWork() { queued_completion_work = true; }
     void setVisibilityResultBuffer(MTL::Buffer* buffer);
     MTL::Buffer* getVisibilityResultBuffer() const { return visibility_buffer; }
     bool hasRenderPass(MTL::RenderPassDescriptor* descriptor) const {
@@ -122,6 +150,14 @@ class CommandBuffer final : public ICommandBuffer {
     // nothing to wait for
     static inline std::atomic<u64> submitted_buffers{0};
     static inline std::atomic<u64> completed_buffers{0};
+    static inline std::atomic<u64> checkpoint_total{0};
+    // Encoded work which may write guest memory, and how much of it a
+    // checkpoint already waited for
+    static inline std::atomic<u64> guest_write_epoch{0};
+    static inline std::atomic<u64> guest_write_synced{0};
+    std::shared_ptr<CompletionQueue> completions;
+    std::shared_ptr<CompletionToken> completion_token;
+    bool queued_completion_work{false};
     std::shared_ptr<UploadBufferPool> upload_pool;
     std::vector<MTL::Buffer*> retired_upload_buffers;
     u64 raster_updates{0};

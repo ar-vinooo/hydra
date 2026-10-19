@@ -11,7 +11,10 @@ class IMmu;
 
 namespace hydra::horizon::kernel {
 
+class Process;
+
 class SharedMemory : public AutoObject {
+    friend Process;
   public:
     static constexpr AutoObjectTypeId TYPE_ID = AutoObjectTypeId::SharedMemory;
 
@@ -19,14 +22,15 @@ class SharedMemory : public AutoObject {
                  std::string_view debug_name = "SharedMemory");
     ~SharedMemory() override;
 
-    void mapToRange(hw::tegra_x1::cpu::IMmu* mmu, const ztd::Range<uptr> range_,
-                    MemoryPermission perm);
-
     // Getters
     uptr getPtr() const;
+    u64 getSize() const { return memory->getSize(); }
+    const std::shared_ptr<hw::tegra_x1::cpu::IMemory>& getBacking() const { return memory; }
 
   private:
-    hw::tegra_x1::cpu::IMemory* memory;
+    std::shared_ptr<hw::tegra_x1::cpu::IMemory> memory;
+    void mapToRange(hw::tegra_x1::cpu::IMmu* mmu, const ztd::Range<vaddr_t> range,
+                    MemoryPermission perm);
 };
 
 } // namespace hydra::horizon::kernel

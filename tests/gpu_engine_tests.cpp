@@ -13,6 +13,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
@@ -21,8 +22,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <chrono>
+#include <fstream>
 #include <future>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #include <map>
 #include <stdexcept>
@@ -604,6 +607,38 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
     gmmu.unmap(ADDRESS + 32);
     expect(engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
            "Partially mapped constant buffers are unavailable");
+    expect(engine.getConstBuffer(STAGE, SLOT, 16).getBegin() == new_ptr + OFFSET &&
+               engine.getConstBuffer(STAGE, SLOT, 16).getSize() == 16 &&
+               engine.getConstBuffer(STAGE, SLOT, 17).getSize() == 0,
+           "Direct shader reads validate their prefix without requiring an unmapped tail");
+    bind(ADDRESS + OFFSET, 0x10000);
+    const auto prefix_upload = engine.getConstBufferUpload(STAGE, SLOT, 16);
+    expect(prefix_upload.isValid() && prefix_upload.getSize() == 16 &&
+               std::memcmp(reinterpret_cast<const void*>(prefix_upload.getPtr()),
+                           replacement.data() + 4, 16) == 0,
+           "A 64 KiB selector uploads mapped shader constants from a smaller allocation");
+    auto* prefix_commands = static_cast<renderer::metal::CommandBuffer*>(commands.get());
+    auto* prefix_encoder = prefix_commands->getComputeCommandEncoder();
+    prefix_encoder->setComputePipelineState(pipeline);
+    prefix_encoder->setBuffer(
+        static_cast<renderer::metal::Buffer*>(prefix_upload.getBase())->getBuffer(),
+        prefix_upload.getOffset(), 0);
+    prefix_encoder->setBuffer(output, 0, 1);
+    prefix_encoder->dispatchThreads(MTL::Size(4, 1, 1), MTL::Size(4, 1, 1));
+    auto* prefix_native = prefix_commands->getCommandBuffer()->retain();
+    tls_crnt_command_buffer = nullptr;
+    commands.reset();
+    prefix_native->waitUntilCompleted();
+    expect(prefix_native->status() == MTL::CommandBufferStatusCompleted &&
+               std::memcmp(output->contents(), replacement.data() + 4, 16) == 0,
+           "Metal reads the complete required prefix despite an unmapped selector tail");
+    prefix_native->release();
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    expect(engine.getConstBuffer(STAGE, SLOT, 0x10001).getSize() == 0 &&
+               engine.getConstBuffer(STAGE, SLOT).getSize() == 0,
+           "Reads beyond the declared size and unbounded reads still reject missing memory");
+    bind(ADDRESS + OFFSET, SIZE);
     gmmu.map(ADDRESS + 32, {new_ptr + 32, 32});
     check_range(new_ptr + OFFSET);
     engine.method(0x904 + STAGE * 8, SLOT << 4);
@@ -620,86 +655,180 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
     std::cout << "PASS: constant buffers follow GPU remap, unmap and heap rebase without rebinding\n";
 }
 
-void testOcclusionReports() {
-    using namespace hydra::hw::tegra_x1::gpu::renderer;
-    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
-    Gpu gpu;
-    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
-    auto& engine = gpu.get3DEngine();
-    auto* device = renderer.getDevice();
-    std::vector<u8> image_memory(0x20000, 0);
-    std::array<u8, 32> report_memory{};
-    GMmu gmmu(nullptr);
-    constexpr u64 REPORT = 0x400000;
-    gmmu.map(REPORT, {reinterpret_cast<uptr>(report_memory.data()), report_memory.size()});
-    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
-    tls_crnt_command_buffer = commands.get();
-    auto& cache = renderer.getTextureCache();
-    const auto ptr = reinterpret_cast<uptr>(image_memory.data());
-    auto* color = cache.find(commands.get(),
-        TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
-                          false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
-    auto* depth = cache.find(commands.get(),
-        TextureDescriptor(ptr + 0x10000, MTL::TextureType2D, TextureFormat::Z32Float,
-                          false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
-    RenderPassDescriptor pass_descriptor{};
-    pass_descriptor.color_targets[0].texture = color;
-    pass_descriptor.depth_stencil_target.texture = depth;
-    std::unique_ptr<RenderPassBase> pass(renderer.createRenderPass(pass_descriptor));
-    renderer.bindRenderPass(pass.get());
-    const auto shader = [&](ShaderType type, const std::string& code) {
-        ShaderDescriptor descriptor{};
-        descriptor.type = type;
-        descriptor.backend = ShaderBackend::Msl;
-        descriptor.code.assign(code.begin(), code.end());
-        return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
-    };
-    const auto vertex = shader(ShaderType::Vertex, R"(
+// A 4x4 render target with depth, a full screen triangle at depth 0.5 and the
+// report memory, for the occlusion tests. The triangle counts 16 samples when
+// the depth buffer holds 0.75, none when it holds 0.25, and 4 with a 2x2
+// scissor.
+struct OcclusionRig {
+    static constexpr u64 REPORT = 0x400000;
+    // The test fixture installs the thread locals the engines use
+    explicit OcclusionRig(usize report_bytes)
+        : renderer{static_cast<hydra::hw::tegra_x1::gpu::renderer::metal::Renderer&>(
+              gpu.getRenderer())},
+          engine{gpu.get3DEngine()}, image_memory(0x20000, 0),
+          report_memory(report_bytes, 0), gmmu(nullptr) {
+        using namespace hydra::hw::tegra_x1::gpu::renderer;
+        gmmu.map(REPORT, {reinterpret_cast<uptr>(report_memory.data()),
+                          report_memory.size()});
+        commands.reset(renderer.createCommandBuffer());
+        tls_crnt_command_buffer = commands.get();
+        auto& cache = renderer.getTextureCache();
+        const auto ptr = reinterpret_cast<uptr>(image_memory.data());
+        auto* color = cache.find(commands.get(),
+            TextureDescriptor(ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
+                              false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
+        auto* depth = cache.find(commands.get(),
+            TextureDescriptor(ptr + 0x10000, MTL::TextureType2D, TextureFormat::Z32Float,
+                              false, 0, 4, 4, 1, 1, 1, 0, 0, 0), TextureUsage::Write);
+        RenderPassDescriptor pass_descriptor{};
+        pass_descriptor.color_targets[0].texture = color;
+        pass_descriptor.depth_stencil_target.texture = depth;
+        pass.reset(renderer.createRenderPass(pass_descriptor));
+        renderer.bindRenderPass(pass.get());
+        const auto shader = [&](ShaderType type, const std::string& code) {
+            ShaderDescriptor descriptor{};
+            descriptor.type = type;
+            descriptor.backend = ShaderBackend::Msl;
+            descriptor.code.assign(code.begin(), code.end());
+            return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+        };
+        vertex = shader(ShaderType::Vertex, R"(
 #include <metal_stdlib>
 using namespace metal;
 vertex float4 main_(uint id [[vertex_id]]) {
     float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
     return float4(p[id], 0.5, 1);
 })");
-    const auto fragment = shader(ShaderType::Fragment, R"(
+        fragment = shader(ShaderType::Fragment, R"(
 #include <metal_stdlib>
 using namespace metal;
 fragment float4 main_() { return float4(1); }
 )");
-    PipelineDescriptor pipeline_descriptor{};
-    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
-    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
-    pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
-    pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
-    pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
-    std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
-    renderer.bindPipeline(pipeline.get());
-    const MTL::ScissorRect full(0, 0, 4, 4);
-    for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
-        renderer.setViewport(i, MTL::Viewport{0, 0, 4, 4, 0, 1});
-        renderer.setScissor(i, full);
+        PipelineDescriptor pipeline_descriptor{};
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+        pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
+        pipeline.reset(renderer.createPipeline(pipeline_descriptor));
+        renderer.bindPipeline(pipeline.get());
+        setScissor(full);
+        for (u32 i = 0; i < VIEWPORT_COUNT; i++)
+            renderer.setViewport(i, MTL::Viewport{0, 0, 4, 4, 0, 1});
+        renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
+        renderer.setDepthTestEnabled(true);
+        renderer.setDepthWriteEnabled(false);
+        renderer.setDepthCompareOp(engines::CompareOp::Less);
+        renderer.setStencilState({});
+        renderer.setClearState({.rect = full});
+        renderer.clearDepth(commands.get(), 0, 0.25f);
+        tls_crnt_gmmu = &gmmu;
     }
-    renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
-    renderer.setDepthTestEnabled(true);
-    renderer.setDepthWriteEnabled(false);
-    renderer.setDepthCompareOp(engines::CompareOp::Less);
-    renderer.setStencilState({});
-    renderer.setClearState({.rect = full});
-    renderer.clearDepth(commands.get(), 0, 0.25f);
-    tls_crnt_gmmu = &gmmu;
+    ~OcclusionRig() {
+        // Reports still on their way write to the memory and address space of
+        // the rig, also when a test failed
+        commands.reset();
+        renderer.drainReports();
+        tls_crnt_command_buffer = nullptr;
+        tls_crnt_gmmu = nullptr;
+    }
+    OcclusionRig(const OcclusionRig&) = delete;
+    OcclusionRig& operator=(const OcclusionRig&) = delete;
+
+    void setScissor(const MTL::ScissorRect& rect) {
+        for (u32 i = 0; i < VIEWPORT_COUNT; i++)
+            renderer.setScissor(i, rect);
+    }
+
+    const MTL::ScissorRect full{0, 0, 4, 4};
+    Gpu gpu;
+    hydra::hw::tegra_x1::gpu::renderer::metal::Renderer& renderer;
+    hydra::hw::tegra_x1::gpu::engines::ThreeD& engine;
+    std::vector<u8> image_memory;
+    std::vector<u8> report_memory;
+    GMmu gmmu;
+    std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::ICommandBuffer> commands;
+    std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::RenderPassBase> pass;
+    std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::ShaderBase> vertex;
+    std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::ShaderBase> fragment;
+    std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::PipelineBase> pipeline;
+};
+
+void testOcclusionReports() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto* device = renderer.getDevice();
+    auto& report_memory = rig.report_memory;
+    auto& gmmu = rig.gmmu;
+    auto& commands = rig.commands;
+    constexpr u64 REPORT = OcclusionRig::REPORT;
+    const MTL::ScissorRect full = rig.full;
     renderer.setOcclusionCounterEnabled(true);
     engine.method(0x54c, 1);
     const auto draw = [&] {
         renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
     };
-    const auto report = [&](u32 counter, bool short_query = false) {
+    const auto report_range =
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(report_memory.data()),
+                                   report_memory.size());
+    const auto queue_report = [&](u32 counter, bool short_query = false,
+                                  u64 address = REPORT) {
         engine.method(0x6c0, 0);
-        engine.method(0x6c1, static_cast<u32>(REPORT));
+        engine.method(0x6c1, static_cast<u32>(address));
         engine.method(0x6c3, 2 | (counter << 23) | (static_cast<u32>(short_query) << 28));
+    };
+    // A report reaches memory once the GPU finished it. Whoever consumes the
+    // memory in the command stream waits for that, as this does.
+    const auto report = [&](u32 counter, bool short_query = false) {
+        queue_report(counter, short_query);
+        renderer.flushReports(commands.get(), report_range);
         u64 value = 0;
         std::memcpy(&value, report_memory.data(), short_query ? 4 : 8);
         return value;
     };
+
+    // A report does not make the encoding thread wait for the GPU, and
+    // nothing reaches memory before the GPU finished
+    draw();
+    std::memset(report_memory.data(), 0xa5, report_memory.size());
+    const auto checkpoints = metal::CommandBuffer::getCheckpointCount();
+    queue_report(0x15);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints,
+           "Queueing a counter report does not wait for the GPU");
+    expect(std::all_of(report_memory.begin(), report_memory.end(),
+                       [](u8 value) { return value == 0xa5; }),
+           "A report is not published before its commands were submitted");
+    {
+        // The callbacks of the submission follow its reports
+        std::atomic<u64> seen_by_callback{~0ull};
+        std::atomic<bool> callback_succeeded{false};
+        auto finished = std::make_shared<std::promise<void>>();
+        auto done = finished->get_future();
+        commands->onCompletedChecked([&, finished](bool succeeded) {
+            u64 value;
+            std::memcpy(&value, report_memory.data(), sizeof(value));
+            seen_by_callback = value;
+            callback_succeeded = succeeded;
+            finished->set_value();
+        });
+        commands.reset();
+        expect(done.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+               "The submission completes");
+        expect(seen_by_callback == 0 && callback_succeeded,
+               "The callbacks of a submission run after its reports were published");
+        u32 words[4];
+        std::memcpy(words, report_memory.data(), sizeof(words));
+        expect(words[0] == 0 && words[1] == 0 && (words[2] != 0 || words[3] != 0),
+               "The published report has a zero count behind the depth clear and a timestamp");
+    }
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    renderer.clearDepth(commands.get(), 0, 0.25f);
+    engine.method(0x54c, 1);
+
     draw();
     expect(report(0x15) == 0, "Fully occluded geometry reports zero samples");
     std::copy_n(report_memory.data(), 16, report_memory.data() + 16);
@@ -716,20 +845,79 @@ fragment float4 main_() { return float4(1); }
     u64 first_timestamp;
     std::memcpy(&first_timestamp, report_memory.data() + 8, 8);
     expect(first_timestamp != 0, "Long reports include a completion timestamp");
+
+    // Conditional rendering reads the memory of a report the GPU has not
+    // finished: it waits for it instead of comparing stale data
+    {
+        std::memset(report_memory.data(), 0, report_memory.size());
+        draw();
+        const auto before = metal::CommandBuffer::getCheckpointCount();
+        queue_report(0x15);
+        engine.method(0x554, 0);
+        engine.method(0x555, static_cast<u32>(REPORT));
+        engine.method(0x556, 4); // Renders if it differs from the zero reference
+        expect(engine.shouldExecute(),
+               "Conditional rendering sees the report that was still in flight");
+        expect(metal::CommandBuffer::getCheckpointCount() > before,
+               "Reading a pending report waits for the GPU");
+        u64 value;
+        std::memcpy(&value, report_memory.data(), sizeof(value));
+        expect(value == 32, "The report that conditional rendering waited for is complete");
+        // A report to other memory is not waited for
+        std::array<u8, 16> other{};
+        constexpr u64 OTHER = 0x410000;
+        gmmu.map(OTHER, {reinterpret_cast<uptr>(other.data()), other.size()});
+        queue_report(0x15, false, OTHER);
+        const auto after = metal::CommandBuffer::getCheckpointCount();
+        expect(engine.shouldExecute(), "The published report still differs");
+        expect(metal::CommandBuffer::getCheckpointCount() == after,
+               "Reading unrelated memory does not wait for pending reports");
+        renderer.flushReports(commands.get(),
+                              ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(other.data()), 16));
+        u64 other_value;
+        std::memcpy(&other_value, other.data(), sizeof(other_value));
+        expect(other_value == 32, "The report to the other memory arrives");
+        gmmu.unmap(OTHER);
+        engine.method(0x556, 1);
+        engine.method(0x54c, 1);
+    }
+
+    // An acquire of memory that a pending report writes does not run into its
+    // timeout: the report is finished first
+    {
+        draw();
+        queue_report(0x2, true);
+        engine.method(0x6c2, 16);
+        const auto start = std::chrono::steady_clock::now();
+        engine.method(0x6c3, 1);
+        expect(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500),
+               "Acquiring a report of the same submission does not deadlock");
+        u32 word;
+        std::memcpy(&word, report_memory.data(), sizeof(word));
+        expect(word == 16, "The acquired report holds the sample count");
+        engine.method(0x54c, 1);
+    }
+    draw();
+    queue_report(0x15);
     std::unique_ptr<BufferBase> indices(renderer.allocateTemporaryBuffer(6));
     const u16 triangle[] = {0, 1, 2};
     std::memcpy(reinterpret_cast<void*>(indices->getPtr()), triangle, sizeof(triangle));
-    const u32 guard_word = 0xcafebabe;
-    std::memcpy(report_memory.data() + 4, &guard_word, sizeof(guard_word));
     renderer.bindIndexBuffer(BufferView(indices.get()), engines::IndexType::UInt16);
     renderer.drawIndexed(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 0, 1);
     expect(report(0x2, true) == 32, "Indexed draws add their visible samples to the counter");
-    u32 kept_word;
-    u64 kept_timestamp;
-    std::memcpy(&kept_word, report_memory.data() + 4, 4);
-    std::memcpy(&kept_timestamp, report_memory.data() + 8, 8);
-    expect(kept_word == guard_word && kept_timestamp == first_timestamp,
-           "Short reports leave the following words and timestamp untouched");
+    {
+        const u32 guard_word = 0xcafebabe;
+        std::memcpy(report_memory.data() + 4, &guard_word, sizeof(guard_word));
+        u64 timestamp_before;
+        std::memcpy(&timestamp_before, report_memory.data() + 8, 8);
+        expect(report(0x2, true) == 32, "A repeated report keeps the accumulated count");
+        u32 kept_word;
+        u64 kept_timestamp;
+        std::memcpy(&kept_word, report_memory.data() + 4, 4);
+        std::memcpy(&kept_timestamp, report_memory.data() + 8, 8);
+        expect(kept_word == guard_word && kept_timestamp == timestamp_before,
+               "Short reports leave the following words and timestamp untouched");
+    }
     renderer.setOcclusionCounterEnabled(false);
     draw();
     expect(report(0x15) == 32, "Disabled counters preserve the accumulated value");
@@ -773,7 +961,165 @@ fragment float4 main_() { return float4(1); }
         static_cast<metal::CommandBuffer*>(commands.get())->getBlitCommandEncoder();
     }
     expect(report(0x15) == 2560,
-           "Long-lived counters fold completed pages without losing samples");
+           "Long-lived counters add up completed pages without losing samples");
+
+    // Several reports of one stream: each one is the counter at its place,
+    // they arrive in order, and none of them waits for the GPU
+    {
+        std::array<u8, 64> chain{};
+        constexpr u64 CHAIN = 0x420000;
+        gmmu.map(CHAIN, {reinterpret_cast<uptr>(chain.data()), chain.size()});
+        engine.method(0x54c, 1);
+        const auto before = metal::CommandBuffer::getCheckpointCount();
+        queue_report(0x15, false, CHAIN);
+        draw();
+        queue_report(0x15, false, CHAIN + 16);
+        draw();
+        draw();
+        queue_report(0x15, false, CHAIN + 32);
+        engine.method(0x54c, 1);
+        draw();
+        queue_report(0x15, false, CHAIN + 48);
+        expect(metal::CommandBuffer::getCheckpointCount() == before,
+               "A stream of reports and resets never waits for the GPU");
+        renderer.flushReports(commands.get(),
+                              ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(chain.data()), chain.size()));
+        u64 values[4], times[4];
+        for (u32 i = 0; i < 4; i++) {
+            std::memcpy(&values[i], chain.data() + i * 16, 8);
+            std::memcpy(&times[i], chain.data() + i * 16 + 8, 8);
+        }
+        expect(values[0] == 0 && values[1] == 16 && values[2] == 48 && values[3] == 16,
+               fmt::format("Reports hold the counter at their place in the stream "
+                           "({} {} {} {})", values[0], values[1], values[2], values[3]).c_str());
+        expect(times[0] <= times[1] && times[1] <= times[2] && times[2] <= times[3],
+               "Reports are published in stream order");
+        gmmu.unmap(CHAIN);
+    }
+
+    // A report into memory split over host mappings
+    {
+        std::array<u8, 4> head{};
+        std::array<u8, 12> tail{};
+        constexpr u64 SPLIT = 0x430000;
+        gmmu.map(SPLIT, {reinterpret_cast<uptr>(head.data()), head.size()});
+        gmmu.map(SPLIT + 4, {reinterpret_cast<uptr>(tail.data()), tail.size()});
+        engine.method(0x54c, 1);
+        draw();
+        queue_report(0x15, false, SPLIT);
+        renderer.flushReports(commands.get(),
+                              ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(tail.data()), tail.size()));
+        u32 low, high;
+        u64 time;
+        std::memcpy(&low, head.data(), 4);
+        std::memcpy(&high, tail.data(), 4);
+        std::memcpy(&time, tail.data() + 4, 8);
+        expect(low == 16 && high == 0 && time != 0,
+               "Counter reports span separate host mappings without losing the timestamp");
+        // The memory has to exist when the report is queued
+        gmmu.unmap(SPLIT + 4);
+        std::memset(head.data(), 0x77, head.size());
+        queue_report(0x15, false, SPLIT);
+        renderer.drainReports();
+        expect(std::all_of(head.begin(), head.end(), [](u8 value) { return value == 0x77; }),
+               "A report whose tail is unmapped writes nothing");
+        gmmu.unmap(SPLIT);
+    }
+
+    // The memory can change before the GPU produces the report. It is
+    // resolved when the report is written, like the GPU would, and a report
+    // into memory that is gone is dropped.
+    {
+        std::array<u8, 16> first{}, second{};
+        constexpr u64 MOVING = 0x440000;
+        gmmu.map(MOVING, {reinterpret_cast<uptr>(first.data()), first.size()});
+        engine.method(0x54c, 1);
+        draw();
+        queue_report(0x15, false, MOVING);
+        std::memset(first.data(), 0x33, first.size());
+        gmmu.unmap(MOVING);
+        gmmu.map(MOVING, {reinterpret_cast<uptr>(second.data()), second.size()});
+        renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(first.data()), first.size()));
+        u64 value;
+        std::memcpy(&value, second.data(), sizeof(value));
+        expect(value == 16 && first[0] == 0x33 && first[15] == 0x33,
+               "A report goes to the memory mapped when the GPU produced it");
+        draw();
+        queue_report(0x15, false, MOVING);
+        gmmu.unmap(MOVING);
+        renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(second.data()), second.size()));
+        renderer.drainReports();
+        std::memcpy(&value, second.data(), sizeof(value));
+        expect(value == 16, "A report to memory which was unmapped meanwhile is dropped");
+    }
+
+    // A stopped process receives nothing
+    {
+        GMmu stopped(nullptr);
+        std::array<u8, 16> memory{};
+        constexpr u64 STOPPED = 0x450000;
+        stopped.map(STOPPED, {reinterpret_cast<uptr>(memory.data()), memory.size()});
+        tls_crnt_gmmu = &stopped;
+        engine.method(0x54c, 1);
+        draw();
+        queue_report(0x15, false, STOPPED);
+        stopped.cancelGpuWork();
+        renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(memory.data()), memory.size()));
+        renderer.drainReports();
+        expect(std::all_of(memory.begin(), memory.end(), [](u8 value) { return value == 0; }),
+               "Reports of a cancelled address space are dropped");
+        tls_crnt_gmmu = &gmmu;
+    }
+
+    // A failed submission publishes nothing and leaves the counter invalid
+    // until it is reset. The token is the one Metal's completion would set.
+    {
+        std::memset(report_memory.data(), 0x5c, report_memory.size());
+        engine.method(0x54c, 1);
+        draw();
+        static_cast<metal::CommandBuffer*>(commands.get())->getCompletionToken()->complete(false);
+        std::atomic<int> outcome{-1};
+        auto failed = std::make_shared<std::promise<void>>();
+        auto failed_done = failed->get_future();
+        queue_report(0x15);
+        commands->onCompletedChecked([&, failed](bool succeeded) {
+            outcome = succeeded ? 1 : 0;
+            failed->set_value();
+        });
+        commands.reset();
+        expect(failed_done.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+               "A failed submission still completes");
+        expect(outcome == 0, "A failed submission is reported to its callbacks");
+        expect(std::all_of(report_memory.begin(), report_memory.end(),
+                           [](u8 value) { return value == 0x5c; }),
+               "A report of a failed submission is not published");
+        commands.reset(renderer.createCommandBuffer());
+        tls_crnt_command_buffer = commands.get();
+        renderer.clearDepth(commands.get(), 0, 0.75f);
+        draw();
+        renderer.flushReports(commands.get(), report_range);
+        queue_report(0x15);
+        renderer.flushReports(commands.get(), report_range);
+        expect(std::all_of(report_memory.begin(), report_memory.end(),
+                           [](u8 value) { return value == 0x5c; }),
+               "The counter stays invalid after a failed submission");
+        engine.method(0x54c, 1);
+        draw();
+        expect(report(0x15) == 16, "A reset makes the counter valid again");
+
+        // A report behind commands which failed has no result either, even
+        // when no draw of that submission is lost
+        std::memset(report_memory.data(), 0x5c, report_memory.size());
+        commands.reset();
+        commands.reset(renderer.createCommandBuffer());
+        tls_crnt_command_buffer = commands.get();
+        static_cast<metal::CommandBuffer*>(commands.get())->getCompletionToken()->complete(false);
+        queue_report(0x15);
+        renderer.flushReports(commands.get(), report_range);
+        expect(std::all_of(report_memory.begin(), report_memory.end(),
+                           [](u8 value) { return value == 0x5c; }),
+               "A report queued behind failed commands is not published");
+    }
 
     NS_STACK_SCOPED auto witness = device->newBuffer(16, MTL::ResourceStorageModeShared);
     std::memset(witness->contents(), 0, 16);
@@ -784,8 +1130,18 @@ fragment float4 main_() { return float4(1); }
     commands->onCompleted([completion] { completion->set_value(); });
     engine.method(0x6c0, 0xffffff00); // Reserved upper-address bits are ignored.
     engine.method(0x6c2, 0x12345678);
+    u32 previous_payload;
+    std::memcpy(&previous_payload, report_memory.data(), 4);
+    const auto release_checkpoints = metal::CommandBuffer::getCheckpointCount();
     engine.method(0x6c3, 1u << 28); // Short payload release.
     u32 payload;
+    std::memcpy(&payload, report_memory.data(), 4);
+    expect(payload == previous_payload &&
+               metal::CommandBuffer::getCheckpointCount() == release_checkpoints &&
+               static_cast<const u8*>(witness->contents())[0] == 0,
+           "A queued release neither publishes nor blocks before its GPU work is submitted");
+    renderer.flushReports(commands.get(),
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(report_memory.data()), 4));
     std::memcpy(&payload, report_memory.data(), 4);
     expect(payload == 0x12345678 && static_cast<const u8*>(witness->contents())[0] == 0x5a,
            "A semaphore payload is published only after preceding GPU writes finish");
@@ -798,6 +1154,8 @@ fragment float4 main_() { return float4(1); }
     engine.method(0x6c1, static_cast<u32>(REPORT + 0x100));
     engine.method(0x6c2, 0x87654321);
     engine.method(0x6c3, 0);
+    renderer.flushReports(commands.get(),
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(split_head.data()), 4));
     const auto split_report = gmmu.readMappedBytes(REPORT + 0x100, 16);
     u64 split_value, split_time;
     std::memcpy(&split_value, split_report.data(), 8);
@@ -814,9 +1172,314 @@ fragment float4 main_() { return float4(1); }
     commands.reset();
     expect(finished.wait_for(std::chrono::seconds(1)) == std::future_status::ready,
            "Logical completion callbacks remain attached to final submission");
+    renderer.drainReports();
+    // Memory written by the completion thread is invalidated by the GPU thread
+    renderer.applyQueuedMemoryInvalidations();
     tls_crnt_command_buffer = nullptr;
     tls_crnt_gmmu = nullptr;
-    std::cout << "PASS: real occlusion counts, reset epochs, rollover and completion-ordered reports\n";
+    std::cout << "PASS: real occlusion counts, reset epochs, rollover and asynchronous completion-ordered reports\n";
+}
+
+// The completion queue runs work in the order it was pushed, each piece once
+// its command buffer completed, whatever the order in which those complete
+void testCompletionQueueOrder() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer::metal;
+    std::mutex mutex;
+    std::vector<int> order;
+    const auto record = [&](int value) {
+        std::scoped_lock lock(mutex);
+        order.push_back(value);
+    };
+    const auto snapshot = [&] {
+        std::scoped_lock lock(mutex);
+        return order;
+    };
+    std::array<u8, 16> memory{};
+    const auto range =
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(memory.data()), memory.size());
+    CompletionQueue queue;
+    auto early = std::make_shared<CompletionToken>();
+    auto late = std::make_shared<CompletionToken>();
+    const auto first = queue.push(early, [&](bool ok) { record(ok ? 1 : -1); }, {range});
+    const auto second = queue.push(late, [&](bool ok) { record(ok ? 2 : -2); });
+    const auto third = queue.push(nullptr, [&](bool) { record(3); });
+    expect(first < second && second < third,
+           "Sequence numbers grow with the queue order");
+    expect(queue.hasPendingWrites() && queue.lastWriteTo(range) == first,
+           "Pending writes are found by their range");
+    expect(queue.lastWriteTo(ztd::Range<uptr>::fromSize(range.getEnd(), 16)) == 0,
+           "Other memory has no pending writes");
+    late->complete(true);
+    queue.notify();
+    expect(!queue.wait(third, std::chrono::milliseconds(100)) && snapshot().empty(),
+           "Work does not overtake the work pushed before it");
+    early->complete(false);
+    queue.notify();
+    expect(queue.wait(third, std::chrono::seconds(5)), "All the work finishes");
+    expect((snapshot() == std::vector<int>{-1, 2, 3}),
+           "Work runs in push order and learns whether its command buffer succeeded");
+    expect(!queue.hasPendingWrites() && queue.lastWriteTo(range) == 0 &&
+               queue.getPendingCount() == 0,
+           "Finished work has no pending writes");
+    late->complete(false);
+    expect(late->succeeded(), "A token completes only once");
+    // What is ready when the queue goes away still runs
+    std::atomic<int> ran{0};
+    {
+        CompletionQueue other;
+        auto token = std::make_shared<CompletionToken>();
+        token->complete(true);
+        other.push(token, [&](bool ok) { ran = ok ? 1 : 2; });
+    }
+    expect(ran == 1, "Work which is ready runs before the queue is destroyed");
+    std::cout << "PASS: completion queue order\n";
+}
+
+// The callbacks of a submission (its fence) follow the reports it queued, even
+// slow ones, while submissions without reports are not held back
+void testReportCallbackOrdering() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    std::atomic<int> publisher{0};
+    std::atomic<int> seen{-1};
+    renderer.queueOcclusionReport(commands.get(), [&](std::optional<u64>) {
+        publisher = 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        publisher = 2;
+    }, {});
+    commands->onCompletedChecked([&](bool succeeded) {
+        seen = publisher.load() * 10 + (succeeded ? 1 : 0);
+    });
+    commands.reset();
+    for (u32 i = 0; i < 500 && seen == -1; i++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    expect(seen == 21, "The callbacks of a submission wait for the reports it queued");
+
+    // The submissions after one with a slow report: their callbacks (their
+    // fences) come after the callbacks of that one. A fence only counts, so a
+    // later one reached first would satisfy the wait for the earlier one before
+    // its reports were written.
+    std::atomic<bool> slow_finished{false};
+    std::mutex order_mutex;
+    std::vector<int> order;
+    std::atomic<bool> second_saw_report{false};
+    commands.reset(renderer.createCommandBuffer());
+    renderer.queueOcclusionReport(commands.get(), [&](std::optional<u64>) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        slow_finished = true;
+    }, {});
+    commands->onCompleted([&] {
+        std::scoped_lock lock(order_mutex);
+        order.push_back(1);
+    });
+    commands.reset();
+    commands.reset(renderer.createCommandBuffer());
+    commands->onCompleted([&] {
+        second_saw_report = slow_finished.load();
+        std::scoped_lock lock(order_mutex);
+        order.push_back(2);
+    });
+    commands.reset();
+    for (u32 i = 0; i < 500; i++) {
+        {
+            std::scoped_lock lock(order_mutex);
+            if (order.size() == 2)
+                break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    {
+        std::scoped_lock lock(order_mutex);
+        expect((order == std::vector<int>{1, 2}) && second_saw_report,
+               "A submission after one with queued reports is completed after it");
+    }
+    // With nothing queued a submission is completed straight from Metal
+    renderer.drainReports();
+    std::promise<void> direct;
+    auto direct_done = direct.get_future();
+    commands.reset(renderer.createCommandBuffer());
+    commands->onCompleted([&] { direct.set_value(); });
+    commands.reset();
+    expect(direct_done.wait_for(std::chrono::milliseconds(500)) ==
+               std::future_status::ready,
+           "A submission with no queued work in front of it completes promptly");
+    std::cout << "PASS: submission callbacks follow their reports\n";
+}
+
+// A report which the GPU has not produced yet must not land on top of what
+// the command stream writes to the same memory afterwards
+void testReportsLandBeforeLaterWrites() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    std::array<u32, 8> memory{};
+    GMmu gmmu(nullptr);
+    constexpr u64 SEMAPHORE = 0x500000;
+    gmmu.map(SEMAPHORE, {reinterpret_cast<uptr>(memory.data()), sizeof(memory)});
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    tls_crnt_gmmu = &gmmu;
+    const auto range =
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(memory.data()), sizeof(memory));
+    // A slow report into the first word, then a release to the same word
+    renderer.queueOcclusionReport(commands.get(), [&](std::optional<u64>) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::atomic_ref<u32>(memory[0]).store(0x11111111, std::memory_order_release);
+    }, {range});
+    engine.method(0x6c0, 0);
+    engine.method(0x6c1, static_cast<u32>(SEMAPHORE));
+    engine.method(0x6c2, 0x22222222);
+    engine.method(0x6c3, 1u << 28);
+    renderer.flushReports(commands.get(), range);
+    expect(std::atomic_ref<u32>(memory[0]).load(std::memory_order_acquire) == 0x22222222,
+           "A release behind a report to the same memory has the last word");
+
+    // The same for the memory a texture flush or a copy engine touches
+    std::atomic<u32> landed{0};
+    renderer.queueOcclusionReport(commands.get(), [&](std::optional<u64>) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        landed = 1;
+    }, {range});
+    {
+        auto& cache = renderer.getTextureCache();
+        std::scoped_lock lock(cache.getMutex());
+        cache.flushMemory(commands.get(), range);
+    }
+    expect(landed == 1, "Flushing the memory of a pending report waits for the report");
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: reports land before later writes to their memory\n";
+}
+
+// What tells the guest that earlier work is done (a released semaphore, a
+// syncpoint, a wait for idle) comes after the reports of that work
+void testSignalsFollowQueuedReports() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    std::array<u32, 8> memory{};
+    GMmu gmmu(nullptr);
+    constexpr u64 SEMAPHORE = 0x500000;
+    gmmu.map(SEMAPHORE, {reinterpret_cast<uptr>(memory.data()), sizeof(memory)});
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    tls_crnt_gmmu = &gmmu;
+    std::atomic<u32> landed{0};
+    const auto queue_slow_report = [&] {
+        landed = 0;
+        renderer.queueOcclusionReport(commands.get(), [&](std::optional<u64>) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+            landed = 1;
+        }, {});
+    };
+
+    queue_slow_report();
+    engine.method(0x6c0, 0);
+    engine.method(0x6c1, static_cast<u32>(SEMAPHORE + 16));
+    engine.method(0x6c2, 7);
+    engine.method(0x6c3, 1u << 28);
+    expect(landed == 0 && memory[4] == 0,
+           "The release and its earlier reports remain pending before submission");
+    renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(&memory[4]), sizeof(u32)));
+    expect(landed == 1 && memory[4] == 7,
+           "A released semaphore is not visible before the reports queued ahead of it");
+
+    auto& syncpoints = gpu.getVideoSyncpoints();
+    const auto syncpoint = syncpoints.allocate();
+    expect(syncpoint.has_value(), "Allocate a 3D syncpoint");
+    queue_slow_report();
+    engine.method(0xb2, *syncpoint);
+    expect(landed == 0 && syncpoints.read(*syncpoint) == 0,
+           "A queued syncpoint increment does not complete before submission");
+    expect(renderer.synchronize(commands.get()), "Submit work preceding the syncpoint");
+    renderer.drainReports();
+    expect(landed == 1 && syncpoints.read(*syncpoint) == 1,
+           "A syncpoint increment is not visible before the reports queued ahead of it");
+
+    queue_slow_report();
+    gpu.subchannelMethod(0, 0x1e, 0); // WAIT_FOR_IDLE
+    expect(landed == 1, "A wait for idle includes the reports queued ahead of it");
+
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: signals to the guest follow the queued reports\n";
+}
+
+// NVN invalidates the shader instruction cache many times per frame. Only
+// commands which may have written guest memory (shader code included) are
+// worth waiting for; plain GPU work is not.
+void testShaderInvalidationWaitsOnlyForGuestWrites() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    auto* metal_commands = static_cast<metal::CommandBuffer*>(commands.get());
+    // Nothing is pending from earlier tests
+    renderer.synchronize(commands.get());
+    NS_STACK_SCOPED auto scratch =
+        renderer.getDevice()->newBuffer(64, MTL::ResourceStorageModeShared);
+    metal_commands->getBlitCommandEncoder()->fillBuffer(scratch, NS::Range(0, 64), 0x11);
+    const auto checkpoints = metal::CommandBuffer::getCheckpointCount();
+    engine.method(0x87, 1);
+    engine.method(0x369, 1);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints,
+           "Invalidating shader instructions does not wait for GPU work which writes no guest memory");
+    // Kernels: only one which writes a storage buffer (guest memory) is waited for
+    ShaderDescriptor descriptor{};
+    descriptor.type = ShaderType::Compute;
+    descriptor.backend = ShaderBackend::Msl;
+    const std::string code = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void main_(device uint* data [[buffer(0)]], uint id [[thread_position_in_grid]]) {
+    data[id] = id;
+})";
+    descriptor.code.assign(code.begin(), code.end());
+    std::unique_ptr<ShaderBase> kernel(renderer.createShader(descriptor));
+    std::unique_ptr<BufferBase> storage(renderer.allocateTemporaryBuffer(64));
+    ComputeDispatch dispatch{};
+    dispatch.shader = kernel.get();
+    dispatch.storage_buffers.push_back({0, BufferView(storage.get()), false});
+    dispatch.grid_size = MTL::Size(1, 1, 1);
+    dispatch.block_size = MTL::Size(16, 1, 1);
+    renderer.dispatchCompute(commands.get(), dispatch);
+    engine.method(0x87, 1);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints,
+           "A kernel which writes no storage buffer is not waited for");
+    dispatch.storage_buffers[0].written = true;
+    renderer.dispatchCompute(commands.get(), dispatch);
+    engine.method(0x87, 0x10);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints,
+           "Only the instruction bit of the invalidation waits");
+    engine.method(0x87, 1);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints + 1,
+           "Invalidating shader instructions waits for kernels which write storage buffers");
+    engine.method(0x87, 1);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints + 1,
+           "Once the kernel finished there is nothing left to wait for");
+    // A draw which writes a storage buffer counts as well (the renderer notes
+    // it), also for the variant without wait for idle (NO_WFI, method 0x369)
+    metal_commands->getBlitCommandEncoder()->fillBuffer(scratch, NS::Range(0, 64), 0x22);
+    metal_commands->noteGuestMemoryWrites();
+    engine.method(0x369, 1);
+    expect(metal::CommandBuffer::getCheckpointCount() == checkpoints + 2,
+           "Guest writes noted by the renderer are waited for by the NO_WFI variant too");
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    std::cout << "PASS: shader invalidation waits only for GPU writes to guest memory\n";
 }
 
 // Release semaphores with a reduction combine the payload with memory, and
@@ -842,6 +1505,8 @@ void testReportSemaphoreReductionAndAcquire() {
         engine.method(0x6c2, payload);
         // Short release with reduction enabled
         engine.method(0x6c3, (1u << 28) | (1u << 3) | (op << 9) | (format << 17));
+        renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(memory.data()), sizeof(u32)));
         return memory[0];
     };
     expect(reduce(0, 0, 10, 5) == 15, "Release reduction ADD");
@@ -860,6 +1525,8 @@ void testReportSemaphoreReductionAndAcquire() {
     engine.method(0x6c2, 1);
     memory[0] = 1;
     engine.method(0x6c3, (1u << 28) | (1u << 3));
+    renderer.flushReports(commands.get(), ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(memory.data()), sizeof(u32)));
     expect(memory[0] == 2 && memory[1] == 0x77777777,
            "A reduction does not write a timestamp or neighbouring words");
 
@@ -2121,6 +2788,54 @@ void testChannelMethodsAndFences() {
         method(0x5, static_cast<u32>(BASE + offset));
     };
 
+    method(0x14, 0x89abcdef);
+    expect(gpu.channelContext().puller_regs[0x14] == 0x89abcdef,
+           "SET_REFERENCE preserves all 32 bits in channel state");
+
+    {
+        auto& metal_renderer = static_cast<renderer::metal::Renderer&>(gpu.getRenderer());
+        NS_STACK_SCOPED auto reference_buffer = metal_renderer.getDevice()->newBuffer(
+            16, MTL::ResourceStorageModeShared);
+        std::memset(reference_buffer->contents(), 0, 16);
+        std::unique_ptr<renderer::ICommandBuffer> reference_commands(
+            metal_renderer.createCommandBuffer());
+        static_cast<renderer::metal::CommandBuffer*>(reference_commands.get())
+            ->getBlitCommandEncoder()->fillBuffer(reference_buffer, NS::Range(0, 16), 0x7b);
+        tls_crnt_command_buffer = reference_commands.get();
+        method(0x14, 0x12345678);
+        tls_crnt_command_buffer = nullptr;
+        expect(gpu.channelContext().puller_regs[0x14] == 0x12345678 &&
+                   static_cast<const u8*>(reference_buffer->contents())[15] == 0x7b,
+               "SET_REFERENCE publishes its value after preceding GPU work completes");
+    }
+
+    set_address(0x80);
+    u32 ring_value = 0;
+    std::memcpy(memory.data() + 0x80, &ring_value, sizeof(ring_value));
+    method(6, 3);
+    for (const u32 expected : {1u, 2u, 3u, 0u, 1u}) {
+        method(7, 0x10u | (6u << 27) | (1u << 31) | (1u << 24));
+        std::memcpy(&ring_value, memory.data() + 0x80, sizeof(ring_value));
+        expect(ring_value == expected, "Unsigned semaphore INC cycles through the inclusive limit");
+    }
+    ring_value = 0;
+    std::memcpy(memory.data() + 0x80, &ring_value, sizeof(ring_value));
+    for (const u32 expected : {3u, 2u, 1u, 0u, 3u}) {
+        method(7, 0x10u | (7u << 27) | (1u << 31) | (1u << 24));
+        std::memcpy(&ring_value, memory.data() + 0x80, sizeof(ring_value));
+        expect(ring_value == expected, "Unsigned semaphore DEC cycles down through zero");
+    }
+    for (const u32 operation : {6u, 7u}) {
+        PfifoDecodeState invalid;
+        tls_crnt_decode_state = &invalid;
+        method(7, 0x10u | (operation << 27) | (1u << 24));
+        tls_crnt_decode_state = nullptr;
+        u32 unchanged;
+        std::memcpy(&unchanged, memory.data() + 0x80, sizeof(unchanged));
+        expect(invalid.failed && invalid.error == 25 && unchanged == ring_value,
+               "Unsupported signed INC/DEC faults without changing the semaphore");
+    }
+
     // Release (4 bytes) and long release (payload and timestamp)
     set_address(0x10);
     method(0x1b, 0xabcd0001u);
@@ -2281,6 +2996,11 @@ void testChannelMethodsAndFences() {
         const auto fill = static_cast<u8>(0x20u + expected_count);
         queue_fill(fill);
         gpu.get3DEngine().method(0xb2, *engine_syncpoint | flags);
+        expect(syncpoints.read(*engine_syncpoint) == expected_count - 1,
+               "A 3D syncpoint remains pending until its GPU commands complete");
+        expect(gpu.getRenderer().synchronize(commands.get()),
+               "Submit GPU work preceding the 3D syncpoint");
+        gpu.getRenderer().drainReports();
         expect(syncpoints.read(*engine_syncpoint) == expected_count &&
                    gpu_bytes[0] == fill && gpu_bytes[15] == fill,
                "3D stream-out/ROP syncpoint increments follow real GPU writes with either CLEAN_L2 setting");
@@ -2307,7 +3027,262 @@ void testChannelMethodsAndFences() {
 
 void runBlit2DTests();
 
-int main() {
+// Random programs of draws, reports, resets and submissions, written by
+// tests/occlusion_reference.py, run on Metal: the reports of each program are
+// compared with an independent model of the counter. One line per program,
+// operations separated by spaces:
+//   D<n>   n draws (counted by the coverage and the counting state)
+//   C0/C1/C2   coverage of a draw: 16 samples, none (depth), 4 (scissor)
+//   X0/X1  counting off/on
+//   R<s>/r<s>   long/short report into slot s
+//   Z      reset of the counter     S  submit (new command buffer)
+//   E      end the render encoder   F  wait for the pending reports
+int runOcclusionCases(const char* input_path, const char* output_path) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    constexpr u32 SLOTS = 48;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(SLOTS * 16);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto& commands = rig.commands;
+    const auto memory = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(rig.report_memory.data()), rig.report_memory.size());
+    std::ifstream input(input_path);
+    std::ofstream output(output_path);
+    if (!input || !output) {
+        std::cerr << "Cannot open the case files\n";
+        return 2;
+    }
+    std::string line;
+    u32 program = 0;
+    while (std::getline(input, line)) {
+        // Every program starts from the same state
+        std::fill(rig.report_memory.begin(), rig.report_memory.end(), 0);
+        rig.setScissor(rig.full);
+        renderer.clearDepth(commands.get(), 0, 0.75f);
+        renderer.setOcclusionCounterEnabled(true);
+        engine.method(0x54c, 1);
+        std::istringstream tokens(line);
+        std::string token;
+        while (tokens >> token) {
+            const char kind = token[0];
+            const u32 number = token.size() > 1
+                                   ? static_cast<u32>(std::stoul(token.substr(1)))
+                                   : 0;
+            switch (kind) {
+            case 'D':
+                for (u32 i = 0; i < std::max(1u, number); i++)
+                    renderer.draw(commands.get(), engines::PrimitiveType::Triangles,
+                                  0, 3, 0, 1);
+                break;
+            case 'C':
+                rig.setScissor(number == 2 ? MTL::ScissorRect(0, 0, 2, 2) : rig.full);
+                renderer.clearDepth(commands.get(), 0, number == 1 ? 0.25f : 0.75f);
+                break;
+            case 'X':
+                renderer.setOcclusionCounterEnabled(number != 0);
+                break;
+            case 'R':
+            case 'r':
+                engine.method(0x6c0, 0);
+                engine.method(0x6c1, static_cast<u32>(OcclusionRig::REPORT + number * 16));
+                engine.method(0x6c3, 2 | (0x15u << 23) | (kind == 'r' ? 1u << 28 : 0u));
+                break;
+            case 'Z':
+                engine.method(0x54c, 1);
+                break;
+            case 'S':
+                commands.reset(renderer.createCommandBuffer());
+                tls_crnt_command_buffer = commands.get();
+                break;
+            case 'E':
+                static_cast<metal::CommandBuffer*>(commands.get())->getBlitCommandEncoder();
+                break;
+            case 'F':
+                renderer.flushReports(commands.get(), memory);
+                break;
+            default:
+                std::cerr << "Unknown operation " << token << '\n';
+                return 2;
+            }
+        }
+        renderer.flushReports(commands.get(), memory);
+        output << "P " << program++ << '\n';
+        for (u32 slot = 0; slot < SLOTS; slot++) {
+            u64 value, timestamp;
+            std::memcpy(&value, rig.report_memory.data() + slot * 16, sizeof(value));
+            std::memcpy(&timestamp, rig.report_memory.data() + slot * 16 + 8,
+                        sizeof(timestamp));
+            output << "S " << slot << ' ' << value << ' ' << timestamp << '\n';
+        }
+    }
+    renderer.drainReports();
+    return 0;
+}
+
+int runSemaphoreCases(const char* input_path, const char* output_path) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto* device = renderer.getDevice();
+    NS::Error* error = nullptr;
+    const char* source = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void initialize(device uint* memory [[buffer(0)]],
+                       constant uint& initial [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    memory[i] = i == 4 ? initial : 0xa5c39e71u;
+}
+kernel void observe(const device uint* memory [[buffer(0)]],
+                    device uint* results [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    results[i] = memory[i];
+})";
+    NS_STACK_SCOPED auto library = device->newLibrary(metal::toNsString(source), nullptr, &error);
+    expect(library != nullptr, "Semaphore reference kernels compile");
+    NS_STACK_SCOPED auto initialize = library->newFunction(metal::toNsString("initialize"));
+    NS_STACK_SCOPED auto observe = library->newFunction(metal::toNsString("observe"));
+    NS_STACK_SCOPED auto initialize_pipeline = device->newComputePipelineState(initialize, &error);
+    NS_STACK_SCOPED auto observe_pipeline = device->newComputePipelineState(observe, &error);
+    expect(initialize_pipeline && observe_pipeline, "Semaphore reference pipelines compile");
+    NS_STACK_SCOPED auto memory = device->newBuffer(4096, MTL::ResourceStorageModeShared);
+    NS_STACK_SCOPED auto results = device->newBuffer(32, MTL::ResourceStorageModeShared);
+    GMmu gmmu(nullptr);
+    constexpr u64 ADDRESS = 0x710000;
+    gmmu.map(ADDRESS, {reinterpret_cast<uptr>(memory->contents()), 4096});
+    tls_crnt_gmmu = &gmmu;
+    struct ResetTls {
+        ~ResetTls() {
+            tls_crnt_gmmu = nullptr;
+            tls_crnt_decode_state = nullptr;
+            tls_crnt_command_buffer = nullptr;
+        }
+    } reset_tls;
+    std::ifstream input(input_path);
+    std::ofstream output(output_path);
+    expect(bool(input) && bool(output), "Open semaphore case files");
+    u32 operation, signed_format, initial, payload, repetitions, no_wfi;
+    u32 count = 0;
+    while (input >> operation >> signed_format >> initial >> payload >> repetitions >> no_wfi) {
+        expect(operation < 16 && signed_format < 2 && no_wfi < 2 &&
+                   repetitions >= 1 && repetitions <= 1024, "Valid semaphore fixture");
+        PfifoDecodeState decode;
+        tls_crnt_decode_state = &decode;
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        tls_crnt_command_buffer = commands.get();
+        auto* native = static_cast<metal::CommandBuffer*>(commands.get());
+        auto* encoder = native->getComputeCommandEncoder();
+        encoder->setComputePipelineState(initialize_pipeline);
+        encoder->setBuffer(memory, 0, 0);
+        encoder->setBytes(&initial, sizeof(initial), 1);
+        encoder->dispatchThreads(MTL::Size(8, 1, 1), MTL::Size(8, 1, 1));
+        if (no_wfi)
+            expect(renderer.synchronize(commands.get()), "Initialize no-WFI fixture on GPU");
+        const auto before = metal::CommandBuffer::getCheckpointCount();
+        const auto method = [&](u32 index, u32 value) { gpu.subchannelMethod(0, index, value); };
+        method(4, 0);
+        method(5, static_cast<u32>(ADDRESS + 16));
+        method(6, payload);
+        const u32 control = 0x10u | (operation << 27) |
+            ((signed_format == 0 ? 1u : 0u) << 31) | (no_wfi << 20) | (1u << 24);
+        for (u32 step = 0; step < repetitions; ++step)
+            method(7, control);
+        const auto checkpoints = metal::CommandBuffer::getCheckpointCount() - before;
+        encoder = native->getComputeCommandEncoder();
+        encoder->setComputePipelineState(observe_pipeline);
+        encoder->setBuffer(memory, 0, 0);
+        encoder->setBuffer(results, 0, 1);
+        encoder->dispatchThreads(MTL::Size(8, 1, 1), MTL::Size(8, 1, 1));
+        expect(renderer.synchronize(commands.get()), "Observe semaphore on actual Metal GPU");
+        const auto* words = static_cast<const u32*>(results->contents());
+        for (u32 i = 0; i < 8; ++i)
+            if (i != 4) expect(words[i] == 0xa5c39e71u, "Semaphore reduction preserves neighboring GPU words");
+        output << words[4] << ' ' << decode.error.load() << ' ' << checkpoints << '\n';
+        tls_crnt_decode_state = nullptr;
+        tls_crnt_command_buffer = nullptr;
+        ++count;
+    }
+    expect(input.eof(), "Parse semaphore cases");
+    std::cout << "PASS: " << count << " production puller reductions with Metal initialization/readback\n";
+    return 0;
+}
+
+int runChannelMethodCases(const char* input_path, const char* output_path) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    NS_STACK_SCOPED auto memory = renderer.getDevice()->newBuffer(4096, MTL::ResourceStorageModeShared);
+    struct ResetTls {
+        ~ResetTls() {
+            tls_crnt_decode_state = nullptr;
+            tls_crnt_command_buffer = nullptr;
+        }
+    } reset_tls;
+    std::ifstream input(input_path);
+    std::ofstream output(output_path);
+    expect(bool(input) && bool(output), "Open channel method cases");
+    u32 method, argument, fill;
+    while (input >> method >> argument >> fill) {
+        expect(method < 0x1000 && fill <= 255, "Valid channel method fixture");
+        PfifoDecodeState decode;
+        decode.context = std::make_unique<GpuChannelContext>(gpu);
+        tls_crnt_decode_state = &decode;
+        std::atomic<bool> published{false};
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        tls_crnt_command_buffer = commands.get();
+        auto* native = static_cast<metal::CommandBuffer*>(commands.get());
+        native->getBlitCommandEncoder()->fillBuffer(memory, NS::Range(0, 4096), static_cast<u8>(fill));
+        renderer.queueGuestWrite(commands.get(), [&published](bool succeeded) {
+            published.store(succeeded, std::memory_order_release);
+        }, {});
+        const auto before = metal::CommandBuffer::getCheckpointCount();
+        gpu.subchannelMethod(0, method, argument);
+        const auto checkpoints = metal::CommandBuffer::getCheckpointCount() - before;
+        const bool published_before = published.load(std::memory_order_acquire);
+        u32 visible = 0;
+        if (published_before)
+            std::memcpy(&visible, memory->contents(), sizeof(visible));
+        expect(renderer.synchronize(commands.get()), "Complete real Metal work after channel method");
+        renderer.drainReports();
+        const auto* bytes = static_cast<const u8*>(memory->contents());
+        expect(published.load(std::memory_order_acquire) &&
+                   std::all_of(bytes, bytes + 4096, [fill](u8 byte) { return byte == fill; }),
+               "Prior Metal work and its ordered publisher complete");
+        output << decode.error.load() << ' ' << checkpoints << ' '
+               << published_before << ' ' << visible << '\n';
+        tls_crnt_decode_state = nullptr;
+        tls_crnt_command_buffer = nullptr;
+    }
+    expect(input.eof(), "Parse channel method cases");
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 4 && std::string_view(argv[1]) == "--channel-method-cases") {
+        try {
+            return runChannelMethodCases(argv[2], argv[3]);
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string_view(argv[1]) == "--semaphore-cases") {
+        try {
+            return runSemaphoreCases(argv[2], argv[3]);
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 4 && std::string(argv[1]) == "--occlusion-cases") {
+        try {
+            return runOcclusionCases(argv[2], argv[3]);
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
     try {
         runBlit2DTests();
         testMacroAlu();
@@ -2319,6 +3294,11 @@ int main() {
         testGuestMemoryBuffer();
         testConstBufferRemapping();
         testOcclusionReports();
+        testCompletionQueueOrder();
+        testReportCallbackOrdering();
+        testReportsLandBeforeLaterWrites();
+        testSignalsFollowQueuedReports();
+        testShaderInvalidationWaitsOnlyForGuestWrites();
         testReportSemaphoreReductionAndAcquire();
         testConditionalRendering();
         testIndexDecoding();

@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
+#include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
@@ -62,10 +63,12 @@ int main(int argc, char** argv) {
     std::vector<Failure> failures;
     const auto worker = [&] {
         NS_STACK_SCOPED auto thread_pool = NS::AutoreleasePool::alloc()->init();
+        auto& debugger = DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess();
+        debugger.registerThisThread("Shader corpus");
         while (true) {
             const usize index = next.fetch_add(1);
             if (index >= files.size())
-                return;
+                break;
             const auto& path = files[index];
             const auto name = path.filename().string();
             const auto type = name.find("_compute_") != std::string::npos
@@ -115,6 +118,7 @@ int main(int argc, char** argv) {
                 compiled++;
             }
         }
+        debugger.unregisterThisThread();
     };
     const usize thread_count =
         verbose ? 1

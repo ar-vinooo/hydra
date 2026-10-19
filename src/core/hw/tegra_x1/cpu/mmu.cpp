@@ -36,13 +36,43 @@ horizon::kernel::MemoryInfo IMmu::queryMemory(vaddr_t va) const {
         region = queryRegion(addr);
     }
 
-    // HACK
+    // DeviceShared follows live GPU mappings, including overlapping aliases.
+    info.device_ref_count = 0;
+    info.state.attr &= ~horizon::kernel::MemoryAttribute::DeviceShared;
+    if (info.state.type != horizon::kernel::MemoryType::Free) {
+        const auto physical_region = queryRegion(va);
+        const auto host = unmapAddr(va);
+        auto left = info.addr;
+        auto right = info.addr + info.size;
+        std::scoped_lock lock(device_mappings->mutex);
+        bool intersects = false;
+        for (const auto& [space, spans] : device_mappings->spaces) {
+            for (const auto& span : spans) {
+                const auto begin = alignDown(span.guest, GUEST_PAGE_SIZE);
+                const auto end = align(span.guest + span.size, GUEST_PAGE_SIZE);
+                if (end <= info.addr || begin >= info.addr + info.size)
+                    continue;
+                intersects = true;
+                if (begin <= va) left = std::max(left, begin);
+                else right = std::min(right, begin);
+                if (end <= va) left = std::max(left, end);
+                else right = std::min(right, end);
+                if (va >= begin && va < end && span.host != 0 &&
+                    host == span.host - (span.guest - begin) + (va - begin))
+                    ++info.device_ref_count;
+            }
+        }
+        if (intersects) {
+            info.addr = std::max(left, physical_region.va);
+            info.size = std::min(right, physical_region.va + physical_region.size) - info.addr;
+        }
+        if (info.device_ref_count != 0)
+            info.state.attr |= horizon::kernel::MemoryAttribute::DeviceShared;
+    }
     if (info.state.type == horizon::kernel::MemoryType::Free) {
         info.ipc_ref_count = 0;
-        info.device_ref_count = 0;
     } else {
         info.ipc_ref_count = 1;
-        info.device_ref_count = 1;
     }
 
     return info;

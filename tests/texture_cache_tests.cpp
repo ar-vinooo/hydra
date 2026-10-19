@@ -28,6 +28,102 @@ void check(bool value, const char* message) {
 
 void runTextureFormatTests();
 
+void testGpuOwnedAliasReplay() {
+    using hydra::hw::tegra_x1::gpu::getBlockLinearOffset;
+    for (const bool mip_chain : {true, false}) {
+        std::vector<u8> memory(0x20000, 0x5a), expected = memory;
+        const auto address = reinterpret_cast<uptr>(memory.data());
+        const TextureDescriptor destination(address, MTL::TextureType2D,
+            mip_chain ? TextureFormat::R8Unorm : TextureFormat::RG32Float,
+            false, 0, mip_chain ? 256 : 64, mip_chain ? 256 : 64,
+            1, mip_chain ? 9 : 1, 1, mip_chain ? 2 : 0, 5, 0);
+        const auto source_descriptor = [&](u32 level) {
+            return TextureDescriptor(address + (mip_chain
+                    ? destination.getLevelOffset(level) : level * 0x4000),
+                MTL::TextureType2D,
+                mip_chain ? TextureFormat::R8Unorm : TextureFormat::RGBA32Float,
+                false, 0, mip_chain ? 256u >> level : 32u >> level,
+                mip_chain ? 256u >> level : 32u >> level,
+                1, 1, 1, 0, mip_chain ? 5 - level : 2 - level, 0);
+        };
+        metal::Renderer renderer;
+        auto& cache = renderer.getTextureCache();
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        auto* target = cache.find(commands.get(), destination, TextureUsage::Read);
+        for (u32 level = 0; level < 2; ++level)
+            cache.find(commands.get(), source_descriptor(level), TextureUsage::Read);
+        const auto clear = [&](ITextureView* view, const TextureDescriptor& desc,
+                               u32 level, bool source) {
+            const auto dims = desc.getLevelDimensions(level);
+            auto* native = static_cast<metal::Texture*>(view->getBase())->getTexture();
+            auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            auto* attachment = pass->colorAttachments()->object(0);
+            attachment->setTexture(native);
+            attachment->setLevel(level);
+            attachment->setLoadAction(MTL::LoadActionClear);
+            attachment->setStoreAction(MTL::StoreActionStore);
+            attachment->setClearColor(source ? MTL::ClearColor(0.75, 1, 1.25, 1.5)
+                                              : MTL::ClearColor(0.25, 0.5, 0, 1));
+            static_cast<metal::CommandBuffer*>(commands.get())->getRenderCommandEncoder(pass);
+            std::array<u8, 16> texel{};
+            const std::array<f32, 4> color = source
+                ? std::array<f32, 4>{0.75f, 1, 1.25f, 1.5f}
+                : std::array<f32, 4>{0.25f, 0.5f, 0, 1};
+            std::memcpy(texel.data(), color.data(), sizeof(color));
+            if (mip_chain) texel[0] = source ? 191 : 64;
+            const auto bytes = getTextureFormatInfo(desc.format).bytes_per_block;
+            const auto block = desc.getLevelBlockSizeLog2(level);
+            const auto stride = align(static_cast<u32>(dims.width) * bytes,
+                                      64u << static_cast<u32>(block.width));
+            for (u32 y = 0; y < dims.height; ++y) {
+                for (u32 x = 0; x < dims.width; ++x) {
+                    const auto offset = desc.ptr - address + desc.getLevelOffset(level) +
+                        getBlockLinearOffset(x * bytes, y, 0, stride,
+                            static_cast<u32>(dims.height), static_cast<u32>(block.height), 0);
+                    std::memcpy(expected.data() + offset, texel.data(), bytes);
+                }
+            }
+        };
+        cache.find(commands.get(), destination, TextureUsage::Write);
+        for (u32 level = 0; level < destination.level_count; ++level)
+            clear(target, destination, level, false);
+        for (u32 level = 0; level < 2; ++level) {
+            const auto source = source_descriptor(level);
+            auto* view = cache.find(commands.get(), source, TextureUsage::Write);
+            clear(view, source, 0, true);
+            // Replaying the older destination must preserve newer aliases
+            // even after those aliases have already reached guest memory.
+            cache.flushMemory(commands.get(), source.getRange());
+        }
+        target = cache.find(commands.get(), destination, TextureUsage::Read);
+        for (u32 level = 0; level < destination.level_count; ++level) {
+            const auto dims = destination.getLevelDimensions(level);
+            const auto bytes = getTextureFormatInfo(destination.format).bytes_per_block;
+            const u32 row_bytes = static_cast<u32>(dims.width) * bytes;
+            const u32 image_bytes = row_bytes * static_cast<u32>(dims.height);
+            NS_STACK_SCOPED auto result = renderer.getDevice()->newBuffer(
+                image_bytes, MTL::ResourceStorageModeShared);
+            static_cast<metal::CommandBuffer*>(commands.get())->getBlitCommandEncoder()
+                ->copyFromTexture(static_cast<metal::Texture*>(target->getBase())->getTexture(),
+                    0, level, MTL::Origin(0, 0, 0), dims, result, 0, row_bytes, image_bytes);
+            check(renderer.synchronize(commands.get()), "GPU alias replay readback completes");
+            const auto block = destination.getLevelBlockSizeLog2(level);
+            const auto stride = align(row_bytes, 64u << static_cast<u32>(block.width));
+            for (u32 y = 0; y < dims.height; ++y) {
+                for (u32 x = 0; x < dims.width; ++x) {
+                    const auto offset = destination.getLevelOffset(level) +
+                        getBlockLinearOffset(x * bytes, y, 0, stride,
+                            static_cast<u32>(dims.height), static_cast<u32>(block.height), 0);
+                    check(std::memcmp(static_cast<const u8*>(result->contents()) +
+                              y * row_bytes + x * bytes, expected.data() + offset, bytes) == 0,
+                          "Alias replay preserves older GPU texels and the newest overlapping bytes");
+                }
+            }
+        }
+    }
+    std::cout << "PASS: GPU-owned mip/layout and different-width aliases replay in byte order\n";
+}
+
 int main() {
     try {
         // Exercise the real cache and Metal texture views, including
@@ -39,6 +135,7 @@ int main() {
         setenv("HYDRA_DISABLE_SHADER_CACHE", "1", 1);
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
         runTextureFormatTests();
+        testGpuOwnedAliasReplay();
         std::vector<u8> guest_memory(65536, 0);
         metal::Renderer renderer;
         std::unique_ptr<ICommandBuffer> commands(
@@ -345,6 +442,133 @@ int main() {
                       "BC3 mip written through RGBA32 blocks reaches the BC texture");
             }
             std::cout << "PASS: BC blocks written through RGBA32 render targets\n";
+        }
+
+        // Unreal writes the small levels of a mip chain as textures of their
+        // own, one GOB (64 bytes) wide: a 32x32 level as 64x32, 16x16 as 64x16
+        // and so on, at the address of that level inside the chain (the 256x256
+        // and 512x512 R8 chains of the Crash Bandicoot 4 log). The chain has
+        // GPU data of its own, so it cannot be rebuilt from guest memory: the
+        // levels must be copied from the textures that were written, in both
+        // directions, without touching the padding columns.
+        {
+            std::vector<u8> tail_memory(0x20000, 0);
+            const auto tail_ptr = reinterpret_cast<uptr>(tail_memory.data());
+            metal::Renderer tail_renderer;
+            auto& tail_cache = tail_renderer.getTextureCache();
+            std::unique_ptr<ICommandBuffer> tail_commands(
+                tail_renderer.createCommandBuffer());
+            const TextureDescriptor chain(tail_ptr, MTL::TextureType2D,
+                                          TextureFormat::R8Unorm, false, 0, 256,
+                                          256, 1, 9, 1, 2, 5, 0);
+            check(chain.size == 0x16400 && chain.getLevelOffset(3) == 0x15000 &&
+                      chain.getLevelSize(3) == 0x800 &&
+                      chain.getLevelOffset(8) == 0x16200,
+                  "The R8 chain has the layout of the log");
+            const auto clear = [&](ITextureView* view, u32 level, f64 value) {
+                auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+                auto* attachment = pass->colorAttachments()->object(0);
+                attachment->setTexture(
+                    static_cast<metal::Texture*>(view->getBase())->getTexture());
+                attachment->setLevel(level);
+                attachment->setLoadAction(MTL::LoadActionClear);
+                attachment->setStoreAction(MTL::StoreActionStore);
+                attachment->setClearColor(MTL::ClearColor(value, 0, 0, 1));
+                static_cast<metal::CommandBuffer*>(tail_commands.get())
+                    ->getRenderCommandEncoder(pass);
+            };
+            // What each tail texture is cleared to, exact in R8Unorm
+            const auto tailByte = [](u32 level) {
+                return static_cast<u8>(40 + 20 * level);
+            };
+            struct Tail {
+                u32 level, width, height, block_height_log2;
+            };
+            const std::array<Tail, 6> tails{{{3, 64, 32, 2}, {4, 64, 16, 1},
+                                             {5, 64, 8, 0}, {6, 64, 4, 0},
+                                             {7, 64, 2, 0}, {8, 64, 1, 0}}};
+            auto* chain_view = tail_cache.find(tail_commands.get(), chain,
+                                               TextureUsage::Read);
+            tail_cache.find(tail_commands.get(), chain, TextureUsage::Write);
+            clear(chain_view, 0, 0.5);
+            for (const auto& level : tails) {
+                const TextureDescriptor tail(
+                    tail_ptr + chain.getLevelOffset(level.level),
+                    MTL::TextureType2D, TextureFormat::R8Unorm, false, 0,
+                    level.width, level.height, 1, 1, 1, 0,
+                    level.block_height_log2, 0);
+                check(tail.size == chain.getLevelSize(level.level),
+                      "A tail texture covers exactly its level of the chain");
+                auto* tail_view = tail_cache.find(tail_commands.get(), tail,
+                                                  TextureUsage::Read);
+                tail_cache.find(tail_commands.get(), tail, TextureUsage::Write);
+                clear(tail_view, 0, tailByte(level.level) / 255.0);
+            }
+            chain_view = tail_cache.find(tail_commands.get(), chain,
+                                         TextureUsage::Read);
+            auto* chain_texture =
+                static_cast<metal::Texture*>(chain_view->getBase())->getTexture();
+            NS_STACK_SCOPED auto readback = tail_renderer.getDevice()->newBuffer(
+                0x4000, MTL::ResourceStorageModeShared);
+            auto* blit = static_cast<metal::CommandBuffer*>(tail_commands.get())
+                             ->getBlitCommandEncoder();
+            for (u32 i = 0; i < tails.size(); ++i) {
+                const u32 side = 32u >> i;
+                blit->copyFromTexture(chain_texture, 0, tails[i].level,
+                                      MTL::Origin(0, 0, 0),
+                                      MTL::Size(side, side, 1), readback,
+                                      i * 0x800, side, side * side);
+            }
+            // The other direction: the chain is written after the tail
+            // texture, which is then sampled
+            clear(chain_view, 3, 230.0 / 255.0);
+            tail_cache.find(tail_commands.get(), chain, TextureUsage::Write);
+            const TextureDescriptor tail3(
+                tail_ptr + chain.getLevelOffset(3), MTL::TextureType2D,
+                TextureFormat::R8Unorm, false, 0, 64, 32, 1, 1, 1, 0, 2, 0);
+            auto* tail3_view = tail_cache.find(tail_commands.get(), tail3,
+                                               TextureUsage::Read);
+            auto* tail3_texture =
+                static_cast<metal::Texture*>(tail3_view->getBase())->getTexture();
+            blit = static_cast<metal::CommandBuffer*>(tail_commands.get())
+                       ->getBlitCommandEncoder();
+            blit->copyFromTexture(tail3_texture, 0, 0, MTL::Origin(0, 0, 0),
+                                  MTL::Size(64, 32, 1), readback, 0x3000, 64,
+                                  64 * 32);
+            tail_commands.reset();
+            const auto* bytes = static_cast<const u8*>(readback->contents());
+            for (u32 i = 0; i < tails.size(); ++i) {
+                const u32 side = 32u >> i;
+                const u8 expected = tailByte(tails[i].level);
+                bool all_match = true;
+                u32 first_wrong = 0;
+                for (u32 y = 0; y < side; ++y)
+                    for (u32 x = 0; x < side; ++x)
+                        if (bytes[i * 0x800 + y * side + x] != expected) {
+                            if (all_match)
+                                first_wrong = bytes[i * 0x800 + y * side + x];
+                            all_match = false;
+                        }
+                check(all_match,
+                      fmt::format("Mip tail level {} written GOB wide reaches its level of "
+                                  "the chain (expected {}, found {})",
+                                  tails[i].level, expected, first_wrong)
+                          .c_str());
+            }
+            bool chain_into_tail = true;
+            bool padding_kept = true;
+            for (u32 y = 0; y < 32; ++y) {
+                for (u32 x = 0; x < 64; ++x) {
+                    const u8 value = bytes[0x3000 + y * 64 + x];
+                    if (x < 32)
+                        chain_into_tail &= value == 230;
+                    else
+                        padding_kept &= value == tailByte(3); // the tail's own
+                }
+            }
+            check(chain_into_tail, "A level of the chain reaches the tail texture of that level");
+            check(padding_kept, "The padding columns of the tail texture are left alone");
+            std::cout << "PASS: mip tail textures written GOB wide synchronize with their chain\n";
         }
 
         // A bridge merges initially separate intervals after a GPU write.
@@ -1195,6 +1419,50 @@ int main() {
             cb.reset();
             std::cout << "PASS: packed depth/stencil target flush\n";
         }
+
+        // Aliases with different texel byte widths must preserve guest bytes,
+        // including the BGRA8 -> RG32Float pair seen in Crash 4.
+        for (const bool reverse : {false, true}) {
+            std::vector<u8> memory(4096, 0);
+            const auto address = reinterpret_cast<uptr>(memory.data());
+            metal::Renderer alias_renderer;
+            auto& aliases = alias_renderer.getTextureCache();
+            std::unique_ptr<ICommandBuffer> cb(alias_renderer.createCommandBuffer());
+            const auto make = [address](bool wide) {
+                return TextureDescriptor(address, MTL::TextureType2D,
+                    wide ? TextureFormat::RG32Float : TextureFormat::BGRA8Unorm,
+                    true, 64, wide ? 8 : 16, 4, 1, 1, 1, 0, 0, 0);
+            };
+            const auto dst_desc = make(!reverse);
+            aliases.find(cb.get(), dst_desc, TextureUsage::Read);
+            const auto src_desc = make(reverse);
+            auto* src = aliases.find(cb.get(), src_desc, TextureUsage::Write);
+            auto* width_pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            auto* width_attachment = width_pass->colorAttachments()->object(0);
+            auto* native_src = static_cast<metal::Texture*>(src->getBase())->getTexture();
+            width_attachment->setTexture(native_src);
+            width_attachment->setLoadAction(MTL::LoadActionClear);
+            width_attachment->setStoreAction(MTL::StoreActionStore);
+            width_attachment->setClearColor(MTL::ClearColor(0.25, 0.5, 0.75, 1));
+            auto* width_commands = static_cast<metal::CommandBuffer*>(cb.get());
+            width_commands->getRenderCommandEncoder(width_pass);
+            NS_STACK_SCOPED auto expected = alias_renderer.getDevice()->newBuffer(
+                256, MTL::ResourceStorageModeShared);
+            width_commands->getBlitCommandEncoder()->copyFromTexture(native_src, 0, 0,
+                MTL::Origin(0, 0, 0), MTL::Size(src_desc.width, 4, 1),
+                expected, 0, 64, 256);
+            auto* dst = aliases.find(cb.get(), dst_desc, TextureUsage::Read);
+            NS_STACK_SCOPED auto width_result = alias_renderer.getDevice()->newBuffer(
+                256, MTL::ResourceStorageModeShared);
+            width_commands->getBlitCommandEncoder()->copyFromTexture(
+                static_cast<metal::Texture*>(dst->getBase())->getTexture(), 0, 0,
+                MTL::Origin(0, 0, 0), MTL::Size(dst_desc.width, 4, 1),
+                width_result, 0, 64, 256);
+            check(alias_renderer.synchronize(cb.get()), "Alias readback completed");
+            check(std::memcmp(expected->contents(), width_result->contents(), 256) == 0,
+                  "Different-width texture aliases preserve all guest bytes");
+        }
+        std::cout << "PASS: BGRA8/RG32Float aliases in both directions\n";
 
         // Guest readback must replay aliases by GPU write time, rather than
         // the cache's insertion/hash order. The first storage is deliberately

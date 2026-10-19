@@ -36,6 +36,8 @@ class MemoryAnalyzer {
     std::unordered_set<u8> stage_inputs;
     std::unordered_set<u8> stage_outputs;
     std::unordered_set<u32> const_buffers;
+    std::map<u32, u64> const_buffer_sizes;
+    std::set<u32> indexed_const_buffers;
     std::map<u32, TextureInfo> textures;
     std::map<u32, ImageInfo> images;
     // Storage buffers by binding (constant buffer slot << 16 | word)
@@ -61,6 +63,7 @@ class MemoryAnalyzer {
     CONST_REF_GETTER(stage_inputs, getStageInputs);
     CONST_REF_GETTER(stage_outputs, getStageOutputs);
     CONST_REF_GETTER(const_buffers, getConstBuffers);
+    CONST_REF_GETTER(const_buffer_sizes, getConstBufferSizes);
     CONST_REF_GETTER(textures, getTextures);
     CONST_REF_GETTER(images, getImages);
     CONST_REF_GETTER(storage_buffers, getStorageBuffers);

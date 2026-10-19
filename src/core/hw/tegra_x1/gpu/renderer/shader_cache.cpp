@@ -115,20 +115,24 @@ struct ShaderKeyBuilder {
     }
 };
 
-bool matchesMappedCode(uptr address, const std::vector<u8>& bytes) {
+bool matchesMappedCode(uptr address, const std::vector<u8>& bytes,
+                       u64 prefix = 0) {
+    const usize count_to_check = prefix != 0
+        ? static_cast<usize>(prefix) : bytes.size();
+    if (count_to_check > bytes.size()) return false;
     usize offset = 0;
-    while (offset < bytes.size()) {
+    while (offset < count_to_check) {
         uptr base;
         const auto mapping = tls_crnt_gmmu->findAddr(address + offset, base);
         if (!mapping || mapping->ptr == 0) return false;
         const auto within = address + offset - base;
-        const auto count = std::min<usize>(mapping->size - within, bytes.size() - offset);
+        const auto count = std::min<usize>(mapping->size - within, count_to_check - offset);
         if (std::memcmp(bytes.data() + offset,
                         reinterpret_cast<const void*>(mapping->ptr + within), count) != 0)
             return false;
         offset += count;
     }
-    if (bytes.size() == 0x10000) return true;
+    if (prefix != 0 || bytes.size() == 0x10000) return true;
     // A previously unmapped tail becoming mapped also changes the snapshot.
     uptr base;
     const auto tail = tls_crnt_gmmu->findAddr(address + bytes.size(), base);
@@ -307,6 +311,24 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
     };
     std::scoped_lock lock(lookup_mutex);
     auto actual = descriptor;
+    actual.code_revision = 0;
+    actual.state.branch_constants.clear();
+    const auto version_key = makeShaderKey(actual);
+    auto& versions = compiled_versions[version_key];
+    for (const auto& version : versions) {
+        const auto& resources = version.shader->getDescriptor().resource_mapping;
+        if (!matchesMappedCode(descriptor.gpu_addr, *version.bytes,
+                               resources.code_read_size))
+            continue;
+        const auto constants_match = std::all_of(
+            resources.branch_constants.begin(), resources.branch_constants.end(),
+            [&](const auto& entry) {
+                return descriptor.read_const_word &&
+                    descriptor.read_const_word(entry.first.first,
+                                               entry.first.second) == entry.second;
+            });
+        if (constants_match) return inspect(actual, version.shader);
+    }
     auto& source = sources[{reinterpret_cast<uptr>(tls_crnt_gmmu), descriptor.gpu_addr,
                             descriptor.stage}];
     const auto epoch = instruction_epoch.load();
@@ -350,7 +372,9 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         }
         actual.cache_key = makeShaderKey(actual);
     }
-    return inspect(actual, CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true>::find(actual));
+    auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true>::find(actual);
+    if (shader) versions.push_back({actual.code_snapshot, shader});
+    return inspect(actual, shader);
 }
 
 ShaderBase* ShaderCache::createHot1(const GuestShaderDescriptor& descriptor) {

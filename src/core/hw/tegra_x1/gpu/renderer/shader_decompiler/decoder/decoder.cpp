@@ -39,6 +39,9 @@ void Decoder::decode() {
 // Enumerate only the proven bounded targets; arbitrary indirect addresses are
 // never treated as shader code.
 bool Decoder::emitIndirectBranch(instruction_t inst, u32 pc) {
+    // Target validation also depends on the available code window.
+    if (context.decomp_context.code_read_size)
+        *context.decomp_context.code_read_size = invalid<u64>();
     if ((inst & 0x60u) != 0)
         return false; // cbuf mode / LMT
     const auto saved = context.code_stream->getSeek();
@@ -156,6 +159,8 @@ void Decoder::parseNextInstruction() {
     const auto seek = context.code_stream->getSeek();
     const auto size = context.code_stream->getSize();
     if (seek > size || size - seek < sizeof(instruction_t)) {
+        if (context.decomp_context.code_read_size)
+            *context.decomp_context.code_read_size = invalid<u64>();
         LOG_ERROR(ShaderDecompiler, "Shader control flow left the code at {:#x}",
                   pc);
         context.builder.opExit();
@@ -163,6 +168,10 @@ void Decoder::parseNextInstruction() {
         return;
     }
     const auto inst = context.code_stream->read<instruction_t>();
+    if (context.decomp_context.code_read_size)
+        *context.decomp_context.code_read_size = std::max(
+            *context.decomp_context.code_read_size,
+            static_cast<u64>(seek + sizeof(instruction_t)));
     if ((pc % 4) == 0) // Sched
         return;
 
@@ -603,6 +612,8 @@ void Decoder::parseNextInstruction() {
                 (*context.decomp_context.branch_constants)[
                     {slot, static_cast<u32>(byte_offset) / 4}] = address;
         }
+        if (context.decomp_context.code_read_size)
+            *context.decomp_context.code_read_size = invalid<u64>();
         if (address < context.code_offset || address % 8 != 0 ||
             address - context.code_offset >= context.code_stream->getSize()) {
             LOG_ERROR(ShaderDecompiler, "JMP target outside shader: {:#x}", address);

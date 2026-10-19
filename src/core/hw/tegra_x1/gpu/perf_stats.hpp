@@ -1,10 +1,40 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 
 namespace hydra::hw::tegra_x1::gpu {
+
+// Why the GPU thread waited for the host GPU, see ScopedCheckpointReason
+enum class CheckpointReason : u8 {
+    Other,
+    ShaderInvalidate,
+    SyncPoint,
+    ReportRelease,
+    ReportFlush,
+    ConditionalRender,
+    SemaphoreAcquire,
+    PullerAcquire,
+    PullerOther,
+    TextureReadback,
+    StorageWrite,
+    Count,
+};
+
+constexpr usize CHECKPOINT_REASON_COUNT =
+    static_cast<usize>(CheckpointReason::Count);
+
+constexpr const char* getCheckpointReasonName(CheckpointReason reason) {
+    constexpr const char* names[CHECKPOINT_REASON_COUNT] = {
+        "other",          "shader invalidate", "syncpoint",
+        "report release", "report flush",      "conditional render",
+        "acquire",        "puller acquire",    "puller other",
+        "texture readback", "storage write",
+    };
+    return names[static_cast<usize>(reason)];
+}
 
 // DEBUG: frame timing statistics, logged when HYDRA_PERF_STATS is set
 struct PerfStats {
@@ -38,6 +68,11 @@ struct PerfStats {
     std::atomic<u64> buffer_snapshots{0};
     std::atomic<u64> buffer_snapshot_bytes{0};
     std::atomic<u64> checkpoint_skips{0};
+    std::array<std::atomic<u64>, CHECKPOINT_REASON_COUNT> checkpoint_count{};
+    std::array<std::atomic<u64>, CHECKPOINT_REASON_COUNT> checkpoint_ns{};
+    // Occlusion reports queued, and how often a consumer had to wait for them
+    std::atomic<u64> reports_queued{0};
+    std::atomic<u64> report_waits{0};
     // Draws issued with state Hydra does not implement yet (MSAA, alpha-to-coverage)
     std::atomic<u64> msaa_draws{0};
     std::atomic<u64> alpha_to_coverage_draws{0};

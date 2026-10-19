@@ -5,6 +5,7 @@
 
 namespace hydra::hw::tegra_x1::cpu {
 class IMmu;
+struct DeviceMappingState;
 }
 
 namespace hydra::hw::tegra_x1::gpu {
@@ -19,7 +20,7 @@ struct AddressSpace {
 // TODO: free memory
 class GMmu : public GenericMmu<GMmu, AddressSpace> {
   public:
-    explicit GMmu(cpu::IMmu* mmu_) : mmu{mmu_} {}
+    explicit GMmu(cpu::IMmu* mmu_);
     ~GMmu();
     void cancelGpuWork() { gpu_cancelled.store(true, std::memory_order_release); }
     bool gpuWorkCancelled() const { return gpu_cancelled.load(std::memory_order_acquire); }
@@ -34,19 +35,18 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
     void mapImpl([[maybe_unused]] uptr base, [[maybe_unused]] AddressSpace as) {
     }
-    void unmapImpl([[maybe_unused]] uptr base,
-                   [[maybe_unused]] AddressSpace as) {}
+    void unmapImpl(uptr base, AddressSpace as);
 
     // Address space
-    uptr createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr);
+    uptr createAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr, u64 replace_size = 0);
 
     uptr allocatePrivateAddressSpace(u64 size, uptr gpu_addr) {
         return createAddressSpace(ztd::Range<vaddr_t>::fromSize(0x0, size),
                                   gpu_addr);
     }
 
-    uptr mapBufferToAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr) {
-        return createAddressSpace(range, gpu_addr);
+    uptr mapBufferToAddressSpace(ztd::Range<vaddr_t> range, uptr gpu_addr, u64 replace_size = 0) {
+        return createAddressSpace(range, gpu_addr, replace_size);
     }
 
     // Sparse memory without backing reads as zero
@@ -94,6 +94,8 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
   private:
     cpu::IMmu* mmu;
+    std::shared_ptr<cpu::DeviceMappingState> device_mappings;
+    void publishDeviceMappings(uptr excluded = invalid<uptr>());
     std::atomic<bool> gpu_cancelled{false};
     std::vector<uptr> zero_blocks;
 
