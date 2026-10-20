@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
@@ -247,14 +248,30 @@ void TwoD::copy(const u32 index, const u32 pixels_from_memory_src_y0_int) {
         .src_width = static_cast<f32>(exact_width),
         .src_height = static_cast<f32>(exact_height),
     };
-    gpu.getRenderer().blitTexture(
-        tls_crnt_command_buffer, src,
-        {static_cast<f32>(src_x0), static_cast<f32>(src_y0), 0.0f},
-        {src_width, src_height, 1}, 0, 0, dst,
-        {static_cast<f32>(region->dst_x), static_cast<f32>(region->dst_y),
-         0.0f},
-        {region->width, region->height, 1}, 0, regs.dst.layer, 1, 1,
-        options);
+    if (!src || !dst) {
+        ONCE(LOG_WARN(Engines, "2D copy without a source or destination texture"));
+        return;
+    }
+    command_ir::CopyCommand blit;
+    blit.resources.capture(gpu.getRenderer(), tls_crnt_gmmu);
+    blit.src = src;
+    blit.dst = dst;
+    blit.src_origin = {static_cast<f32>(src_x0), static_cast<f32>(src_y0), 0.0f};
+    blit.src_size = {src_width, src_height, 1};
+    blit.dst_origin = {static_cast<f32>(region->dst_x),
+                       static_cast<f32>(region->dst_y), 0.0f};
+    blit.dst_size = {region->width, region->height, 1};
+    blit.dst_layer = regs.dst.layer;
+    blit.options = options;
+    if (!command_ir::sealCopy(gpu.getRenderer(), blit) ||
+        !command_ir::executeCopy(gpu.getRenderer(), tls_crnt_command_buffer,
+                                 blit)) {
+        LOG_ERROR(Gpu, "2D copy rejected: resource lifetime or GPU mapping "
+                       "changed");
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return;
+    }
 
     // Small and pitch linear destinations are typically staging copies the CPU
     // reads back directly (e.g. UE4's sky light average brightness), without a

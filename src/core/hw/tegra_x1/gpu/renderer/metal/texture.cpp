@@ -20,7 +20,7 @@ namespace {
 // Copies a region between textures. Metal blits need equal pixel formats:
 // formats of the same texel size go through a view, single plane depth and
 // color formats through a buffer.
-void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
+bool copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
                 TextureFormat src_format, u32 src_slice, u32 src_level,
                 MTL::Origin src_origin, MTL::Texture* dst,
                 TextureFormat dst_format, u32 dst_slice, u32 dst_level,
@@ -48,13 +48,14 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
         size.depth = std::min({size.depth,
                                available(src->depth(), src_level, src_origin.z),
                                available(dst->depth(), dst_level, dst_origin.z)});
+        // Nothing to copy is not a failure
         if (size.width == 0 || size.height == 0 || size.depth == 0)
-            return;
+            return true;
     }
     if (src->pixelFormat() == dst->pixelFormat()) {
         encoder->copyFromTexture(src, src_slice, src_level, src_origin, size,
                                  dst, dst_slice, dst_level, dst_origin);
-        return;
+        return true;
     }
 
     const bool same_texel = src_info.bytes_per_block ==
@@ -103,7 +104,7 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
         if (src_origin.x >= src_width || src_origin.y >= src_height ||
             src_origin.z >= src_depth || dst_origin.x >= dst_width ||
             dst_origin.y >= dst_height || dst_origin.z >= dst_depth)
-            return;
+            return true;
         size.depth = std::min<NS::UInteger>(
             {size.depth,
              static_cast<NS::UInteger>(src_depth - src_origin.z),
@@ -146,14 +147,15 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
                           size.depth),
                 dst, dst_slice, dst_level, dst_origin);
             buffer->release();
-            return;
+            return true;
         }
     }
 
     if (!sizes_match) {
         ONCE(LOG_NOT_IMPLEMENTED(MetalRenderer, "Texture copy from {} to {}",
                                  src_format, dst_format));
-        return;
+        // Nothing was encoded: the caller must not treat dst as updated
+        return false;
     }
 
     if (!src_ds && !dst_ds && src->buffer() == nullptr) {
@@ -164,7 +166,7 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
                                      dst_origin);
             // Encoded commands retain the view
             view->release();
-            return;
+            return true;
         }
     }
 
@@ -182,6 +184,7 @@ void copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
     encoder->copyFromBuffer(buffer, 0, row_bytes, image_bytes, size, dst,
                             dst_slice, dst_level, dst_origin);
     buffer->release();
+    return true;
 }
 
 } // namespace
@@ -545,7 +548,7 @@ void Texture::copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
 }
 
 // TODO: make sure source and destination sizes match
-void Texture::copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
+bool Texture::copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
                        const u32 src_level, const u32 src_layer,
                        const u32 dst_level, const u32 dst_layer,
                        const u32 level_count, const u32 layer_count) {
@@ -559,16 +562,17 @@ void Texture::copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
         for (u32 j = 0; j < level_count; j++) {
             const u32 crnt_dst_level = dst_level + j;
             const auto dims = descriptor.getLevelDimensions(crnt_dst_level);
-            copyRegion(encoder, mtl_src, src->getDescriptor().format,
-                       src_layer + i, src_level + j, MTL::Origin(0, 0, 0),
-                       texture, descriptor.format, dst_layer + i,
-                       crnt_dst_level, MTL::Origin(0, 0, 0),
-                       dims);
+            if (!copyRegion(encoder, mtl_src, src->getDescriptor().format,
+                            src_layer + i, src_level + j, MTL::Origin(0, 0, 0),
+                            texture, descriptor.format, dst_layer + i,
+                            crnt_dst_level, MTL::Origin(0, 0, 0), dims))
+                return false;
         }
     }
+    return true;
 }
 
-void Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
+bool Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
                        const MTL::Origin src_origin, const u32 src_level,
                        const u32 src_layer, const MTL::Origin dst_origin,
                        const u32 dst_level, const u32 dst_layer,
@@ -580,13 +584,15 @@ void Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
     auto encoder = command_buffer_impl->getBlitCommandEncoder();
 
     for (u32 i = 0; i < layer_count; i++) {
-        copyRegion(encoder, mtl_src, src->getDescriptor().format,
-                   src_layer + i, src_level,
-                   MTL::Origin(src_origin.x, src_origin.y, src_origin.z),
-                   texture, descriptor.format, dst_layer + i, dst_level,
-                   MTL::Origin(dst_origin.x, dst_origin.y, dst_origin.z),
-                   MTL::Size(size.width, size.height, size.depth));
+        if (!copyRegion(encoder, mtl_src, src->getDescriptor().format,
+                        src_layer + i, src_level,
+                        MTL::Origin(src_origin.x, src_origin.y, src_origin.z),
+                        texture, descriptor.format, dst_layer + i, dst_level,
+                        MTL::Origin(dst_origin.x, dst_origin.y, dst_origin.z),
+                        MTL::Size(size.width, size.height, size.depth)))
+            return false;
     }
+    return true;
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

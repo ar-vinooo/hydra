@@ -147,6 +147,13 @@ class Renderer : public IRenderer {
     void bindUniformBuffer(const BufferView& buffer, ShaderType shader_type,
                            u32 index) override;
     BufferView getGuestMemoryBuffer(ztd::Range<uptr> range) override;
+    bool readTextureContents(ITexture* texture,
+                             std::vector<std::vector<u8>>& out) override;
+    bool writeTextureContents(
+        ITexture* texture,
+        const std::vector<std::vector<u8>>& contents) override;
+    bool readBufferContents(const BufferView& view,
+                            std::vector<u8>& out) override;
     void bindStorageBuffer(const BufferView& buffer, ShaderType shader_type,
                            u32 index) override;
     void bindTexture(ITextureView* texture, SamplerBase* sampler,

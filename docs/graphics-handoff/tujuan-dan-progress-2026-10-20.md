@@ -293,3 +293,48 @@ slot dibebaskan di completed handler Metal yang tidak bergantung pada thread yan
 terlihat dari kode, tetapi belum ada stress test saturasi; (b) `finish(false)` setelah `claimCompletion()` tetap
 diizinkan (kegagalan publikasi tetap bisa dilaporkan); status `Completing` eksplisit belum dibuat. Versi isi resource
 dan capture/replay belum dimulai.
+
+## Draw diagnostics: fitur unsupported per draw
+
+Fitur yang dilewati shader (`ResourceMapping::unsupported`) kini muncul per draw: `FrameTracer` menulis baris
+`VS unsupported: ...` / `FS unsupported: ...` di bawah baris shader tiap draw, dan `VisualDiagnostics` mencatat event
+`draw_unsupported` (`vs_unsupported`, `fs_unsupported`) pada draw yang sedang ditangkap. Dengan itu objek hitam atau
+tekstur rusak bisa langsung dicek: bila draw-nya memakai fitur PARTIAL/MISSING, penyebab yang mungkin adalah shader;
+bila tidak, curigai upload tekstur, binding, atau render target. Tidak membuktikan sebab. Jalur ini belum punya tes
+otomatis (ditulis hanya saat tracer/diagnostics aktif); diverifikasi build dan regresi gpu-engine, frame-trace,
+visual-diagnostic. Capture/replay offline belum dimulai. Koreksi: remap saat `ready()` menunggu hanya memfault bila
+mapping barunya tidak valid; mapping baru yang valid dibaca apa adanya, semantik yang benar belum dipastikan.
+
+## Audit texture eksternal: copy yang gagal harus dilaporkan
+
+Diverifikasi di kode, lalu diperbaiki:
+
+1. **Copy tak didukung dilaporkan sukses** (`metal/texture.cpp`, `copyRegion`): pasangan format yang bukan texel-ke-texel
+   (mis. depth/stencil terkemas atau RGB32 yang disimpan sebagai RGBA32 melawan warna) hanya menulis log sekali dan
+   kembali; `synchronize2DWith2D` tetap mengembalikan `true`. Kini `ITexture::copyFrom` (dua overload tekstur) mengembalikan
+   `bool` (false = tidak ada yang di-encode), diteruskan lewat `Texture::copyFromHot4/5`, `synchronize2DWith2D` dan
+   `synchronize3DWith3D`. Kegagalan memicu fallback lewat guest memory (`sync_via_guest`) atau `reportUnsupportedAlias`;
+   jalur resize dan overlap mencatat event `copy_unsupported_resize` / `copy_unsupported_overlap`. Daerah kosong atau
+   di luar level dianggap "tidak ada yang disalin" (true). Tes: `testCrossFormatCopies` (copy valid true; depth/stencil
+   ke warna false, untuk kedua overload).
+2. **Hitungan level/layer yang bisa membungkus**: `synchronize2DWith2D` dan `synchronize3DWith3D` menghitung
+   `level_count - level`; level/layer di luar jangkauan (mis. alamat di padding) membuatnya membungkus (unsigned). Kini
+   ditolak sebelum menyalin. `calculateLevelAndLayer` sengaja TIDAK dibatasi `level_count` (kubus yang levelnya dirender
+   satu per satu memang melewatinya; tes "Cubemap level shares the cubemap storage" menangkap upaya itu), tetapi layer
+   dibatasi `layer_count`; `calculateLevelAndSlice` (3D) dibatasi level terakhir. `adjustDim` tidak lagi menggeser >= 32.
+3. **Header TIC (P2), nyata**: `ThreeD::getTexture` hanya mengenal Pitch dan BlockLinear; `PitchColorKey` (1) jatuh ke
+   `default` dan diperlakukan sebagai block-linear, jadi layout pitch-nya salah tanpa pesan. `clb197tex.h` menunjukkan
+   `PITCHCK` / `BLCK` berbagi posisi field dengan `PITCH` / `BL` (pitch di bit 111:96, ukuran di 143:128 dst.); kunci
+   warna hanya menambah field di kata terakhir. Kini `getTicLayout` memetakan PitchColorKey ke linear dan
+   BlockLinearColorKey ke tiled; versi 5-7 tidak punya layout dan teksturnya tidak di-bind (dilaporkan sekali).
+   Kunci warna sendiri belum diterapkan (dilaporkan sekali). Tes: `testTicLodRange` (layout per versi).
+4. **Pitch dengan mip/layer/depth (P1)**: header NVIDIA tidak melarang kombinasinya (field `MAX_MIP_LEVEL`,
+   `DEPTH_MINUS_ONE` dan tipe 3D/cube ada di header pitch) tetapi juga tidak mendefinisikan stride layer atau offset
+   level, sehingga hanya permukaan pertama yang bisa dialamatkan (`size = height * linear_stride`). Tidak ditolak
+   (tidak ada dasar), tetapi kini dilaporkan sekali: `Pitch texture with N levels, M layers, depth D (only the first
+   surface is read)`. Klaim audit bahwa Maxwell melarangnya tidak didukung oleh header yang ada.
+5. Apakah ini penyebab tekstur sampah Crash 4 belum terbukti: perlu capture.
+
+Header berubah (`texture.hpp`, `texture_cache.hpp`): rebuild `hydra` dan hot module sudah dilakukan; restart aplikasi.
+Regresi lulus: `run_python_references.sh` ALL PASS, shader-library 60, texture-cache 40, gpu-engine 45, serta
+frame-trace, dma-slice, raster-state, render-hash, work-manager. Tidak stage/commit.

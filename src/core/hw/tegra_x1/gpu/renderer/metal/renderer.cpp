@@ -1036,7 +1036,8 @@ BufferView Renderer::getGuestMemoryBuffer(ztd::Range<uptr> range) {
         }
     }
     return BufferView{guest_memory_buffers[begin].buffer,
-                      range.getBegin() - begin, range.getSize()};
+                      range.getBegin() - begin, range.getSize()}
+        .withGuestRange(range);
 }
 
 void Renderer::bindStorageBuffer(const BufferView& buffer,

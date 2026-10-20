@@ -247,10 +247,15 @@ bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor, uptr ptr,
     u32 layer_offset = 0;
     if (base_descriptor.layer_count > 1) {
         out_layer = offset / base_descriptor.layer_size;
+        if (out_layer >= base_descriptor.layer_count)
+            return false;
         layer_offset = out_layer * base_descriptor.layer_size;
     }
 
-    // Level
+    // Level. Layered textures whose levels are rendered one at a time may
+    // describe fewer levels than their layer stride holds, so a level past
+    // level_count is accepted here; copies bound it themselves. The loop ends
+    // once the offset is reached or passed
     out_level = 0;
     u32 crnt_level_offset = 0;
     const u32 level_offset = offset - layer_offset;
@@ -354,6 +359,9 @@ bool calculateLevelAndSlice(const TextureDescriptor& base_descriptor, uptr ptr,
     out_level = 0;
     u32 level_offset = 0;
     while (level_offset < offset) {
+        // The last level absorbs what lies after it; it is not a new level
+        if (out_level + 1 >= base_descriptor.level_count)
+            break;
         const u32 level_size = base_descriptor.getLevelSize(out_level);
         if (level_offset + level_size >= offset)
             break;
@@ -493,10 +501,15 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 TextureStorage::forEachOutside(
                     old_stale_ranges, old_descriptor.getRange(),
                     [&](ztd::Range<uptr>) { old_fresh = true; });
-                if (old_fresh)
-                    new_storage.base->copyFrom(command_buffer, old_base, 0, 0, 0,
-                                               0, old_descriptor.level_count,
-                                               old_descriptor.layer_count);
+                if (old_fresh &&
+                    !new_storage.base->copyFrom(command_buffer, old_base, 0, 0,
+                                                0, 0, old_descriptor.level_count,
+                                                old_descriptor.layer_count))
+                    logTextureEvent("copy_unsupported_resize", new_descriptor,
+                                    fmt::format("old={:#x} {} {}",
+                                                old_descriptor.ptr,
+                                                old_descriptor.type,
+                                                old_descriptor.format));
                 new_storage.gpu_written_timestamp = std::max(
                     new_storage.gpu_written_timestamp, old_gpu_written);
                 new_storage.cpu_modified_timestamp = std::max(
@@ -604,10 +617,14 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                                         other_descriptor.format));
             continue;
         }
-        storage.base->copyFrom(
-            command_buffer, other_base, 0, 0, overlapping_storage.level,
-            overlapping_storage.layer, other_descriptor.level_count,
-            other_descriptor.layer_count);
+        if (!storage.base->copyFrom(
+                command_buffer, other_base, 0, 0, overlapping_storage.level,
+                overlapping_storage.layer, other_descriptor.level_count,
+                other_descriptor.layer_count))
+            logTextureEvent("copy_unsupported_overlap", descriptor,
+                            fmt::format("old={:#x} {} {}", other_descriptor.ptr,
+                                        other_descriptor.type,
+                                        other_descriptor.format));
     }
 
     // Return view
@@ -770,11 +787,9 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                     std::max(static_cast<u32>(level_dims.width), texel_descriptor.width),
                     std::max(static_cast<u32>(level_dims.height), texel_descriptor.height),
                     1);
-                storage.base->copyFrom(command_buffer, other_storage.base,
-                                       MTL::Origin(0, 0, 0), src_level, 0,
-                                       MTL::Origin(0, 0, 0), dst_level, 0,
-                                       size, 1);
-                return true;
+                return storage.base->copyFrom(
+                    command_buffer, other_storage.base, MTL::Origin(0, 0, 0),
+                    src_level, 0, MTL::Origin(0, 0, 0), dst_level, 0, size, 1);
             }
         }
         // Same memory layout, but different dimensions: copy the overlapping
@@ -800,6 +815,13 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
             return false;
         }
 
+        // The counts below would wrap for a level or layer past the end
+        if (level >= descriptor.level_count ||
+            other_level >= other_descriptor.level_count ||
+            layer >= descriptor.layer_count ||
+            other_layer >= other_descriptor.layer_count)
+            return false;
+
         const auto dims = descriptor.getLevelDimensions(level);
         const auto other_dims =
             other_descriptor.getLevelDimensions(other_level);
@@ -812,23 +834,26 @@ bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                 ? std::min(descriptor.layer_count - layer,
                            other_descriptor.layer_count - other_layer)
                 : 1u;
-        storage.base->copyFrom(
+        return storage.base->copyFrom(
             command_buffer, other_storage.base, MTL::Origin(0, 0, 0), other_level,
             other_layer, MTL::Origin(0, 0, 0), level, layer, size, layers);
-        return true;
     }
 
-    storage.base->copyFrom(
+    if (level >= descriptor.level_count ||
+        other_level >= other_descriptor.level_count ||
+        layer >= descriptor.layer_count ||
+        other_layer >= other_descriptor.layer_count)
+        return false;
+    return storage.base->copyFrom(
         command_buffer, other_storage.base, other_level, other_layer, level,
         layer,
         std::min(descriptor.level_count - level,
                  other_descriptor.level_count - other_level),
         std::min(descriptor.layer_count - layer,
                  other_descriptor.layer_count - other_layer));
-    return true;
 }
 
-void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
+bool TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     const auto& descriptor = storage.base->getDescriptor();
@@ -845,9 +870,12 @@ void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
                                 other_level, other_slice)) {
         LOG_DEBUG(Gpu, "Cannot synchronize 3D textures ({}) and ({})",
                   descriptor, other_descriptor);
-        return;
+        return false;
     }
 
+    if (level >= descriptor.level_count ||
+        other_level >= other_descriptor.level_count)
+        return false;
     const auto dims = descriptor.getLevelDimensions(level);
     const auto other_dims = other_descriptor.getLevelDimensions(other_level);
     const u32 level_count =
@@ -856,19 +884,20 @@ void TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
 
     if (slice == 0 && other_slice == 0 && static_cast<u32>(dims.depth) == static_cast<u32>(other_dims.depth)) {
         // Do a simplified copy in case we are copying whole levels
-        storage.base->copyFrom(command_buffer, other_storage.base, other_level,
-                               0, level, 0, level_count, 1);
+        return storage.base->copyFrom(command_buffer, other_storage.base,
+                                      other_level, 0, level, 0, level_count, 1);
     } else {
         ASSERT_DEBUG(
             level_count == 1, Gpu,
             "Cannot copy multiple 3D levels with non-matching dimensions");
         const NS::UInteger slice_count =
             std::min(static_cast<u32>(dims.depth) - slice, static_cast<u32>(other_dims.depth) - other_slice);
-        storage.base->copyFrom(command_buffer, other_storage.base,
-                               MTL::Origin(0, 0, other_slice), other_level, 0,
-                               MTL::Origin(0, 0, slice), level, 0,
-                               MTL::Size(static_cast<u32>(dims.width), static_cast<u32>(dims.height), slice_count),
-                               1);
+        return storage.base->copyFrom(
+            command_buffer, other_storage.base,
+            MTL::Origin(0, 0, other_slice), other_level, 0,
+            MTL::Origin(0, 0, slice), level, 0,
+            MTL::Size(static_cast<u32>(dims.width), static_cast<u32>(dims.height), slice_count),
+            1);
     }
 }
 

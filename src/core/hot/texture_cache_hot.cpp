@@ -125,6 +125,16 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                     storage.gpu_written_timestamp != TextureCacheTimePoint{})
                     continue;
                 if (storage.base->getDescriptor().getRange().intersects(range)) {
+                    // A render target that was written back before the guest
+                    // overwrote this part: what the GPU holds there is stale
+                    // as well. Without this mark an alias scan finds it
+                    // "newer" than a texture created later and copies it, or
+                    // writes it back over the guest's data (streamed textures
+                    // reuse the memory of dead render targets)
+                    if (storage.gpu_written_timestamp != TextureCacheTimePoint{})
+                        storage.markStale(
+                            storage.base->getDescriptor().getRange().clampedTo(
+                                range));
                     storage.cpu_modified_timestamp = now;
                     logTextureEvent("guest_modified",
                                     storage.base->getDescriptor(),
@@ -413,8 +423,17 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                     if (type_class == TextureTypeClass::_2D &&
                         other_type_class == TextureTypeClass::_2D) {
                         flush_decode();
-                        if (!synchronize2DWith2D(command_buffer, storage,
-                                                 other_storage) &&
+                        // DEBUG: "no_block_alias" skips the direct GPU copy
+                        // between block data and the texels standing in for
+                        // it (BC mips streamed through RG32/RGBA32 targets)
+                        const bool skip_direct =
+                            isTextureFormatCompressed(descriptor.format) !=
+                                isTextureFormatCompressed(
+                                    other_descriptor.format) &&
+                            debugFlag("no_block_alias");
+                        if ((skip_direct ||
+                             !synchronize2DWith2D(command_buffer, storage,
+                                                  other_storage)) &&
                             !sync_via_guest(other_storage)) {
                             alias_sync_complete = false;
                             // DEBUG: report textures that alias but cannot be synchronized
@@ -456,8 +475,12 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                     } else if (type_class == TextureTypeClass::_3D &&
                                other_type_class == TextureTypeClass::_3D) {
                         flush_decode();
-                        synchronize3DWith3D(command_buffer, storage,
-                                            other_storage);
+                        if (!synchronize3DWith3D(command_buffer, storage,
+                                                 other_storage) &&
+                            !sync_via_guest(other_storage)) {
+                            alias_sync_complete = false;
+                            reportUnsupportedAlias(descriptor, other_descriptor);
+                        }
                     } else if (!sync_via_guest(other_storage)) {
                         alias_sync_complete = false;
                         reportUnsupportedAlias(descriptor, other_descriptor);

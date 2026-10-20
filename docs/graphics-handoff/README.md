@@ -1,5 +1,8 @@
 # Hydra graphics work: handoff
 
+**Command IR Clear/Copy, versi isi, capture/replay, saturasi (2026-10-21):**
+[Ringkasan, cara memakai `HYDRA_GPU_CAPTURE` dan `hydra-gpu-replay`, batasnya](p1-p2-command-ir-capture-2026-10-21.md).
+
 **Pengelolaan eksekusi (2026-10-20):**
 [Budget CPU/GPU, lifecycle pekerjaan, ownership dan completion retirement](execution-management-2026-10-20.md).
 

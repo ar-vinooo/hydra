@@ -542,7 +542,7 @@ void Texture::copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
         encoder, src, dims, layer, level);
 }
 
-void Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
+bool Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
                        const u32 src_level, const u32 src_layer,
                        const u32 dst_level, const u32 dst_layer,
                        const u32 level_count, const u32 layer_count) {
@@ -552,7 +552,7 @@ void Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
         level_count, layer_count);
 }
 
-void Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
+bool Texture::copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
                        const MTL::Origin src_origin, const u32 src_level,
                        const u32 src_layer, const MTL::Origin dst_origin,
                        const u32 dst_level, const u32 dst_layer,
@@ -736,7 +736,7 @@ bool TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
         command_buffer, storage, other_storage);
 }
 
-void TextureCache::synchronize3DWith3D(ICommandBuffer* command_buffer,
+bool TextureCache::synchronize3DWith3D(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     ::hydra::hot::Scope hot_scope;

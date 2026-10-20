@@ -934,7 +934,10 @@ u32 TextureDescriptor::getStorageHash() const {
 
 namespace {
 
-u32 adjustDim(u32 dim, u32 level) { return std::max(dim >> level, 1u); }
+u32 adjustDim(u32 dim, u32 level) {
+    // A shift by the width of the type or more is undefined
+    return level >= 32 ? 1u : std::max(dim >> level, 1u);
+}
 
 } // namespace
 

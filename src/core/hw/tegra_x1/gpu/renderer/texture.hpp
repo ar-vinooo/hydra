@@ -32,11 +32,14 @@ class ITexture : public resource::TrackedResource {
                  ztd::Range<u32>(0, descriptor.level_count),
                  ztd::Range<u32>(0, descriptor.layer_count));
     }
-    virtual void copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
+    // The texture copies return false when nothing was encoded because the
+    // formats cannot be copied: the destination is not up to date and the
+    // caller has to synchronize another way
+    virtual bool copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
                           const u32 src_level, const u32 src_layer,
                           const u32 dst_level, const u32 dst_layer,
                           const u32 level_count, const u32 layer_count) = 0;
-    virtual void copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
+    virtual bool copyFrom(ICommandBuffer* command_buffer, const ITexture* src,
                           const MTL::Origin src_origin, const u32 src_level,
                           const u32 src_layer, const MTL::Origin dst_origin,
                           const u32 dst_level, const u32 dst_layer,

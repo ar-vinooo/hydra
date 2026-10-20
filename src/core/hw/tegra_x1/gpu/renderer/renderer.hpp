@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/content_version.hpp"
 #include "core/hw/tegra_x1/gpu/resource/resource_registry.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
@@ -94,6 +95,8 @@ class IRenderer {
         MemoryInvalidationScope scope = MemoryInvalidationScope::BufferCache |
                                         MemoryInvalidationScope::TextureCache |
                                         MemoryInvalidationScope::ShaderCache) {
+        // The bytes behind this range changed (guest CPU or DMA write)
+        content_versions.write(range);
         if (any(scope & MemoryInvalidationScope::BufferCache)) {
             std::scoped_lock lock(buffer_cache.getMutex());
             buffer_cache.invalidateMemory(range);
@@ -298,6 +301,26 @@ class IRenderer {
         return 0.0;
     }
 
+    // Blocking copies of a texture's host contents for capture and replay:
+    // one blob per layer and level (layer major, tightly packed rows, depth
+    // before stencil for combined formats). The caller submits earlier work
+    // that writes the texture first. False if the format is not supported.
+    virtual bool readTextureContents([[maybe_unused]] ITexture* texture,
+                                     [[maybe_unused]] std::vector<std::vector<u8>>& out) {
+        return false;
+    }
+    virtual bool writeTextureContents(
+        [[maybe_unused]] ITexture* texture,
+        [[maybe_unused]] const std::vector<std::vector<u8>>& contents) {
+        return false;
+    }
+    // Blocking copy of the bytes a buffer view covers, also from buffers the
+    // CPU cannot map. Earlier work that writes it has to be submitted.
+    virtual bool readBufferContents([[maybe_unused]] const BufferView& view,
+                                    [[maybe_unused]] std::vector<u8>& out) {
+        return false;
+    }
+
     // Compute
     virtual void
     dispatchCompute([[maybe_unused]] ICommandBuffer* command_buffer,
@@ -370,6 +393,7 @@ class IRenderer {
 
     // Caches
     resource::ResourceRegistry resource_registry;
+    resource::ContentVersions content_versions;
     BufferCache buffer_cache;
     TextureCache texture_cache;
     SamplerCache sampler_cache;
@@ -412,6 +436,7 @@ class IRenderer {
   public:
     CONST_REF_GETTER(info, getInfo);
     REF_GETTER(resource_registry, getResourceRegistry);
+    REF_GETTER(content_versions, getContentVersions);
     REF_GETTER(buffer_cache, getBufferCache);
     REF_GETTER(texture_cache, getTextureCache);
     REF_GETTER(sampler_cache, getSamplerCache);

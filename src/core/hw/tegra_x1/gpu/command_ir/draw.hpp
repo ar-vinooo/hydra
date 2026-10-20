@@ -3,8 +3,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
 
-#include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
-#include "core/hw/tegra_x1/gpu/resource/resource_registry.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/resource_set.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/texture_binding.hpp"
 
@@ -41,12 +40,6 @@ struct StageBindings {
 // Host-resolved command, consumed synchronously before caches or mappings
 // change. Cache resources and owned buffers carry leases; external raw
 // resources still require caller ownership through encoding.
-struct ResourceReference {
-    const void* object;
-    resource::ResourceKind kind;
-    resource::ResourceHandle handle;
-};
-
 struct DrawCommand {
     renderer::PipelineBase* pipeline{nullptr};
     renderer::RenderPassBase* render_pass{nullptr};
@@ -63,6 +56,8 @@ struct DrawCommand {
     u64 mapping_generation{0};
     std::vector<resource::MappingDependency> mapping_dependencies;
     bool resources_sealed{false};
+    // Guest memory read and written, versioned when the command was sealed
+    resource::ContentManifest contents;
 
     engines::PrimitiveType primitive{engines::PrimitiveType::Triangles};
     engines::IndexType index_type{engines::IndexType::None};
@@ -79,6 +74,11 @@ void captureDrawAddressSpace(renderer::IRenderer& renderer,
 bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command);
 bool validateDrawResources(renderer::IRenderer& renderer,
                            const DrawCommand& command);
+// Whether every byte the draw reads is still what it was when sealed. A draw
+// executed later than it was prepared (deferred or reordered) needs this, or
+// a snapshot of what it read.
+bool validateDrawContents(renderer::IRenderer& renderer,
+                          const DrawCommand& command);
 
 bool executeDraw(renderer::IRenderer& renderer,
                  renderer::ICommandBuffer* command_buffer,

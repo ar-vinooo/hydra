@@ -290,7 +290,7 @@ class TextureCache {
     static bool synchronize2DWith2D(ICommandBuffer* command_buffer,
                                     TextureStorage& storage,
                                     TextureStorage& other_storage);
-    static void synchronize3DWith3D(ICommandBuffer* command_buffer,
+    static bool synchronize3DWith3D(ICommandBuffer* command_buffer,
                                     TextureStorage& storage,
                                     TextureStorage& other_storage);
 
@@ -308,7 +308,7 @@ class TextureCache {
     static bool synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                                         TextureStorage& storage,
                                         TextureStorage& other_storage);
-    static void synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
+    static bool synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
                                         TextureStorage& storage,
                                         TextureStorage& other_storage);
     void decodeTextureHot2(ICommandBuffer* command_buffer,

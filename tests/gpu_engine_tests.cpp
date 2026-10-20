@@ -6,9 +6,13 @@
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
 #include "core/hw/tegra_x1/gpu/engines/compute.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
@@ -1220,6 +1224,515 @@ void testDrawResourceLeases() {
     std::cout << "PASS: Draw ownership survives caches and packets until GPU completion; inherited bindings are explicit\n";
 }
 
+void testDrawContentVersions() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    command_ir::DrawCommand command;
+    command.pipeline = rig.pipeline.get();
+    command.render_pass = rig.pass.get();
+    command.count = 3;
+    command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+    command.state.scissors.fill(rig.full);
+    std::array<u32, 64> guest{};
+    const auto base = reinterpret_cast<uptr>(guest.data());
+    std::shared_ptr<BufferBase> buffer(new metal::Buffer(
+        rig.renderer.getDevice()->newBuffer(256, MTL::ResourceStorageModeShared)));
+    command.vertices[0] = BufferView(buffer.get())
+                              .withGuestRange(ztd::Range<uptr>(base, base + 256));
+    const ztd::Range<uptr> written(base + 512, base + 576);
+    command.storage_writes.push_back(written);
+    expect(command_ir::sealDrawResources(rig.renderer, command),
+           "A draw with guest-backed buffers seals");
+    expect(command.contents.reads.size() == 1 && command.contents.writes.size() >= 1,
+           "The seal records what the draw reads and writes");
+    expect(command_ir::validateDrawContents(rig.renderer, command),
+           "Contents are current right after sealing");
+    // The guest CPU rewrites the bytes behind the same buffer: identity and
+    // generation are unchanged, the content is not
+    const auto handle = rig.renderer.getResourceRegistry().track(
+        buffer->getResourceLifetime(), resource::ResourceKind::Buffer, buffer.get());
+    rig.renderer.invalidateMemory(ztd::Range<uptr>(base + 64, base + 68));
+    expect(rig.renderer.getResourceRegistry().matches(
+               handle, resource::ResourceKind::Buffer, buffer.get()) &&
+               command_ir::validateDrawResources(rig.renderer, command),
+           "A content write leaves resource identity valid");
+    expect(!command_ir::validateDrawContents(rig.renderer, command),
+           "A content write makes the prepared draw stale");
+    expect(command_ir::sealDrawResources(rig.renderer, command) &&
+               command_ir::validateDrawContents(rig.renderer, command),
+           "Resealing prepares the draw against the new contents");
+    // Writes elsewhere do not matter
+    rig.renderer.invalidateMemory(ztd::Range<uptr>(base + 1024, base + 1028));
+    expect(command_ir::validateDrawContents(rig.renderer, command),
+           "Writes outside the read ranges keep the draw current");
+    // Executing the draw publishes its own writes
+    const auto before = rig.renderer.getContentVersions().latest(written);
+    expect(command_ir::executeDraw(rig.renderer, rig.commands.get(), command),
+           "The draw executes");
+    expect(rig.renderer.getContentVersions().latest(written) > before,
+           "Executing a draw versions the memory it wrote");
+    rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+    std::cout << "PASS: draw content versions track guest writes separately "
+                 "from resource identity\n";
+}
+
+void testClearAndCopyCommands() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& versions = rig.renderer.getContentVersions();
+    const auto& pass_descriptor = rig.pass->getDescriptor();
+    const auto color_range =
+        pass_descriptor.color_targets[0].texture->getBase()->getDescriptor().getRange();
+    const auto depth_range =
+        pass_descriptor.depth_stencil_target.texture->getBase()->getDescriptor().getRange();
+
+    // Nothing to clear without a pass
+    command_ir::ClearCommand empty;
+    expect(command_ir::sealClear(rig.renderer, empty) &&
+               command_ir::executeClear(rig.renderer, rig.commands.get(), empty),
+           "A clear without a render pass succeeds trivially");
+
+    command_ir::ClearCommand clear;
+    clear.resources.capture(rig.renderer, &rig.gmmu);
+    clear.render_pass = rig.pass.get();
+    clear.state = {.rect = rig.full, .stencil_write_mask = 0xff};
+    clear.color = command_ir::ClearCommand::Color{0, 0, 0xf, simd::uint4{1, 2, 3, 4}};
+    clear.depth = command_ir::ClearCommand::Depth{0, 0.25f};
+    expect(command_ir::sealClear(rig.renderer, clear) &&
+               clear.resources.contents.reads.empty() &&
+               clear.resources.contents.writes.size() == 2,
+           "A clear reads nothing and writes the cleared attachments");
+    expect(clear.resources.valid(rig.renderer),
+           "A sealed clear names live resources");
+    const auto color_before = versions.latest(color_range);
+    const auto depth_before = versions.latest(depth_range);
+    expect(command_ir::executeClear(rig.renderer, rig.commands.get(), clear),
+           "A sealed clear executes");
+    expect(versions.latest(color_range) > color_before &&
+               versions.latest(depth_range) > depth_before,
+           "Executing a clear versions the memory it wrote");
+
+    // A colour-only clear writes only the colour target
+    command_ir::ClearCommand colour_only;
+    colour_only.resources.capture(rig.renderer, &rig.gmmu);
+    colour_only.render_pass = rig.pass.get();
+    colour_only.state = {.rect = rig.full, .stencil_write_mask = 0xff};
+    colour_only.color = command_ir::ClearCommand::Color{0, 0, 0xf, simd::uint4{}};
+    expect(command_ir::sealClear(rig.renderer, colour_only) &&
+               colour_only.resources.contents.writes.size() == 1,
+           "A colour clear writes only the colour attachment");
+
+    // Unsealed or stale clears are rejected
+    command_ir::ClearCommand unsealed = clear;
+    unsealed.resources.sealed = false;
+    expect(!command_ir::executeClear(rig.renderer, rig.commands.get(), unsealed),
+           "An unsealed clear is rejected");
+    rig.pass.reset();
+    expect(!clear.resources.valid(rig.renderer) &&
+               !command_ir::executeClear(rig.renderer, rig.commands.get(), clear),
+           "A clear whose pass was released is rejected");
+
+    // Copy
+    std::vector<u8> memory(0x4000, 0);
+    const auto base = reinterpret_cast<uptr>(memory.data());
+    auto make_texture = [&](uptr ptr) {
+        std::unique_ptr<ITexture> texture(rig.renderer.createTexture(TextureDescriptor(
+            ptr, MTL::TextureType2D, TextureFormat::RGBA8Unorm, false, 0, 4, 4, 1,
+            1, 1, 0, 0, 0)));
+        return texture;
+    };
+    auto src_texture = make_texture(base);
+    auto dst_texture = make_texture(base + 0x2000);
+    const TextureViewDescriptor view_descriptor(
+        MTL::TextureType2D, TextureFormat::RGBA8Unorm, {0, 1}, {0, 1});
+    std::unique_ptr<ITextureView> src_view(src_texture->createView(view_descriptor));
+    std::unique_ptr<ITextureView> dst_view(dst_texture->createView(view_descriptor));
+    command_ir::CopyCommand copy;
+    copy.resources.capture(rig.renderer, &rig.gmmu);
+    copy.src = src_view.get();
+    copy.dst = dst_view.get();
+    copy.src_size = {4, 4, 1};
+    copy.dst_size = {4, 4, 1};
+    expect(command_ir::sealCopy(rig.renderer, copy) &&
+               copy.resources.contents.reads.size() == 1 &&
+               copy.resources.contents.writes.size() == 1,
+           "A copy reads its source and writes its destination");
+    const ztd::Range<uptr> src_range = src_texture->getDescriptor().getRange();
+    const ztd::Range<uptr> dst_range = dst_texture->getDescriptor().getRange();
+    expect(copy.resources.contentsCurrent(rig.renderer),
+           "The copy's source is current when sealed");
+    const auto dst_before = versions.latest(dst_range);
+    expect(command_ir::executeCopy(rig.renderer, rig.commands.get(), copy) &&
+               versions.latest(dst_range) > dst_before &&
+               versions.latest(src_range) == 0,
+           "Executing a copy versions only the destination");
+    rig.renderer.invalidateMemory(ztd::Range<uptr>(src_range.getBegin(),
+                                                   src_range.getBegin() + 4));
+    expect(!copy.resources.contentsCurrent(rig.renderer),
+           "A guest write into the source makes the prepared copy stale");
+    expect(command_ir::sealCopy(rig.renderer, copy) &&
+               copy.resources.contentsCurrent(rig.renderer),
+           "Resealing prepares the copy against the new contents");
+    command_ir::CopyCommand incomplete;
+    expect(!command_ir::sealCopy(rig.renderer, incomplete),
+           "A copy without textures cannot be sealed");
+    dst_view.reset();
+    expect(!copy.resources.valid(rig.renderer) &&
+               !command_ir::executeCopy(rig.renderer, rig.commands.get(), copy),
+           "A copy whose destination view was destroyed is rejected");
+    rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+    std::cout << "PASS: clear and copy commands seal their resources, version "
+                 "their writes and reject released resources\n";
+}
+
+void testCaptureAndReplay() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    const auto make_shader = [&](ShaderType type, const char* code, u32 uniform) {
+        ShaderDescriptor descriptor{};
+        descriptor.type = type;
+        descriptor.backend = ShaderBackend::Msl;
+        descriptor.code.assign(code, code + std::strlen(code));
+        descriptor.resource_mapping.uniform_buffers[uniform] = uniform;
+        return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+    };
+    auto vertex = make_shader(ShaderType::Vertex, R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]], constant float4* pos [[buffer(0)]]) {
+    return pos[id];
+})", 0);
+    auto fragment = make_shader(ShaderType::Fragment, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_(constant float4& color [[buffer(1)]]) { return color; }
+)", 1);
+    PipelineDescriptor pipeline_descriptor{};
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+    pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+    pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+    pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
+    std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+
+    const std::array<float, 12> positions{-1, -1, 0.5f, 1, 3, -1, 0.5f, 1,
+                                          -1, 3, 0.5f, 1};
+    std::unique_ptr<BufferBase> position_buffer(renderer.allocateTemporaryBuffer(sizeof(positions)));
+    position_buffer->copyFrom(reinterpret_cast<uptr>(positions.data()));
+    std::unique_ptr<BufferBase> color_buffer(renderer.allocateTemporaryBuffer(16));
+    const auto set_color = [&](std::array<float, 4> color) {
+        color_buffer->copyFrom(reinterpret_cast<uptr>(color.data()));
+    };
+
+    auto cb = rig.commands.get();
+    capture::Recorder recorder(renderer);
+    {
+        command_ir::ClearCommand clear;
+        clear.resources.capture(renderer, nullptr);
+        clear.render_pass = rig.pass.get();
+        clear.state = {.rect = rig.full, .stencil_write_mask = 0xff};
+        const std::array<float, 4> value{0.1f, 0.2f, 0.3f, 1.0f};
+        clear.color = command_ir::ClearCommand::Color{
+            0, 0, 0xf, std::bit_cast<simd::uint4>(value)};
+        expect(command_ir::sealClear(renderer, clear) &&
+                   recorder.recordClear(cb, clear) &&
+                   command_ir::executeClear(renderer, cb, clear),
+               "A clear is recorded and executed");
+    }
+    const auto draw = [&](MTL::ScissorRect scissor, std::array<float, 4> color) {
+        set_color(color);
+        command_ir::DrawCommand command;
+        command.pipeline = pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(scissor);
+        command.stages[0].active = true;
+        command.stages[0].uniforms.push_back({0, BufferView(position_buffer.get())});
+        command.stages[1].active = true;
+        command.stages[1].uniforms.push_back({1, BufferView(color_buffer.get())});
+        command_ir::captureDrawAddressSpace(renderer, command, nullptr);
+        expect(command_ir::sealDrawResources(renderer, command) &&
+                   recorder.recordDraw(cb, command) &&
+                   command_ir::executeDraw(renderer, cb, command),
+               "A draw is recorded and executed");
+        // The CPU rewrites the shared buffer next: the GPU has to be done
+        // with this draw first (the engines upload immutable snapshots)
+        renderer.synchronize(cb);
+    };
+    // The same buffer object holds different bytes for the two draws
+    draw(MTL::ScissorRect{0, 0, 3, 2}, {1, 0, 0, 1});
+    draw(MTL::ScissorRect{1, 1, 3, 3}, {0, 1, 0, 1});
+    auto file = recorder.finish(cb);
+    expect(recorder.failure().empty(), "The capture has no failure");
+    expect(file.commands.size() == 3 && file.textures.size() == 2 &&
+               file.views.size() == 2 && file.shaders.size() == 2 &&
+               file.pipelines.size() == 1 && file.passes.size() == 1 &&
+               file.buffers.size() == 3,
+           "Objects are recorded once and changed buffers get a record each");
+
+    // What the original run drew
+    const auto pixel = [&](const capture::CaptureFile& f, u32 x, u32 y) {
+        const auto& blob = f.textures[0].final_contents.at(0);
+        const auto* p = blob.data() + (y * 4 + x) * 4;
+        return std::array<u32, 4>{p[0], p[1], p[2], p[3]};
+    };
+    expect(pixel(file, 0, 0) == std::array<u32, 4>({255, 0, 0, 255}),
+           "Draw A covers its scissor");
+    expect(pixel(file, 1, 1) == std::array<u32, 4>({0, 255, 0, 255}) &&
+               pixel(file, 3, 3) == std::array<u32, 4>({0, 255, 0, 255}),
+           "Draw B overwrites A and covers its own scissor");
+    const auto outside = pixel(file, 3, 0);
+    expect(outside[0] >= 25 && outside[0] <= 27 && outside[1] >= 50 &&
+               outside[1] <= 52 && outside[2] >= 76 && outside[2] <= 78 &&
+               outside[3] == 255,
+           "Pixels no draw covered keep the clear");
+    expect(file.textures[0].initial.size() == 1 && file.textures[1].initial.size() == 1,
+           "Initial contents were read before the first command");
+
+    // Kept for hydra-gpu-replay when asked
+    if (const char* dir = std::getenv("HYDRA_TEST_CAPTURE_DIR"))
+        file.save(std::filesystem::path(dir) / "two_draws.hcap");
+
+    // Round trip through bytes
+    const auto bytes = file.serialize();
+    auto loaded = capture::CaptureFile::deserialize(bytes);
+    expect(loaded.serialize() == bytes, "A capture survives serialization");
+    {
+        auto noted = loaded;
+        noted.notes = {"texture a has no recorded contents", "b"};
+        expect(capture::CaptureFile::deserialize(noted.serialize()).notes ==
+                   noted.notes,
+               "Capture notes survive serialization");
+    }
+    bool rejected = false;
+    for (const auto& broken : {std::vector<u8>(bytes.begin(), bytes.begin() + 5),
+                               std::vector<u8>(bytes.begin(), bytes.end() - 1)}) {
+        try {
+            (void)capture::CaptureFile::deserialize(broken);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+            continue;
+        }
+        rejected = false;
+        break;
+    }
+    expect(rejected, "Truncated captures are rejected");
+    auto foreign = bytes;
+    foreign[0] = 'X';
+    bool foreign_rejected = false;
+    try {
+        (void)capture::CaptureFile::deserialize(foreign);
+    } catch (const std::runtime_error&) {
+        foreign_rejected = true;
+    }
+    expect(foreign_rejected, "Files without the magic are rejected");
+
+    // Replay on a fresh renderer reproduces the pixels
+    Gpu replay_gpu;
+    auto& replay_renderer = replay_gpu.getRenderer();
+    const auto result = capture::replay(replay_renderer, loaded);
+    expect(result.ok && result.matches,
+           "Replaying the capture reproduces every written texture");
+    expect(pixel(loaded, 0, 0) == std::array<u32, 4>({255, 0, 0, 255}) &&
+               result.contents[0] == loaded.textures[0].final_contents,
+           "The replayed pixels are those of the original draws");
+
+    // The live path: start, the engines hand over their commands, a file is
+    // written once enough were recorded, and it replays
+    {
+        const auto directory = std::filesystem::temp_directory_path() /
+                               fmt::format("hydra_capture_test_{}", getpid());
+        std::filesystem::create_directories(directory);
+        auto& live = capture::LiveCapture::instance();
+        live.setDirectory(directory);
+        expect(!live.active(), "No capture runs before it is started");
+        live.start(renderer, 2);
+        expect(live.active(), "A started capture is active");
+        command_ir::ClearCommand clear;
+        clear.resources.capture(renderer, nullptr);
+        clear.render_pass = rig.pass.get();
+        clear.state = {.rect = rig.full, .stencil_write_mask = 0xff};
+        clear.color = command_ir::ClearCommand::Color{0, 0, 0xf, simd::uint4{}};
+        expect(command_ir::sealClear(renderer, clear), "The clear seals");
+        live.clear(renderer, cb, clear);
+        expect(command_ir::executeClear(renderer, cb, clear),
+               "The recorded clear executes");
+        live.commandExecuted(cb);
+        expect(live.active(), "The capture waits for its remaining commands");
+        command_ir::DrawCommand command;
+        command.pipeline = pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        command.stages[0].active = true;
+        command.stages[0].uniforms.push_back({0, BufferView(position_buffer.get())});
+        command.stages[1].active = true;
+        command.stages[1].uniforms.push_back({1, BufferView(color_buffer.get())});
+        command_ir::captureDrawAddressSpace(renderer, command, nullptr);
+        expect(command_ir::sealDrawResources(renderer, command), "The draw seals");
+        live.draw(renderer, cb, command);
+        expect(live.active(), "Recording the last command does not end the capture");
+        expect(command_ir::executeDraw(renderer, cb, command),
+               "The recorded draw executes");
+        live.commandExecuted(cb);
+        expect(!live.active(), "The capture ends once its last command ran");
+        const auto path = directory / "capture_0.hcap";
+        expect(std::filesystem::exists(path), "The capture file was written");
+        const auto live_file = capture::CaptureFile::load(path);
+        expect(live_file.commands.size() == 2, "The file holds the recorded commands");
+        Gpu live_gpu;
+        const auto live_result = capture::replay(live_gpu.getRenderer(), live_file);
+        expect(live_result.ok && live_result.matches,
+               "A capture written by the live path replays");
+        std::filesystem::remove_all(directory);
+        live.setDirectory({});
+    }
+
+    // Controls: changing what the capture holds changes the pixels
+    auto changed = loaded;
+    for (auto& buffer : changed.buffers)
+        if (buffer.bytes.size() == 16 && std::bit_cast<std::array<float, 4>>(
+                [&] { std::array<u8, 16> a; std::memcpy(a.data(), buffer.bytes.data(), 16); return a; }())[1] == 1.0f) {
+            const std::array<float, 4> blue{0, 0, 1, 1};
+            std::memcpy(buffer.bytes.data(), blue.data(), 16);
+        }
+    const auto changed_result = capture::replay(replay_renderer, changed);
+    expect(changed_result.ok && !changed_result.matches,
+           "A different buffer content gives different pixels");
+    auto reordered = loaded;
+    std::swap(reordered.commands[1], reordered.commands[2]);
+    const auto reordered_result = capture::replay(replay_renderer, reordered);
+    expect(reordered_result.ok && !reordered_result.matches,
+           "A different command order gives different pixels");
+    auto missing = loaded;
+    missing.commands[1].draw.pipeline = 99;
+    expect(!capture::replay(replay_renderer, missing).ok,
+           "A capture naming a missing object fails to replay");
+    std::cout << "PASS: a draw capture serializes, replays on a fresh renderer "
+                 "with identical pixels and rejects damaged files\n";
+}
+
+// HYDRA_GPU_BENCH=1: reference numbers for the host cost of commands. Not a
+// pass/fail test; the figures are for comparing a change against a baseline.
+void benchmarkCommands() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    const auto per = [](auto&& body, u32 iterations) {
+        const auto start = std::chrono::steady_clock::now();
+        for (u32 i = 0; i < iterations; i++)
+            body();
+        return static_cast<double>(
+                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()) /
+               iterations;
+    };
+
+    // Content versions
+    resource::ContentVersions versions;
+    u32 counter = 0;
+    const auto write_ns = per([&] {
+        const uptr base = 0x100000 + (counter++ % 4096) * 0x100;
+        versions.write(ztd::Range<uptr>(base, base + 0x80));
+    }, 200000);
+    const auto latest_ns = per([&] {
+        const uptr base = 0x100000 + (counter++ % 4096) * 0x100;
+        (void)versions.latest(ztd::Range<uptr>(base, base + 0x80));
+    }, 200000);
+
+    // A draw: seal, then encode
+    command_ir::DrawCommand command;
+    command.pipeline = rig.pipeline.get();
+    command.render_pass = rig.pass.get();
+    command.count = 3;
+    command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+    command.state.scissors.fill(rig.full);
+    std::unique_ptr<BufferBase> buffer(renderer.allocateTemporaryBuffer(256));
+    std::array<u32, 8> guest{};
+    const auto base = reinterpret_cast<uptr>(guest.data());
+    for (u32 i = 0; i < 4; i++)
+        command.vertices[i] = BufferView(buffer.get()).withGuestRange(
+            ztd::Range<uptr>(base, base + 32));
+    command_ir::captureDrawAddressSpace(renderer, command, nullptr);
+    const auto seal_ns = per([&] {
+        (void)command_ir::sealDrawResources(renderer, command);
+    }, 20000);
+    const auto validate_ns = per([&] {
+        (void)command_ir::validateDrawContents(renderer, command);
+    }, 200000);
+    auto bare = command;
+    for (auto& view : bare.vertices)
+        view = {};
+    const auto bare_seal_ns = per([&] {
+        (void)command_ir::sealDrawResources(renderer, bare);
+    }, 20000);
+    (void)command_ir::sealDrawResources(renderer, command);
+    const auto* cb = rig.commands.get();
+    u32 encoded = 0;
+    const auto execute_ns = per([&] {
+        (void)command_ir::executeDraw(renderer, rig.commands.get(), command);
+        if (++encoded % 512 == 0)
+            renderer.synchronize(rig.commands.get());
+    }, 4096);
+    renderer.synchronize(rig.commands.get());
+    (void)cb;
+
+    // Submission
+    auto* device = MTL::CreateSystemDefaultDevice();
+    auto* queue = device->newCommandQueue();
+    auto completions = std::make_shared<metal::CompletionQueue>();
+    const auto submit_ns = per([&] {
+        auto* commands = queue->commandBuffer();
+        metal::commitManagedSubmission(commands, completions);
+    }, 2000);
+    while (completions->submissions.stats().pending != 0)
+        std::this_thread::yield();
+    completions.reset();
+    queue->release();
+    device->release();
+
+    std::cout << fmt::format(
+        "BENCH content version write {:.0f} ns, latest {:.0f} ns\n"
+        "BENCH draw seal {:.0f} ns (without buffers {:.0f} ns), content check "
+        "{:.0f} ns, encode {:.0f} ns\n"
+        "BENCH empty managed submission {:.0f} ns\n",
+        write_ns, latest_ns, seal_ns, bare_seal_ns, validate_ns, execute_ns,
+        submit_ns);
+}
+
+// Buffer textures are their backing buffer: capture reads and restores its bytes
+void testBufferTextureContents() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = gpu.getRenderer();
+    std::unique_ptr<ITexture> texture(renderer.createTexture(TextureDescriptor(
+        0, MTL::TextureTypeTextureBuffer, TextureFormat::R32Uint, true, 64, 16, 1,
+        1, 1, 1, 0, 0, 0)));
+    std::vector<u8> bytes(64);
+    for (usize i = 0; i < bytes.size(); i++)
+        bytes[i] = static_cast<u8>(i * 7 + 1);
+    expect(renderer.writeTextureContents(texture.get(), {bytes}),
+           "A buffer texture accepts its bytes");
+    std::vector<std::vector<u8>> read;
+    expect(renderer.readTextureContents(texture.get(), read) && read.size() == 1 &&
+               read[0] == bytes,
+           "A buffer texture returns the bytes it was given");
+    expect(!renderer.writeTextureContents(texture.get(), {bytes, bytes}) &&
+               !renderer.writeTextureContents(
+                   texture.get(), {std::vector<u8>(1 << 20, 0)}),
+           "Wrong shapes and oversized contents are refused");
+    std::cout << "PASS: buffer textures are captured through their backing buffer\n";
+}
+
 void testDrawResourceValidation() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
@@ -1785,6 +2298,103 @@ void testManagedMetalSubmissions() {
     native_queue->release();
     device->release();
     std::cout << "PASS: managed Metal checkpoint and async submission lifecycle\n";
+}
+
+// With every admission slot held by command buffers the GPU has not started,
+// a further submitter waits, and finishing the held work lets it proceed: the
+// slots are freed by GPU completion alone, never by the waiting thread.
+void testSubmissionSaturation() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    auto* device = MTL::CreateSystemDefaultDevice();
+    auto* queue = device->newCommandQueue();
+    auto* event = device->newSharedEvent();
+    auto* scratch = device->newBuffer(256, MTL::ResourceStorageModeShared);
+    auto completions = std::make_shared<metal::CompletionQueue>();
+    const auto submit = [&](u64 wait_for) {
+        auto* commands = queue->commandBuffer();
+        if (wait_for != 0)
+            commands->encodeWait(event, wait_for);
+        auto* blit = commands->blitCommandEncoder();
+        blit->fillBuffer(scratch, NS::Range(0, 256), 0x5a);
+        blit->endEncoding();
+        metal::commitManagedSubmission(commands, completions);
+    };
+    const auto wait_idle = [&](std::chrono::seconds limit) {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        while (completions->submissions.stats().pending != 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return completions->submissions.stats().pending == 0;
+    };
+
+    for (u32 i = 0; i < 64; i++)
+        submit(1);
+    expect(completions->submissions.stats().pending == 64,
+           "The held command buffers occupy every admission slot");
+    std::atomic<bool> extra_done{false};
+    std::thread extra([&] {
+        submit(0);
+        extra_done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    expect(!extra_done && completions->submissions.stats().pending == 64,
+           "A submitter beyond the budget waits instead of exceeding it");
+    event->setSignaledValue(1);
+    extra.join();
+    expect(extra_done && wait_idle(std::chrono::seconds(10)),
+           "Finishing the held work admits the waiting submitter");
+    auto stats = completions->submissions.stats();
+    expect(stats.admitted == 65 && stats.succeeded == 65 && stats.failed == 0 &&
+               stats.peak_pending == 64,
+           "Every submission completed and the budget was never exceeded");
+
+    // Many submitters against the budget make progress and drain
+    constexpr u32 THREADS = 8, PER_THREAD = 150;
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < THREADS; t++)
+        threads.emplace_back([&] {
+            for (u32 i = 0; i < PER_THREAD; i++)
+                submit(0);
+        });
+    for (auto& thread : threads)
+        thread.join();
+    expect(wait_idle(std::chrono::seconds(30)),
+           "Concurrent submitters drain without blocking forever");
+    stats = completions->submissions.stats();
+    expect(stats.admitted == 65 + THREADS * PER_THREAD &&
+               stats.succeeded == stats.admitted && stats.failed == 0 &&
+               stats.peak_pending <= 64,
+           "All submissions succeeded within the admission budget");
+
+    // Held work and a burst of further submitters: all complete once released
+    for (u32 i = 0; i < 64; i++)
+        submit(2);
+    std::atomic<u32> finished{0};
+    std::vector<std::thread> burst;
+    for (u32 t = 0; t < 4; t++)
+        burst.emplace_back([&] {
+            for (u32 i = 0; i < 10; i++)
+                submit(0);
+            finished++;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    expect(finished == 0, "A burst behind held work waits");
+    event->setSignaledValue(2);
+    for (auto& thread : burst)
+        thread.join();
+    expect(wait_idle(std::chrono::seconds(30)) && finished == 4,
+           "A burst behind held work completes once the work is released");
+    expect(completions->submissions.stats().failed == 0 &&
+               completions->submissions.stats().peak_pending <= 64,
+           "The budget held through the burst");
+    completions.reset();
+    scratch->release();
+    event->release();
+    queue->release();
+    device->release();
+    std::cout << "PASS: Metal submission saturation holds the budget and always "
+                 "makes progress\n";
 }
 
 void testCompletionQueueOrder() {
@@ -3949,10 +4559,17 @@ int main(int argc, char** argv) {
         testDrawStateSnapshots();
         testDrawCommands();
         testDrawResourceValidation();
+        testDrawContentVersions();
+        testClearAndCopyCommands();
+        testCaptureAndReplay();
+        testBufferTextureContents();
+        if (std::getenv("HYDRA_GPU_BENCH"))
+            benchmarkCommands();
         testDrawResourceLeases();
         testRenderTargetMappingMemo();
         testOcclusionReports();
         testCompletionQueueOrder();
+        testSubmissionSaturation();
         testManagedMetalSubmissions();
         testReportCallbackOrdering();
         testReportsLandBeforeLaterWrites();

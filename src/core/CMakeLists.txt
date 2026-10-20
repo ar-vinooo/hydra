@@ -514,11 +514,21 @@ add_library(hydra-core
     hw/tegra_x1/gpu/engines/inline_base.hpp
     hw/tegra_x1/gpu/engines/3d.cpp
     hw/tegra_x1/gpu/engines/3d.hpp
+    hw/tegra_x1/gpu/capture/draw_capture.cpp
+    hw/tegra_x1/gpu/capture/draw_capture.hpp
     hw/tegra_x1/gpu/command_ir/draw.cpp
     hw/tegra_x1/gpu/command_ir/draw.hpp
+    hw/tegra_x1/gpu/command_ir/resource_set.cpp
+    hw/tegra_x1/gpu/command_ir/resource_set.hpp
+    hw/tegra_x1/gpu/command_ir/clear.cpp
+    hw/tegra_x1/gpu/command_ir/clear.hpp
+    hw/tegra_x1/gpu/command_ir/copy.cpp
+    hw/tegra_x1/gpu/command_ir/copy.hpp
     hw/tegra_x1/gpu/resource/resource_lifetime.hpp
     hw/tegra_x1/gpu/resource/resource_registry.hpp
     hw/tegra_x1/gpu/resource/resource_registry.cpp
+    hw/tegra_x1/gpu/resource/content_version.hpp
+    hw/tegra_x1/gpu/resource/content_version.cpp
     hw/tegra_x1/gpu/resource/mapping_capture.hpp
     hw/tegra_x1/gpu/resource/mapping_capture.cpp
     hw/tegra_x1/gpu/renderer/draw_state.cpp
@@ -660,6 +670,7 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/buffer.cpp
     hw/tegra_x1/gpu/renderer/metal/buffer.hpp
     hw/tegra_x1/gpu/renderer/metal/texture.cpp
+    hw/tegra_x1/gpu/renderer/metal/texture_io.cpp
     hw/tegra_x1/gpu/renderer/metal/texture.hpp
     hw/tegra_x1/gpu/renderer/metal/texture_view.cpp
     hw/tegra_x1/gpu/renderer/metal/texture_view.hpp

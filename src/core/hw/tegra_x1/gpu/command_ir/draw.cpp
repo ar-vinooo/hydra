@@ -48,6 +48,44 @@ bool mappingMatches(resource::ResourceRegistry& registry,
             resource::validateMappings(*command.address_space,
                                        command.mapping_dependencies));
 }
+
+ztd::Range<uptr> textureRange(const renderer::ITextureView* view) {
+    if (!view || !view->getBase())
+        return {0, 0};
+    return view->getBase()->getDescriptor().getRange();
+}
+
+// The guest ranges behind the command's buffers and textures, versioned now
+void buildDrawContents(renderer::IRenderer& renderer, DrawCommand& command) {
+    command.contents = {};
+    // One version for every read of this command
+    const u64 version = renderer.getContentVersions().current();
+    const auto read = [&](const renderer::BufferView& view) {
+        if (view.isValid())
+            command.contents.addRead(version, view.getGuestRange());
+    };
+    for (const auto& view : command.vertices)
+        read(view);
+    read(command.indices);
+    for (const auto& stage : command.stages) {
+        if (!stage.active)
+            continue;
+        for (const auto& binding : stage.uniforms)
+            read(binding.buffer);
+        for (const auto& binding : stage.storage)
+            read(binding.buffer);
+        for (const auto& binding : stage.textures)
+            command.contents.addRead(version, textureRange(binding.texture));
+    }
+    if (command.render_pass) {
+        const auto& pass = command.render_pass->getDescriptor();
+        for (const auto& target : pass.color_targets)
+            command.contents.addWrite(textureRange(target.texture));
+        command.contents.addWrite(textureRange(pass.depth_stencil_target.texture));
+    }
+    for (const auto& range : command.storage_writes)
+        command.contents.addWrite(range);
+}
 } // namespace
 
 void captureDrawAddressSpace(renderer::IRenderer& renderer,
@@ -108,6 +146,7 @@ bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command) {
                 if (binding.texture)
                     track(binding.texture->getBase(), ResourceKind::Texture);
     command.resources_sealed = true;
+    buildDrawContents(renderer, command);
     if (!validateDrawResources(renderer, command)) {
         command.resources_sealed = false;
         return false;
@@ -140,6 +179,12 @@ bool validateDrawResources(renderer::IRenderer& renderer,
         ++index;
     });
     return matches && index == command.direct_resource_count;
+}
+
+bool validateDrawContents(renderer::IRenderer& renderer,
+                          const DrawCommand& command) {
+    return command.resources_sealed &&
+           command.contents.readsCurrent(renderer.getContentVersions());
 }
 
 bool executeDraw(renderer::IRenderer& renderer,
@@ -195,6 +240,8 @@ bool executeDraw(renderer::IRenderer& renderer,
         std::scoped_lock lock(cache.getMutex());
         cache.synchronizeStorageWrites(command_buffer, command.storage_writes);
     }
+    for (const auto& range : command.contents.writes)
+        renderer.getContentVersions().write(range);
     return true;
 }
 

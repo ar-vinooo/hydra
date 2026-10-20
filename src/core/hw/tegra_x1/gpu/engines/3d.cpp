@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/engines/storage_buffer.hpp"
@@ -638,8 +640,12 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
 
 void ThreeD::executeDrawCommand(command_ir::DrawCommand& command) {
     if (command_ir::sealDrawResources(gpu.getRenderer(), command)) {
+        if (auto& live = capture::LiveCapture::instance(); live.active())
+            live.draw(gpu.getRenderer(), tls_crnt_command_buffer, command);
         labelCaptureDraw(command.count);
         if (command_ir::executeDraw(gpu.getRenderer(), tls_crnt_command_buffer, command)) {
+            if (auto& live = capture::LiveCapture::instance(); live.active())
+                live.commandExecuted(tls_crnt_command_buffer);
             profileDraw(command.count);
             captureVisualDraw(true);
             return;
@@ -820,21 +826,23 @@ void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
     // TODO: implement
 
     // Regular clear
+    command_ir::ClearCommand command;
+    command.resources.capture(gpu.getRenderer(), tls_crnt_gmmu);
     {
         std::scoped_lock texture_cache_lock(
             gpu.getRenderer().getTextureCache().getMutex());
-        gpu.getRenderer().bindRenderPass(getRenderPass());
+        command.render_pass = getRenderPass();
     }
 
     // The stencil write mask applies when the clear control asks for it
     constexpr u32 REG_CLEAR_CONTROL = 0x43e;
     constexpr u32 REG_STENCIL_FRONT_MASK = 0x4e7;
     const bool respect_stencil_mask = (regs_raw[REG_CLEAR_CONTROL] & 0x1) != 0;
-    gpu.getRenderer().setClearState({
+    command.state = {
         .rect = getClearRect(),
         .stencil_write_mask =
             respect_stencil_mask ? regs_raw[REG_STENCIL_FRONT_MASK] & 0xff : 0xff,
-    });
+    };
 
     if (data.color_mask != 0x0 && data.target_id < COLOR_TARGET_COUNT) {
         auto color = std::bit_cast<std::array<u32, 4>>(regs.clear_color);
@@ -847,18 +855,32 @@ void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
                     .format),
             color, mask);
         if (mask != 0x0)
-            gpu.getRenderer().clearColor(tls_crnt_command_buffer, data.target_id,
-                                         data.layer_id, mask,
-                                         std::bit_cast<simd::uint4>(color));
+            command.color = command_ir::ClearCommand::Color{
+                data.target_id, data.layer_id, mask,
+                std::bit_cast<simd::uint4>(color)};
     }
 
     if (data.depth)
-        gpu.getRenderer().clearDepth(tls_crnt_command_buffer, data.layer_id,
-                                     regs.clear_depth);
+        command.depth = command_ir::ClearCommand::Depth{data.layer_id,
+                                                        regs.clear_depth};
 
     if (data.stencil)
-        gpu.getRenderer().clearStencil(tls_crnt_command_buffer, data.layer_id,
-                                       regs.clear_stencil);
+        command.stencil = command_ir::ClearCommand::Stencil{data.layer_id,
+                                                            regs.clear_stencil};
+
+    if (command_ir::sealClear(gpu.getRenderer(), command)) {
+        if (auto& live = capture::LiveCapture::instance(); live.active())
+            live.clear(gpu.getRenderer(), tls_crnt_command_buffer, command);
+        if (command_ir::executeClear(gpu.getRenderer(), tls_crnt_command_buffer,
+                                     command)) {
+            if (auto& live = capture::LiveCapture::instance(); live.active())
+                live.commandExecuted(tls_crnt_command_buffer);
+            return;
+        }
+    }
+    LOG_ERROR(Gpu, "Clear rejected: resource lifetime or GPU mapping changed");
+    if (tls_crnt_decode_state)
+        tls_crnt_decode_state->fail(25);
 }
 
 void ThreeD::resetCounter(const u32 index, const u32 data) {
@@ -1892,6 +1914,22 @@ renderer::PipelineBase* ThreeD::getPipeline() {
                       : 0,
                   getGeometryLayerSource());
 
+    if (auto& visual = VisualDiagnostics::instance(); visual.active()) {
+        renderer::ShaderType stages[] = {renderer::ShaderType::Vertex,
+                                         renderer::ShaderType::Fragment};
+        VisualDiagnostics::Fields fields;
+        for (const auto type : stages) {
+            const auto* shader = descriptor.shaders[static_cast<u32>(type)];
+            if (shader && !shader->getDescriptor().resource_mapping.unsupported.empty())
+                fields[type == renderer::ShaderType::Vertex ? "vs_unsupported"
+                                                            : "fs_unsupported"] =
+                    fmt::format("{}", fmt::join(shader->getDescriptor()
+                                                    .resource_mapping.unsupported,
+                                                "; "));
+        }
+        if (!fields.empty())
+            visual.event("draw_unsupported", fields);
+    }
     if (const auto* vertex_shader =
             descriptor.shaders[static_cast<u32>(renderer::ShaderType::Vertex)];
         vertex_shader != nullptr && vertex_shader->getDescriptor().writes_layer) {
@@ -2107,19 +2145,17 @@ ThreeD::getTexture(const TextureImageControl& tic,
     if (format == renderer::TextureFormat::Invalid)
         return nullptr;
 
-    bool is_linear = false;
-    u32 linear_stride = 0;
-    switch (tic.hdr_version) {
-    case TicHdrVersion::Pitch:
-        is_linear = true;
-        linear_stride = static_cast<u32>(tic.pitch_5_20) << 5u;
-        break;
-    case TicHdrVersion::BlockLinear:
-        break;
-    default:
-        LOG_NOT_IMPLEMENTED(Engines, "TIC HDR version {}", tic.hdr_version);
-        break;
+    const auto layout = getTicLayout(tic);
+    if (!layout) {
+        ONCE(LOG_NOT_IMPLEMENTED(Engines, "TIC header version {}, texture not bound",
+                                 tic.hdr_version));
+        return nullptr;
     }
+    if (tic.hdr_version == TicHdrVersion::PitchColorKey ||
+        tic.hdr_version == TicHdrVersion::BlockLinearColorKey)
+        ONCE(LOG_NOT_IMPLEMENTED(Engines, "Texture color key"));
+    const bool is_linear = layout->is_linear;
+    const u32 linear_stride = layout->linear_stride;
 
     auto type = toTextureType(tic.texture_type);
     u32 depth = tic.depth_minus_one + 1;
@@ -2141,6 +2177,13 @@ ThreeD::getTexture(const TextureImageControl& tic,
                       width, height, depth, layer_count));
         return nullptr;
     }
+    // A pitch header has no layer stride or level offsets: only the first
+    // surface is addressable
+    if (is_linear && (level_count > 1 || layer_count > 1 || depth > 1))
+        ONCE(LOG_NOT_IMPLEMENTED(Engines,
+                                 "Pitch texture with {} levels, {} layers, "
+                                 "depth {} (only the first surface is read)",
+                                 level_count, layer_count, depth));
     const renderer::TextureDescriptor descriptor(
         tls_crnt_gmmu->unmapAddr(gpu_addr), type, format, is_linear,
         linear_stride, width, height, depth, level_count, layer_count,
@@ -2280,6 +2323,19 @@ f32 srgbToLinear(u32 value) {
 }
 
 } // namespace
+
+std::optional<TicLayout> getTicLayout(const TextureImageControl& tic) {
+    switch (tic.hdr_version) {
+    case TicHdrVersion::Pitch:
+    case TicHdrVersion::PitchColorKey:
+        return TicLayout{true, static_cast<u32>(tic.pitch_5_20) << 5u};
+    case TicHdrVersion::BlockLinear:
+    case TicHdrVersion::BlockLinearColorKey:
+        return TicLayout{false, 0};
+    default:
+        return std::nullopt;
+    }
+}
 
 TicLodRange getTicLodRange(const TextureImageControl& tic) {
     // The color key headers use these bits for the key
@@ -2652,12 +2708,19 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
     // Shaders
     for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
         const auto& program = regs.shader_programs[static_cast<usize>(stage)];
+        const auto* shader = getShaderUnchecked(stage);
         str += fmt::format(
             "    {}: enabled={} shader={} code={:#x}\n",
             stage == ShaderStage::VertexB ? "VS" : "FS",
-            static_cast<bool>(program.config.enable),
-            fmt::ptr(getShaderUnchecked(stage)),
+            static_cast<bool>(program.config.enable), fmt::ptr(shader),
             static_cast<u64>(regs.shader_program_region) + program.offset);
+        // Features the translation skipped: the output may be wrong
+        if (shader && !shader->getDescriptor().resource_mapping.unsupported.empty())
+            str += fmt::format(
+                "    {} unsupported: {}\n",
+                stage == ShaderStage::VertexB ? "VS" : "FS",
+                fmt::join(shader->getDescriptor().resource_mapping.unsupported,
+                          "; "));
     }
 
     // Render targets
@@ -2697,6 +2760,8 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                        regs_raw[0x4e0] != 0, regs_raw[0x4e4], regs_raw[0x4e5],
                        regs_raw[0x4e6], regs_raw[0x4e1], regs_raw[0x4e2],
                        regs_raw[0x4e3], regs_raw[0x4e7], regs_raw[0x565] != 0);
+    for (const auto& line : describeTextureBindings())
+        str += "    " + line + "\n";
     for (u32 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
         const auto& attrib = regs.vertex_attrib_states[i];
         // Unused attributes are fixed with a zero size
@@ -3127,6 +3192,47 @@ std::optional<u32> ThreeD::readTextureHandle(u32 stage_index,
     return handle;
 }
 
+std::vector<std::string> ThreeD::describeTextureBindings() const {
+    std::vector<std::string> lines;
+    for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
+        const auto* shader = getShaderUnchecked(stage);
+        if (!shader)
+            continue;
+        const char* name = stage == ShaderStage::VertexB ? "VS" : "FS";
+        for (const auto& [binding, host_binding] :
+             shader->getDescriptor().resource_mapping.textures) {
+            const auto handle = readTextureHandle(static_cast<u32>(stage) - 1, binding);
+            if (!handle || getImageHandle(*handle) > regs.tex_header_pool_max_index) {
+                lines.push_back(fmt::format("{} tex{} (host {}): no valid handle",
+                                            name, binding, host_binding));
+                continue;
+            }
+            const auto bytes = tls_crnt_gmmu->readMappedBytes(
+                static_cast<u64>(regs.tex_header_pool) +
+                    u64(getImageHandle(*handle)) * sizeof(TextureImageControl),
+                sizeof(TextureImageControl));
+            if (bytes.size() != sizeof(TextureImageControl)) {
+                lines.push_back(fmt::format("{} tex{} (host {}): TIC {} unmapped",
+                                            name, binding, host_binding,
+                                            getImageHandle(*handle)));
+                continue;
+            }
+            TextureImageControl tic;
+            std::memcpy(&tic, bytes.data(), sizeof(tic));
+            lines.push_back(fmt::format(
+                "{} tex{} (host {}): tic={} tsc={} addr={:#x} fmt={} {}x{} "
+                "levels={} layout={} type={}",
+                name, binding, host_binding, getImageHandle(*handle),
+                getSamplerHandle(*handle), makeAddr(tic.addr_lo, tic.addr_hi),
+                renderer::toTextureFormat(tic.format_word, tic.is_srgb),
+                tic.width_minus_one + 1, tic.height_minus_one + 1,
+                tic.mip_max_levels + 1u, static_cast<TicHdrVersion>(tic.hdr_version),
+                static_cast<u32>(tic.texture_type)));
+        }
+    }
+    return lines;
+}
+
 void ThreeD::selectVisualResources() {
     auto& visual = VisualDiagnostics::instance();
     if (!visual.active() || !visual.options().resource)
@@ -3185,6 +3291,13 @@ void ThreeD::captureVisualDraw(bool after) {
             {"depth_bias_constant_bits", std::to_string(regs_raw[0x56f])},
             {"depth_bias_slope_bits", std::to_string(regs_raw[0x55b])},
             {"depth_bias_clamp_bits", std::to_string(regs_raw[0x61f])}});
+        {
+            const auto lines = describeTextureBindings();
+            VisualDiagnostics::Fields fields;
+            for (usize i = 0; i < lines.size(); i++)
+                fields[fmt::format("binding{:02}", i)] = lines[i];
+            visual.event("texture_bindings", fields);
+        }
         visual.event("index_state", {{"address", std::to_string(static_cast<u64>(regs.index_buffer_addr))},
             {"type", std::to_string(static_cast<u32>(regs.index_type))},
             {"start", std::to_string(regs.vertex_elements_start)},

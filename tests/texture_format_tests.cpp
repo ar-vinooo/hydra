@@ -212,6 +212,30 @@ void testTicViewLodRange() {
     range = engines::getTicLodRange(tic);
     check(range.min == 0 && range.max == 15, "An inverted view range is ignored");
     std::cout << "PASS: TIC resource view LOD range\n";
+
+    // Memory layout per header version
+    tic.pitch_5_20 = 0x123;
+    tic.hdr_version = engines::TicHdrVersion::Pitch;
+    auto layout = engines::getTicLayout(tic);
+    check(layout && layout->is_linear && layout->linear_stride == (0x123u << 5),
+          "A pitch TIC is linear with its pitch");
+    tic.hdr_version = engines::TicHdrVersion::PitchColorKey;
+    layout = engines::getTicLayout(tic);
+    check(layout && layout->is_linear && layout->linear_stride == (0x123u << 5),
+          "A pitch color key TIC has the layout of a pitch TIC");
+    tic.hdr_version = engines::TicHdrVersion::BlockLinear;
+    layout = engines::getTicLayout(tic);
+    check(layout && !layout->is_linear, "A block linear TIC is tiled");
+    tic.hdr_version = engines::TicHdrVersion::BlockLinearColorKey;
+    layout = engines::getTicLayout(tic);
+    check(layout && !layout->is_linear,
+          "A block linear color key TIC has the layout of a block linear TIC");
+    for (const u32 invalid : {5u, 6u, 7u}) {
+        tic.hdr_version = static_cast<engines::TicHdrVersion>(invalid);
+        check(!engines::getTicLayout(tic),
+              "An undefined header version has no layout");
+    }
+    std::cout << "PASS: TIC memory layout per header version\n";
 }
 
 ImageFormatWord makeTic(ImageFormat format, ImageComponent r, ImageComponent g,
@@ -1039,8 +1063,9 @@ void testCrossFormatCopies() {
         auto* dst = cache.find(commands.get(),
                                make(0x4000 + slot++ * 0x1000, test_case.dst),
                                TextureUsage::Read);
-        dst->getBase()->copyFrom(commands.get(), src->getBase(), 0, 0, 0, 0, 1,
-                                 1);
+        check(dst->getBase()->copyFrom(commands.get(), src->getBase(), 0, 0, 0,
+                                       0, 1, 1),
+              "A supported cross-format copy reports success");
         auto* native =
             static_cast<metal::Texture*>(dst->getBase())->getTexture();
         auto* result = renderer.getDevice()->newBuffer(
@@ -1055,6 +1080,22 @@ void testCrossFormatCopies() {
               "Cross-format copies keep the source bytes");
         result->release();
     }
+    // Packed depth/stencil has no texel-for-texel colour counterpart: nothing
+    // is encoded, which the caller needs to know to synchronize another way
+    auto* packed = cache.find(commands.get(),
+                              make(0x1000, TextureFormat::Z24Unorm_S8Uint),
+                              TextureUsage::Read);
+    auto* colour = cache.find(commands.get(),
+                              make(0x9000, TextureFormat::RGBA8Unorm),
+                              TextureUsage::Read);
+    check(!colour->getBase()->copyFrom(commands.get(), packed->getBase(), 0, 0,
+                                       0, 0, 1, 1),
+          "An unsupported copy between depth/stencil and colour reports failure");
+    check(!colour->getBase()->copyFrom(commands.get(), packed->getBase(),
+                                       MTL::Origin(0, 0, 0), 0, 0,
+                                       MTL::Origin(0, 0, 0), 0, 0,
+                                       MTL::Size(4, 4, 1), 1),
+          "An unsupported region copy reports failure");
     commands.reset();
     std::cout << "PASS: cross-format texture copies through views and "
                  "buffers\n";

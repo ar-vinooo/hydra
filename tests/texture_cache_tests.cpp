@@ -1766,6 +1766,71 @@ int main() {
                   "render target");
         }
 
+        // A render target that was written back and then overwritten by the
+        // guest (streaming reuses the memory of dead render targets) holds
+        // stale data too. Textures created over the memory afterwards must
+        // neither copy it nor write it back over the guest's data
+        {
+            std::vector<u8> reused_memory(0x8000, 0);
+            const auto reused_base = reinterpret_cast<uptr>(reused_memory.data());
+            std::unique_ptr<ICommandBuffer> reused_commands(
+                renderer.createCommandBuffer());
+            // A small target in the middle of what becomes a larger texture
+            const TextureDescriptor small_target(
+                reused_base + 0x400, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
+                false, 0, 16, 8, 1, 1, 1, 0, 0, 0);
+            cache.find(reused_commands.get(), small_target, TextureUsage::Write);
+            cache.flushMemory(reused_commands.get(), small_target.getRange());
+            // The guest streams a texture over the memory
+            std::memset(reused_memory.data(), 0x5a, 0x2000);
+            cache.invalidateMemory(ztd::Range<uptr>::fromSize(reused_base, 0x2000));
+            const TextureDescriptor streamed(
+                reused_base, MTL::TextureType2D, TextureFormat::BC5_RGUnorm, false,
+                0, 64, 64, 1, 1, 1, 0, 0, 0);
+            cache.find(reused_commands.get(), streamed, TextureUsage::Read);
+            reused_commands.reset();
+            bool streamed_intact = true;
+            for (usize i = 0; i < 0x2000; ++i)
+                streamed_intact &= reused_memory[i] == 0x5a;
+            check(streamed_intact,
+                  "A written back render target the guest overwrote does not "
+                  "overwrite the guest's data again");
+            // And an alias of the same size reads the guest's bytes
+            std::vector<u8> same_memory(0x8000, 0);
+            const auto same_base = reinterpret_cast<uptr>(same_memory.data());
+            std::unique_ptr<ICommandBuffer> same_commands(
+                renderer.createCommandBuffer());
+            const TextureDescriptor same_target(
+                same_base, MTL::TextureType2D, TextureFormat::RGBA8Unorm, false, 0,
+                64, 64, 1, 1, 1, 0, 0, 0);
+            cache.find(same_commands.get(), same_target, TextureUsage::Write);
+            cache.flushMemory(same_commands.get(), same_target.getRange());
+            std::memset(same_memory.data(), 0x5a, 0x4000);
+            cache.invalidateMemory(ztd::Range<uptr>::fromSize(same_base, 0x4000));
+            const TextureDescriptor same_alias(
+                same_base, MTL::TextureType2D, TextureFormat::BGRA8Unorm, false, 0,
+                64, 64, 1, 1, 1, 0, 0, 0);
+            auto* same_view =
+                cache.find(same_commands.get(), same_alias, TextureUsage::Read);
+            auto* same_readback = renderer.getDevice()->newBuffer(
+                4, MTL::ResourceStorageModeShared);
+            static_cast<metal::CommandBuffer*>(same_commands.get())
+                ->getBlitCommandEncoder()
+                ->copyFromTexture(
+                    static_cast<metal::Texture*>(same_view->getBase())->getTexture(),
+                    0, 0, MTL::Origin(0, 0, 0), MTL::Size(1, 1, 1), same_readback,
+                    0, 4, 4);
+            same_commands.reset();
+            const auto* same_texel =
+                static_cast<const u8*>(same_readback->contents());
+            const bool same_guest = same_texel[0] == 0x5a && same_texel[1] == 0x5a &&
+                                    same_texel[2] == 0x5a && same_texel[3] == 0x5a;
+            same_readback->release();
+            check(same_guest,
+                  "An alias reads the guest's data, not a render target that "
+                  "was written back before the guest overwrote it");
+        }
+
         // A completion handler must keep its pool alive after the owner exits.
         std::weak_ptr<metal::UploadBufferPool> weak_pool = pool_state;
         auto* pending = pool_state->acquire(4097);

@@ -14,15 +14,17 @@ void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const BufferBase* src,
                        [[maybe_unused]] const ztd::Range<u32> dst_levels,
                        [[maybe_unused]] const ztd::Range<u32> dst_layers) {}
-void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
+bool Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const ITexture* src,
                        [[maybe_unused]] const u32 src_level,
                        [[maybe_unused]] const u32 src_layer,
                        [[maybe_unused]] const u32 dst_level,
                        [[maybe_unused]] const u32 dst_layer,
                        [[maybe_unused]] const u32 level_count,
-                       [[maybe_unused]] const u32 layer_count) {}
-void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
+                       [[maybe_unused]] const u32 layer_count) {
+    return true;
+}
+bool Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const ITexture* src,
                        [[maybe_unused]] const MTL::Origin src_origin,
                        [[maybe_unused]] const u32 src_level,
@@ -31,7 +33,9 @@ void Texture::copyFrom([[maybe_unused]] ICommandBuffer* command_buffer,
                        [[maybe_unused]] const u32 dst_level,
                        [[maybe_unused]] const u32 dst_layer,
                        [[maybe_unused]] const MTL::Size size,
-                       [[maybe_unused]] const u32 layer_count) {}
+                       [[maybe_unused]] const u32 layer_count) {
+    return true;
+}
 
 void Texture::copyBufferBytes([[maybe_unused]] ICommandBuffer* command_buffer,
                               [[maybe_unused]] const ITexture* src,

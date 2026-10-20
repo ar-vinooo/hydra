@@ -58,7 +58,8 @@ BufferView BufferCache::snapshot(ztd::Range<uptr> range) {
             return {};
         buffer->copyFrom(range.getBegin());
     }
-    return BufferView(ownSnapshot(buffer), 0, range.getSize());
+    return BufferView(ownSnapshot(buffer), 0, range.getSize())
+        .withGuestRange(range);
 }
 
 void BufferCache::markGpuModified(ztd::Range<uptr> range) {
@@ -92,7 +93,7 @@ BufferView BufferCache::getHot0(ICommandBuffer* command_buffer,
     if (!gpu_modified.empty() && intersectsGpuModified(range)) {
         auto view = renderer.getGuestMemoryBuffer(range);
         if (view.isValid())
-            return view;
+            return view.withGuestRange(range);
     }
     auto& entry = find(range);
     if (entry.buffer != nullptr) {
@@ -116,7 +117,8 @@ BufferView BufferCache::getHot0(ICommandBuffer* command_buffer,
     }
 
     return BufferView{entry.buffer, range.getBegin() - entry.range.getBegin(),
-                      range.getSize()};
+                      range.getSize()}
+        .withGuestRange(range);
 }
 
 void BufferCache::invalidateMemoryHot1(ztd::Range<uptr> range) {

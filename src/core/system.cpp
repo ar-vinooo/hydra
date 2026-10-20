@@ -1,5 +1,6 @@
 #include "core/system.hpp"
 
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
@@ -572,6 +573,8 @@ void System::progressFrame(u32 width, u32 height,
         os.getDisplayDriver().acquirePresentTextures(command_buffer);
     if (acquired) {
         hw::tegra_x1::gpu::FrameTracer::instance().onPresent();
+        hw::tegra_x1::gpu::capture::LiveCapture::instance().onPresent(
+            gpu.getRenderer());
         hw::tegra_x1::gpu::VisualDiagnostics::instance().onPresent();
     }
 

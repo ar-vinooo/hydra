@@ -158,6 +158,15 @@ struct TicLodRange {
 };
 
 TicLodRange getTicLodRange(const TextureImageControl& tic);
+
+// Memory layout a TIC describes. The color key versions share the layout of
+// their plain versions (clb197tex.h: the key sits in the last words); other
+// header versions have no known layout.
+struct TicLayout {
+    bool is_linear;
+    u32 linear_stride;
+};
+std::optional<TicLayout> getTicLayout(const TextureImageControl& tic);
 MTL::StencilOperation decodeStencilOp(u32 value);
 
 // The texture format selects the border color interpretation (integer bits,
@@ -809,6 +818,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     bool prepareDraw(command_ir::DrawCommand& command);
     void executeDrawCommand(command_ir::DrawCommand& command);
     void selectVisualResources();
+    // One line per texture the bound shaders sample, from the guest TIC/TSC
+    std::vector<std::string> describeTextureBindings() const;
     void captureVisualDraw(bool after);
 };
 

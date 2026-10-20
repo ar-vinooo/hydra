@@ -17,6 +17,15 @@ struct BufferView {
 
     bool isValid() const { return base != nullptr; }
 
+    // Host address range of the guest memory this view stands for, empty for
+    // buffers which do not mirror guest memory. Content versions use it.
+    BufferView withGuestRange(ztd::Range<uptr> range) const {
+        auto view = *this;
+        view.guest_range = range;
+        return view;
+    }
+    ztd::Range<uptr> getGuestRange() const { return guest_range; }
+
     explicit BufferView(std::shared_ptr<BufferBase> owner_, u64 offset_ = 0,
                         u64 size_ = invalid<u64>())
         : BufferView(owner_.get(), offset_, size_) {
@@ -52,6 +61,7 @@ struct BufferView {
     BufferBase* base{nullptr};
     u64 offset{0};
     u64 size{0};
+    ztd::Range<uptr> guest_range{0, 0};
 
   public:
     GETTER(base, getBase);
