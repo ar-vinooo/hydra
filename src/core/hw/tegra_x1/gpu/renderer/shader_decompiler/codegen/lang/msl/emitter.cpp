@@ -335,9 +335,8 @@ std::optional<RawImageLayout> getRawLayout(const GuestShaderState& state,
         if (layout && layout->bytes() == rawAccessBytes(raw_size))
             return layout;
     }
-    ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                             "Raw surface access of size {} to image {}",
-                             raw_size, index));
+    SHADER_UNSUPPORTED_ONCE("Raw surface access of size {} to image {}",
+                             raw_size, index);
     return std::nullopt;
 }
 
@@ -903,7 +902,7 @@ void MslEmitter::emitDeclarations() {
         case SvSemantic::ClipDistance:
             break;
         default:
-            LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Output SV semantic {}",
+            SHADER_UNSUPPORTED("Output SV semantic {}",
                                 sv_semantic);
             break;
         }
@@ -1501,12 +1500,9 @@ void MslEmitter::emitTextureSample(
         } else if (depth_compare &&
                    border_it->second.depth_compare_op ==
                        engines::CompareOp::Invalid) {
-            ONCE(LOG_NOT_IMPLEMENTED(
-                ShaderDecompiler,
-                "Depth comparison without a comparing sampler with borders"));
+            SHADER_UNSUPPORTED_ONCE("Depth comparison without a comparing sampler with borders");
         } else if (is_integer && is_gather) {
-            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                                     "Integer texture gathers with borders"));
+            SHADER_UNSUPPORTED_ONCE("Integer texture gathers with borders");
         } else {
             border = &border_it->second;
             const std::array axes = {getBorderAxis(*border, 0),
@@ -1519,16 +1515,12 @@ void MslEmitter::emitTextureSample(
                                       axes[1].border, axes[2].border);
             if (mirrors && any(flags & (TextureSampleFlags::Offset |
                                         TextureSampleFlags::Offsets))) {
-                ONCE(LOG_NOT_IMPLEMENTED(
-                    ShaderDecompiler,
-                    "Texel offsets of mirrored border addressing (applied "
-                    "after the mirroring)"));
+                SHADER_UNSUPPORTED_ONCE("Texel offsets of mirrored border addressing (applied "
+                    "after the mirroring)");
             }
             if (is_integer && any(flags & TextureSampleFlags::Offset)) {
-                ONCE(LOG_NOT_IMPLEMENTED(
-                    ShaderDecompiler,
-                    "Texel offsets of integer texture borders (not "
-                    "considered for the border)"));
+                SHADER_UNSUPPORTED_ONCE("Texel offsets of integer texture borders (not "
+                    "considered for the border)");
             }
         }
     }
@@ -1699,7 +1691,7 @@ void MslEmitter::emitTextureSample(
             args = fmt::format("as_type<uint{}>({})", coord_count, coords_str);
         if (depth_compare) {
             // TODO: emulate
-            LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Texture read depth compare");
+            SHADER_UNSUPPORTED("Texture read depth compare");
         }
     } else {
         func_name = "sample";
@@ -1740,8 +1732,7 @@ void MslEmitter::emitTextureSample(
         else if (int_coords && is_1d) {
             // texture1d::read takes a level of detail known at compile time,
             // and a 1D texture has a single level in practice
-            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                                     "1D texel fetch with a level of detail"));
+            SHADER_UNSUPPORTED_ONCE("1D texel fetch with a level of detail");
             args += ", 0u";
         } else if (int_coords)
             args += fmt::format(", as_type<uint>({})", getValueStr(lod));
@@ -1997,7 +1988,7 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
         value = "(~((1u << state.lane) - 1u))";
         break;
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "System register {:#x}", sr);
+        SHADER_UNSUPPORTED("System register {:#x}", sr);
         value = "0u";
         break;
     }
@@ -2134,7 +2125,7 @@ std::string MslEmitter::getImageBoundsStr(u32 index, TextureType type,
                            "state.img{1}.get_depth()",
                            coords, index);
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Image type {}",
+        SHADER_UNSUPPORTED("Image type {}",
                             static_cast<u32>(type));
         return "false";
     }
@@ -2291,7 +2282,7 @@ void MslEmitter::emitImageAtomic(const ir::Value& dst, u32 index,
         func = "atomic_exchange";
         break;
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Image atomic op {}", op);
+        SHADER_UNSUPPORTED("Image atomic op {}", op);
         func = "atomic_fetch_add";
         operand = "0u";
         break;
@@ -2376,7 +2367,7 @@ std::string MslEmitter::getSvStr(const Sv& sv) {
     case SvSemantic::VertexID:
         return "vid";
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "SV {} (index: {})", sv.semantic,
+        SHADER_UNSUPPORTED("SV {} (index: {})", sv.semantic,
                             sv.index);
         return INVALID_VALUE;
     }

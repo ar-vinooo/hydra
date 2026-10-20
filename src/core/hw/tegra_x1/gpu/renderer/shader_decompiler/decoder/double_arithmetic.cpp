@@ -92,7 +92,7 @@ constexpr u32 DOUBLE_ONE_HI = 0x3ff00000u;
 
 void warnConditionCodes(instruction_t inst, const char* name) {
     if (bit(inst, 47))
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "{}.CC", name));
+        SHADER_UNSUPPORTED_ONCE("{}.CC", name);
 }
 
 } // namespace

@@ -79,7 +79,7 @@ void emitVmad(DecoderContext& context, instruction_t inst) {
     // carry/saturation/scaling semantics lack NVIDIA hardware evidence.
     if (extractBits(inst, 47, 1) || extractBits(inst, 51, 2) ||
         extractBits(inst, 55, 1)) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "VMAD CC/scale/saturation");
+        SHADER_UNSUPPORTED("VMAD CC/scale/saturation");
         return;
     }
     const bool conditional = begin(context, inst);
@@ -104,9 +104,7 @@ void emitVmnmx(DecoderContext& context, instruction_t inst) {
     const u32 operation = static_cast<u32>(extractBits(inst, 51, 3));
     if (extractBits(inst, 47, 1) ||
         extractBits(inst, 48, 1) != extractBits(inst, 49, 1)) {
-        LOG_NOT_IMPLEMENTED(
-            ShaderDecompiler,
-            "VMNMX CC/mixed signedness (secondary operation {})", operation);
+        SHADER_UNSUPPORTED("VMNMX CC/mixed signedness (secondary operation {})", operation);
         return;
     }
     const bool conditional = begin(context, inst);
@@ -153,8 +151,7 @@ void emitVsetp(DecoderContext& context, instruction_t inst) {
     const auto boolean_op = static_cast<BoolOp>(extractBits(inst, 45, 2));
     if (static_cast<u32>(boolean_op) == 3 ||
         extractBits(inst, 48, 1) != extractBits(inst, 49, 1)) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "VSETP boolean operation 3/mixed signedness");
+        SHADER_UNSUPPORTED("VSETP boolean operation 3/mixed signedness");
         return;
     }
     const bool conditional = begin(context, inst);

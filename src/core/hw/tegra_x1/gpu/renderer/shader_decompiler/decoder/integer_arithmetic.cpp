@@ -9,15 +9,25 @@ void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
               bool write_cc, bool extended, bool saturate) {
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, pred, pred_inv);
+    const auto one = ir::Value::createConstantU(1);
+    const auto zero = ir::Value::createConstantU(0);
     auto a = b.opCopy(ir::Value::createRegister(src_a));
     auto other = b.opBitCast(src_b, ir::ScalarType::U32);
-    if (avg_mode == AvgMode::NegA) a = b.opNeg(a);
-    if (avg_mode == AvgMode::NegB) other = b.opNeg(other);
+    // A negated operand is inverted and the missing +1 enters as the carry:
+    // 1 for a plain add, the carry flag for .X. This is what makes a 64-bit
+    // subtraction (IADD.CC, IADD.X) borrow correctly and gives a negated
+    // operand the carry of the 33-bit sum.
+    const bool negated = avg_mode == AvgMode::NegA || avg_mode == AvgMode::NegB;
+    if (avg_mode == AvgMode::NegA) a = b.opBitwiseNot(a);
+    if (avg_mode == AvgMode::NegB) other = b.opBitwiseNot(other);
     const auto sum = b.opAdd(a, other);
-    auto result = sum;
-    if (extended) result = b.opAdd(sum, b.opSelect(ir::Value::createConditionFlag(2), ir::Value::createConstantU(1), ir::Value::createConstantU(0)));
-    if (avg_mode == AvgMode::PlusOne) result = b.opAdd(result, ir::Value::createConstantU(1));
-    const auto zero = ir::Value::createConstantU(0);
+    auto carry_in = zero;
+    if (extended)
+        carry_in = b.opSelect(ir::Value::createConditionFlag(2), one, zero);
+    else if (negated)
+        carry_in = one;
+    if (avg_mode == AvgMode::PlusOne) carry_in = b.opAdd(carry_in, one);
+    auto result = b.opAdd(sum, carry_in);
     const auto sign = [&](ir::Value v) { return b.opCompareNotEqual(b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero); };
     // Signed overflow of the unsaturated sum, shared by SAT and the CC flags.
     std::optional<ir::Value> overflow;
@@ -30,7 +40,7 @@ void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
         result = b.opSelect(*overflow, clamp, result);
     }
     if (write_cc) {
-        const auto carry = b.opBitwiseOr(b.opCompareLess(sum, a), b.opCompareLess(result, sum));
+        const auto carry = b.opBitwiseOr(b.opCompareLess(sum, a), b.opCompareLess(b.opAdd(sum, carry_in), sum));
         b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(result, zero));
         b.opCopy(ir::Value::createConditionFlag(1), sign(result));
         b.opCopy(ir::Value::createConditionFlag(2), carry);
@@ -40,10 +50,37 @@ void emitIadd(DecoderContext& context, pred_t pred, bool pred_inv,
     if (conditional) b.opEndIf();
 }
 
-// TODO: write_cc
+// lhs + rhs (+ the carry flag when extended). With write_cc the flags of the
+// sum go to CC like IADD.CC; the result is still copied by the caller.
+ir::Value addWithCarry(DecoderContext& context, ir::Value lhs, ir::Value rhs,
+                       bool extended, bool write_cc) {
+    auto& b = context.builder;
+    const auto zero = ir::Value::createConstantU(0);
+    const auto sign = [&](ir::Value v) {
+        return b.opCompareNotEqual(
+            b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero);
+    };
+    const auto sum = b.opAdd(lhs, rhs);
+    auto result = sum;
+    if (extended)
+        result = b.opAdd(sum, b.opSelect(ir::Value::createConditionFlag(2),
+                                         ir::Value::createConstantU(1), zero));
+    if (write_cc) {
+        const auto carry = b.opBitwiseOr(b.opCompareLess(sum, lhs),
+                                         b.opCompareLess(result, sum));
+        const auto overflow = sign(b.opBitwiseAnd(
+            b.opBitwiseNot(b.opBitwiseXor(lhs, rhs)), b.opBitwiseXor(lhs, result)));
+        b.opCopy(ir::Value::createConditionFlag(0), b.opCompareEqual(result, zero));
+        b.opCopy(ir::Value::createConditionFlag(1), sign(result));
+        b.opCopy(ir::Value::createConditionFlag(2), carry);
+        b.opCopy(ir::Value::createConditionFlag(3), overflow);
+    }
+    return result;
+}
+
 void emitIscadd(DecoderContext& context, pred_t pred, bool pred_inv,
                 AvgMode avg_mode, reg_t dst, reg_t src_a, u32 shift,
-                ir::Value src_b) {
+                ir::Value src_b, bool write_cc = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = negIf(context.builder,
@@ -53,7 +90,10 @@ void emitIscadd(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opShiftLeft(src_a_v, ir::Value::createConstantU(shift));
     auto src_b_v = negIf(context.builder, context.builder.opBitCast(src_b, ir::ScalarType::U32), avg_mode == AvgMode::NegB);
 
-    auto res = context.builder.opAdd(src_a_v, src_b_v);
+    if (write_cc && avg_mode == AvgMode::PlusOne)
+        SHADER_UNSUPPORTED("ISCADD.PO condition code");
+    auto res = addWithCarry(context, src_a_v, src_b_v, false,
+                            write_cc && avg_mode != AvgMode::PlusOne);
     if (avg_mode == AvgMode::PlusOne)
         res = context.builder.opAdd(res, ir::Value::createConstantU(1));
     context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32),
@@ -208,12 +248,14 @@ ir::Value extractIadd3Half(DecoderContext& context, ir::Value value,
     }
 }
 
-// TODO: x, write_cc
 void emitIadd3(DecoderContext& context, InstIadd3Base base,
                ir::Value src_b, Iadd3Half half_a = Iadd3Half::Full,
                Iadd3Half half_b = Iadd3Half::Full,
                Iadd3Half half_c = Iadd3Half::Full,
                Iadd3Shift shift = Iadd3Shift::None) {
+    // A three-input carry can be 2, which one carry flag cannot hold
+    if (base.x || base.write_cc)
+        SHADER_UNSUPPORTED("IADD3 X/CC");
     const auto conditional =
         handlePredCond(context.builder, base.pred, base.pred_inv);
 
@@ -335,7 +377,8 @@ void emitIadd32I(DecoderContext& context, InstIadd32I inst) {
 void emitIscaddR(DecoderContext& context, InstIscaddR inst) {
     emitIscadd(context, inst.base.pred, inst.base.pred_inv, inst.base.avg_mode,
                inst.base.dst, inst.base.src_a, inst.base.shift,
-               ir::Value::createRegister(inst.src_b, ir::ScalarType::I32));
+               ir::Value::createRegister(inst.src_b, ir::ScalarType::I32),
+               inst.base.write_cc);
 }
 
 void emitIscaddC(DecoderContext& context, InstIscaddC inst) {
@@ -344,7 +387,8 @@ void emitIscaddC(DecoderContext& context, InstIscaddC inst) {
         inst.base.dst, inst.base.src_a, inst.base.shift,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::ScalarType::I32));
+            ir::ScalarType::I32),
+        inst.base.write_cc);
 }
 
 void emitIscaddI(DecoderContext& context, InstIscaddI inst) {
@@ -352,14 +396,15 @@ void emitIscaddI(DecoderContext& context, InstIscaddI inst) {
                inst.base.dst, inst.base.src_a, inst.base.shift,
                ir::Value::createConstant(
                    getIntImm20(inst.imm20_0, inst.imm20_19, true),
-                   ir::ScalarType::I32));
+                   ir::ScalarType::I32),
+               inst.base.write_cc);
 }
 
 // LEA: dst = (neg ? -a : a) << shift + b
 void emitLeaLo(DecoderContext& context, InstLeaLoBase inst,
                ir::Value src_b) {
-    if (inst.x || inst.write_cc || static_cast<pred_t>(inst.dst_pred) != PT)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "LEA X/CC/predicate output");
+    if (static_cast<pred_t>(inst.dst_pred) != PT)
+        SHADER_UNSUPPORTED("LEA predicate output");
 
     const auto conditional =
         handlePredCond(context.builder, inst.pred, inst.pred_inv);
@@ -371,7 +416,9 @@ void emitLeaLo(DecoderContext& context, InstLeaLoBase inst,
                                         ir::Value::createConstantU(inst.shift));
     context.builder.opCopy(
         ir::Value::createRegister(inst.dst, ir::ScalarType::U32),
-        context.builder.opAdd(src_a, context.builder.opBitCast(src_b, ir::ScalarType::U32)));
+        addWithCarry(context, src_a,
+                     context.builder.opBitCast(src_b, ir::ScalarType::U32),
+                     inst.x, inst.write_cc));
 
     if (conditional)
         context.builder.opEndIf();
@@ -404,8 +451,8 @@ namespace {
 void emitLeaHi(DecoderContext& context, pred_t pred, bool pred_inv, reg_t dst,
                reg_t src_a_lo, reg_t src_a_hi, u32 shift, bool neg_a, bool x,
                bool write_cc, pred_t dst_pred, ir::Value src_b) {
-    if (x || write_cc || dst_pred != PT)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "LEA.HI X/CC/predicate output");
+    if (dst_pred != PT)
+        SHADER_UNSUPPORTED("LEA.HI predicate output");
 
     auto& builder = context.builder;
     const auto conditional = handlePredCond(builder, pred, pred_inv);
@@ -432,8 +479,9 @@ void emitLeaHi(DecoderContext& context, pred_t pred, bool pred_inv, reg_t dst,
                                         ir::Value::createConstantU(32 - shift)),
                    builder.opShiftLeft(hi, ir::Value::createConstantU(shift))));
     builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::U32),
-                   builder.opAdd(word, builder.opBitCast(src_b,
-                                                         ir::ScalarType::U32)));
+                   addWithCarry(context, word,
+                                builder.opBitCast(src_b, ir::ScalarType::U32),
+                                x, write_cc));
 
     if (conditional)
         builder.opEndIf();
@@ -461,7 +509,8 @@ void emitLeaHiC(DecoderContext& context, InstLeaHiC inst) {
 void emitIscadd32I(DecoderContext& context, InstIscadd32I inst) {
     emitIscadd(context, inst.pred, inst.pred_inv, AvgMode::NoNeg, inst.dst,
                inst.src_a, inst.shift,
-               ir::Value::createConstant(inst.imm, ir::ScalarType::I32));
+               ir::Value::createConstant(inst.imm, ir::ScalarType::I32),
+               inst.write_cc);
 }
 
 void emitXmadR(DecoderContext& context, InstXmadR inst) {

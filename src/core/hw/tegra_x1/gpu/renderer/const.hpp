@@ -585,6 +585,8 @@ struct ResourceMapping {
     std::map<u32, MTL::TextureType> image_types;
     // The vertex shader exports the render target layer or viewport index
     bool writes_layer{false};
+    // Guest features the decompile skipped; the shader may compute wrong values
+    std::vector<std::string> unsupported;
 
     ResourceMapping() {
         for (auto& uniform_buffer : uniform_buffers)

@@ -111,7 +111,7 @@ void emitInsert(DecoderContext& context, InstBfiBase inst, ir::Value control,
     b.opCopy(ir::Value::createRegister(inst.dst),
              b.opSelect(valid, result, base));
     if (inst.write_cc)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "BFI condition code output");
+        SHADER_UNSUPPORTED("BFI condition code output");
     if (conditional)
         b.opEndIf();
 }

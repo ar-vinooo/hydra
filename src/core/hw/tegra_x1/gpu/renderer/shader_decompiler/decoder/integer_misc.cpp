@@ -158,7 +158,7 @@ void emitFchk(DecoderContext& context, instruction_t inst, OperandForm form) {
         handlePredCond(b, static_cast<pred_t>(extractBits(inst, 16, 3)),
                        extractBits(inst, 19, 1) != 0);
     if (extractBits(inst, 39, 6) != 0)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "FCHK check {}",
+        SHADER_UNSUPPORTED("FCHK check {}",
                             extractBits(inst, 39, 6));
     const auto dst = static_cast<pred_t>(extractBits(inst, 3, 3));
     if (dst != PT)

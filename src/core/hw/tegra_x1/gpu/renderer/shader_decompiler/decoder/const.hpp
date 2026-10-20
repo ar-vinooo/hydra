@@ -13,7 +13,7 @@
     }
 #define COMMENT(f, ...) COMMENT_IMPL(DEBUG, f, f, __VA_ARGS__)
 #define COMMENT_NOT_IMPLEMENTED(f, ...)                                        \
-    COMMENT_IMPL(NOT_IMPLEMENTED, f " (NOT IMPLEMENTED)", f, __VA_ARGS__)
+    SHADER_UNSUPPORTED("Opcode " f, ##__VA_ARGS__)
 
 #define DEFINE_INST_VARIANTS_IMPL(inst_name, reg_name)                         \
     union Inst##inst_name##R {                                                 \
@@ -162,7 +162,7 @@ inline ir::Value getFlowTest(ir::Builder& b, u32 test) {
     case 30: return b.opBitwiseOr(s, z);
     case 31: return b.opBitwiseAnd(b.opNot(s), b.opNot(z));
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Flow test {}", test);
+        SHADER_UNSUPPORTED("Flow test {}", test);
         return ir::Value::createConstantB(false);
     }
 }

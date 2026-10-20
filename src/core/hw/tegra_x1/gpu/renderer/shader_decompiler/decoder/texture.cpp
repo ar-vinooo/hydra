@@ -286,7 +286,7 @@ void emitTextureQuery(DecoderContext& context, pred_t pred, bool pred_inv,
         break;
     }
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Texture query {}", query);
+        SHADER_UNSUPPORTED("Texture query {}", query);
         break;
     }
 
@@ -571,7 +571,7 @@ void emitTexelFetchSwizzled(DecoderContext& context, InstTlds inst) {
         lod_zero = false;
         break;
     case 6: // 2D.LZ.MS
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TLDS multisample fetch"));
+        SHADER_UNSUPPORTED_ONCE("TLDS multisample fetch");
         coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
         break;
     case 7: // 3D.LZ
@@ -919,7 +919,7 @@ void emitMipLevelQuery(DecoderContext& context, const InstTmml& inst,
         array = true;
         break;
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TMML texture dimension {}",
+        SHADER_UNSUPPORTED("TMML texture dimension {}",
                             inst.dim.get());
         if (conditional)
             b.opEndIf();
@@ -1021,7 +1021,7 @@ void emitTextureGradient(DecoderContext& context, InstTxd inst, bool bindless) {
                        inst.dim == TextureDimension::_1DArray;
     if (inst.dim == TextureDimension::_3DArray || (cube && inst.aoffi)) {
         // Metal has neither 3D arrays nor cubemap texel offsets.
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "TXD texture dimension/offset {}",
+        SHADER_UNSUPPORTED("TXD texture dimension/offset {}",
                             static_cast<u32>(inst.dim.get()));
         if (conditional)
             b.opEndIf();

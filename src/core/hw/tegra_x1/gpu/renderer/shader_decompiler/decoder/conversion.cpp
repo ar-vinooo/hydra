@@ -81,7 +81,7 @@ void emitFloatToFloat(DecoderContext& context, InstF2fBase inst,
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
     if (inst.write_cc)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2F CC"));
+        SHADER_UNSUPPORTED_ONCE("F2F CC");
 
     const auto src_fmt = inst.src_fmt.get();
     const auto dst_fmt = inst.dst_fmt.get();
@@ -163,7 +163,7 @@ void emitFloatToInt(DecoderContext& context, InstF2iBase inst,
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
     if (inst.write_cc)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "F2I CC"));
+        SHADER_UNSUPPORTED_ONCE("F2I CC");
 
     auto value = src.lo;
     bool is_f16 = inst.src_fmt == FloatFormat::F16;
@@ -222,7 +222,7 @@ void emitIntToInt(DecoderContext& context, InstI2iBase inst,
 
     const auto to_width = [](SmallIntegerWidth width) {
         if (width == SmallIntegerWidth::_64) {
-            ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "64-bit I2I"));
+            SHADER_UNSUPPORTED_ONCE("64-bit I2I");
             return 2u;
         }
         return static_cast<u32>(width);
@@ -261,7 +261,7 @@ void emitIntToFloat(DecoderContext& context, InstI2fBase inst,
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, inst.pred, inst.pred_inv);
     if (inst.write_cc)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "I2F CC"));
+        SHADER_UNSUPPORTED_ONCE("I2F CC");
 
     const auto dst_fmt = inst.dst_fmt.get();
     const bool is_64 = inst.src_width == SmallIntegerWidth::_64;

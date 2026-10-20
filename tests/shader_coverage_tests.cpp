@@ -3359,6 +3359,45 @@ void testSubroutines(MTL::Device* device) {
                  "call stacks\n";
 }
 
+// Features the decoder skips must reach the shader's report, and supported
+// forms must not appear in it.
+std::vector<std::string> decodeUnsupported(const std::vector<u64>& insts) {
+    std::vector<u64> words;
+    for (const auto inst : insts) {
+        if (words.size() % 4 == 0)
+            words.push_back(0);
+        words.push_back(inst);
+    }
+    if (words.size() % 4 == 0)
+        words.push_back(0);
+    words.push_back(0xe30000000007000full); // EXIT
+    std::vector<u8> bytes(words.size() * 8);
+    std::memcpy(bytes.data(), words.data(), bytes.size());
+    ztd::io::MemoryStream stream(bytes);
+    DecompilerContext context{};
+    context.type = ShaderType::Compute;
+    shader_decomp::UnsupportedCollector collector;
+    ir::Module module;
+    ir::Builder builder(module);
+    decoder::Decoder decoder({context, &stream, builder});
+    decoder.decode();
+    return collector.features;
+}
+
+void testUnsupportedFeatureReport() {
+    const auto iadd3 = [](u64 bits) { return 0x5cc0000000000000ull | PT_GUARD | 3ull | (1ull << 8) | (2ull << 20) | (4ull << 39) | bits; };
+    const auto lea = [](u64 bits) { return 0x5bd0000000000000ull | PT_GUARD | 3ull | (1ull << 8) | (2ull << 20) | bits; };
+    expect(decodeUnsupported({iadd3(0)}).empty(), "Plain IADD3 reports nothing");
+    expect(decodeUnsupported({lea(7ull << 48)}).empty(), "LEA without predicate output reports nothing");
+    expect(decodeUnsupported({lea((7ull << 48) | (1ull << 46) | (1ull << 47))}).empty(), "LEA.X.CC is supported");
+    const auto x = decodeUnsupported({iadd3(1ull << 48), iadd3(1ull << 48), iadd3(1ull << 47)});
+    expect(x.size() == 1 && x[0] == "IADD3 X/CC", "IADD3 .X/.CC is reported once per shader");
+    const auto pred = decodeUnsupported({lea(0)});
+    expect(pred.size() == 1 && pred[0] == "LEA predicate output", "LEA predicate output is reported");
+    expect(decodeUnsupported({iadd3(0)}).empty(), "Reports do not leak between shaders");
+    std::cout << "PASS: unsupported guest features are reported per shader" << std::endl;
+}
+
 void testExitTargetsAndAbsoluteJump(MTL::Device* device) {
     const auto word = [](u32 i) { return i + 1 + i / 3; };
     const auto mov = [](u32 dst, u32 value) {
@@ -3481,6 +3520,7 @@ void runShaderCoverageTests(MTL::Device* device) {
     testAlphaTest(device);
     testDualSourceBlending(device);
     testSubroutines(device);
+    testUnsupportedFeatureReport();
     testExitTargetsAndAbsoluteJump(device);
 }
 

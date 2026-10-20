@@ -150,7 +150,7 @@ TextureType getSurfaceType(u32 type) {
     case 5:
         return TextureType::_3D;
     default:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Surface type {}", type);
+        SHADER_UNSUPPORTED("Surface type {}", type);
         return TextureType::_2D;
     }
 }
@@ -289,7 +289,7 @@ void emitFlo(DecoderContext& context, instruction_t inst, ir::Value src) {
 void emitCsetp(DecoderContext& context, instruction_t inst) {
     const auto test = extractBits(inst, 8, 5);
     if (test != 13 && test != 0 && test != 15) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "CSETP flow test {}", test);
+        SHADER_UNSUPPORTED("CSETP flow test {}", test);
         return;
     }
     auto& b = context.builder;
@@ -339,7 +339,7 @@ void emitR2p(DecoderContext& context, instruction_t inst, u32 variant) {
 void emitAtomsCas(DecoderContext& context, instruction_t inst) {
     const u32 sub_op = static_cast<u32>(extractBits(inst, 52, 4));
     if (sub_op != 4) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "ATOMS.CAS sub-operation {}",
+        SHADER_UNSUPPORTED("ATOMS.CAS sub-operation {}",
                             sub_op);
         return;
     }
@@ -365,7 +365,7 @@ void emitAtoms(DecoderContext& context, instruction_t inst) {
     const u32 size = static_cast<u32>(extractBits(inst, 28, 2));
     const u32 op = static_cast<u32>(extractBits(inst, 52, 4));
     if (size > 1 || op > 8) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "ATOMS size {} operation {}", size, op);
+        SHADER_UNSUPPORTED("ATOMS size {} operation {}", size, op);
         return;
     }
     auto& b = context.builder;

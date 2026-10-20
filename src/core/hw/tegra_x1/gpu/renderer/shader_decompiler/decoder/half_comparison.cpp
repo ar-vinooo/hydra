@@ -159,7 +159,7 @@ void emitHsetp2(DecoderContext& context, instruction_t inst,
     const bool h_and =
         extractBits(inst, form == HalfOperandForm::Register ? 49 : 53, 1) != 0;
     if (form == HalfOperandForm::ConstBuffer && extractBits(inst, 54, 1) != 0)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler, "HSETP2 cbuf |b|"));
+        SHADER_UNSUPPORTED_ONCE("HSETP2 cbuf |b|");
     auto result = compareHalves(context, inst, form, ftz);
     // The AND of both halves and its inverse
     if (h_and) {

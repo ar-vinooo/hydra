@@ -45,7 +45,7 @@ SvAccess getSvAccessFromAddr(u64 addr) {
         break;
     }
 
-    LOG_NOT_IMPLEMENTED(ShaderDecompiler, "SV address 0x{:02x}", addr);
+    SHADER_UNSUPPORTED("SV address 0x{:02x}", addr);
 
     return {Sv(SvSemantic::Invalid), invalid<u8>()};
 }

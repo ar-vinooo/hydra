@@ -106,8 +106,7 @@ void emitLoadConstant(DecoderContext& context, pred_t pred, bool pred_inv,
 
     // TODO: slot addressing (mode 0 is the default and already supported)
     if (static_cast<u32>(address_mode) != 0)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "LDC address mode {} (slot: {}, reg: r{}, offset: "
+        SHADER_UNSUPPORTED("LDC address mode {} (slot: {}, reg: r{}, offset: "
                             "{:#x})",
                             static_cast<u32>(address_mode), cbuf_slot, src,
                             cbuf_offset);
@@ -229,8 +228,7 @@ void emitLoadGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
 
     const auto access = makeStorageAccess(context, e, src, offset);
     if (!access)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "Global load without a storage buffer (size: {}, "
+        SHADER_UNSUPPORTED("Global load without a storage buffer (size: {}, "
                             "src: {}, offset: {})",
                             size, src, offset);
 
@@ -262,8 +260,7 @@ void emitStoreGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
 
     const auto access = makeStorageAccess(context, e, addr, offset);
     if (!access) {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "Global store without a storage buffer (size: {}, "
+        SHADER_UNSUPPORTED("Global store without a storage buffer (size: {}, "
                             "addr: {}, offset: {})",
                             size, addr, offset);
     } else {
@@ -305,8 +302,7 @@ void emitAtomicGlobal(DecoderContext& context, pred_t pred, bool pred_inv,
                                        is_float ? 9 : op, size == 1);
         }
     } else {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "Global atomic (size: {}, op: {}, addr: {}, "
+        SHADER_UNSUPPORTED("Global atomic (size: {}, op: {}, addr: {}, "
                             "offset: {})",
                             size, op, addr, offset);
     }
@@ -435,8 +431,7 @@ void emitAtomCas(DecoderContext& context, InstAtomCas inst) {
         result = b.opAtomicStorageCas(access->binding, access->offset,
                                       access->size, compare, value);
     } else {
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "Global ATOM.CAS (64-bit: {}, addr: {})", is_64,
+        SHADER_UNSUPPORTED("Global ATOM.CAS (64-bit: {}, addr: {})", is_64,
                             addr);
     }
     if (dst != RZ)

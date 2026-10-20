@@ -412,6 +412,15 @@ ShaderBase* ShaderCache::createHot1(const GuestShaderDescriptor& descriptor) {
         host_descriptor.backend, host_descriptor.code,
         host_descriptor.resource_mapping, descriptor.read_const_word);
     host_descriptor.writes_layer |= host_descriptor.resource_mapping.writes_layer;
+    if (!host_descriptor.resource_mapping.unsupported.empty()) {
+        std::string features;
+        for (const auto& feature : host_descriptor.resource_mapping.unsupported)
+            features += (features.empty() ? "" : "; ") + feature;
+        LOG_WARN(ShaderDecompiler,
+                 "Shader {:#x} ({}) uses unsupported features and may "
+                 "compute wrong values: {}",
+                 descriptor.gpu_addr, host_descriptor.type, features);
+    }
     if (const char* dump_dir = std::getenv("HYDRA_DUMP_SHADERS")) {
         std::ofstream out(fmt::format("{}/gpu_{:#x}_{}.metal", dump_dir,
                                       descriptor.gpu_addr,

@@ -53,8 +53,7 @@ void emitShiftLeft(DecoderContext& context, InstShlBase inst, ir::Value shift) {
     emitShift(context, inst.dst, inst.src_a, shift, inst.pred, inst.pred_inv,
               false, inst.m);
     if (inst.x || inst.write_cc)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "SHL extended mode/condition code");
+        SHADER_UNSUPPORTED("SHL extended mode/condition code");
 }
 
 void emitShiftRight(DecoderContext& context, InstShrBase inst,
@@ -62,8 +61,7 @@ void emitShiftRight(DecoderContext& context, InstShrBase inst,
     emitShift(context, inst.dst, inst.src_a, shift, inst.pred, inst.pred_inv,
               true, inst.m, inst.is_signed, inst.brev);
     if (static_cast<u32>(inst.x_mode.get()) || inst.write_cc)
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "SHR extended mode/condition code");
+        SHADER_UNSUPPORTED("SHR extended mode/condition code");
 }
 
 } // namespace
@@ -146,8 +144,7 @@ void emitShf(DecoderContext& context, instruction_t inst, bool right,
     }
     b.opCopy(ir::Value::createRegister(reg_t(extractBits(inst, 0, 8))), res);
     if (extractBits(inst, 47, 1) || extractBits(inst, 48, 2))
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                            "SHF condition code/extended mode");
+        SHADER_UNSUPPORTED("SHF condition code/extended mode");
     if (conditional)
         b.opEndIf();
 }

@@ -245,8 +245,7 @@ void MemoryAnalyzer::handleAMemLoad(const AMem amem) {
     // TODO: support indexing with src
     // Not an assertion: release builds must not translate this silently wrong
     if (amem.reg != RZ)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                                 "Indexed attribute load (src: {})", amem.reg));
+        SHADER_UNSUPPORTED_ONCE("Indexed attribute load (src: {})", amem.reg);
     pushSv(input_svs, stage_inputs, amem.imm);
 }
 
@@ -264,8 +263,7 @@ void MemoryAnalyzer::handleCMemLoad(const CMem cmem) {
 void MemoryAnalyzer::handleAMemStore(const AMem amem) {
     // TODO: support indexing with src
     if (amem.reg != RZ)
-        ONCE(LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                                 "Indexed attribute store (src: {})", amem.reg));
+        SHADER_UNSUPPORTED_ONCE("Indexed attribute store (src: {})", amem.reg);
     const auto access = pushSv(output_svs, stage_outputs, amem.imm);
     if (access.sv.semantic == SvSemantic::ClipDistance)
         clip_distance_outputs |=

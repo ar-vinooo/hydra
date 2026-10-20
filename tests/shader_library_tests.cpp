@@ -162,10 +162,11 @@ void testIntegerConditions(MTL::Device* device) {
         check(command->status()==MTL::CommandBufferStatusCompleted,"IADD CC/CSETP executes");
         const auto* result=static_cast<const u32*>(output->contents());
         for(u32 variant=0;variant<4;variant++) for(u32 mode=0;mode<3;mode++) {
-            const u32 aa=mode==2 ? 0u-a : a;
+            // A negated operand is inverted with a carry-in of 1 (a 33-bit add)
+            const u32 aa=mode==2 ? ~a : a;
             u32 bb=variant<2 ? b : 1;
-            if(mode==1) bb=0u-bb;
-            const u64 sum=u64(aa)+bb; const u32 value=static_cast<u32>(sum);
+            if(mode==1) bb=~bb;
+            const u64 sum=u64(aa)+bb+(mode!=0 ? 1u : 0u); const u32 value=static_cast<u32>(sum);
             const std::array<u32,6> expected{value==0, value>>31, u32(sum>>32), ((~(aa^bb)&(aa^value))>>31), value!=0, value==0};
             for(u32 i=0;i<6;i++) check(result[(variant*3+mode)*6+i]==expected[i],"IADD flags survive discarded RZ result and drive CSETP NEU");
         }

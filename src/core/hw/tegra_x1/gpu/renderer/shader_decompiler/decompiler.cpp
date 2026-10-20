@@ -140,6 +140,7 @@ void decompileHot(
     }
 
     // Build IR
+    UnsupportedCollector unsupported;
     ir::Module modul;
     {
         ir::Builder builder(modul);
@@ -233,6 +234,7 @@ void decompileHot(
     }
 
     emitter->emit(modul);
+    out_resource_mapping.unsupported = std::move(unsupported.features);
 }
 
 std::optional<u32> findGeometryLayerSource(std::span<const u8> code) {

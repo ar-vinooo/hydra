@@ -316,6 +316,11 @@ def enc_lea_hi(dst, a_lo, b, a_hi, shift, neg_a=0):
     return (base(0x5bd8, dst, a_lo) | (b << 20) | (shift << 28) | (neg_a << 37) | (a_hi << 39) | (PT << 48))
 
 
+def with_carry(inst, x_bit=None, cc=0, x=0):
+    """Sets the .X (carry in) and .CC (carry out) bits of an add-class encoding."""
+    return inst | ((x << x_bit) if x_bit is not None else 0) | (cc << 47)
+
+
 def enc_xmad(dst, a, b, c, hilo_a=0, hilo_b=0, a_signed=0, b_signed=0, cop=0, psl=0, mrg=0):
     """XMAD, register operands (opcode 0x5b00; fields from the decoder / nvdisasm)."""
     return ((0x5b00 << 48) | dst | (a << 8) | (PT << 16) | (b << 20) | (hilo_b << 35) |
@@ -922,6 +927,149 @@ def make_arith_cases(rng):
     return cases
 
 
+CC_C = 4  # condition flags: bit0 Z, bit1 S, bit2 C, bit3 O
+
+
+def make_carry_cases(rng):
+    """Carry chains: LEA.LO/LEA.HI/ISCADD .CC and .X against exact 64/96-bit integer sums.
+
+    Expected values come from Python big integers; only the carry flag is compared
+    (Z/S/O of these instructions are not documented). Every input register that is
+    not an expected output must come back unchanged.
+    """
+    cases = []
+    M = 0xffffffff
+    W = (1 << 64) - 1
+
+    def chain(group, insts, regs, out, cc_in, cc_out, cc_all=False):
+        # cc_all: every flag must equal cc_out (untouched); otherwise only the carry flag is compared
+        cases.append(Case(group, ','.join('%016x' % i for i in insts), tuple(regs),
+                          {'out': out, 'cc_in': cc_in, 'cc_out': cc_out, 'cc_all': cc_all}, 'chain'))
+
+    triples = int_triples(rng, 24)
+    # 64-bit (a64 << shift) + b64: LEA.CC for the low word, LEA.HI.X for the high word
+    for shift in range(32):
+        for neg in (0, 1):
+            lo = with_carry(enc_lea_lo(4, 0, 1, shift, neg), 46, 1, 0)
+            hi = with_carry(enc_lea_hi(5, 0, 3, 2, shift, neg), 38, 0, 1)
+            for a_lo, b_lo, a_hi in triples[:5]:
+                b_hi = rng.getrandbits(32)
+                a64 = (a_hi << 32) | a_lo
+                if neg:
+                    a64 = (-a64) & W
+                total = (((a64 << shift) & W) + ((b_hi << 32) | b_lo)) & W
+                lo_sum = (((a64 << shift) & M) + b_lo)
+                chain('carry_lea64', [lo, hi], (a_lo, b_lo, a_hi, b_hi, 0, 0, 0, 0),
+                      {4: total & M, 5: total >> 32}, rng.randrange(16), CC_C if lo_sum > M else 0)
+    # the carry survives only until the next flag writer: LEA.HI.X without .CC leaves CC alone
+    for cc_in in range(16):
+        inst = with_carry(enc_lea_hi(5, 0, 3, 2, 3), 38, 0, 1)
+        for a_lo, b_hi, a_hi in triples[:6]:
+            high = (((((a_hi << 32) | a_lo) << 3) >> 32) & M)
+            chain('carry_in_hi', [inst], (a_lo, 0, a_hi, b_hi, 0, 0, 0, 0),
+                  {5: (high + b_hi + bool(cc_in & CC_C)) & M}, cc_in, cc_in, True)
+        inst = with_carry(enc_lea_lo(5, 0, 3, 4), 46, 0, 1)
+        for a_lo, b, _ in triples[:6]:
+            chain('carry_in_lo', [inst], (a_lo, 0, 0, b, 0, 0, 0, 0),
+                  {5: (((a_lo << 4) & M) + b + bool(cc_in & CC_C)) & M}, cc_in, cc_in, True)
+    # without .X the incoming carry is ignored; without .CC the flags are untouched
+    for cc_in in (0, CC_C, 0xf):
+        for a, b, _ in triples[:6]:
+            chain('carry_ignored', [enc_lea_lo(5, 0, 3, 2)], (a, 0, 0, b, 0, 0, 0, 0),
+                  {5: (((a << 2) & M) + b) & M}, cc_in, cc_in, True)
+            chain('carry_ignored', [enc_lea_hi(5, 0, 3, 2, 2)], (a, 0, b, b, 0, 0, 0, 0),
+                  {5: ((((b << 32) | a) << 2 >> 32) + b) & M}, cc_in, cc_in, True)
+    # ISCADD.CC: carry out of (a << shift) + b; no carry in
+    for shift in (0, 1, 3, 8, 31):
+        inst = with_carry(enc_iscadd(3, 0, 1, shift), None, 1)
+        for a, b, _ in triples:
+            total = ((a << shift) & M) + b
+            chain('carry_iscadd', [inst], (a, b, 0, 0, 0, 0, 0, 0), {3: total & M},
+                  rng.randrange(16), CC_C if total > M else 0)
+    # a three-limb sum: LEA.CC, LEA.X.CC, LEA.X.CC with shift 0; each .X.CC both reads and writes C
+    first = with_carry(enc_lea_lo(4, 0, 3, 0), 46, 1, 0)
+    mid = with_carry(enc_lea_lo(5, 1, 6, 0), 46, 1, 1)
+    last = with_carry(enc_lea_lo(2, 2, 7, 0), 46, 1, 1)
+    for _ in range(300):
+        limbs = [rng.choice([0, M, 1, 0x80000000, rng.getrandbits(32)]) for _ in range(6)]
+        a0, a1, a2, b0, b1, b2 = limbs
+        total = ((a2 << 64) | (a1 << 32) | a0) + ((b2 << 64) | (b1 << 32) | b0)
+        chain('carry_96bit', [first, mid, last], (a0, a1, a2, b0, 0, 0, b1, b2),
+              {4: total & M, 5: (total >> 32) & M, 2: (total >> 64) & M}, rng.randrange(16),
+              CC_C if total >> 96 else 0)
+    return cases
+
+
+def make_iadd_carry_cases(rng):
+    """IADD / IADD32I .CC and .X (no negation): flags and 64-bit chains against big-integer sums.
+
+    Z/S/C/O follow the definition of a 32-bit add (zero, sign bit, unsigned carry out, signed
+    overflow). A negated operand is its bit inverse plus a carry-in of 1 (or the carry flag with
+    .X), the only reading under which IADD.CC / IADD.X subtract 64-bit values correctly.
+    """
+    cases = []
+    M = 0xffffffff
+    triples = int_triples(rng, 48)
+
+    def flags(a, b, cin):
+        total = a + b + cin
+        r = total & M
+        overflow = ((~(a ^ b)) & (a ^ r)) >> 31 & 1
+        return (r == 0) | ((r >> 31) << 1) | ((total > M) << 2) | (overflow << 3)
+
+    def chain(group, insts, regs, out, cc_in, cc_out):
+        cases.append(Case(group, ','.join('%016x' % i for i in insts), tuple(regs),
+                          {'out': out, 'cc_in': cc_in, 'cc_out': cc_out, 'cc_all': True}, 'chain'))
+
+    for x in (0, 1):
+        inst = enc_iadd(3, 0, 1) | (x << 43) | (1 << 47)
+        for cc_in in (0, CC_C, 0xb):
+            for a, b, _ in triples:
+                cin = x and bool(cc_in & CC_C)
+                chain('iadd_cc' + ('_x' if x else ''), [inst], (a, b, 0, 0, 0, 0, 0, 0),
+                      {3: (a + b + cin) & M}, cc_in, flags(a, b, cin))
+        inst = enc_iadd32i(3, 0, 0x7fffffff) | (x << 53) | (1 << 52)
+        for cc_in in (0, CC_C):
+            for a, _, _ in triples[:16]:
+                cin = x and bool(cc_in & CC_C)
+                chain('iadd32i_cc' + ('_x' if x else ''), [inst], (a, 0, 0, 0, 0, 0, 0, 0),
+                      {3: (a + 0x7fffffff + cin) & M}, cc_in, flags(a, 0x7fffffff, cin))
+    # 64-bit add: IADD.CC then IADD.X
+    lo = enc_iadd(4, 0, 1) | (1 << 47)
+    hi = enc_iadd(5, 2, 3) | (1 << 43) | (1 << 47)
+    for a_lo, b_lo, a_hi in triples:
+        b_hi = rng.getrandbits(32)
+        total = ((a_hi << 32) | a_lo) + ((b_hi << 32) | b_lo)
+        chain('iadd_chain64', [lo, hi], (a_lo, b_lo, a_hi, b_hi, 0, 0, 0, 0),
+              {4: total & M, 5: (total >> 32) & M}, rng.randrange(16),
+              flags(a_hi, b_hi, bool(a_lo + b_lo > M)))
+    # negated operands: a + ~b + 1 (plain) or a + ~b + C (.X); both operand positions
+    for mode in (1, 2):
+        for x in (0, 1):
+            inst = enc_iadd(3, 0, 1, mode) | (x << 43) | (1 << 47)
+            for cc_in in (0, CC_C):
+                for a, b, _ in triples:
+                    cin = bool(cc_in & CC_C) if x else 1
+                    lhs, rhs = (a, b ^ M) if mode == 1 else (a ^ M, b)
+                    chain('iadd_neg%s_cc' % ('_x' if x else ''), [inst], (a, b, 0, 0, 0, 0, 0, 0),
+                          {3: (lhs + rhs + cin) & M}, cc_in, flags(lhs, rhs, cin))
+    # 64-bit subtraction: IADD.CC with -b, then IADD.X with ~b; C ends as "no borrow"
+    lo = enc_iadd(4, 0, 1, 1) | (1 << 47)
+    hi = enc_iadd(5, 2, 3, 1) | (1 << 43) | (1 << 47)
+    for a_lo, b_lo, a_hi in triples:
+        for b_hi in (rng.getrandbits(32), a_hi, 0):
+            a64, b64 = (a_hi << 32) | a_lo, (b_hi << 32) | b_lo
+            total = (a64 - b64) & ((1 << 64) - 1)
+            chain('iadd_sub64', [lo, hi], (a_lo, b_lo, a_hi, b_hi, 0, 0, 0, 0),
+                  {4: total & M, 5: total >> 32}, rng.randrange(16),
+                  flags(a_hi, b_hi ^ M, bool(a_lo + (b_lo ^ M) + 1 > M)))
+    for b in (0, 1, 0x80000000, M):  # b = 0 still carries out of a - b
+        inst = enc_iadd(3, 0, 1, 1) | (1 << 47)
+        chain('iadd_sub_carry', [inst], (5, b, 0, 0, 0, 0, 0, 0),
+              {3: (5 - b) & M}, 0, flags(5, b ^ M, 1))
+    return cases
+
+
 def is_denormal(b):
     return (b & 0x7f800000) == 0 and (b & 0x7fffff) != 0
 
@@ -945,7 +1093,10 @@ def run(binary, cases):
         with cases_path.open('w') as f_:
             for c in cases:
                 inst = c.inst if isinstance(c.inst, str) else '%016x' % c.inst
-                f_.write('%s 0 0 %x %x %x 0 0 0 0 0\n' % (inst, *c.regs))
+                if c.tolerance == 'chain':
+                    f_.write('%s 0 %x %s\n' % (inst, c.expected['cc_in'], ' '.join('%x' % r for r in c.regs)))
+                else:
+                    f_.write('%s 0 0 %x %x %x 0 0 0 0 0\n' % (inst, *c.regs))
         completed = subprocess.run([str(binary), str(cases_path), str(out_path)])
         if completed.returncode != 0:
             raise SystemExit('runner failed: %d' % completed.returncode)
@@ -957,6 +1108,13 @@ def run(binary, cases):
 
 def matches(case, row):
     regs, preds, cc = row[:8], row[8], row[9]
+    if case.tolerance == 'chain':
+        want = list(case.regs)
+        for index, value in case.expected['out'].items():
+            want[index] = value
+        flags = case.expected['cc_out']
+        flags_ok = (cc == flags) if case.expected['cc_all'] else ((cc & CC_C) == flags)
+        return regs == want and preds == 0 and flags_ok, None
     scratch = case.tolerance == 'scratch'  # the sequence uses R4 and up
     if regs[0:3] != list(case.regs) or (regs[4:] != [0] * 4 and not scratch) or preds != 0:
         return False, 'clobbered state'
@@ -999,7 +1157,7 @@ def main():
     parser.add_argument('--show', type=int, default=3)
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng) + make_arith_cases(rng)
+    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng) + make_arith_cases(rng) + make_carry_cases(rng) + make_iadd_carry_cases(rng)
     cases = split_denormals(cases)
     if args.group:
         cases = [c for c in cases if c.group == args.group]

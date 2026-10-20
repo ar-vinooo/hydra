@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/unsupported.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp {
 

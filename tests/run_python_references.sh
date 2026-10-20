@@ -41,5 +41,9 @@ TAIL=2 run index-decode python3 "$T/index_decode_reference.py" "$BIN/hydra-index
 TAIL=3 run viewport python3 "$T/viewport_reference.py" "$BIN/hydra-viewport-reference-tests" --header "$NV/clb197.h"
 TAIL=2 run texel-fetch python3 "$T/texel_fetch_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
 TAIL=2 run gather python3 "$T/gather_reference.py" "$BIN/hydra-maxwell-alu-reference-tests"
+echo "== unsupported-feature reporting"
+if grep -rn "LOG_NOT_IMPLEMENTED(ShaderDecompiler" "$ROOT/src/core/hw/tegra_x1/gpu/renderer/shader_decompiler" | grep -v "unsupported.hpp"; then
+  echo "use SHADER_UNSUPPORTED so the shader records the feature"; fail=1
+fi
 [ $fail -eq 0 ] && echo "ALL PASS" || echo "SOME FAILED"
 exit $fail

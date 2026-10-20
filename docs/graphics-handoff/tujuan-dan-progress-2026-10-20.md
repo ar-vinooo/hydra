@@ -210,3 +210,51 @@ X8B8G8R8 (+sRGB). Tata letak diturunkan dari nama format di `clb197.h` (garis ba
 satu langkah kuantisasi (float32 eksak, bit X diabaikan). Semua cocok, tanpa bug;
 kontrol: kanal R/B tertukar pada A2B10G10R10 dan R5G6B5 menggagalkan tes. Format
 integer, Z/O, dan blending ke format-format ini tidak diuji.
+
+## Tahap C: rantai carry integer (LEA/ISCADD .X/.CC) dan peta cakupan instruksi
+
+**Audit (dari decoder, oracle Python, dan tes C++).** Status per keluarga ALU GPU:
+
+| Keluarga | Status | Bukti / batas |
+|---|---|---|
+| FADD/FMUL/FFMA/FMNMX, MUFU, FSETP/ISETP, ISET/FSET, SEL, BFE/BFI, XMAD, IADD, IADD3 (tanpa X/CC), LEA.LO/HI, LOP/LOP3, SHL/SHR/IMNMX/POPC/FLO, HADD2/HMUL2/HFMA2 | VERIFIED (model Python) | `maxwell_alu_reference.py`, `maxwell_predicate_reference.py`; denormal fp32 = GAP host yang tercatat |
+| SHF (funnel shift) | VERIFIED (tes C++ tulisan tangan) | `shader_library_tests.cpp`; belum ada model Python |
+| **LEA.LO/LEA.HI `.X`/`.CC`, ISCADD `.CC`** | **VERIFIED untuk carry C (baru)** | bagian ini; sebelumnya dihitung tanpa carry dengan hanya log |
+| IADD `.X`/`.CC`, XMAD `.X`/`.CC` | IMPLEMENTED_UNVERIFIED | kode ada; belum dibandingkan dengan model |
+| IADD3 `.X`/`.CC` | MISSING (kini dilaporkan) | sebelumnya diabaikan diam-diam; carry tiga operand bisa 2 sehingga satu flag C tidak cukup; semantik perlu bukti hardware |
+| LEA/LEA.HI keluaran predikat (`dst_pred != PT`), ISCADD.PO + CC, SHL/SHR/SHF X/CC | MISSING (dilaporkan `LOG_NOT_IMPLEMENTED`) | |
+| ICMP/FCMP, I2I, PSETP/PSET, R2P, FSWZADD, VOTE | IMPLEMENTED_UNVERIFIED / sebagian lewat tes shader-library | tanpa model independen |
+
+**Celah yang dipilih.** Penjumlahan 64-bit pada shader (alamat LDG/STG, offset buffer) dikompilasi sebagai
+`LEA.CC` lalu `LEA.HI.X`. Hydra memperlakukan `.X` dan `.CC` sebagai tidak ada: kata tinggi salah
+tanpa kegagalan (hanya satu baris log). `IADD3.X/.CC` bahkan tanpa log.
+
+**Perubahan** (`decoder/integer_arithmetic.cpp`): helper `addWithCarry` (carry masuk dari C, flag Z/S/C/O
+seperti IADD.CC) dipakai oleh LEA.LO, LEA.HI, ISCADD dan ISCADD32I. Pembacaan carry masuk terjadi sebelum
+flag ditulis, jadi `.X.CC` memakai C lama. IADD3 `.X/.CC` dan keluaran predikat LEA kini
+`LOG_NOT_IMPLEMENTED`, tidak lagi diam.
+
+**Tes** (`maxwell_alu_reference.py`, `make_carry_cases`, 968 kasus baru; total 16.806, semua cocok): model
+integer besar Python untuk
+(a<<s)+b 64-bit (shift 0-31, negasi, carry masuk acak), carry masuk X-saja untuk LEA.LO/HI, carry masuk
+diabaikan tanpa `.X` dengan semua flag tak berubah, ISCADD.CC, dan jumlah 96-bit tiga limb dengan `.X.CC`.
+Setiap register masukan yang bukan keluaran harus tak berubah. Kontrol: dengan decoder lama 5 dari 6 grup
+gagal (carry_lea64 111/320, carry_96bit 48/300).
+
+**Batas.** Hanya flag C dibandingkan; Z/S/O pada LEA/ISCADD mengikuti konvensi IADD.CC dan tidak ada
+sumber primer. Semantik `.X`/`.CC` pada SASS tidak dipublikasikan NVIDIA; acuan adalah identitas aritmetika
+64-bit yang harus dipenuhi pasangan instruksi, bukan trace hardware. Regresi: shader-library 59, gpu-engine
+45 (MTL_DEBUG_LAYER=1), predicate oracle 499.296 kasus. Belum diuji di game; tidak di-stage/commit.
+Worktree saat sesi ini bersih (perubahan sebelumnya sudah ter-commit), hanya `tests/__pycache__/` yang untracked.
+
+## Fault terlacak dan peta cakupan (lanjutan)
+
+Fitur yang dilewati decoder/analyzer/emitter kini tercatat per shader (`SHADER_UNSUPPORTED`, 
+`ResourceMapping::unsupported`, satu baris WARN di `ShaderCache`), termasuk opcode yang belum didekode
+(`Opcode <nama>`). Kebijakan: catat lalu lanjut. Peta lengkap per keluarga, status, bukti dan fault id:
+[instruction-coverage-2026-10-20.md](instruction-coverage-2026-10-20.md). Oracle ALU menjadi 17.206 kasus
+(`iadd_cc`, `iadd_cc_x`, `iadd32i_cc*`, `iadd_chain64`: flag Z/S/C/O dan rantai 64-bit), semua cocok.
+IADD dengan operand dinegasi diperbaiki (`~b` + carry-in, bukan `-b`; dasarnya identitas pengurangan 64-bit, bukan hardware); oracle 17.738 kasus.
+Regresi: `run_python_references.sh` ALL PASS, shader-library 60, gpu-engine 45, texture-cache 40
+(MTL_DEBUG_LAYER=1). Header berubah (`ResourceMapping`, `shader_decompiler/const.hpp`): rebuild `hydra` +
+hot module dan restart aplikasi. Tidak stage/commit.

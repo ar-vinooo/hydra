@@ -541,9 +541,7 @@ void Decoder::parseNextInstruction() {
     INST(0xe250000000000000, 0xfff0000000000000) {
         if (!emitIndirectBranch(inst, pc)) {
             if (context.decomp_context.read_const_word)
-                LOG_NOT_IMPLEMENTED(
-                    ShaderDecompiler,
-                    "BRX unbounded/unsupported target pattern at {:#x}", pc);
+                SHADER_UNSUPPORTED("BRX unbounded/unsupported target pattern at {:#x}", pc);
             else
                 // Offline tools have no constant buffers, so a jump table
                 // cannot be resolved there
@@ -604,7 +602,7 @@ void Decoder::parseNextInstruction() {
                       slot, static_cast<u32>(byte_offset) / 4)
                 : std::nullopt;
             if (!value) {
-                LOG_NOT_IMPLEMENTED(ShaderDecompiler, "JMP unresolved cbuf target");
+                SHADER_UNSUPPORTED("JMP unresolved cbuf target");
                 return;
             }
             address = *value;
@@ -653,8 +651,7 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xe200000000000000, 0xfff0000000000020) {
         if (!emitIndirectBranch(inst, pc))
-            LOG_NOT_IMPLEMENTED(ShaderDecompiler,
-                                "JMX unbounded/unsupported target pattern at {:#x}", pc);
+            SHADER_UNSUPPORTED("JMX unbounded/unsupported target pattern at {:#x}", pc);
     }
     INST(0xe000000000000000, 0xff00000000000000) { EMIT(Ipa); }
     INST(0xdf60000000000000, 0xfff8000000000000) { EMIT(TmmlB); }
