@@ -38,6 +38,11 @@ class WorkTicket {
     WorkStatus status() const;
     // False means blocked or terminal. Failed dependencies fail this work.
     bool start();
+    // Atomically takes the right to publish success: true only while Running
+    // and not cancelled. After it, cancel() no longer wins, so a completion
+    // callback (fence, semaphore) is never published for cancelled work.
+    // The caller must finish() afterwards.
+    bool claimCompletion();
     void finish(bool succeeded);
     void cancel();
     bool wait(std::chrono::milliseconds timeout) const;
@@ -54,6 +59,7 @@ class WorkTicket {
   private:
     friend class WorkManager;
     bool registered{false};
+    bool completing{false};
     void terminate(WorkStatus outcome);
     std::shared_ptr<WorkManagerState> state;
     const std::size_t bytes;

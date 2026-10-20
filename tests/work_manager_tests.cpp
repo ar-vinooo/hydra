@@ -58,6 +58,53 @@ int main() {
         active->finish(true);
         auto next = blocked.get();
         check(next && next->start(), "Completion wakes blocked submitter");
+
+        // Completion claim: publication and cancellation exclude each other
+        WorkManager claims{{4, 0}};
+        auto claimed = claims.admit();
+        check(claimed->start() && claimed->claimCompletion() &&
+                  !claimed->claimCompletion(),
+              "Running work can be claimed once");
+        claimed->cancel();
+        check(claimed->status() == WorkStatus::Running,
+              "A cancel after the claim does not revoke the completion");
+        claimed->finish(true);
+        check(claimed->status() == WorkStatus::Succeeded,
+              "Claimed work finishes as succeeded");
+        auto cancelled_first = claims.admit();
+        check(cancelled_first->start(), "Work starts");
+        cancelled_first->cancel();
+        check(!cancelled_first->claimCompletion(),
+              "Cancelled work cannot be claimed");
+        auto queued = claims.admit();
+        check(!queued->claimCompletion(), "Queued work cannot be claimed");
+        queued->cancel();
+        for (int round = 0; round < 4000; ++round) {
+            auto racing = claims.admit();
+            check(racing->start(), "Racing work starts");
+            std::atomic<bool> go{false}, published{false};
+            std::thread completer([&] {
+                while (!go.load()) {}
+                if (racing->claimCompletion()) {
+                    published = true;
+                    racing->finish(true);
+                } else {
+                    racing->finish(false);
+                }
+            });
+            std::thread canceller([&] {
+                while (!go.load()) {}
+                racing->cancel();
+            });
+            go = true;
+            completer.join();
+            canceller.join();
+            const auto status = racing->status();
+            check(published ? status == WorkStatus::Succeeded
+                            : status == WorkStatus::Cancelled,
+                  "A completion is published only for work that succeeded");
+        }
+        check(claims.stats().pending == 0, "Racing work releases its budget");
         auto stopping = std::async(std::launch::async, [&] { return bounded.admit(); });
         bounded.stop();
         check(!stopping.get() && !bounded.tryAdmit(), "Stop wakes and rejects submitters");

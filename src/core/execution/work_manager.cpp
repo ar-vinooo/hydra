@@ -72,11 +72,21 @@ bool WorkTicket::start() {
     current = WorkStatus::Running;
     return true;
 }
+bool WorkTicket::claimCompletion() {
+    std::scoped_lock lock(state->mutex);
+    if (current != WorkStatus::Running || completing)
+        return false;
+    completing = true;
+    return true;
+}
 void WorkTicket::terminate(WorkStatus outcome) {
     std::vector<std::shared_ptr<WorkTicket>> released;
     {
         std::scoped_lock lock(state->mutex);
         if (terminal(current))
+            return;
+        // Completion was claimed: the callback may already be running
+        if (completing && outcome == WorkStatus::Cancelled)
             return;
         if (outcome == WorkStatus::Succeeded && current != WorkStatus::Running)
             outcome = WorkStatus::Failed;

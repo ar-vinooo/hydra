@@ -2156,6 +2156,33 @@ void testReportSemaphoreReductionAndAcquire() {
     expect(waited >= std::chrono::milliseconds(40) &&
                waited < std::chrono::milliseconds(900),
            "Acquire waits for the semaphore release");
+    {
+        // Under PFIFO an unsatisfied acquire yields instead of blocking the
+        // worker; the channel resumes once the word holds the value
+        PfifoDecodeState state;
+        tls_crnt_decode_state = &state;
+        memory[0] = 0;
+        engine.method(0x6c2, 9);
+        const auto begin = std::chrono::steady_clock::now();
+        engine.method(0x6c3, 1);
+        expect(std::chrono::steady_clock::now() - begin <
+                   std::chrono::milliseconds(40) &&
+                   state.semaphore_wait &&
+                   state.semaphore_wait->address == SEMAPHORE &&
+                   state.semaphore_wait->payload == 9 &&
+                   state.semaphore_wait->operation == 1,
+               "An unsatisfied acquire yields with an equality wait");
+        state.semaphore_wait.reset();
+        engine.method(0x6c3, 1 | (1u << 16));
+        expect(state.semaphore_wait && state.semaphore_wait->operation == 4,
+               "An unsatisfied GE acquire yields with a >= wait");
+        state.semaphore_wait.reset();
+        memory[0] = 9;
+        engine.method(0x6c3, 1);
+        engine.method(0x6c3, 1 | (1u << 16));
+        expect(!state.semaphore_wait, "A satisfied acquire does not yield");
+        tls_crnt_decode_state = nullptr;
+    }
     commands.reset();
     tls_crnt_command_buffer = nullptr;
     tls_crnt_gmmu = nullptr;

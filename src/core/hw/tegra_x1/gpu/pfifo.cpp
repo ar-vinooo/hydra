@@ -449,8 +449,10 @@ void Pfifo::threadFunc() {
                         [complete = entry_list.on_complete,
                          state = entry_list.decode_state,
                          work = entry_list.work](bool succeeded) {
+                            // The claim keeps a concurrent cancel from
+                            // winning after the fence was published
                             if (succeeded && (!state || !state->failed) &&
-                                work->status() == execution::WorkStatus::Running) {
+                                work->claimCompletion()) {
                                 if (complete)
                                     complete();
                                 work->finish(true);

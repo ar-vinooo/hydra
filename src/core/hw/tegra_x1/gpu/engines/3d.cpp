@@ -1085,8 +1085,7 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
         break;
     case 1: { // Acquire
         // Wait until memory equals (or is at least) the payload. Another
-        // channel or the CPU releases it. The wait is bounded so that a
-        // semaphore nobody releases cannot hang the whole GPU.
+        // channel or the CPU releases it.
         uptr base;
         const auto as = tls_crnt_gmmu->findAddr(semaphore_address, base);
         if (!as || as->ptr == 0) {
@@ -1107,23 +1106,36 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
         }
         const u32 payload = regs.report_semaphore_payload;
         const bool greater_equal = extractBits(data, 16, 1) != 0;
-        const auto start = std::chrono::steady_clock::now();
-        while (true) {
+        const auto satisfied = [&] {
             const u32 current = std::atomic_ref<u32>(*word).load(
                 std::memory_order_acquire);
-            if (greater_equal ? static_cast<i32>(current - payload) >= 0
-                              : current == payload)
-                return;
+            return greater_equal ? static_cast<i32>(current - payload) >= 0
+                                 : current == payload;
+        };
+        if (satisfied())
+            return;
+        // Under PFIFO the channel yields and resumes after this method once
+        // the condition holds, so it cannot block the channel that releases
+        // it (operations 1 and 4 as in the puller's semaphore acquire)
+        if (tls_crnt_decode_state) {
+            tls_crnt_decode_state->semaphore_wait = PfifoSemaphoreWait{
+                semaphore_address, payload, greater_equal ? 4u : 1u};
+            return;
+        }
+        // Direct callers have no scheduler: bound the wait so that a
+        // semaphore nobody releases cannot hang them
+        const auto start = std::chrono::steady_clock::now();
+        while (!satisfied()) {
             if (std::chrono::steady_clock::now() - start >
                 std::chrono::seconds(1)) {
                 ONCE(LOG_WARN(Engines,
-                              "Semaphore acquire at {:#x} timed out ({:#x} "
-                              "vs {:#x})",
-                              semaphore_address, current, payload));
+                              "Semaphore acquire at {:#x} timed out",
+                              semaphore_address));
                 return;
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+        return;
     }
     case 2: // Counter
         switch (counter_type) {
