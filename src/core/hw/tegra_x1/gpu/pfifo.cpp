@@ -337,18 +337,14 @@ bool Pfifo::ready(GpfifoEntryList& list) {
     }
     if (state.semaphore_wait) {
         const auto wait = *state.semaphore_wait;
-        uptr base;
-        const auto mapping = list.gmmu->findAddr(wait.address, base);
-        if (!mapping || mapping->ptr == 0 ||
-            mapping->size - (wait.address - base) < sizeof(u32) ||
-            (mapping->ptr + wait.address - base) %
-                std::atomic_ref<u32>::required_alignment != 0) {
+        auto* word_ptr = resolveSemaphoreWord(*list.gmmu, wait.address);
+        if (!word_ptr) {
             LOG_ERROR(Gpu, "Pending semaphore is unmapped at {:#x}", wait.address);
             state.fail(31);
             return true;
         }
-        const u32 word = std::atomic_ref<u32>(*reinterpret_cast<u32*>(
-            mapping->ptr + wait.address - base)).load(std::memory_order_acquire);
+        const u32 word = std::atomic_ref<u32>(*word_ptr).load(
+            std::memory_order_acquire);
         const bool satisfied = wait.operation == 1 ? word == wait.payload
             : wait.operation == 4 ? static_cast<i32>(word - wait.payload) >= 0
             : (word & wait.payload) != 0;

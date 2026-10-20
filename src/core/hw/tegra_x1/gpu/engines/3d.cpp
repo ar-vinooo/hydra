@@ -1086,14 +1086,17 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
     case 1: { // Acquire
         // Wait until memory equals (or is at least) the payload. Another
         // channel or the CPU releases it.
-        uptr base;
-        const auto as = tls_crnt_gmmu->findAddr(semaphore_address, base);
-        if (!as || as->ptr == 0) {
-            ONCE(LOG_WARN(Engines, "Acquire of unmapped GPU address {:#x}",
-                          semaphore_address));
+        auto* word = resolveSemaphoreWord(*tls_crnt_gmmu, semaphore_address);
+        if (!word) {
+            LOG_ERROR(Engines,
+                      "Acquire of unmapped, truncated or unaligned semaphore "
+                      "at {:#x}",
+                      semaphore_address);
+            // Continuing would treat the acquire as satisfied
+            if (tls_crnt_decode_state)
+                tls_crnt_decode_state->fail(31);
             return;
         }
-        auto* word = reinterpret_cast<u32*>(as->ptr + semaphore_address - base);
         {
             // A report queued earlier in the stream may release it; its
             // submission has to be committed for that

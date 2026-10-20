@@ -2181,6 +2181,27 @@ void testReportSemaphoreReductionAndAcquire() {
         engine.method(0x6c3, 1);
         engine.method(0x6c3, 1 | (1u << 16));
         expect(!state.semaphore_wait, "A satisfied acquire does not yield");
+        // Invalid semaphore words fault the channel instead of passing
+        std::array<u32, 2> short_memory{};
+        constexpr u64 SHORT = 0x600000;
+        gmmu.map(SHORT, {reinterpret_cast<uptr>(short_memory.data()), 6});
+        const auto acquire_at = [&](u64 address) {
+            PfifoDecodeState probe;
+            tls_crnt_decode_state = &probe;
+            engine.method(0x6c0, static_cast<u32>(address >> 32));
+            engine.method(0x6c1, static_cast<u32>(address));
+            engine.method(0x6c3, 1);
+            tls_crnt_decode_state = &state;
+            return probe.failed.load() && probe.error.load() == 31 &&
+                   !probe.semaphore_wait;
+        };
+        expect(acquire_at(0x700000), "Acquire of an unmapped address faults");
+        expect(acquire_at(SHORT + 4), "Acquire of a word cut off by its mapping faults");
+        expect(acquire_at(SEMAPHORE + 2), "Acquire of an unaligned word faults");
+        expect(!acquire_at(SHORT), "Acquire of a valid word does not fault");
+        gmmu.unmap(SHORT);
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(SEMAPHORE));
         tls_crnt_decode_state = nullptr;
     }
     commands.reset();

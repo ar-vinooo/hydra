@@ -278,3 +278,18 @@ Dua temuan audit eksternal diperiksa langsung di kode; keduanya nyata.
 Regresi (MTL_DEBUG_LAYER=1): shader-library 60, texture-cache 40, gpu-engine 45, work-manager, resource-registry,
 raster-state, render-hash, register-write, frame-trace, visual-diagnostic, dma-slice lulus; `hydra` dan hot module
 ter-build. Header `work_manager.hpp` berubah: restart aplikasi. Belum diuji di game; tidak stage/commit.
+
+## Acquire semaphore: fault untuk word tidak valid (audit eksternal kedua)
+
+`ThreeD::setReportSemaphore` (acquire) hanya me-warn dan kembali bila alamat tak terpetakan, sehingga channel
+melanjutkan seolah acquire terpenuhi; ukuran dan alignment tidak diperiksa seperti di `Pfifo::ready()`. Kini
+`resolveSemaphoreWord` (`pfifo.hpp`) dipakai bersama oleh acquire 3D dan `Pfifo::ready()` (tak terpetakan, kurang dari
+4 byte di mapping, atau tidak sejajar untuk akses atomik -> null). Acquire 3D memfault channel (kode 31); `ready()`
+me-resolve ulang tiap pemeriksaan, jadi remap saat menunggu juga memfault. Tes: `testReportSemaphoreReductionAndAcquire`
+(unmapped, terpotong mapping, tidak sejajar, dan kasus valid tidak fault).
+
+Dinilai tetapi tidak diubah: (a) antrean GPU 64 slot: `admit()` hanya menunggu command buffer yang sudah di-commit, dan
+slot dibebaskan di completed handler Metal yang tidak bergantung pada thread yang menunggu, jadi starvation tidak
+terlihat dari kode, tetapi belum ada stress test saturasi; (b) `finish(false)` setelah `claimCompletion()` tetap
+diizinkan (kegagalan publikasi tetap bisa dilaporkan); status `Completing` eksplisit belum dibuat. Versi isi resource
+dan capture/replay belum dimulai.

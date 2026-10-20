@@ -32,6 +32,20 @@ struct PfifoSemaphoreWait {
     u32 operation;
 };
 
+// Host word behind a guest semaphore address, or null when it is unmapped,
+// shorter than four bytes in its mapping or not aligned for atomic access
+inline u32* resolveSemaphoreWord(const GMmu& gmmu, u64 address) {
+    uptr base;
+    const auto mapping = gmmu.findAddr(address, base);
+    if (!mapping || mapping->ptr == 0 ||
+        mapping->size - (address - base) < sizeof(u32))
+        return nullptr;
+    const auto ptr = mapping->ptr + address - base;
+    if (ptr % std::atomic_ref<u32>::required_alignment != 0)
+        return nullptr;
+    return reinterpret_cast<u32*>(ptr);
+}
+
 struct PfifoDecodeState : PfifoPacket {
     PfifoDecodeState();
     ~PfifoDecodeState();
