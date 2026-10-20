@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
+
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -7,7 +9,7 @@ namespace hydra::hw::tegra_x1::gpu::renderer {
 class ICommandBuffer;
 class ITexture;
 
-class BufferBase {
+class BufferBase : public resource::TrackedResource {
   public:
     explicit BufferBase(u64 size_) : size{size_} {}
     virtual ~BufferBase() = default;

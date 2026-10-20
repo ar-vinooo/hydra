@@ -372,7 +372,7 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         }
         actual.cache_key = makeShaderKey(actual);
     }
-    auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true>::find(actual);
+    auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true, true>::find(actual);
     if (shader) versions.push_back({actual.code_snapshot, shader});
     return inspect(actual, shader);
 }

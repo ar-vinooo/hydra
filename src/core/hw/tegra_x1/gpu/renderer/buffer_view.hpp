@@ -21,6 +21,8 @@ struct BufferView {
                         u64 size_ = invalid<u64>())
         : BufferView(owner_.get(), offset_, size_) {
         owner = std::move(owner_);
+        if (base)
+            base->setResourceOwner(owner);
     }
 
     uptr getPtr() const { return base->getPtr() + offset; }

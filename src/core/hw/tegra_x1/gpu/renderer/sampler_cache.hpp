@@ -12,7 +12,7 @@ class SamplerBase;
 class IRenderer;
 
 class SamplerCache
-    : public CacheBase<SamplerCache, SamplerBase*, SamplerDescriptor, true> {
+    : public CacheBase<SamplerCache, SamplerBase*, SamplerDescriptor, true, true> {
   public:
     explicit SamplerCache(IRenderer& renderer_) : renderer{renderer_} {}
 

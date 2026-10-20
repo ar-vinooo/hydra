@@ -17,6 +17,8 @@ using TextureCacheClock = std::chrono::steady_clock;
 using TextureCacheTimePoint = TextureCacheClock::time_point;
 
 struct TextureStorage {
+    std::shared_ptr<void> base_owner;
+    std::vector<std::shared_ptr<void>> view_owners;
     ITexture* base{nullptr};
     SmallCache<u32, ITextureView*> view_cache;
     TextureCacheTimePoint update_timestamp;

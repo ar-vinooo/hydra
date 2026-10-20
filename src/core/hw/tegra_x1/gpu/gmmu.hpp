@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/hw/generic_mmu.hpp"
+#include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
+#include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
 namespace hydra::hw::tegra_x1::cpu {
@@ -18,7 +20,8 @@ struct AddressSpace {
 };
 
 // TODO: free memory
-class GMmu : public GenericMmu<GMmu, AddressSpace> {
+class GMmu : public GenericMmu<GMmu, AddressSpace>,
+             public resource::TrackedResource {
   public:
     explicit GMmu(cpu::IMmu* mmu_);
     ~GMmu();
@@ -27,6 +30,9 @@ class GMmu : public GenericMmu<GMmu, AddressSpace> {
 
     static u64 implGetSize(const AddressSpace& as) { return as.size; }
 
+    std::optional<AddressSpace> findAddr(uptr addr, uptr& out_base) const;
+    AddressSpace findAddrImpl(uptr addr, uptr& out_base) const;
+    bool matchesMappings(const std::vector<resource::MappingDependency>& dependencies) const;
     uptr unmapAddr(uptr gpu_addr) const;
 
     // Copy a contiguous guest range across separate host mappings, stopping

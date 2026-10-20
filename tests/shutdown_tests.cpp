@@ -2355,6 +2355,92 @@ int main(int argc, char** argv) {
             testSemaphoreShutdown(system, process);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-work-management") {
+            namespace gpu = hw::tegra_x1::gpu;
+            namespace nv = services::nvdrv;
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager()
+                                .createProcess("Managed dispatch test");
+            nv::ioctl::NvHostGpu channel;
+            bindTestChannel(channel, process);
+            std::array<u32, 6> request{};
+            const auto submit_fenced = [&] {
+                request = {0, 0, 0, static_cast<u32>(gpu::GpfifoFlags::FenceGet), 0, 0};
+                auto bytes = std::span<u8>(reinterpret_cast<u8*>(request.data()), sizeof(request));
+                nv::ioctl::IoctlContext context{
+                    .system = system, .process = process,
+                    .in_stream = ztd::io::MemoryStream(bytes),
+                    .out_stream = ztd::io::MemoryStream(bytes)};
+                return channel.ioctl(context, 0x48, 0x08);
+            };
+            auto& fifo = system.getGpu().getPfifo();
+            const auto before = fifo.getSubmittedCount();
+            {
+                auto oversized = fifo.reserveEntries(64 * 1024 * 1024);
+                check(!oversized, "Oversized entry list is rejected before allocation");
+                std::vector<gpu::PfifoAdmission> held;
+                for (usize index = 0; index < 4096; ++index) {
+                    auto admission = fifo.reserveEntries(1);
+                    check(static_cast<bool>(admission), "Dispatch capacity admits bounded work");
+                    held.push_back(std::move(admission));
+                }
+                check(!fifo.reserveEntries(1), "Full CPU dispatch budget rejects without blocking");
+                check(submit_fenced() == nv::NvResult::InsufficientMemory,
+                      "Full admission budget rejects before reserving a fence");
+                check(fifo.getSubmittedCount() == before,
+                      "Admission alone does not consume a submission or fence");
+            }
+            check(fifo.getWorkStats().pending == 0 && fifo.getWorkStats().bytes == 0,
+                  "Abandoned reservations release both budgets");
+            check(submit_fenced() == nv::NvResult::Success && request[5] == 1,
+                  "Rejected submission leaves no gap in the next fence target");
+            check(system.getGpu().getVideoSyncpoints().waitFor(request[4], request[5],
+                                                              std::chrono::seconds(5)),
+                  "Accepted fence reaches completion after capacity recovers");
+            gpu::GMmu space(nullptr);
+            auto done = std::make_shared<std::promise<void>>();
+            auto completion = done->get_future();
+            check(fifo.submitEntries(space, {}, gpu::GpfifoFlags::None,
+                                    [done] { done->set_value(); }),
+                  "Dispatch resumes after budget is released");
+            check(completion.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                  "Managed CPU dispatch reaches GPU completion");
+            // The guest callback precedes final ticket retirement.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (fifo.getWorkStats().pending && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            check(fifo.getWorkStats().pending == 0 && fifo.getWorkStats().succeeded == 2,
+                  "Work retires exactly once after host completion");
+            auto& renderer = static_cast<gpu::renderer::metal::Renderer&>(system.getGpu().getRenderer());
+            using gpu::renderer::metal::stackAutoRelease;
+            NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+            NS_STACK_SCOPED auto gate = renderer.getDevice()->newSharedEvent();
+            {
+                std::unique_ptr<gpu::renderer::ICommandBuffer> commands(renderer.createCommandBuffer());
+                auto* native = static_cast<gpu::renderer::metal::CommandBuffer*>(commands.get());
+                native->getCommandBuffer()->encodeWait(gate, 1);
+            }
+            std::atomic<bool> signalled{false};
+            check(fifo.submitEntries(space, {}, gpu::GpfifoFlags::None,
+                                    [&] { signalled = true; }),
+                  "Queue work behind a held GPU submission");
+            check(fifo.waitForCompletion(fifo.getSubmittedCount()),
+                  "CPU finishes encoding while host completion is still pending");
+            auto cancelling = std::async(std::launch::async, [&] { fifo.cancel(space); });
+            const auto cancel_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!space.gpuWorkCancelled() && std::chrono::steady_clock::now() < cancel_deadline)
+                std::this_thread::yield();
+            const bool waiting = cancelling.wait_for(std::chrono::milliseconds(50)) !=
+                                 std::future_status::ready;
+            gate->setSignaledValue(1);
+            check(cancelling.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                  "Cancellation drains already submitted GPU work");
+            cancelling.get();
+            check(waiting && !signalled && fifo.getWorkStats().pending == 0,
+                  "In-flight cancellation never publishes successful guest completion");
+            std::cout << "PASS: CPU dispatch admission, cancellation, budget recovery and GPU retirement\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--check-pfifo-decode") {
             System system(ui);
             auto* process = system.getOs().getKernel().getProcessManager()

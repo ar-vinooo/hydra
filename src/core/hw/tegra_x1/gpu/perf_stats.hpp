@@ -52,6 +52,13 @@ struct PerfStats {
     std::atomic<u64> upload_buffers_created{0};
     std::atomic<u64> upload_buffers_reused{0};
     std::atomic<u64> draw_state_ns{0};
+    std::atomic<u64> draw_prepare_ns{0};
+    std::atomic<u64> draw_command_ns{0};
+    std::atomic<u64> draw_pipeline_ns{0};
+    std::atomic<u64> draw_targets_ns{0};
+    std::atomic<u64> draw_snapshot_ns{0};
+    std::atomic<u64> draw_apply_ns{0};
+    std::atomic<u64> draw_resources_ns{0};
     std::atomic<u64> shader_compile_ns{0};
     std::atomic<u64> shader_compiles{0};
     std::atomic<u64> shader_library_hits{0};
@@ -91,9 +98,13 @@ struct PerfStats {
 
 class ScopedPerfTimer {
   public:
-    explicit ScopedPerfTimer(std::atomic<u64>& counter_)
-        : counter{counter_}, start{std::chrono::steady_clock::now()} {}
+    explicit ScopedPerfTimer(std::atomic<u64>& counter_, bool enabled_ = true)
+        : counter{counter_}, enabled{enabled_},
+          start{enabled ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{}} {}
     ~ScopedPerfTimer() {
+        if (!enabled)
+            return;
         counter += static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start)
@@ -102,6 +113,7 @@ class ScopedPerfTimer {
 
   private:
     std::atomic<u64>& counter;
+    bool enabled;
     std::chrono::steady_clock::time_point start;
 };
 

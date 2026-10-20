@@ -23,11 +23,15 @@ class Pipeline;
 struct CombinedTextureSampler {
     const TextureView* texture_view{nullptr};
     const Sampler* sampler{nullptr};
+    std::shared_ptr<void> texture_owner;
+    std::shared_ptr<void> sampler_owner;
 };
 
 struct State {
     const RenderPass* render_pass{nullptr};
     const Pipeline* pipeline{nullptr};
+    std::shared_ptr<void> render_pass_owner;
+    std::shared_ptr<void> pipeline_owner;
     bool depth_test_enabled;
     bool depth_write_enabled;
     engines::CompareOp depth_compare_op;
@@ -152,6 +156,8 @@ class Renderer : public IRenderer {
     void unbindUniformBuffers(ShaderType shader_type) override;
     void unbindStorageBuffers(ShaderType shader_type) override;
     void unbindTextures(ShaderType shader_type) override;
+    std::vector<TextureBinding>
+    getTextureBindings(ShaderType shader_type) const override;
 
     f64 debugSyncCommandBuffer(ICommandBuffer* command_buffer) override;
     bool synchronize(ICommandBuffer* command_buffer) override;

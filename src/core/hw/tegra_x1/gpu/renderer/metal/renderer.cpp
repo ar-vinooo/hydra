@@ -1,5 +1,6 @@
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
 
 #include <cmath>
 #include <fstream>
@@ -412,6 +413,7 @@ Renderer::createRenderPassHot12(const RenderPassDescriptor& descriptor) {
 }
 
 void Renderer::bindRenderPassHot13(const RenderPassBase* render_pass) {
+    state.render_pass_owner = render_pass ? render_pass->getResourceOwner() : nullptr;
     state.render_pass = static_cast<const RenderPass*>(render_pass);
 }
 
@@ -571,6 +573,7 @@ PipelineBase* Renderer::createPipelineHot18(const PipelineDescriptor& descriptor
 }
 
 void Renderer::bindPipelineHot19(const PipelineBase* pipeline) {
+    state.pipeline_owner = pipeline ? pipeline->getResourceOwner() : nullptr;
     state.pipeline = static_cast<const Pipeline*>(pipeline);
 }
 
@@ -1060,7 +1063,24 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
     }
     state.textures[static_cast<u32>(shader_type)][index] = {
         .texture_view = static_cast<TextureView*>(texture),
-        .sampler = static_cast<Sampler*>(sampler)};
+        .sampler = static_cast<Sampler*>(sampler),
+        .texture_owner = texture ? texture->getResourceOwner() : nullptr,
+        .sampler_owner = sampler ? sampler->getResourceOwner() : nullptr};
+}
+
+std::vector<TextureBinding>
+Renderer::getTextureBindings(ShaderType shader_type) const {
+    std::vector<TextureBinding> result;
+    if (shader_type == ShaderType::Count)
+        return result;
+    const auto& bindings = state.textures[static_cast<u32>(shader_type)];
+    for (u32 index = 0; index < bindings.size(); ++index) {
+        const auto& binding = bindings[index];
+        if (binding.texture_view || binding.sampler)
+            result.push_back({index, const_cast<TextureView*>(binding.texture_view),
+                              const_cast<Sampler*>(binding.sampler)});
+    }
+    return result;
 }
 
 void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
@@ -1396,7 +1416,7 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         enc->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
                                   MTL::Size(block.width, block.height, block.depth));
         enc->endEncoding();
-        cb->commit();
+        commitManagedSubmission(cb, completions);
         cb->waitUntilCompleted();
         const auto ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
         static std::map<u64, double> max_ms;

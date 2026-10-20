@@ -20,17 +20,7 @@
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
 
-TextureCache::~TextureCache() {
-    for (auto& [mem_key, mem] : entries) {
-        for (auto& [group_key, group] : mem.cache) {
-            for (auto& [storage_key, storage] : group.cache) {
-                for (auto& [view_key, view] : storage.view_cache)
-                    delete view;
-                delete storage.base;
-            }
-        }
-    }
-}
+TextureCache::~TextureCache() = default;
 
 ITextureView* TextureCache::find(ICommandBuffer* command_buffer,
                                  const TextureDescriptor& descriptor,
@@ -481,6 +471,12 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 const auto old_cpu_modified = storage.cpu_modified_timestamp;
                 const auto old_flushed_ranges = storage.flushed_ranges;
                 const auto old_stale_ranges = storage.stale_ranges;
+                auto old_storage = std::move(storage);
+                if (command_buffer) {
+                    command_buffer->retainResource(old_storage.base_owner);
+                    for (const auto& owner : old_storage.view_owners)
+                        command_buffer->retainResource(owner);
+                }
                 group.cache.remove(key);
 
                 // Create a new storage
@@ -507,8 +503,6 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                     new_storage.cpu_modified_timestamp, old_cpu_modified);
                 new_storage.flushed_ranges = old_flushed_ranges;
                 new_storage.stale_ranges = old_stale_ranges;
-
-                // TODO: destroy the old storage
 
                 actual_storage = &new_storage;
             }
@@ -591,6 +585,11 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     // Copy overlapping storages
     for (auto& overlapping_storage : overlapping_storages) {
         const auto other_base = overlapping_storage.storage.base;
+        if (command_buffer) {
+            command_buffer->retainResource(overlapping_storage.storage.base_owner);
+            for (const auto& owner : overlapping_storage.storage.view_owners)
+                command_buffer->retainResource(owner);
+        }
         const auto& other_descriptor = other_base->getDescriptor();
         // What the guest overwrote since the GPU wrote this storage is stale:
         // the new storage was decoded from the guest's data already
@@ -611,8 +610,6 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
             other_descriptor.layer_count);
     }
 
-    // TODO: destroy overlapping storages
-
     // Return view
     return getTextureView(storage, view_descriptor);
 }
@@ -623,6 +620,7 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
                                  TextureUsage usage) {
     if (storage.base == nullptr) {
         storage.base = renderer.createTexture(descriptor);
+        storage.base_owner = storage.base->createResourceOwner();
         // DEBUG: HYDRA_RT_ZERO_INIT=1 starts render targets in memory the GPU
         // never wrote with zeros. Decoding guest memory into them shows
         // whatever other data (e.g. streamed textures) shares that memory.
@@ -658,6 +656,7 @@ TextureCache::getTextureView(TextureStorage& storage,
     }
 
     auto view = storage.base->createView(view_descriptor);
+    storage.view_owners.push_back(view->createResourceOwner());
     storage.view_cache.insert(free_key, view);
     return view;
 }

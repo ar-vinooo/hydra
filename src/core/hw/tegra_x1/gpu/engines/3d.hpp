@@ -3,6 +3,7 @@
 #include "core/hw/tegra_x1/gpu/engines/inline_base.hpp"
 #include "core/hw/tegra_x1/gpu/macro/driver_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -668,10 +669,14 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
         std::array<u64, 4> tic{};
         u32 type{0};
         renderer::ITextureView* view{nullptr};
+        std::vector<resource::MappingDependency> mappings;
     };
     static constexpr u32 TEXTURE_MEMO_SLOTS = 32;
     std::array<std::array<TextureMemo, TEXTURE_MEMO_SLOTS>, 5> texture_memo{};
     u64 texture_memo_epoch{~0ull};
+    u64 texture_memo_mapping_generation{0};
+    resource::ResourceHandle texture_memo_address_space;
+    std::vector<resource::MappingDependency> render_target_memo_mappings;
     std::map<u64, u32> geometry_layer_sources;
     const void* texture_memo_render_pass{nullptr};
     const void* texture_memo_gmmu{nullptr};
@@ -696,7 +701,6 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
         renderer::ShaderType::Count)] = {nullptr};
 
     // State
-    std::vector<ztd::Range<uptr>> storage_writes;
     // GPU virtual ranges, resolved when consumed rather than at bind time.
     ztd::Range<uptr>
         bound_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
@@ -796,10 +800,14 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     void configureShaderStage(const ShaderStage stage,
                               const TextureImageControl* tex_header_pool,
-                              const TextureSamplerControl* tex_sampler_pool);
+                              const TextureSamplerControl* tex_sampler_pool,
+                              command_ir::StageBindings& bindings,
+                              std::vector<ztd::Range<uptr>>& storage_writes);
 
-    bool drawInternal();
-    void synchronizeStorageWrites();
+    renderer::DrawState prepareDrawState();
+    renderer::RenderPassBase* resolveDrawTargets();
+    bool prepareDraw(command_ir::DrawCommand& command);
+    void executeDrawCommand(command_ir::DrawCommand& command);
     void selectVisualResources();
     void captureVisualDraw(bool after);
 };

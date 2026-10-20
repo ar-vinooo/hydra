@@ -35,6 +35,8 @@ Implementations stay in their original source files, with `HotN` suffixes.
 
 Supported runtime paths include:
 
+- Normalized draw command sealing, resource validation and consumption. Resource
+  registry storage, retirement and mapping-capture TLS remain host-owned.
 - 3D and compute engine method dispatch, shader/resource binding, draw/clear,
   viewport/scissor, blending, culling, depth bias and depth/stencil state.
 - 2D copies, DMA and inline uploads.
@@ -136,3 +138,5 @@ Captures land in `<session>/gputrace/`; open them in Xcode or with
 `d<N> vs 0x<guest VS> fs 0x<guest FS> n=<count> rt0=0x<RT0 address>`.
 `--gpu-capture` makes Metal retain every resource; on 8 GB machines it can
 swap heavily, so leave it off for normal play.
+
+Work lifecycle/admission dan callback submit Metal tetap dimiliki host (`core/execution` dan `gpu/management`); module memakai simbol host. Perubahan layout ownership memerlukan rebuild aplikasi + module dan restart aplikasi. Lihat [execution management](../docs/graphics-handoff/execution-management-2026-10-20.md) untuk tes budget, cancellation dan retirement.

@@ -20,6 +20,10 @@ class GenericMmu {
     GenericMmu() noexcept = default;
 
   public:
+    u64 getMappingGeneration() const {
+        return generation.load(std::memory_order_acquire);
+    }
+
     void map(uptr base, Impl impl) {
         std::unique_lock lock(mutex);
         mapLocked(base, impl);
@@ -30,7 +34,7 @@ class GenericMmu {
         auto it = mapped_ranges.find(base);
         ASSERT_DEBUG(it != mapped_ranges.end(), Mmu,
                      "Failed to unmap with base 0x{:08x}", base);
-        THIS->unmapImpl(base, it->second);
+        static_cast<Subclass*>(this)->unmapImpl(base, it->second);
         mapped_ranges.erase(it);
         generation.fetch_add(1, std::memory_order_release);
     }
@@ -38,8 +42,8 @@ class GenericMmu {
     /*
     void Remap(uptr base) {
         auto impl = mapped_ranges.at(base);
-        THIS->UnmapImpl(base, impl);
-        THIS->MapImpl(base, impl);
+        static_cast<Subclass*>(this)->UnmapImpl(base, impl);
+        static_cast<Subclass*>(this)->MapImpl(base, impl);
     }
     */
 
@@ -78,12 +82,12 @@ class GenericMmu {
 
     template <typename T>
     T load(uptr addr) const {
-        return *reinterpret_cast<T*>(CONST_THIS->unmapAddr(addr));
+        return *reinterpret_cast<T*>(static_cast<const Subclass*>(this)->unmapAddr(addr));
     }
 
     template <typename T>
     void store(uptr addr, T value) const {
-        *reinterpret_cast<T*>(CONST_THIS->UnmapAddr(addr)) = value;
+        *reinterpret_cast<T*>(static_cast<const Subclass*>(this)->UnmapAddr(addr)) = value;
     }
 
   private:
@@ -105,11 +109,11 @@ class GenericMmu {
         // Most GPU mappings are disjoint. Preserve the existing first-range
         // precedence if overlapping mappings are ever installed.
         if (!has_overlapping_ranges) {
-            const auto size = THIS->implGetSize(impl);
+            const auto size = static_cast<Subclass*>(this)->implGetSize(impl);
             for (const auto& [other_base, other] : mapped_ranges) {
                 if (other_base == base)
                     continue;
-                const auto other_size = THIS->implGetSize(other);
+                const auto other_size = static_cast<Subclass*>(this)->implGetSize(other);
                 if (size != 0 && other_size != 0 &&
                     (base <= other_base ? other_base - base < size
                                         : base - other_base < other_size)) {
@@ -119,7 +123,7 @@ class GenericMmu {
             }
         }
         mapped_ranges[base] = impl;
-        THIS->mapImpl(base, impl);
+        static_cast<Subclass*>(this)->mapImpl(base, impl);
         generation.fetch_add(1, std::memory_order_release);
     }
 
@@ -130,14 +134,14 @@ class GenericMmu {
             if (it == mapped_ranges.begin())
                 return nullptr;
             --it;
-            out_size = THIS->implGetSize(it->second);
+            out_size = static_cast<Subclass*>(this)->implGetSize(it->second);
             if (addr - it->first >= out_size)
                 return nullptr;
             out_base = it->first;
             return &it->second;
         }
         for (auto& [base, impl] : mapped_ranges) {
-            out_size = THIS->implGetSize(impl);
+            out_size = static_cast<Subclass*>(this)->implGetSize(impl);
             if (addr >= base && addr - base < out_size) {
                 out_base = base;
                 return &impl;

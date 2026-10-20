@@ -134,6 +134,7 @@ class CommandBuffer final : public ICommandBuffer {
                     u32 index);
 
   private:
+    void commitSubmission();
     MTL::CommandQueue* command_queue{nullptr};
     MTL::CommandBuffer* command_buffer{nullptr};
     MTL::CommandEncoder* command_encoder{nullptr};

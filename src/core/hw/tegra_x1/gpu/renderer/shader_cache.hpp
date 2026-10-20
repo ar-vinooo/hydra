@@ -84,7 +84,7 @@ struct GuestShaderDescriptor {
 };
 
 class ShaderCache
-    : public CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true> {
+    : public CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true, true> {
   public:
     explicit ShaderCache(IRenderer& renderer_) : renderer{renderer_} {}
 

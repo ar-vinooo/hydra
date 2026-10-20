@@ -1,6 +1,9 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
+
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
@@ -8,10 +11,11 @@ class ICommandBuffer;
 class BufferBase;
 class ITexture;
 
-class ITextureView {
+class ITextureView : public resource::TrackedResource {
   public:
     ITextureView(ITexture* base_, const TextureViewDescriptor& descriptor_)
-        : base{base_}, descriptor{descriptor_} {}
+        : base{base_}, descriptor{descriptor_},
+          base_owner{base_ ? base_->getResourceOwner() : nullptr} {}
     virtual ~ITextureView() = default;
 
     // Copying
@@ -27,6 +31,7 @@ class ITextureView {
   protected:
     ITexture* base;
     const TextureViewDescriptor descriptor;
+    std::shared_ptr<void> base_owner;
 
   public:
     GETTER(base, getBase);

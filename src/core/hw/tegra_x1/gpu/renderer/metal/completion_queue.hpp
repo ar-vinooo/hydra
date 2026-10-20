@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/execution/work_manager.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -51,6 +52,9 @@ class CompletionQueue {
   public:
     // The flag tells whether the command buffer completed successfully
     using Work = std::function<void(bool succeeded)>;
+
+    // Shared admission budget for submissions using this Metal queue.
+    execution::WorkManager submissions{{64, 0}};
 
     CompletionQueue();
     ~CompletionQueue();

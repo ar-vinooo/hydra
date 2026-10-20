@@ -8,6 +8,9 @@
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
@@ -34,6 +37,50 @@
 using namespace hydra;
 using namespace hydra::hw::tegra_x1::gpu;
 using hydra::hw::tegra_x1::gpu::renderer::metal::stackAutoRelease;
+
+namespace hydra::hw::tegra_x1::gpu::engines {
+struct ThreeDTestAccess {
+    static void execute(ThreeD& engine, command_ir::DrawCommand& command) {
+        engine.executeDrawCommand(command);
+    }
+    static void colorTarget(ThreeD& engine, u64 address) {
+        engine.regs.color_target_control.count = 1;
+        engine.regs.color_target_control.maps = 0;
+        auto& target = engine.regs.color_targets[0];
+        target = {};
+        target.addr = {static_cast<u32>(address >> 32), static_cast<u32>(address)};
+        target.width_or_stride = 16;
+        target.height = 4;
+        target.format = ColorSurfaceFormat::RGBA8Unorm;
+        target.tile_mode.is_linear = 1;
+        target.array_mode.layers = 1;
+        engine.regs.depth_target_enabled = 0;
+    }
+    static renderer::RenderPassBase* targets(ThreeD& engine) {
+        auto* pass = engine.resolveDrawTargets();
+        engine.texture_memo_epoch = engine.gpu.getRenderer().getTextureCache().getEpoch();
+        engine.texture_memo_render_pass = pass;
+        engine.texture_memo_gmmu = tls_crnt_gmmu;
+        engine.texture_memo_mapping_generation = tls_crnt_gmmu->getMappingGeneration();
+        engine.texture_memo_address_space = engine.gpu.getRenderer().getResourceRegistry().track(
+            tls_crnt_gmmu->getResourceLifetime(), resource::ResourceKind::AddressSpace, tls_crnt_gmmu);
+        engine.render_target_memo_key.swap(engine.render_target_key);
+        return pass;
+    }
+    static command_ir::StageBindings fragmentBindings(ThreeD& engine,
+                                                     renderer::ShaderBase* shader) {
+        const auto index = static_cast<u32>(renderer::ShaderType::Fragment);
+        auto* previous = engine.active_shaders[index];
+        engine.active_shaders[index] = shader;
+        command_ir::StageBindings bindings;
+        std::vector<ztd::Range<uptr>> writes;
+        engine.configureShaderStage(ShaderStage::Fragment, nullptr, nullptr,
+                                    bindings, writes);
+        engine.active_shaders[index] = previous;
+        return bindings;
+    }
+};
+} // namespace hydra::hw::tegra_x1::gpu::engines
 
 namespace {
 
@@ -508,6 +555,24 @@ void testConstBufferRemapping() {
     };
     bind(ADDRESS + OFFSET, SIZE);
     check_range(old_ptr + OFFSET);
+    renderer::ShaderDescriptor descriptor{};
+    descriptor.type = renderer::ShaderType::Fragment;
+    descriptor.backend = ShaderBackend::Msl;
+    const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_(constant uint4* values [[buffer(1)]]) {
+    return float4(values[0]);
+})";
+    descriptor.code.assign(source.begin(), source.end());
+    descriptor.resource_mapping.uniform_buffers[SLOT] = 1;
+    descriptor.resource_mapping.uniform_buffer_sizes[SLOT] = SIZE;
+    std::unique_ptr<renderer::ShaderBase> shader(renderer.createShader(descriptor));
+    const auto recorded_before = engines::ThreeDTestAccess::fragmentBindings(engine, shader.get());
+    expect(recorded_before.active && recorded_before.reset_textures &&
+               recorded_before.uniforms.size() == 1 && recorded_before.uniforms[0].index == 1 &&
+               recorded_before.storage.empty() && recorded_before.textures.empty(),
+           "Engine records declared host bindings and an explicit empty texture snapshot");
     const auto before = engine.getConstBufferUpload(STAGE, SLOT);
     expect(*reinterpret_cast<const u32*>(before.getPtr()) == original[4],
            "Initial constant buffer upload reads original backing");
@@ -515,6 +580,10 @@ void testConstBufferRemapping() {
     gmmu.map(ADDRESS, {new_ptr, sizeof(replacement)});
     check_range(new_ptr + OFFSET);
     const auto after = engine.getConstBufferUpload(STAGE, SLOT);
+    const auto recorded_after = engines::ThreeDTestAccess::fragmentBindings(engine, shader.get());
+    expect(*reinterpret_cast<const u32*>(recorded_before.uniforms[0].buffer.getPtr()) == original[4] &&
+               *reinterpret_cast<const u32*>(recorded_after.uniforms[0].buffer.getPtr()) == replacement[4],
+           "Recorded engine bindings keep old snapshots while later commands resolve remapped memory");
     expect(*reinterpret_cast<const u32*>(after.getPtr()) == replacement[4] &&
                *reinterpret_cast<const u32*>(before.getPtr()) == original[4],
            "Remap without bind uploads new data and retains the previous snapshot");
@@ -753,6 +822,511 @@ fragment float4 main_() { return float4(1); }
     std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::ShaderBase> fragment;
     std::unique_ptr<hydra::hw::tegra_x1::gpu::renderer::PipelineBase> pipeline;
 };
+
+void testDrawStateSnapshots() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    std::vector<u8> baseline;
+    for (const bool snapshot : {false, true}) {
+        OcclusionRig rig(32);
+        auto& renderer = rig.renderer;
+        auto* commands = static_cast<metal::CommandBuffer*>(rig.commands.get());
+        renderer.setClearState({.rect = rig.full});
+        renderer.clearColor(commands, 0, 0, 0xf, simd::uint4{});
+        DrawState state{};
+        state.depth_test_enabled = true;
+        state.depth_compare_op = engines::CompareOp::Less;
+        state.viewports.fill({0, 0, 4, 4, 0, 1});
+        state.scissors.fill(rig.full);
+        const auto apply = [&](const DrawState& value) {
+            if (snapshot) {
+                applyDrawState(renderer, value);
+            } else {
+                // The setters used by drawInternal before the snapshot split.
+                renderer.setDepthTestEnabled(value.depth_test_enabled);
+                renderer.setDepthWriteEnabled(value.depth_write_enabled);
+                renderer.setDepthCompareOp(value.depth_compare_op);
+                renderer.setBlendConstant(value.blend_constant);
+                renderer.setStencilState(value.stencil);
+                renderer.setCullState(value.cull_enabled, value.cull_mode,
+                                      value.front_face);
+                renderer.setDepthBias(value.depth_bias_constant,
+                                      value.depth_bias_slope, value.depth_bias_clamp);
+                renderer.setDepthClamp(value.depth_clamp);
+                for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+                    renderer.setViewport(i, value.viewports[i]);
+                    renderer.setScissor(i, value.scissors[i]);
+                }
+            }
+        };
+        const auto draw = [&] {
+            renderer.draw(commands, engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+        };
+        apply(state);
+        draw(); // Rejected by the depth buffer (0.5 >= 0.25).
+        state.depth_test_enabled = false;
+        state.scissors.fill({0, 0, 2, 2});
+        const auto saved = state;
+        apply(saved);
+        draw();
+        state.depth_test_enabled = true;
+        state.scissors.fill(rig.full);
+        apply(state);
+        commands->getBlitCommandEncoder();
+        apply(saved); // Restore by value after mutation and encoder replacement.
+        draw();
+        state = saved;
+        state.viewports.fill({2, 2, 2, 2, 0, 1});
+        state.scissors.fill(rig.full);
+        apply(state);
+        draw();
+        expect(renderer.synchronize(commands), "Complete snapshot raster draws");
+        auto* color = static_cast<metal::TextureView*>(
+            rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+        const auto pixels = readTexture(renderer.getDevice(), color, 4);
+        for (usize y = 0; y < 4; y++) {
+            for (usize x = 0; x < 4; x++) {
+                const u8 expected = ((x < 2 && y < 2) || (x >= 2 && y >= 2))
+                    ? 255 : 0;
+                for (usize component = 0; component < 4; component++)
+                    expect(pixels[(y * 4 + x) * 4 + component] == expected,
+                           "Snapshot depth, scissor and viewport produce expected pixels");
+            }
+        }
+        if (!snapshot)
+            baseline = pixels;
+        else
+            expect(pixels == baseline, "Snapshot and legacy raster paths match byte for byte");
+    }
+    std::cout << "PASS: draw-state snapshots match legacy pixels after mutation and encoder replacement\n";
+}
+
+void testDrawCommands() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using command_ir::DrawCommand;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    // Empty commands do not touch the renderer or require resources.
+    {
+        metal::Renderer renderer;
+        command_ir::executeDraw(renderer, nullptr, {});
+    }
+    std::vector<u8> baseline;
+    for (const auto index_type : {engines::IndexType::None,
+                                 engines::IndexType::UInt16,
+                                 engines::IndexType::UInt32}) {
+        for (const bool recorded_path : {false, true}) {
+            OcclusionRig rig(32);
+            auto& renderer = rig.renderer;
+            auto* commands = static_cast<metal::CommandBuffer*>(rig.commands.get());
+            auto make_shader = [&](ShaderType type, const char* source) {
+                ShaderDescriptor descriptor{};
+                descriptor.type = type;
+                descriptor.backend = ShaderBackend::Msl;
+                descriptor.code.assign(source, source + std::strlen(source));
+                if (type == ShaderType::Fragment) {
+                    descriptor.resource_mapping.uniform_buffers[1] = 1;
+                    descriptor.resource_mapping.storage_buffers.push_back({0, 0, 2, true});
+                    descriptor.resource_mapping.textures.emplace(0, 0);
+                }
+                return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+            };
+            auto vertex = make_shader(ShaderType::Vertex, R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Out { float4 position [[position]]; uint instance [[flat]]; };
+vertex Out main_(uint id [[vertex_id]], uint instance [[instance_id]],
+                 device const float4* positions [[buffer(30)]]) {
+    float4 p = positions[id];
+    p.x = p.x * 0.5f + (instance == 7 ? -0.5f : 0.5f);
+    return {p, instance};
+}
+)");
+            auto fragment = make_shader(ShaderType::Fragment, R"(
+#include <metal_stdlib>
+using namespace metal;
+struct In { float4 position [[position]]; uint instance [[flat]]; };
+fragment float4 main_(In in [[stage_in]], constant float4* palette [[buffer(1)]],
+                     device atomic_uint* samples [[buffer(2)]],
+                     texture2d<float> image [[texture(0)]], sampler s [[sampler(0)]]) {
+    atomic_fetch_add_explicit(samples, 1u, memory_order_relaxed);
+    return palette[in.instance == 7 ? 0 : 1] * image.sample(s, float2(0.5f));
+}
+)");
+            auto pipeline_descriptor = rig.pipeline->getDescriptor();
+            pipeline_descriptor.shaders[0] = vertex.get();
+            pipeline_descriptor.shaders[1] = fragment.get();
+            std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+            const auto buffer = [&](const void* data, u64 size) {
+                auto* native = renderer.getDevice()->newBuffer(
+                    data, size, MTL::ResourceStorageModeShared);
+                expect(native != nullptr, "Create shared command test buffer");
+                return std::shared_ptr<BufferBase>(new metal::Buffer(native));
+            };
+            // One float4 of padding is outside the view. Vertex IDs 3..6
+            // select the rectangle; the earlier entries deliberately collapse.
+            const std::array<simd::float4, 8> positions{{{}, {}, {}, {},
+                {-1, -1, 0.5f, 1}, {1, -1, 0.5f, 1},
+                {-1, 1, 0.5f, 1}, {1, 1, 0.5f, 1}}};
+            const std::array<simd::float4, 3> colors{{{}, {1, 0, 0, 1}, {0, 1, 0, 1}}};
+            const std::array<u32, 4> zeros{};
+            auto vertices = buffer(positions.data(), sizeof(positions));
+            auto palette = buffer(colors.data(), sizeof(colors));
+            auto samples = buffer(zeros.data(), sizeof(zeros));
+            const std::weak_ptr<BufferBase> vertex_lifetime = vertices;
+            const std::weak_ptr<BufferBase> palette_lifetime = palette;
+            const std::weak_ptr<BufferBase> storage_lifetime = samples;
+            const auto samples_ptr = samples->getPtr();
+            std::array<u8, 4> white{255, 255, 255, 255};
+            auto* image = renderer.getTextureCache().find(commands,
+                TextureDescriptor(reinterpret_cast<uptr>(white.data()),
+                    MTL::TextureType2D, TextureFormat::RGBA8Unorm, true, 4,
+                    1, 1, 1, 1, 1, 0, 0, 0), TextureUsage::Read);
+            SamplerDescriptor sampler_descriptor{};
+            sampler_descriptor.depth_compare_op = engines::CompareOp::Always;
+            std::unique_ptr<SamplerBase> sampler(renderer.createSampler(sampler_descriptor));
+            DrawCommand command;
+            command.pipeline = pipeline.get();
+            command.render_pass = rig.pass.get();
+            command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+            command.state.scissors.fill(rig.full);
+            command.vertices[0] = BufferView(vertices, sizeof(simd::float4));
+            command.stages[0].active = true;
+            command.stages[1].active = true;
+            command.stages[1].reset_textures = true;
+            command.stages[1].uniforms.push_back({1, BufferView(palette, sizeof(simd::float4))});
+            command.stages[1].storage.push_back({2, BufferView(samples)});
+            command.stages[1].textures.push_back({0, image, sampler.get()});
+            command.storage_writes.push_back(ztd::Range<uptr>::fromSize(samples_ptr, sizeof(u32)));
+            command.count = 4;
+            command.primitive = engines::PrimitiveType::TriangleStrip;
+            command.first = 3;
+            command.base_instance = 7;
+            command.instance_count = 2;
+            command.index_type = index_type;
+            if (index_type != engines::IndexType::None) {
+                std::shared_ptr<BufferBase> indices;
+                if (index_type == engines::IndexType::UInt16) {
+                    const std::array<u16, 7> values{99, 99, 88, 0, 1, 2, 3};
+                    indices = buffer(values.data(), sizeof(values));
+                } else {
+                    const std::array<u32, 7> values{99, 99, 88, 0, 1, 2, 3};
+                    indices = buffer(values.data(), sizeof(values));
+                }
+                command.indices = BufferView(indices, 2 * engines::getIndexTypeSize(index_type));
+                command.first = 1;
+                command.base_vertex = 3;
+            }
+            expect(command_ir::sealDrawResources(renderer, command),
+                   "Seal live draw resources before recording");
+            const auto recorded = command;
+            command = {};
+            vertices.reset();
+            palette.reset();
+            samples.reset();
+            expect(!vertex_lifetime.expired() && !palette_lifetime.expired() &&
+                       !storage_lifetime.expired(),
+                   "Recorded commands retain owned buffer views after caller release");
+            renderer.setClearState({.rect = rig.full});
+            renderer.clearColor(commands, 0, 0, 0xf, simd::uint4{});
+            const auto checkpoints = metal::CommandBuffer::getCheckpointCount();
+            const auto epoch = renderer.getTextureCache().getEpoch();
+            if (recorded_path) {
+                expect(command_ir::executeDraw(renderer, commands, recorded),
+                       "Encode a validated recorded command");
+            } else {
+                renderer.bindRenderPass(recorded.render_pass);
+                renderer.bindPipeline(recorded.pipeline);
+                applyDrawState(renderer, recorded.state);
+                renderer.bindVertexBuffer(recorded.vertices[0], 0);
+                renderer.unbindUniformBuffers(ShaderType::Fragment);
+                renderer.bindUniformBuffer(recorded.stages[1].uniforms[0].buffer, ShaderType::Fragment, 1);
+                renderer.unbindStorageBuffers(ShaderType::Fragment);
+                renderer.bindStorageBuffer(recorded.stages[1].storage[0].buffer, ShaderType::Fragment, 2);
+                renderer.unbindTextures(ShaderType::Fragment);
+                renderer.bindTexture(image, sampler.get(), ShaderType::Fragment, 0);
+                if (index_type == engines::IndexType::None) {
+                    renderer.draw(commands, recorded.primitive, 3, 4, 7, 2);
+                } else {
+                    renderer.bindIndexBuffer(recorded.indices, index_type);
+                    renderer.drawIndexed(commands, recorded.primitive, 1, 4, 3, 7, 2);
+                }
+                renderer.getTextureCache().synchronizeStorageWrites(commands, recorded.storage_writes);
+            }
+            expect(metal::CommandBuffer::getCheckpointCount() > checkpoints &&
+                       renderer.getTextureCache().getEpoch() > epoch,
+                   "Draw command completes storage writes and invalidates aliases");
+            u32 count = 0;
+            std::memcpy(&count, reinterpret_cast<const void*>(samples_ptr), sizeof(count));
+            expect(count == 16, "Draw command runs exactly two instances and publishes storage writes");
+            auto* color = static_cast<metal::TextureView*>(
+                rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+            const auto pixels = readTexture(renderer.getDevice(), color, 4);
+            for (usize y = 0; y < 4; y++) {
+                for (usize x = 0; x < 4; x++) {
+                    const usize offset = (y * 4 + x) * 4;
+                    expect(pixels[offset] == (x < 2 ? 255 : 0) &&
+                               pixels[offset + 1] == (x < 2 ? 0 : 255) &&
+                               pixels[offset + 2] == 0 && pixels[offset + 3] == 255,
+                           "Draw command restores vertex/uniform/storage/texture bindings and draw parameters");
+                }
+            }
+            if (!recorded_path)
+                baseline = pixels;
+            else
+                expect(pixels == baseline, "Direct and indexed command output matches legacy byte for byte");
+        }
+    }
+    std::cout << "PASS: direct/U16/U32 draw commands preserve bindings, offsets, instances, ownership and storage completion\n";
+}
+
+void testRenderTargetMappingMemo() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    std::array<u8, 64> old_data{}, new_data{};
+    constexpr u64 address = 0x500000;
+    rig.gmmu.map(address, {reinterpret_cast<uptr>(old_data.data()), old_data.size()});
+    engines::ThreeDTestAccess::colorTarget(rig.engine, address);
+    std::vector<resource::MappingDependency> first, cached, remapped;
+    RenderPassBase* first_pass;
+    {
+        resource::MappingCaptureScope capture(&rig.gmmu, first);
+        first_pass = engines::ThreeDTestAccess::targets(rig.engine);
+    }
+    expect(!first.empty(), "Render target lookup records its backing mapping");
+    {
+        resource::MappingCaptureScope capture(&rig.gmmu, cached);
+        expect(engines::ThreeDTestAccess::targets(rig.engine) == first_pass,
+               "Unchanged render targets reuse the pass");
+    }
+    expect(!cached.empty() && cached[0].ptr == reinterpret_cast<uptr>(old_data.data()),
+           "Memo hits carry mapping dependencies into the next command");
+    rig.gmmu.map(address, {reinterpret_cast<uptr>(new_data.data()), new_data.size()});
+    {
+        resource::MappingCaptureScope capture(&rig.gmmu, remapped);
+        auto* next = engines::ThreeDTestAccess::targets(rig.engine);
+        expect(next != first_pass &&
+                   next->getDescriptor().color_targets[0].texture->getBase()->getDescriptor().ptr ==
+                       reinterpret_cast<uptr>(new_data.data()),
+               "A new GMMU generation resolves render targets against new backing");
+    }
+    expect(!resource::validateMappings(rig.gmmu, cached) &&
+               resource::validateMappings(rig.gmmu, remapped),
+           "Cached and newly resolved target mappings keep separate versions");
+    {
+        alignas(GMmu) std::array<std::byte, sizeof(GMmu)> storage;
+        const auto destroy = [](GMmu* mmu) { std::destroy_at(mmu); };
+        std::unique_ptr<GMmu, decltype(destroy)> reused(
+            std::construct_at(reinterpret_cast<GMmu*>(storage.data()), nullptr), destroy);
+        struct RestoreContext {
+            GMmu* previous;
+            ~RestoreContext() { tls_crnt_gmmu = previous; }
+        } restore{tls_crnt_gmmu};
+        tls_crnt_gmmu = reused.get();
+        reused->map(address, {reinterpret_cast<uptr>(old_data.data()), old_data.size()});
+        const auto generation = reused->getMappingGeneration();
+        auto* before = engines::ThreeDTestAccess::targets(rig.engine);
+        reused.reset();
+        reused.reset(std::construct_at(reinterpret_cast<GMmu*>(storage.data()), nullptr));
+        reused->map(address, {reinterpret_cast<uptr>(new_data.data()), new_data.size()});
+        expect(reused->getMappingGeneration() == generation,
+               "Reused GMMU address starts with the same numeric mapping generation");
+        auto* after = engines::ThreeDTestAccess::targets(rig.engine);
+        expect(after != before &&
+                   after->getDescriptor().color_targets[0].texture->getBase()->getDescriptor().ptr ==
+                       reinterpret_cast<uptr>(new_data.data()),
+               "Registry identity prevents memo revival when a GMMU address is reused");
+    }
+    std::cout << "PASS: render target memo preserves dependencies and follows GMMU remaps\n";
+}
+
+void testDrawResourceLeases() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    command_ir::DrawCommand command;
+    std::vector<std::weak_ptr<void>> lifetimes;
+    const auto expired = [&] {
+        return std::all_of(lifetimes.begin(), lifetimes.end(),
+                           [](const auto& owner) { return owner.expired(); });
+    };
+    {
+        PipelineCache pipelines(rig.renderer);
+        RenderPassCache passes(rig.renderer);
+        SamplerCache samplers(rig.renderer);
+        TextureCache textures(rig.renderer);
+        auto* vertex = rig.renderer.createShader(rig.vertex->getDescriptor());
+        auto vertex_owner = vertex->createResourceOwner();
+        auto* fragment = rig.renderer.createShader(rig.fragment->getDescriptor());
+        auto fragment_owner = fragment->createResourceOwner();
+        auto pipeline_descriptor = rig.pipeline->getDescriptor();
+        pipeline_descriptor.shaders[0] = vertex;
+        pipeline_descriptor.shaders[1] = fragment;
+        command.pipeline = pipelines.find(pipeline_descriptor);
+        auto pass_descriptor = rig.pass->getDescriptor();
+        pass_descriptor.color_targets[0].texture = textures.find(
+            rig.commands.get(), pass_descriptor.color_targets[0].texture->getBase()->getDescriptor(),
+            TextureUsage::Write);
+        pass_descriptor.depth_stencil_target.texture = textures.find(
+            rig.commands.get(), pass_descriptor.depth_stencil_target.texture->getBase()->getDescriptor(),
+            TextureUsage::Write);
+        command.render_pass = passes.find(pass_descriptor);
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        SamplerDescriptor descriptor{};
+        descriptor.depth_compare_op = engines::CompareOp::Always;
+        auto* sampler = samplers.find(descriptor);
+        rig.renderer.bindTexture(pass_descriptor.color_targets[0].texture, sampler,
+                                 ShaderType::Fragment, 7);
+        command.stages[1] = engines::ThreeDTestAccess::fragmentBindings(
+            rig.engine, rig.fragment.get());
+        expect(command.stages[1].reset_textures &&
+                   command.stages[1].textures.size() == 1 &&
+                   command.stages[1].textures[0].index == 7,
+               "Absent descriptor pools snapshot inherited texture slots");
+        expect(command_ir::sealDrawResources(rig.renderer, command),
+               "Cached resources seal with ownership leases");
+        for (const auto& owner : command.resource_owners)
+            lifetimes.push_back(owner);
+        expect(lifetimes.size() == 9, "Leases include shaders, pass, pipeline, sampler and both texture/view pairs");
+    }
+    expect(!expired() &&
+               command_ir::validateDrawResources(rig.renderer, command),
+           "Command leases survive cache teardown");
+    expect(command_ir::sealDrawResources(rig.renderer, command),
+           "Resealing preserves the previous owners while rebuilding leases");
+    rig.renderer.unbindTextures(ShaderType::Fragment);
+    auto copied = command;
+    command = {};
+    expect(command_ir::executeDraw(rig.renderer, rig.commands.get(), copied),
+           "Copied command restores its explicit inherited slots");
+    expect(rig.renderer.getTextureBindings(ShaderType::Fragment).size() == 1,
+           "Execution restores inherited binding after renderer mutation");
+    rig.renderer.unbindTextures(ShaderType::Fragment);
+    rig.renderer.bindRenderPass(rig.pass.get());
+    rig.renderer.bindPipeline(rig.pipeline.get());
+    copied = {};
+    expect(!expired(),
+           "Command buffer keeps leases after packet destruction");
+    rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!expired() &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    expect(expired(),
+           "GPU completion retires wrapper ownership");
+    rig.renderer.unbindTextures(ShaderType::Fragment);
+    std::cout << "PASS: Draw ownership survives caches and packets until GPU completion; inherited bindings are explicit\n";
+}
+
+void testDrawResourceValidation() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    for (u32 variant = 0; variant < 6; variant++) {
+        OcclusionRig rig(32);
+        command_ir::DrawCommand command;
+        command.pipeline = rig.pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        command.stages[1].active = true;
+        std::shared_ptr<BufferBase> borrowed_buffer(new metal::Buffer(
+            rig.renderer.getDevice()->newBuffer(16, MTL::ResourceStorageModeShared)));
+        command.vertices[0] = BufferView(borrowed_buffer.get());
+        SamplerDescriptor sampler_descriptor{};
+        sampler_descriptor.depth_compare_op = engines::CompareOp::Always;
+        std::unique_ptr<SamplerBase> sampler(rig.renderer.createSampler(sampler_descriptor));
+        std::unique_ptr<ITexture> texture(rig.renderer.createTexture(TextureDescriptor(
+            0, MTL::TextureType2D, TextureFormat::RGBA8Unorm, false, 0,
+            1, 1, 1, 1, 1, 0, 0, 0)));
+        std::unique_ptr<ITextureView> view(texture->createView(TextureViewDescriptor(
+            MTL::TextureType2D, TextureFormat::RGBA8Unorm, {0, 1}, {0, 1})));
+        command.stages[1].textures.push_back({0, view.get(), sampler.get()});
+        expect(!command_ir::validateDrawResources(rig.renderer, command),
+               "Unsealed draws are rejected");
+        expect(command_ir::sealDrawResources(rig.renderer, command), "Seal live resource graph");
+        if (variant == 0)
+            rig.pipeline.reset();
+        else if (variant == 1)
+            rig.pass.reset();
+        else if (variant == 2)
+            rig.fragment.reset();
+        else if (variant == 3)
+            borrowed_buffer.reset();
+        else if (variant == 4)
+            sampler.reset();
+        else
+            texture.reset(); // View is still alive; its parent is gone.
+        expect(!command_ir::validateDrawResources(rig.renderer, command) &&
+                   !command_ir::executeDraw(rig.renderer, rig.commands.get(), command),
+               "Stale pipeline/pass/shader/buffer/sampler/texture is rejected before binding");
+    }
+    {
+        OcclusionRig rig(32);
+        command_ir::DrawCommand command;
+        command.pipeline = rig.pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        expect(command_ir::sealDrawResources(rig.renderer, command), "Seal original generation");
+        const auto previous = command;
+        rig.pipeline->getResourceLifetime().invalidate();
+        expect(!command_ir::validateDrawResources(rig.renderer, previous),
+               "A changed resource generation rejects the old command");
+        expect(command_ir::sealDrawResources(rig.renderer, command), "Reseal current generation");
+        expect(command_ir::validateDrawResources(rig.renderer, command) &&
+                   !command_ir::validateDrawResources(rig.renderer, previous),
+               "Resealing does not revive an old copied command");
+        std::unique_ptr<PipelineBase> replacement(rig.renderer.createPipeline(
+            rig.pipeline->getDescriptor()));
+        command.pipeline = replacement.get();
+        expect(!command_ir::validateDrawResources(rig.renderer, command),
+               "Changing a command pointer requires resealing");
+    }
+    {
+        OcclusionRig rig(32);
+        auto address_space = std::make_unique<GMmu>(nullptr);
+        std::array<u32, 4> old_data{}, new_data{};
+        address_space->map(0x1000, {reinterpret_cast<uptr>(old_data.data()), sizeof(old_data)});
+        command_ir::DrawCommand command;
+        command.pipeline = rig.pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command_ir::captureDrawAddressSpace(rig.renderer, command, address_space.get());
+        {
+            resource::MappingCaptureScope capture(address_space.get(), command.mapping_dependencies);
+            expect(address_space->unmapAddr(0x1000) == reinterpret_cast<uptr>(old_data.data()),
+                   "Capture actual GMMU lookup dependencies");
+        }
+        expect(command.mapping_dependencies.size() == 1 &&
+                   command_ir::sealDrawResources(rig.renderer, command),
+               "Seal a command with its mapping dependencies");
+        address_space->map(0x2000, {reinterpret_cast<uptr>(new_data.data()), sizeof(new_data)});
+        expect(command_ir::validateDrawResources(rig.renderer, command),
+               "An unrelated mapping update does not invalidate the draw");
+        address_space->map(0x1000, {reinterpret_cast<uptr>(new_data.data()), sizeof(new_data)});
+        expect(!command_ir::validateDrawResources(rig.renderer, command),
+               "Remapping a consumed mapping rejects the old draw");
+        {
+            PfifoDecodeState state;
+            bool notified = false;
+            state.on_fault = [&] { notified = true; };
+            struct RestoreDecode {
+                PfifoDecodeState* previous;
+                ~RestoreDecode() { tls_crnt_decode_state = previous; }
+            } restore{tls_crnt_decode_state};
+            tls_crnt_decode_state = &state;
+            engines::ThreeDTestAccess::execute(rig.engine, command);
+            expect(state.failed && state.error == 25 && notified,
+                   "A rejected draw faults its channel instead of reporting success");
+        }
+        address_space.reset();
+        expect(!command_ir::executeDraw(rig.renderer, rig.commands.get(), command),
+               "Retired GMMU is rejected without dereferencing its old address");
+    }
+    std::cout << "PASS: command registry rejects retired resources and used mappings before encoding\n";
+}
 
 void testOcclusionReports() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
@@ -1182,6 +1756,37 @@ void testOcclusionReports() {
 
 // The completion queue runs work in the order it was pushed, each piece once
 // its command buffer completed, whatever the order in which those complete
+void testManagedMetalSubmissions() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    auto* device = MTL::CreateSystemDefaultDevice();
+    auto* native_queue = device->newCommandQueue();
+    auto completions = std::make_shared<metal::CompletionQueue>();
+    std::weak_ptr<int> lifetime;
+    {
+        metal::CommandBuffer commands(native_queue, completions);
+        auto owned = std::make_shared<int>(7);
+        lifetime = owned;
+        commands.retainResource(owned);
+        owned.reset();
+        commands.getCompletionToken();
+        commands.debugCommitAndWait();
+        commands.getCompletionToken();
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completions->submissions.stats().pending &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const auto stats = completions->submissions.stats();
+    expect(stats.admitted == 2 && stats.succeeded == 2 && stats.pending == 0,
+           "Checkpoints and destructor commits both pass through admission and retirement");
+    expect(lifetime.expired(), "GPU completion releases retained resources");
+    completions.reset();
+    native_queue->release();
+    device->release();
+    std::cout << "PASS: managed Metal checkpoint and async submission lifecycle\n";
+}
+
 void testCompletionQueueOrder() {
     using namespace hydra::hw::tegra_x1::gpu::renderer::metal;
     std::mutex mutex;
@@ -3293,8 +3898,14 @@ int main(int argc, char** argv) {
         testRendererClears();
         testGuestMemoryBuffer();
         testConstBufferRemapping();
+        testDrawStateSnapshots();
+        testDrawCommands();
+        testDrawResourceValidation();
+        testDrawResourceLeases();
+        testRenderTargetMappingMemo();
         testOcclusionReports();
         testCompletionQueueOrder();
+        testManagedMetalSubmissions();
         testReportCallbackOrdering();
         testReportsLandBeforeLaterWrites();
         testSignalsFollowQueuedReports();

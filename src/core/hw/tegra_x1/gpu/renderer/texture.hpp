@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
+
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -8,7 +10,7 @@ class ICommandBuffer;
 class BufferBase;
 class ITextureView;
 
-class ITexture {
+class ITexture : public resource::TrackedResource {
   public:
     explicit ITexture(const TextureDescriptor& descriptor_)
         : descriptor{descriptor_} {}

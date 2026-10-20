@@ -601,6 +601,13 @@ void System::progressFrame(u32 width, u32 height,
                 stats.upload_buffers_created.exchange(0);
             const auto buffers_reused = stats.upload_buffers_reused.exchange(0);
             const auto draw_state_ms = per_frame_ms(stats.draw_state_ns);
+            const auto draw_prepare_ms = per_frame_ms(stats.draw_prepare_ns);
+            const auto draw_command_ms = per_frame_ms(stats.draw_command_ns);
+            const auto draw_pipeline_ms = per_frame_ms(stats.draw_pipeline_ns);
+            const auto draw_targets_ms = per_frame_ms(stats.draw_targets_ns);
+            const auto draw_snapshot_ms = per_frame_ms(stats.draw_snapshot_ns);
+            const auto draw_apply_ms = per_frame_ms(stats.draw_apply_ns);
+            const auto draw_resources_ms = per_frame_ms(stats.draw_resources_ns);
             const auto shader_ns = stats.shader_compile_ns.exchange(0);
             const auto shaders = stats.shader_compiles.exchange(0);
             const auto pipeline_ns = stats.pipeline_compile_ns.exchange(0);
@@ -613,6 +620,16 @@ void System::progressFrame(u32 width, u32 height,
                 stats.raster_skips.exchange(0), shaders,
                 static_cast<f64>(shader_ns) / 1e6, pipelines,
                 static_cast<f64>(pipeline_ns) / 1e6);
+            LOG_INFO(Other,
+                     "DRAW PREP: {:.2f} ms/frame total | pipeline {:.2f}, "
+                     "targets/coherence {:.2f}, raster snapshot {:.2f}, "
+                     "vertex/stage resources {:.2f} (subsets of prepare)",
+                     draw_prepare_ms, draw_pipeline_ms, draw_targets_ms,
+                     draw_snapshot_ms, draw_resources_ms);
+            LOG_INFO(Other,
+                     "DRAW COMMAND: {:.2f} ms/frame encode/storage completion | "
+                     "raster apply {:.2f} (subset of command)",
+                     draw_command_ms, draw_apply_ms);
             LOG_INFO(Other,
                      "UPLOAD: {:.2f} ms/frame | {:.1f} MiB/s | buffers {} new, "
                      "{} reused",

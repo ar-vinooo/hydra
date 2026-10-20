@@ -2,9 +2,11 @@
 
 #include "core/hw/tegra_x1/gpu/const.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/execution/work_manager.hpp"
 #include <atomic>
 #include <deque>
 #include <set>
+#include <unordered_map>
 
 namespace hydra::hw::tegra_x1::cpu {
 class IMmu;
@@ -70,6 +72,21 @@ struct GpfifoEntryList {
     std::shared_ptr<PfifoDecodeState> decode_state;
     usize entry_index{0};
     u64 word_offset{0};
+    std::shared_ptr<execution::WorkTicket> work;
+};
+
+class Pfifo;
+class PfifoAdmission {
+    friend class Pfifo;
+  public:
+    PfifoAdmission() = default;
+    PfifoAdmission(PfifoAdmission&&) = default;
+    PfifoAdmission& operator=(PfifoAdmission&&) = default;
+    explicit operator bool() const { return work != nullptr; }
+  private:
+    Pfifo* owner{nullptr};
+    usize bytes{0};
+    std::shared_ptr<execution::WorkTicket> work;
 };
 
 class Pfifo {
@@ -80,14 +97,17 @@ class Pfifo {
     void cancel(GMmu& gmmu);
     bool isStopping() const { return stop.load(std::memory_order_relaxed); }
 
+    PfifoAdmission reserveEntries(usize count);
     bool submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                        GpfifoFlags flags,
                        std::function<void()> on_complete = {},
                        Fence wait_fence = {},
-                       std::shared_ptr<PfifoDecodeState> decode_state = {});
+                       std::shared_ptr<PfifoDecodeState> decode_state = {},
+                       PfifoAdmission admission = {});
 
     // Number of entry lists submitted so far
     u64 getSubmittedCount();
+    execution::WorkStats getWorkStats() const { return dispatches.stats(); }
     // Waits till the first `count` entry lists have been executed
     bool waitForCompletion(u64 count);
 
@@ -98,7 +118,10 @@ class Pfifo {
     std::mutex mutex;
     std::condition_variable cond_var;
 
+    execution::WorkManager dispatches{{4096, 64 * 1024 * 1024}};
     std::deque<GpfifoEntryList> entry_lists;
+    std::unordered_map<GMmu*, std::vector<std::weak_ptr<execution::WorkTicket>>>
+        outstanding;
     std::atomic<bool> stop{false};
     GMmu* active_gmmu{nullptr};
 

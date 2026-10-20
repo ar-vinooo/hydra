@@ -276,6 +276,7 @@ if (HYDRA_HOT_RELOAD)
     # Same flags as hydra-core (class layouts must match), but not linked
     file(GLOB_RECURSE HYDRA_HOT_GPU_SOURCES CONFIGURE_DEPENDS
         "${CMAKE_SOURCE_DIR}/src/core/hw/tegra_x1/gpu/engines/*.cpp"
+        "${CMAKE_SOURCE_DIR}/src/core/hw/tegra_x1/gpu/command_ir/*.cpp"
         "${CMAKE_SOURCE_DIR}/src/core/hw/tegra_x1/gpu/renderer/*.cpp")
     # Process-wide globals, platform implementation singletons and the null
     # backend remain owned by the executable. Never duplicate their state.
@@ -415,6 +416,13 @@ if (HYDRA_METAL_CACHE_TESTS)
         target_include_directories(hydra-${SUITE}-tests PRIVATE src src/ztd/src)
         target_link_libraries(hydra-${SUITE}-tests PRIVATE hydra-core hydra-common hydra_compile_options)
     endforeach ()
+    add_executable(hydra-work-manager-tests tests/work_manager_tests.cpp
+        src/core/execution/work_manager.cpp)
+    target_include_directories(hydra-work-manager-tests PRIVATE src)
+    target_link_libraries(hydra-work-manager-tests PRIVATE hydra_compile_options)
+    add_executable(hydra-resource-registry-tests tests/resource_registry_tests.cpp)
+    target_include_directories(hydra-resource-registry-tests PRIVATE src src/ztd/src)
+    target_link_libraries(hydra-resource-registry-tests PRIVATE hydra-core hydra-common hydra_compile_options)
     add_executable(hydra-gpu-engine-tests tests/gpu_engine_tests.cpp tests/blit_2d_tests.cpp)
     target_include_directories(hydra-gpu-engine-tests PRIVATE src src/ztd/src)
     target_link_libraries(hydra-gpu-engine-tests PRIVATE hydra-core hydra-common hydra_compile_options)

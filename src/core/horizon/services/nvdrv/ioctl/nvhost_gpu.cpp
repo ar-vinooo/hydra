@@ -243,6 +243,9 @@ NvResult NvHostGpu::submitGpfifo(
     const bool get_fence = any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceGet);
     if (reserve_guest_increments && any(flags & hw::tegra_x1::gpu::GpfifoFlags::FenceWait))
         return NvResult::BadParameter;
+    auto admission = gpu.getPfifo().reserveEntries(num_entries);
+    if (!admission)
+        return NvResult::InsufficientMemory;
     hw::tegra_x1::gpu::Fence fence{};
     std::function<void()> on_complete;
     if (get_fence || reserve_guest_increments) {
@@ -259,7 +262,7 @@ NvResult NvHostGpu::submitGpfifo(
     if (!gpu.getPfifo().submitEntries(
         *space,
         std::span<const hw::tegra_x1::gpu::GpfifoEntry>(entries, num_entries),
-        flags, std::move(on_complete), wait_fence, decode_state))
+        flags, std::move(on_complete), wait_fence, decode_state, std::move(admission)))
         return NvResult::InvalidState;
 
     // No error is reported

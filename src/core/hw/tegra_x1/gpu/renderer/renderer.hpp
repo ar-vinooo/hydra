@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/resource_registry.hpp"
+
 #include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
@@ -9,6 +11,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/sampler_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
+
+#include "core/hw/tegra_x1/gpu/renderer/texture_binding.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -278,6 +282,8 @@ class IRenderer {
                                    ShaderType shader_type, u32 index) = 0;
     virtual void bindTexture(ITextureView* texture, SamplerBase* sampler,
                              ShaderType shader_type, u32 index) = 0;
+    virtual std::vector<TextureBinding> getTextureBindings(
+        [[maybe_unused]] ShaderType shader_type) const { return {}; }
     // TODO: images
 
     // Resource unbinding
@@ -363,6 +369,7 @@ class IRenderer {
     std::atomic<bool> has_queued_invalidations{false};
 
     // Caches
+    resource::ResourceRegistry resource_registry;
     BufferCache buffer_cache;
     TextureCache texture_cache;
     SamplerCache sampler_cache;
@@ -404,6 +411,7 @@ class IRenderer {
 
   public:
     CONST_REF_GETTER(info, getInfo);
+    REF_GETTER(resource_registry, getResourceRegistry);
     REF_GETTER(buffer_cache, getBufferCache);
     REF_GETTER(texture_cache, getTextureCache);
     REF_GETTER(sampler_cache, getSamplerCache);

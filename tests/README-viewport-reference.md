@@ -5,6 +5,9 @@ swizzle, window origin, Z clip range, surface clip and scissor registers to
 Hydra's 3D engine; `ThreeD::getViewport` and `ThreeD::getScissor` build the Metal
 state, which `hydra-viewport-reference-tests` prints. A friend struct
 (`ThreeDTestAccess`) gives the test access to these private functions.
+The runner now emits viewport/scissor values from `prepareDrawState()` and
+checks all 16 snapshot entries against the direct helpers before comparison
+with the Python model. The independent model still exercises viewport 0 only.
 
 ```sh
 ninja -C build/swiftui-release -j 6 hydra-viewport-reference-tests

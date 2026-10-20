@@ -191,8 +191,15 @@ void Pfifo::cancel(GMmu& gmmu) {
     gmmu.cancelGpuWork();
     {
         std::unique_lock lock(mutex);
+        if (auto found = outstanding.find(&gmmu); found != outstanding.end()) {
+            for (const auto& weak : found->second)
+                if (auto work = weak.lock())
+                    work->cancel();
+            outstanding.erase(found);
+        }
         for (auto it = entry_lists.begin(); it != entry_lists.end();) {
             if (it->gmmu == &gmmu) {
+                it->work->cancel();
                 retired_submissions.insert(it->correlation_id);
                 it = entry_lists.erase(it);
             } else {
@@ -219,6 +226,12 @@ void Pfifo::shutdown() {
     {
         std::scoped_lock lock(mutex);
         stop = true;
+        dispatches.stop();
+        for (const auto& [space, tickets] : outstanding)
+            for (const auto& weak : tickets)
+                if (auto work = weak.lock())
+                    work->cancel();
+        outstanding.clear();
     }
     cond_var.notify_all();
     completed_cond_var.notify_all();
@@ -228,21 +241,48 @@ void Pfifo::shutdown() {
     entry_lists.clear();
 }
 
+PfifoAdmission Pfifo::reserveEntries(usize count) {
+    PfifoAdmission admission;
+    if (count > (64 * 1024 * 1024) / sizeof(GpfifoEntry))
+        return admission;
+    admission.owner = this;
+    admission.bytes = count * sizeof(GpfifoEntry);
+    admission.work = dispatches.tryAdmit(admission.bytes);
+    return admission;
+}
+
 bool Pfifo::submitEntries(GMmu& gmmu, std::span<const GpfifoEntry> entries,
                           GpfifoFlags flags,
                           std::function<void()> on_complete,
                           Fence wait_fence,
-                          std::shared_ptr<PfifoDecodeState> decode_state) {
+                          std::shared_ptr<PfifoDecodeState> decode_state,
+                          PfifoAdmission admission) {
     LOG_DEBUG(Gpu, "Flags: {}", flags);
 
     {
         std::scoped_lock lock(mutex);
         if (stop || gmmu.gpuWorkCancelled())
             return false;
+        if (!admission)
+            admission = reserveEntries(entries.size());
+        if (!admission || admission.owner != this ||
+            admission.bytes != entries.size_bytes() ||
+            admission.work->status() != execution::WorkStatus::Queued)
+            return false;
+        auto& tickets = outstanding[&gmmu];
+        std::erase_if(tickets, [](const auto& weak) {
+            const auto work = weak.lock();
+            if (!work)
+                return true;
+            const auto status = work->status();
+            return status != execution::WorkStatus::Queued &&
+                   status != execution::WorkStatus::Running;
+        });
+        tickets.push_back(admission.work);
         entry_lists.emplace_back(
             &gmmu, std::vector<GpfifoEntry>(entries.begin(), entries.end()),
             flags, submitted_count + 1, std::move(on_complete), wait_fence,
-            std::move(decode_state));
+            std::move(decode_state), 0, 0, std::move(admission.work));
         submitted_count++;
         VisualDiagnostics::instance().submissionQueued(
             submitted_count, reinterpret_cast<uint64_t>(&gmmu), entries.size());
@@ -354,6 +394,11 @@ void Pfifo::threadFunc() {
         active_gmmu = entry_list.gmmu;
         lock.unlock();
         bool yielded = false;
+        const auto status = entry_list.work->status();
+        if (status == execution::WorkStatus::Cancelled)
+            decode.failed = true;
+        else if (status == execution::WorkStatus::Queued && !entry_list.work->start())
+            decode.fail(25);
         if (!decode.failed) {
             // Entries
             // TODO: flags
@@ -402,12 +447,19 @@ void Pfifo::threadFunc() {
                     // reached
                     tls_crnt_command_buffer->onCompletedChecked(
                         [complete = entry_list.on_complete,
-                         state = entry_list.decode_state](bool succeeded) {
-                            if (succeeded && (!state || !state->failed)) {
+                         state = entry_list.decode_state,
+                         work = entry_list.work](bool succeeded) {
+                            if (succeeded && (!state || !state->failed) &&
+                                work->status() == execution::WorkStatus::Running) {
                                 if (complete)
                                     complete();
-                            } else if (state)
-                                state->fail(25);
+                                work->finish(true);
+                            } else {
+                                work->finish(false);
+                                if (state && work->status() !=
+                                                 execution::WorkStatus::Cancelled)
+                                    state->fail(25);
+                            }
                         });
                 }
                 delete tls_crnt_command_buffer;
@@ -422,6 +474,10 @@ void Pfifo::threadFunc() {
         if (yielded && !stop && !entry_list.gmmu->gpuWorkCancelled()) {
             entry_lists.push_front(std::move(entry_list));
         } else {
+            if (stop || entry_list.gmmu->gpuWorkCancelled())
+                entry_list.work->cancel();
+            else if (decode.failed)
+                entry_list.work->finish(false);
             retired_submissions.insert(entry_list.correlation_id);
             while (retired_submissions.erase(completed_count + 1) != 0)
                 ++completed_count;

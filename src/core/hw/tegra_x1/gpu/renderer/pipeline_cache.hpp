@@ -9,7 +9,7 @@ class IRenderer;
 
 class PipelineCache
     : public CacheBase<PipelineCache, PipelineBase*, PipelineDescriptor,
-                       true> {
+                       true, true> {
   public:
     explicit PipelineCache(IRenderer& renderer_) : renderer{renderer_} {}
 

@@ -2,6 +2,8 @@
 
 #include <list>
 #include <map>
+#include <memory>
+#include <vector>
 #include <string>
 
 #include "common/functions.hpp"
@@ -337,7 +339,7 @@ class strong_number_typedef {
 // compare_descriptors, Subclass::equals tells descriptors with the same hash
 // apart, otherwise the hash alone identifies an object.
 template <typename Subclass, typename T, typename DescriptorT,
-          bool compare_descriptors = false>
+          bool compare_descriptors = false, bool retain_resources = false>
 class CacheBase {
     friend Subclass;
 
@@ -345,7 +347,9 @@ class CacheBase {
 
   public:
     ~CacheBase() noexcept {
-        if constexpr (compare_descriptors) {
+        if constexpr (retain_resources) {
+            resource_owners.clear();
+        } else if constexpr (compare_descriptors) {
             for (auto& [key, bucket] : cache) {
                 for (auto& entry : bucket)
                     THIS->destroyElement(entry.value);
@@ -371,12 +375,12 @@ class CacheBase {
                 }
             }
             // List elements keep their address when the bucket grows
-            return bucket.emplace_back(Entry{descriptor, THIS->create(descriptor)})
+            return bucket.emplace_back(Entry{descriptor, createOwned(descriptor)})
                 .value;
         } else {
             auto it = cache.find(hash);
             if (it == cache.end()) {
-                it = cache.insert({hash, THIS->create(descriptor)}).first;
+                it = cache.insert({hash, createOwned(descriptor)}).first;
 
                 return it->second;
             }
@@ -388,6 +392,14 @@ class CacheBase {
     }
 
   private:
+    std::vector<std::shared_ptr<void>> resource_owners;
+    T createOwned(const DescriptorT& descriptor) {
+        auto value = THIS->create(descriptor);
+        if constexpr (retain_resources)
+            if (value)
+                resource_owners.push_back(value->createResourceOwner());
+        return value;
+    }
     struct Entry {
         DescriptorT descriptor;
         T value;

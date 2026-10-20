@@ -9,7 +9,7 @@ class IRenderer;
 
 class RenderPassCache
     : public CacheBase<RenderPassCache, RenderPassBase*, RenderPassDescriptor,
-                       true> {
+                       true, true> {
   public:
     explicit RenderPassCache(IRenderer& renderer_) : renderer{renderer_} {}
 

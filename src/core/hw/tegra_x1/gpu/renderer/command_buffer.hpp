@@ -1,6 +1,8 @@
 #pragma once
 
 #include <functional>
+#include <memory>
+#include <unordered_map>
 #include <optional>
 #include <vector>
 
@@ -32,6 +34,11 @@ class ICommandBuffer {
         completion_callbacks.push_back(std::move(callback));
     }
 
+    void retainResource(const std::shared_ptr<void>& owner) {
+        if (owner)
+            retained_resources.try_emplace(owner.get(), owner);
+    }
+
     // Statistics only: what the next wait for the host GPU is for
     CheckpointReason checkpoint_reason{CheckpointReason::Other};
 
@@ -43,6 +50,7 @@ class ICommandBuffer {
             callback(succeeded);
     }
     std::vector<std::function<void(bool)>> completion_callbacks;
+    std::unordered_map<const void*, std::shared_ptr<void>> retained_resources;
 };
 
 // Names the waits for the host GPU done in its scope in HYDRA_PERF_STATS

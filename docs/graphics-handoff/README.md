@@ -1,5 +1,15 @@
 # Hydra graphics work: handoff
 
+**Pengelolaan eksekusi (2026-10-20):**
+[Budget CPU/GPU, lifecycle pekerjaan, ownership dan completion retirement](execution-management-2026-10-20.md).
+
+**Lanjutan Resource Registry (2026-10-20):**
+[ID/generation, manifest command, dependency mapping dan batas lifetime](resource-registry-2026-10-20.md).
+
+**Awal migrasi GPU Architecture 2.0 (2026-10-20):**
+[Command IR draw, binding resource, profiling, dan batas lifetime](gpu-architecture-2-2026-10-20.md).
+Jalur instruksi dan backlog kompatibilitas sebelumnya tetap OPEN.
+
 **Titik masuk untuk melanjutkan percakapan (2026-10-19):**
 [Progres terbaru dan validasi Python/Metal](tujuan-dan-progress-2026-10-19.md)
 (bagian terakhir: lifetime SharedMemory dan teardown page table, dengan tes Python–Metal).

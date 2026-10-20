@@ -14,6 +14,7 @@
 #include "core/hw/tegra_x1/gpu/macro/interpreter/driver.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
@@ -596,10 +597,12 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
     auto index_type = IndexType::None;
     auto primitive_type = regs.begin.primitive_type;
     renderer::BufferView index_buffer;
+    command_ir::DrawCommand command;
     {
         std::scoped_lock buffer_cache_lock(
             gpu.getRenderer().getBufferCache().getMutex());
-        if (!drawInternal())
+        resource::MappingCaptureScope mappings(tls_crnt_gmmu, command.mapping_dependencies);
+        if (!prepareDraw(command))
             return;
         captureVisualDraw(false);
         if (visual.skipDraw()) {
@@ -620,42 +623,31 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
     if (count == 0)
         return;
 
-    if (index_buffer.getBase() != nullptr) {
-        // Bind index buffer
-        gpu.getRenderer().bindIndexBuffer(index_buffer, index_type);
-
-        // Draw
-
-        // Vertex start is set as vertex base instead, as start is now index
-        // start
-        // TODO: instance count
-        labelCaptureDraw(count);
-        gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type,
-                                      0, count, regs.vertex_array_start,
-                                      instance_index, 1);
-        synchronizeStorageWrites();
-        profileDraw(count);
-        captureVisualDraw(true);
+    command.primitive = primitive_type;
+    command.count = count;
+    command.base_instance = instance_index;
+    if (index_buffer.isValid()) {
+        command.indices = index_buffer;
+        command.index_type = index_type;
+        command.base_vertex = regs.vertex_array_start;
     } else {
-        // Draw
-        // TODO: instance count
-        labelCaptureDraw(count);
-        gpu.getRenderer().draw(tls_crnt_command_buffer, primitive_type,
-                               regs.vertex_array_start, count, instance_index,
-                               1);
-        synchronizeStorageWrites();
-        profileDraw(count);
-        captureVisualDraw(true);
+        command.first = regs.vertex_array_start;
     }
+    executeDrawCommand(command);
 }
 
-void ThreeD::synchronizeStorageWrites() {
-    if (storage_writes.empty())
-        return;
-    auto& cache = gpu.getRenderer().getTextureCache();
-    std::scoped_lock lock(cache.getMutex());
-    cache.synchronizeStorageWrites(tls_crnt_command_buffer, storage_writes);
-    storage_writes.clear();
+void ThreeD::executeDrawCommand(command_ir::DrawCommand& command) {
+    if (command_ir::sealDrawResources(gpu.getRenderer(), command)) {
+        labelCaptureDraw(command.count);
+        if (command_ir::executeDraw(gpu.getRenderer(), tls_crnt_command_buffer, command)) {
+            profileDraw(command.count);
+            captureVisualDraw(true);
+            return;
+        }
+    }
+    LOG_ERROR(Gpu, "Draw rejected: resource lifetime or GPU mapping changed");
+    if (tls_crnt_decode_state)
+        tls_crnt_decode_state->fail(25);
 }
 
 // Names each draw in a GPU capture after its guest shaders, so Metal draws can
@@ -736,10 +728,12 @@ void ThreeD::drawVertexElementsImpl(
     auto index_type = inline_range ? IndexType::UInt32 : regs.index_type;
     auto primitive_type = regs.begin.primitive_type;
     renderer::BufferView index_buffer;
+    command_ir::DrawCommand command;
     {
         std::scoped_lock buffer_cache_lock(
             gpu.getRenderer().getBufferCache().getMutex());
-        if (!drawInternal())
+        resource::MappingCaptureScope mappings(tls_crnt_gmmu, command.mapping_dependencies);
+        if (!prepareDraw(command))
             return;
         captureVisualDraw(false);
         if (visual.skipDraw()) {
@@ -792,18 +786,14 @@ void ThreeD::drawVertexElementsImpl(
     if (count == 0)
         return;
 
-    // Bind index buffer
-    ASSERT_DEBUG(index_buffer.getBase(), Gpu, "Index buffer not found");
-    gpu.getRenderer().bindIndexBuffer(index_buffer, index_type);
-
-    // Draw (the index buffer view starts at the first index)
-    // TODO: instance count
-    labelCaptureDraw(count);
-    gpu.getRenderer().drawIndexed(tls_crnt_command_buffer, primitive_type, 0,
-                                  count, regs.base_vertex, instance_index, 1);
-    synchronizeStorageWrites();
-    profileDraw(count);
-    captureVisualDraw(true);
+    // The decoded view starts at the guest's first index.
+    command.indices = index_buffer;
+    command.index_type = index_type;
+    command.primitive = primitive_type;
+    command.count = count;
+    command.base_vertex = regs.base_vertex;
+    command.base_instance = instance_index;
+    executeDrawCommand(command);
 }
 
 void ThreeD::clearBuffer(const u32 index, const ClearBufferData data) {
@@ -2454,8 +2444,9 @@ ThreeD::getSampler(const TextureSamplerControl& tsc,
 
 void ThreeD::configureShaderStage(
     const ShaderStage stage, const TextureImageControl* tex_header_pool,
-    const TextureSamplerControl* tex_sampler_pool) {
-    const auto shader_type = toRendererShaderType(stage);
+    const TextureSamplerControl* tex_sampler_pool,
+    command_ir::StageBindings& bindings,
+    std::vector<ztd::Range<uptr>>& storage_writes) {
     const u32 stage_index = static_cast<u32>(stage) -
                             1; // 1 is subtracted, because VertexA is skipped
 
@@ -2464,8 +2455,14 @@ void ThreeD::configureShaderStage(
         return;
     const auto& resource_mapping = shader->getDescriptor().resource_mapping;
 
+    bindings.active = true;
+    bindings.reset_textures = true;
+    if (!tex_header_pool || !tex_sampler_pool)
+        bindings.textures = gpu.getRenderer().getTextureBindings(
+            stage == ShaderStage::Fragment ? renderer::ShaderType::Fragment
+                                            : renderer::ShaderType::Vertex);
+
     // Uniform buffers
-    gpu.getRenderer().unbindUniformBuffers(shader_type);
     for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
         const auto index = resource_mapping.uniform_buffers[i];
         if (index == invalid<u32>())
@@ -2491,11 +2488,10 @@ void ThreeD::configureShaderStage(
             }
             continue;
         }
-        gpu.getRenderer().bindUniformBuffer(buffer, shader_type, index);
+        bindings.uniforms.push_back({index, buffer});
     }
 
     // Storage buffers
-    gpu.getRenderer().unbindStorageBuffers(shader_type);
     for (const auto& storage : resource_mapping.storage_buffers) {
         const auto range = resolveStorageBuffer(
             getConstBuffer(stage_index, storage.cbuf_slot,
@@ -2507,9 +2503,8 @@ void ThreeD::configureShaderStage(
                           storage.cbuf_slot, storage.cbuf_offset));
             continue;
         }
-        gpu.getRenderer().bindStorageBuffer(
-            gpu.getRenderer().getGuestMemoryBuffer(*range), shader_type,
-            storage.host_index);
+        bindings.storage.push_back(
+            {storage.host_index, gpu.getRenderer().getGuestMemoryBuffer(*range)});
         // The shader may write it: users of the range read the live memory
         if (storage.written) {
             storage_writes.push_back(*range);
@@ -2520,7 +2515,6 @@ void ThreeD::configureShaderStage(
 
     // Textures
     if ((tex_header_pool != nullptr) && (tex_sampler_pool != nullptr)) {
-        gpu.getRenderer().unbindTextures(shader_type);
         for (const auto [const_buffer_index, renderer_index] :
              resource_mapping.textures) {
             const auto handle =
@@ -2604,10 +2598,15 @@ void ThreeD::configureShaderStage(
             if (memo != nullptr && memo->view != nullptr &&
                 memo->tic == tic_words && memo->type == memo_type) {
                 texture = memo->view;
+                resource::reuseMappingDependencies(tls_crnt_gmmu, memo->mappings);
             } else {
-                texture = getTexture(tic, shader_texture_type);
+                std::vector<resource::MappingDependency> mappings;
+                {
+                    resource::MappingCaptureScope capture(tls_crnt_gmmu, mappings);
+                    texture = getTexture(tic, shader_texture_type);
+                }
                 if (memo != nullptr)
-                    *memo = {tic_words, memo_type, texture};
+                    *memo = {tic_words, memo_type, texture, std::move(mappings)};
             }
 
             // Sampler
@@ -2619,8 +2618,7 @@ void ThreeD::configureShaderStage(
                 getTicLodRange(tic));
 
             if ((texture != nullptr) && (sampler != nullptr))
-                gpu.getRenderer().bindTexture(texture, sampler, shader_type,
-                                              renderer_index);
+                bindings.textures.push_back({renderer_index, texture, sampler});
         }
     }
 }
@@ -3338,8 +3336,153 @@ void ThreeD::noteUnimplementedMultisample() {
     }
 }
 
-bool ThreeD::drawInternal() {
-    storage_writes.clear();
+renderer::DrawState ThreeD::prepareDrawState() {
+    ScopedPerfTimer timer(PerfStats::instance().draw_snapshot_ns,
+                          PerfStats::isEnabled());
+    renderer::DrawState state{};
+    auto& visual = VisualDiagnostics::instance();
+    static const bool highlight_keep_depth =
+        std::getenv("HYDRA_HIGHLIGHT_KEEP_DEPTH") != nullptr;
+    state.depth_test_enabled =
+        regs.depth_test_enabled != 0u &&
+        (highlight_keep_depth || !isHighlightedDraw()) &&
+        !(visual.selected() && visual.options().no_depth);
+    state.depth_write_enabled = regs.depth_write_enabled != 0u &&
+        !(visual.selected() && visual.options().no_depth);
+    state.depth_compare_op = regs.depth_compare_op;
+    state.blend_constant = std::bit_cast<simd::float4>(regs.blend_constant);
+
+    // Stencil, register offsets from NVIDIA's clb197.h
+    {
+        const auto decode_func = decodeCompareOp;
+
+        renderer::StencilState stencil{};
+        stencil.enabled = regs_raw[0x4e0] != 0;
+        stencil.front = {
+            .func = decode_func(regs_raw[0x4e4]),
+            .fail_op = decodeStencilOp(regs_raw[0x4e1]),
+            .depth_fail_op = decodeStencilOp(regs_raw[0x4e2]),
+            .pass_op = decodeStencilOp(regs_raw[0x4e3]),
+            .ref = regs_raw[0x4e5],
+            .func_mask = regs_raw[0x4e6],
+            .write_mask = regs_raw[0x4e7],
+        };
+        if (regs_raw[0x565] != 0) { // Two sided
+            stencil.back = {
+                .func = decode_func(regs_raw[0x569]),
+                .fail_op = decodeStencilOp(regs_raw[0x566]),
+                .depth_fail_op = decodeStencilOp(regs_raw[0x567]),
+                .pass_op = decodeStencilOp(regs_raw[0x568]),
+                .ref = regs_raw[0x3d5],
+                .func_mask = regs_raw[0x3d7],
+                .write_mask = regs_raw[0x3d6],
+            };
+        } else {
+            stencil.back = stencil.front;
+        }
+        state.stencil = stencil;
+    }
+
+    // Culling. The guest winding is used as is, FLIP_Y included: inverting it
+    // for FLIP_Y culled the front faces of every single-sided mesh in UE4
+    // games (Crash Bandicoot 4 floor and characters), while FLIP_Y=0 games
+    // (CTR) already cull correctly.
+    state.cull_enabled = regs.cull_face_enabled != 0 &&
+        !(visual.selected() && visual.options().no_cull);
+    state.cull_mode = regs.cull_face_mode;
+    state.front_face = regs.front_face_winding;
+
+    // Depth bias (polygon offset), register offsets from NVIDIA's clb197.h.
+    // Each primitive class has its own enable (POINT, LINE, FILL), and the
+    // hardware units are twice the host's (Eden and GL halve them too).
+    constexpr u32 REG_POLY_OFFSET_POINT = 0x370;
+    constexpr u32 REG_SLOPE_SCALE_DEPTH_BIAS = 0x55b;
+    constexpr u32 REG_DEPTH_BIAS = 0x56f;
+    constexpr u32 REG_DEPTH_BIAS_CLAMP = 0x61f;
+    if ((regs_raw[REG_POLY_OFFSET_POINT +
+                  getPrimitiveClass(regs.begin.primitive_type)] &
+         0x1u) != 0) {
+        state.depth_bias_constant =
+            std::bit_cast<f32>(regs_raw[REG_DEPTH_BIAS]) / 2.0f;
+        state.depth_bias_slope =
+            std::bit_cast<f32>(regs_raw[REG_SLOPE_SCALE_DEPTH_BIAS]);
+        state.depth_bias_clamp =
+            std::bit_cast<f32>(regs_raw[REG_DEPTH_BIAS_CLAMP]);
+    }
+
+    // Depth clamps unless the geometry clip mode clips Z (like Eden):
+    // PASSTHRU, FRUSTUM_XYZ_CLIP and FRUSTUM_Z_CLIP
+    constexpr u32 REG_VIEWPORT_CLIP_CONTROL = 0x64f;
+    const u32 geometry_clip =
+        extractBits(regs_raw[REG_VIEWPORT_CLIP_CONTROL], 11, 3);
+    state.depth_clamp = geometry_clip != 1 && geometry_clip != 3 &&
+                        geometry_clip != 5;
+
+    for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+        state.viewports[i] = getViewport(i);
+        state.scissors[i] = getScissor(i);
+    }
+
+    return state;
+}
+
+renderer::RenderPassBase* ThreeD::resolveDrawTargets() {
+    ScopedPerfTimer timer(PerfStats::instance().draw_targets_ns,
+                          PerfStats::isEnabled());
+    auto& texture_cache = gpu.getRenderer().getTextureCache();
+    // Resolve previous texture writes before this draw marks its targets as
+    // written. Storage buffers read and modify the guest allocation directly.
+    for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
+        const auto* shader = getShaderUnchecked(stage);
+        if (shader == nullptr)
+            continue;
+        const auto stage_index = static_cast<u32>(stage) - 1;
+        for (const auto& storage :
+             shader->getDescriptor().resource_mapping.storage_buffers) {
+            const auto range = resolveStorageBuffer(
+                getConstBuffer(stage_index, storage.cbuf_slot,
+                               u64(storage.cbuf_offset) + 12),
+                storage.cbuf_offset);
+            if (range && texture_cache.hasUnflushedGpuWrites(*range))
+                texture_cache.flushMemory(tls_crnt_command_buffer, *range);
+        }
+    }
+    const u64 epoch_before_targets = texture_cache.getEpoch();
+    // Nothing changed in the texture cache since the previous draw: its
+    // render target lookups (which only mark the same targets as written
+    // again) and its texture lookups can be reused
+    const bool same_mapping = tls_crnt_gmmu == texture_memo_gmmu &&
+        gpu.getRenderer().getResourceRegistry().matches(texture_memo_address_space,
+            resource::ResourceKind::AddressSpace, tls_crnt_gmmu) &&
+        tls_crnt_gmmu->getMappingGeneration() == texture_memo_mapping_generation;
+    const bool unchanged = epoch_before_targets == texture_memo_epoch &&
+                           same_mapping &&
+                           texture_memo_render_pass != nullptr;
+    makeRenderTargetKey(render_target_key);
+    renderer::RenderPassBase* render_pass;
+    if (unchanged && render_target_key == render_target_memo_key) {
+        render_pass = static_cast<renderer::RenderPassBase*>(
+            const_cast<void*>(texture_memo_render_pass));
+        resource::reuseMappingDependencies(tls_crnt_gmmu, render_target_memo_mappings);
+    } else {
+        render_target_memo_mappings.clear();
+        resource::MappingCaptureScope capture(tls_crnt_gmmu, render_target_memo_mappings);
+        render_pass = getRenderPass();
+    }
+    texture_memo_valid = epoch_before_targets == texture_memo_epoch &&
+                         render_pass == texture_memo_render_pass && same_mapping;
+    if (!texture_memo_valid)
+        for (auto& stage_memo : texture_memo)
+            for (auto& memo : stage_memo)
+                memo.view = nullptr;
+    return render_pass;
+}
+
+bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
+    ScopedPerfTimer timer(PerfStats::instance().draw_prepare_ns,
+                          PerfStats::isEnabled());
+    command = {};
+    command_ir::captureDrawAddressSpace(gpu.getRenderer(), command, tls_crnt_gmmu);
     auto& visual = VisualDiagnostics::instance();
     const auto shader_address = [&](ShaderStage stage) {
         return static_cast<u64>(regs.shader_program_region) +
@@ -3372,149 +3515,37 @@ bool ThreeD::drawInternal() {
     // Flush tracked pages
     tls_crnt_gmmu->getMmu()->flushTrackedPages();
     // SET_ZPASS_PIXEL_COUNT (NVB197, byte offset 0x1514).
-    gpu.getRenderer().setOcclusionCounterEnabled((regs_raw[0x545] & 1) != 0);
+    command.occlusion_enabled = (regs_raw[0x545] & 1) != 0;
 
     auto& texture_cache = gpu.getRenderer().getTextureCache();
-    auto* pipeline = getPipeline();
-    // Resolve previous texture writes before this draw marks its targets as
-    // written. Storage buffers read and modify the guest allocation directly.
-    for (const auto stage : {ShaderStage::VertexB, ShaderStage::Fragment}) {
-        const auto* shader = getShaderUnchecked(stage);
-        if (shader == nullptr)
-            continue;
-        const auto stage_index = static_cast<u32>(stage) - 1;
-        for (const auto& storage :
-             shader->getDescriptor().resource_mapping.storage_buffers) {
-            const auto range = resolveStorageBuffer(
-                getConstBuffer(stage_index, storage.cbuf_slot,
-                               u64(storage.cbuf_offset) + 12),
-                storage.cbuf_offset);
-            if (range && texture_cache.hasUnflushedGpuWrites(*range))
-                texture_cache.flushMemory(tls_crnt_command_buffer, *range);
-        }
-    }
-    const u64 epoch_before_targets = texture_cache.getEpoch();
-    // Nothing changed in the texture cache since the previous draw: its
-    // render target lookups (which only mark the same targets as written
-    // again) and its texture lookups can be reused
-    const bool unchanged = epoch_before_targets == texture_memo_epoch &&
-                           tls_crnt_gmmu == texture_memo_gmmu &&
-                           texture_memo_render_pass != nullptr;
-    makeRenderTargetKey(render_target_key);
-    renderer::RenderPassBase* render_pass;
-    if (unchanged && render_target_key == render_target_memo_key)
-        render_pass = static_cast<renderer::RenderPassBase*>(
-            const_cast<void*>(texture_memo_render_pass));
-    else
-        render_pass = getRenderPass();
-    texture_memo_valid = epoch_before_targets == texture_memo_epoch &&
-                         render_pass == texture_memo_render_pass &&
-                         tls_crnt_gmmu == texture_memo_gmmu;
-    if (!texture_memo_valid)
-        for (auto& stage_memo : texture_memo)
-            for (auto& memo : stage_memo)
-                memo.view = nullptr;
-    gpu.getRenderer().bindRenderPass(render_pass);
-    gpu.getRenderer().bindPipeline(pipeline);
+    auto* pipeline = [&] {
+        ScopedPerfTimer pipeline_timer(PerfStats::instance().draw_pipeline_ns,
+                                       PerfStats::isEnabled());
+        return getPipeline();
+    }();
+    auto* render_pass = resolveDrawTargets();
+    command.render_pass = render_pass;
+    command.pipeline = pipeline;
     selectVisualResources();
     if (visual.active())
         visual.event("draw_pipeline", {{"render_pass", fmt::format("{}", fmt::ptr(render_pass))},
             {"pipeline", fmt::format("{}", fmt::ptr(pipeline))},
             {"hot_revision", std::to_string(::hydra::hot::generation())}});
 
-    static const bool highlight_keep_depth =
-        std::getenv("HYDRA_HIGHLIGHT_KEEP_DEPTH") != nullptr;
-    gpu.getRenderer().setDepthTestEnabled(
-        regs.depth_test_enabled != 0u &&
-        (highlight_keep_depth || !isHighlightedDraw()) &&
-        !(visual.selected() && visual.options().no_depth));
-    gpu.getRenderer().setDepthWriteEnabled(regs.depth_write_enabled != 0u &&
-        !(visual.selected() && visual.options().no_depth));
-    gpu.getRenderer().setDepthCompareOp(regs.depth_compare_op);
-    gpu.getRenderer().setBlendConstant(
-        std::bit_cast<simd::float4>(regs.blend_constant));
+    command.state = prepareDrawState();
 
-    // Stencil, register offsets from NVIDIA's clb197.h
-    {
-        const auto decode_func = decodeCompareOp;
-
-        renderer::StencilState stencil{};
-        stencil.enabled = regs_raw[0x4e0] != 0;
-        stencil.front = {
-            .func = decode_func(regs_raw[0x4e4]),
-            .fail_op = decodeStencilOp(regs_raw[0x4e1]),
-            .depth_fail_op = decodeStencilOp(regs_raw[0x4e2]),
-            .pass_op = decodeStencilOp(regs_raw[0x4e3]),
-            .ref = regs_raw[0x4e5],
-            .func_mask = regs_raw[0x4e6],
-            .write_mask = regs_raw[0x4e7],
-        };
-        if (regs_raw[0x565] != 0) { // Two sided
-            stencil.back = {
-                .func = decode_func(regs_raw[0x569]),
-                .fail_op = decodeStencilOp(regs_raw[0x566]),
-                .depth_fail_op = decodeStencilOp(regs_raw[0x567]),
-                .pass_op = decodeStencilOp(regs_raw[0x568]),
-                .ref = regs_raw[0x3d5],
-                .func_mask = regs_raw[0x3d7],
-                .write_mask = regs_raw[0x3d6],
-            };
-        } else {
-            stencil.back = stencil.front;
-        }
-        gpu.getRenderer().setStencilState(stencil);
-    }
-
-    // Culling. The guest winding is used as is, FLIP_Y included: inverting it
-    // for FLIP_Y culled the front faces of every single-sided mesh in UE4
-    // games (Crash Bandicoot 4 floor and characters), while FLIP_Y=0 games
-    // (CTR) already cull correctly.
-    auto front_face = regs.front_face_winding;
-    gpu.getRenderer().setCullState(regs.cull_face_enabled != 0 &&
-        !(visual.selected() && visual.options().no_cull),
-                                   regs.cull_face_mode, front_face);
-
-    // Depth bias (polygon offset), register offsets from NVIDIA's clb197.h.
-    // Each primitive class has its own enable (POINT, LINE, FILL), and the
-    // hardware units are twice the host's (Eden and GL halve them too).
-    constexpr u32 REG_POLY_OFFSET_POINT = 0x370;
-    constexpr u32 REG_SLOPE_SCALE_DEPTH_BIAS = 0x55b;
-    constexpr u32 REG_DEPTH_BIAS = 0x56f;
-    constexpr u32 REG_DEPTH_BIAS_CLAMP = 0x61f;
-    if ((regs_raw[REG_POLY_OFFSET_POINT +
-                  getPrimitiveClass(regs.begin.primitive_type)] &
-         0x1u) != 0) {
-        gpu.getRenderer().setDepthBias(
-            std::bit_cast<f32>(regs_raw[REG_DEPTH_BIAS]) / 2.0f,
-            std::bit_cast<f32>(regs_raw[REG_SLOPE_SCALE_DEPTH_BIAS]),
-            std::bit_cast<f32>(regs_raw[REG_DEPTH_BIAS_CLAMP]));
-    } else {
-        gpu.getRenderer().setDepthBias(0.0f, 0.0f, 0.0f);
-    }
-
-    // Depth clamps unless the geometry clip mode clips Z (like Eden):
-    // PASSTHRU, FRUSTUM_XYZ_CLIP and FRUSTUM_Z_CLIP
-    constexpr u32 REG_VIEWPORT_CLIP_CONTROL = 0x64f;
-    const u32 geometry_clip =
-        extractBits(regs_raw[REG_VIEWPORT_CLIP_CONTROL], 11, 3);
-    gpu.getRenderer().setDepthClamp(geometry_clip != 1 && geometry_clip != 3 &&
-                                    geometry_clip != 5);
-
-    for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
-        gpu.getRenderer().setViewport(i, getViewport(i));
-        gpu.getRenderer().setScissor(i, getScissor(i));
-    }
-
+    ScopedPerfTimer bindings_timer(PerfStats::instance().draw_resources_ns,
+                                   PerfStats::isEnabled());
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++) {
         const auto& vertex_array = regs.vertex_arrays[i];
         // HACK: Super Meat Boy contains invalid vertex arrays with address 4096
         if (!vertex_array.config.enable ||
             (vertex_array.addr.hi == 0 && vertex_array.addr.lo == 4096)) {
-            gpu.getRenderer().bindVertexBuffer(renderer::BufferView(), i);
+            command.vertices[i] = {};
             continue;
         }
 
-        gpu.getRenderer().bindVertexBuffer(getVertexBuffer(i), i);
+        command.vertices[i] = getVertexBuffer(i);
     }
 
     // Configure stages
@@ -3534,13 +3565,15 @@ bool ThreeD::drawInternal() {
             : nullptr;
 
     // TODO: configure all stages
-    configureShaderStage(ShaderStage::VertexB, tex_header_pool,
-                         tex_sampler_pool);
-    configureShaderStage(ShaderStage::Fragment, tex_header_pool,
-                         tex_sampler_pool);
+    configureShaderStage(ShaderStage::VertexB, tex_header_pool, tex_sampler_pool,
+                         command.stages[0], command.storage_writes);
+    configureShaderStage(ShaderStage::Fragment, tex_header_pool, tex_sampler_pool,
+                         command.stages[1], command.storage_writes);
     texture_memo_epoch = texture_cache.getEpoch();
     texture_memo_render_pass = render_pass;
     texture_memo_gmmu = tls_crnt_gmmu;
+    texture_memo_mapping_generation = command.mapping_generation;
+    texture_memo_address_space = command.address_space_handle;
     render_target_memo_key.swap(render_target_key);
 
     return true;

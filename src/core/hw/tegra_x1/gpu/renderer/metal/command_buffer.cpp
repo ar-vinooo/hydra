@@ -85,7 +85,7 @@ CommandBuffer::~CommandBuffer() {
                            : "unknown error");
     });
     submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
-    command_buffer->commit();
+    commitSubmission();
     // Command buffers execute in commit order on the same queue, so there is no
     // need to wait for the GPU. HYDRA_GPU_SYNC=1 restores the old behaviour
     // for debugging.
@@ -220,7 +220,7 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     }
     const u64 write_epoch = guest_write_epoch.load(std::memory_order_acquire);
     submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
-    command_buffer->commit();
+    commitSubmission();
     command_buffer->waitUntilCompleted();
     completed_buffers.fetch_add(1, std::memory_order_acq_rel);
     checkpoint_total.fetch_add(1, std::memory_order_acq_rel);

@@ -1,3 +1,4 @@
+#include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
@@ -65,6 +66,33 @@ std::vector<u8> GMmu::readMappedBytes(uptr gpu_addr, usize max_size) {
         gpu_addr += count;
     }
     return bytes;
+}
+
+bool GMmu::matchesMappings(
+    const std::vector<resource::MappingDependency>& dependencies) const {
+    std::shared_lock lock(mutex);
+    for (const auto& dep : dependencies) {
+        uptr base = 0;
+        u64 size = 0;
+        const auto* mapping = const_cast<GMmu*>(this)->findAddrLocked(dep.base, base, size);
+        if (!mapping || base != dep.base || mapping->ptr != dep.ptr ||
+            mapping->size != dep.size || mapping->guest != dep.guest)
+            return false;
+    }
+    return true;
+}
+
+std::optional<AddressSpace> GMmu::findAddr(uptr addr, uptr& out_base) const {
+    const auto result = GenericMmu<GMmu, AddressSpace>::findAddr(addr, out_base);
+    if (result)
+        resource::recordMappingLookup(this, out_base, *result);
+    return result;
+}
+
+AddressSpace GMmu::findAddrImpl(uptr addr, uptr& out_base) const {
+    const auto result = findAddr(addr, out_base);
+    DEBUGGER_ASSERT_DEBUG(result, Mmu, "Failed to find impl for addr 0x{:08x}", addr);
+    return result.value_or(AddressSpace{});
 }
 
 uptr GMmu::unmapAddr(uptr gpu_addr) const {

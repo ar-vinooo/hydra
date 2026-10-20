@@ -21,6 +21,9 @@ using hydra::hw::tegra_x1::gpu::renderer::metal::stackAutoRelease;
 
 namespace hydra::hw::tegra_x1::gpu::engines {
 struct ThreeDTestAccess {
+    static renderer::DrawState state(ThreeD& engine) {
+        return engine.prepareDrawState();
+    }
     static MTL::Viewport viewport(ThreeD& engine, u32 index) {
         return engine.getViewport(index);
     }
@@ -62,8 +65,21 @@ int main(int argc, char** argv) {
             engine.method(scissor, enabled);
             engine.method(scissor + 1, min_x | (max_x << 16));
             engine.method(scissor + 2, min_y | (max_y << 16));
-            const auto viewport = ThreeDTestAccess::viewport(engine, 0);
-            const auto rect = ThreeDTestAccess::scissor(engine, 0);
+            const auto snapshot = ThreeDTestAccess::state(engine);
+            for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+                const auto direct = ThreeDTestAccess::viewport(engine, i);
+                const auto rect = ThreeDTestAccess::scissor(engine, i);
+                const auto& saved = snapshot.viewports[i];
+                const auto& saved_rect = snapshot.scissors[i];
+                if (direct.originX != saved.originX || direct.originY != saved.originY ||
+                    direct.width != saved.width || direct.height != saved.height ||
+                    direct.znear != saved.znear || direct.zfar != saved.zfar ||
+                    rect.x != saved_rect.x || rect.y != saved_rect.y ||
+                    rect.width != saved_rect.width || rect.height != saved_rect.height)
+                    throw std::runtime_error("Snapshot changed viewport/scissor conversion");
+            }
+            const auto& viewport = snapshot.viewports[0];
+            const auto& rect = snapshot.scissors[0];
             char text[512];
             std::snprintf(text, sizeof(text), "%.9g %.9g %.9g %.9g %.9g %.9g %lu %lu %lu %lu\n",
                           viewport.originX, viewport.originY, viewport.width,
