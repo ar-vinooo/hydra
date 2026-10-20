@@ -258,3 +258,23 @@ IADD dengan operand dinegasi diperbaiki (`~b` + carry-in, bukan `-b`; dasarnya i
 Regresi: `run_python_references.sh` ALL PASS, shader-library 60, gpu-engine 45, texture-cache 40
 (MTL_DEBUG_LAYER=1). Header berubah (`ResourceMapping`, `shader_decompiler/const.hpp`): rebuild `hydra` +
 hot module dan restart aplikasi. Tidak stage/commit.
+
+## Sinkronisasi: race completion/cancel dan acquire 3D (diperiksa dari audit eksternal)
+
+Dua temuan audit eksternal diperiksa langsung di kode; keduanya nyata.
+
+1. **Completion vs cancel** (`pfifo.cpp`, callback `onCompletedChecked`): `status()==Running` dicek, lalu
+   `complete()` (menaikkan fence guest) dipanggil, lalu `finish(true)`; `cancel()` dari thread lain bisa menyela,
+   sehingga fence terbit untuk pekerjaan yang berstatus Cancelled. Kini `WorkTicket::claimCompletion()` mengambil hak
+   publikasi secara atomik (hanya dari Running, sekali); `cancel()` setelah klaim tidak berlaku, dan klaim gagal bila
+   sudah dibatalkan. Tes: `work_manager_tests` (klaim, urutan, dan 4.000 putaran dua thread; publikasi hanya bila
+   status akhir Succeeded).
+2. **Acquire 3D memblokir** (`ThreeD::setReportSemaphore`, operasi 1): polling hingga 1 detik di worker PFIFO, lalu
+   lanjut diam-diam. Dengan decode state kini channel menitipkan `semaphore_wait` (operasi 1 = sama, 4 = >=, seperti
+   acquire puller) dan melanjutkan setelah terpenuhi; polling berbatas hanya untuk pemanggil tanpa scheduler (tes).
+   Konsekuensi: acquire yang tidak pernah dirilis sekarang menahan channel itu (seperti puller dan hardware), tidak
+   lagi lolos setelah 1 detik. Tes: `testReportSemaphoreReductionAndAcquire`.
+
+Regresi (MTL_DEBUG_LAYER=1): shader-library 60, texture-cache 40, gpu-engine 45, work-manager, resource-registry,
+raster-state, render-hash, register-write, frame-trace, visual-diagnostic, dma-slice lulus; `hydra` dan hot module
+ter-build. Header `work_manager.hpp` berubah: restart aplikasi. Belum diuji di game; tidak stage/commit.
