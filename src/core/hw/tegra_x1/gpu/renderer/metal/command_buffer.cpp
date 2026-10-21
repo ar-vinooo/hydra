@@ -138,10 +138,58 @@ void CommandBuffer::setVisibilityResultBuffer(MTL::Buffer* buffer) {
     visibility_buffer = buffer != nullptr ? buffer->retain() : nullptr;
 }
 
+namespace {
+
+// Whether a pass on `next` only continues the open pass on `current`: the
+// same attachments, all of them loaded and stored the same way. Ending the
+// open pass and starting a new one would store and load every attachment for
+// the same result.
+bool continuesRenderPass(MTL::RenderPassDescriptor* current,
+                         MTL::RenderPassDescriptor* next) {
+    if (current->renderTargetWidth() != next->renderTargetWidth() ||
+        current->renderTargetHeight() != next->renderTargetHeight() ||
+        current->renderTargetArrayLength() != next->renderTargetArrayLength() ||
+        current->defaultRasterSampleCount() != next->defaultRasterSampleCount())
+        return false;
+    bool any = false;
+    const auto same = [&](MTL::RenderPassAttachmentDescriptor* a,
+                          MTL::RenderPassAttachmentDescriptor* b) {
+        if (a->texture() != b->texture())
+            return false;
+        if (b->texture() == nullptr)
+            return true;
+        any = true;
+        return a->level() == b->level() && a->slice() == b->slice() &&
+               a->depthPlane() == b->depthPlane() &&
+               a->resolveTexture() == b->resolveTexture() &&
+               a->storeAction() == b->storeAction() &&
+               b->loadAction() == MTL::LoadActionLoad;
+    };
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++)
+        if (!same(current->colorAttachments()->object(i),
+                  next->colorAttachments()->object(i)))
+            return false;
+    return same(current->depthAttachment(), next->depthAttachment()) &&
+           same(current->stencilAttachment(), next->stencilAttachment()) && any;
+}
+
+} // namespace
+
 MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     if (render_pass_descriptor == encoder_state.render_pass)
         return getRenderCommandEncoderUnchecked();
+
+    // DEBUG: HYDRA_NO_PASS_MERGE=1 always starts a new pass, for comparisons
+    static const bool merge = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
+    if (merge && encoder_type == EncoderType::Render &&
+        encoder_state.render_pass != nullptr &&
+        continuesRenderPass(encoder_state.render_pass, render_pass_descriptor)) {
+        encoder_state.render_pass = render_pass_descriptor;
+        if (PerfStats::isEnabled())
+            PerfStats::instance().render_pass_merges++;
+        return getRenderCommandEncoderUnchecked();
+    }
 
     // Creating the encoder already resets all cached render state.
     return createRenderCommandEncoder(render_pass_descriptor);

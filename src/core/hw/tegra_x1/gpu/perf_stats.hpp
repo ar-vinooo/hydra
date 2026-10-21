@@ -120,6 +120,8 @@ struct PerfStats {
     std::atomic<u64> render_pass_store_bytes{0};
     std::atomic<u64> render_pass_continuations{0};
     std::array<std::atomic<u64>, 4> render_pass_continuation_causes{};
+    // Passes continued in the open encoder instead of a new one
+    std::atomic<u64> render_pass_merges{0};
     std::atomic<u64> blit_encoders{0};
     std::atomic<u64> buffer_snapshots{0};
     std::atomic<u64> buffer_snapshot_bytes{0};

@@ -201,8 +201,11 @@ fragment float4 red() { return float4(1, 0, 0, 1); }
             stats.render_pass_load_bytes = 0;
             stats.render_pass_store_bytes = 0;
             stats.render_pass_continuations = 0;
+            stats.render_pass_merges = 0;
             for (auto& cause : stats.render_pass_continuation_causes)
                 cause = 0;
+            // The second pass continues the open first one
+            const bool merging = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
             MTL::CommandBuffer* native;
             {
                 CommandBuffer commands(queue);
@@ -241,25 +244,36 @@ fragment float4 red() { return float4(1, 0, 0, 1); }
                     total[k].count += kinds[k].count;
                 }
                 top.insert(top.end(), current.begin(), current.end());
-                if (total[0].count == 2 && total[2].count == 1)
+                if (total[0].count == (merging ? 1u : 2u) && total[2].count == 1)
                     break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
-            check(total[0].count == 2 && total[0].ns > 0,
+            const hydra::u64 render_count = merging ? 1 : 2;
+            check(total[0].count == render_count && total[0].ns > 0,
                   "Render pass times were not resolved");
             check(total[2].count == 1, "Blit pass time was not resolved");
             check(!top.empty() &&
                       top[0].first.find("render 256x256") == 0,
                   "Render pass label is wrong");
             const hydra::u64 bytes = size * size * 4;
-            check(stats.render_passes == 2, "Render passes were not counted");
-            check(stats.render_pass_continuations == 1 &&
-                      stats.render_pass_continuation_causes[0] == 1,
-                  "The loading pass is not a continuation of a render pass");
-            check(stats.render_pass_load_bytes == bytes,
-                  "Load traffic is wrong");
-            check(stats.render_pass_store_bytes == 2 * bytes,
-                  "Store traffic is wrong");
+            if (merging) {
+                // One pass: cleared, drawn twice, stored once
+                check(stats.render_passes == 1 && stats.render_pass_merges == 1,
+                      "The loading pass was not merged");
+                check(stats.render_pass_load_bytes == 0 &&
+                          stats.render_pass_store_bytes == bytes,
+                      "Merged pass traffic is wrong");
+            } else {
+                check(stats.render_passes == 2,
+                      "Render passes were not counted");
+                check(stats.render_pass_continuations == 1 &&
+                          stats.render_pass_continuation_causes[0] == 1,
+                      "The loading pass is not a continuation of a render pass");
+                check(stats.render_pass_load_bytes == bytes,
+                      "Load traffic is wrong");
+                check(stats.render_pass_store_bytes == 2 * bytes,
+                      "Store traffic is wrong");
+            }
             std::vector<uint8_t> pixels(bytes);
             copy->getBytes(pixels.data(), size * 4,
                            MTL::Region::Make2D(0, 0, size, size), 0);
