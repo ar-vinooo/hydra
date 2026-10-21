@@ -18,6 +18,7 @@
 #include "core/horizon/ui/handler_base.hpp"
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/system.hpp"
@@ -2221,6 +2222,68 @@ void testGpuOrderingStress(System& system, kernel::Process* process,
               << seed << '\n';
 }
 
+void testCommandBufferBatching(System& system, kernel::Process* process) {
+    namespace gpu = hw::tegra_x1::gpu;
+    auto& device = system.getGpu();
+    auto& gmmu = process->getGMmu();
+    constexpr usize COUNT = 16;
+    constexpr uptr BASE = 0x78000000;
+    std::array<std::array<u32, 3>, COUNT> words{};
+    std::array<std::future<void>, COUNT> completions;
+    auto channel = std::make_shared<gpu::PfifoDecodeState>();
+    const auto gate = device.getVideoSyncpoints().allocate();
+    check(gate.has_value(), "Batch test allocates its admission gate");
+    usize mapped = 0;
+    bool finished = false;
+    struct Cleanup {
+        std::function<void()> run;
+        ~Cleanup() { run(); }
+    } cleanup{[&] {
+        if (!finished)
+            device.getPfifo().cancel(gmmu);
+        for (usize index = 0; index < mapped; ++index)
+            gmmu.unmap(BASE + index * 0x1000);
+        device.getVideoSyncpoints().release(*gate);
+    }};
+    for (usize index = 0; index < COUNT; ++index) {
+        words[index] = {(1u << 29) | (1u << 16), 0xb197,
+                        (4u << 29) | (static_cast<u32>(index) << 16) | 0xd00};
+        const auto address = BASE + index * 0x1000;
+        gmmu.map(address, {reinterpret_cast<uptr>(words[index].data()),
+                           sizeof(words[index])});
+        ++mapped;
+        const auto entry = std::bit_cast<gpu::GpfifoEntry>(
+            static_cast<u64>(address) | (3ull << 42));
+        auto promise = std::make_shared<std::promise<void>>();
+        completions[index] = promise->get_future();
+        check(device.getPfifo().submitEntries(
+                  gmmu, {&entry, 1},
+                  index == 0 ? gpu::GpfifoFlags::FenceWait
+                             : gpu::GpfifoFlags::None,
+                  [promise] { promise->set_value(); },
+                  index == 0 ? gpu::Fence{*gate, 1} : gpu::Fence{}, channel),
+              "Batch test admits every queued list");
+    }
+    const auto before =
+        gpu::renderer::metal::CommandBuffer::getSubmissionCount();
+    device.getVideoSyncpoints().complete(*gate, 1);
+    for (auto& completion : completions)
+        check(completion.wait_for(std::chrono::seconds(5)) ==
+                  std::future_status::ready,
+              "Batch preserves every submission completion");
+    const auto submitted =
+        gpu::renderer::metal::CommandBuffer::getSubmissionCount() - before;
+    const u64 expected = gpu::optimization::enabled() ? 3 : COUNT;
+    check(submitted == expected && !channel->failed &&
+              channel->context->three_d.getReg(0xd00) == COUNT - 1 &&
+              channel->last_dispatched_sequence == COUNT * 2,
+          "Bounded native batching reduces submissions while retaining exact "
+          "channel order");
+    finished = true;
+    std::cout << "PASS: batch ordering and completion, native submissions="
+              << submitted << '\n';
+}
+
 void testChannelFaults(System& system, kernel::Process* process) {
     namespace gpu = hw::tegra_x1::gpu;
     namespace nv = services::nvdrv;
@@ -2556,6 +2619,15 @@ int main(int argc, char** argv) {
                     "GPU ordering stress");
             testGpuOrderingStress(system, process, static_cast<u32>(iterations),
                                   seed);
+            return 0;
+        }
+        if (argc == 2 &&
+            std::string_view(argv[1]) == "--check-command-buffer-batching") {
+            System system(ui);
+            auto* process =
+                system.getOs().getKernel().getProcessManager().createProcess(
+                    "Command buffer batching test");
+            testCommandBufferBatching(system, process);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--check-channel-scheduling") {

@@ -1,5 +1,6 @@
 #include "core/hw/tegra_x1/gpu/pfifo.hpp"
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 
 #include <limits>
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
@@ -387,8 +388,47 @@ void Pfifo::threadFunc() {
         "GPU thread");
 
     std::unique_lock lock(mutex);
+    std::unique_ptr<renderer::ICommandBuffer> batch_commands;
+    GMmu* batch_space = nullptr;
+    PfifoDecodeState* batch_state = nullptr;
+    unsigned batch_lists = 0;
+    u64 batch_words = 0;
+    std::vector<u64> batch_retirements;
+    // Publish decode retirement only after the native batch was committed;
+    // presentation may submit a queue drain as soon as this counter advances.
+    const auto publish_retirements = [&] {
+        for (const auto id : batch_retirements)
+            retired_submissions.insert(id);
+        batch_retirements.clear();
+        while (retired_submissions.erase(completed_count + 1) != 0)
+            ++completed_count;
+    };
+    // Caller releases mutex: completion callbacks may re-enter admission.
+    const auto flush_batch = [&] {
+        tls_crnt_gmmu = batch_space;
+        tls_crnt_decode_state = batch_state;
+        tls_crnt_command_buffer = batch_commands.get();
+        batch_commands.reset();
+        tls_crnt_command_buffer = nullptr;
+        tls_crnt_decode_state = nullptr;
+        tls_crnt_gmmu = nullptr;
+        batch_space = nullptr;
+        batch_state = nullptr;
+        batch_lists = 0;
+        batch_words = 0;
+    };
     while (true) {
-        cond_var.wait(lock, [&] { return stop || !entry_lists.empty(); });
+        if (batch_commands &&
+            (stop || entry_lists.empty() || batch_space->gpuWorkCancelled())) {
+            lock.unlock();
+            flush_batch();
+            lock.lock();
+            publish_retirements();
+            active_gmmu = nullptr;
+            completed_cond_var.notify_all();
+        }
+        if (!batch_commands)
+            cond_var.wait(lock, [&] { return stop || !entry_lists.empty(); });
         if (stop)
             break;
 
@@ -407,7 +447,29 @@ void Pfifo::threadFunc() {
             blocked.insert(state);
         }
         if (selected == entry_lists.end()) {
+            if (batch_commands) {
+                lock.unlock();
+                flush_batch();
+                lock.lock();
+                publish_retirements();
+                active_gmmu = nullptr;
+                completed_cond_var.notify_all();
+                continue;
+            }
             cond_var.wait_for(lock, std::chrono::milliseconds(1));
+            continue;
+        }
+        const auto* selected_state = selected->decode_state
+                                         ? selected->decode_state.get()
+                                         : &default_decode_state;
+        if (batch_commands &&
+            (selected->gmmu != batch_space || selected_state != batch_state)) {
+            lock.unlock();
+            flush_batch();
+            lock.lock();
+            publish_retirements();
+            active_gmmu = nullptr;
+            completed_cond_var.notify_all();
             continue;
         }
         auto entry_list = std::move(*selected);
@@ -431,8 +493,17 @@ void Pfifo::threadFunc() {
                 VisualDiagnostics::instance().beginSubmission(entry_list.correlation_id);
                 tls_crnt_gmmu = entry_list.gmmu;
                 gpu.getRenderer().applyCaptureRequests();
-                tls_crnt_command_buffer =
-                    gpu.getRenderer().createCommandBuffer();
+                if (!batch_commands) {
+                    batch_commands.reset(
+                        gpu.getRenderer().createCommandBuffer());
+                    batch_space = entry_list.gmmu;
+                    batch_state = &decode;
+                }
+                ++batch_lists;
+                for (const auto& entry : entry_list.entries)
+                    batch_words = std::min<u64>(optimization::MAX_BATCH_WORDS,
+                                                batch_words + entry.size);
+                tls_crnt_command_buffer = batch_commands.get();
                 // Retain the AS through host completion, including yielded/faulted work.
                 if (entry_list.decode_state)
                     tls_crnt_command_buffer->onCompleted(
@@ -512,7 +583,17 @@ void Pfifo::threadFunc() {
                             }
                         });
                 }
-                delete tls_crnt_command_buffer;
+#ifdef ZTD_PLATFORM_APPLE
+                // Batching native submissions must not silently erase an
+                // encoder transition that separated the original lists. Keep
+                // this boundary even when the wrapper is reused. Intra-list
+                // encoder reuse remains the existing backend's responsibility.
+                if (optimization::enabled() &&
+                    CONFIG_INSTANCE.getGpuRenderer() == GpuRenderer::Metal)
+                    static_cast<renderer::metal::CommandBuffer*>(
+                        tls_crnt_command_buffer)
+                        ->endEncoding();
+#endif
                 tls_crnt_command_buffer = nullptr;
                 tls_crnt_gmmu = nullptr;
                 tls_crnt_decode_state = nullptr;
@@ -520,7 +601,6 @@ void Pfifo::threadFunc() {
         }
 
         lock.lock();
-        active_gmmu = nullptr;
         if (yielded && !stop && !entry_list.gmmu->gpuWorkCancelled()) {
             entry_lists.push_front(std::move(entry_list));
         } else {
@@ -528,13 +608,50 @@ void Pfifo::threadFunc() {
                 entry_list.work->cancel();
             else if (decode.failed)
                 entry_list.work->finish(false);
-            retired_submissions.insert(entry_list.correlation_id);
-            while (retired_submissions.erase(completed_count + 1) != 0)
-                ++completed_count;
-            completed_cond_var.notify_all();
+            batch_retirements.push_back(entry_list.correlation_id);
         }
+        bool extend =
+            batch_commands && optimization::enabled() && !stop && !yielded &&
+            !decode.failed && !batch_space->gpuWorkCancelled() &&
+            entry_list.flags == GpfifoFlags::None &&
+            batch_lists < optimization::MAX_BATCH_LISTS && !entry_lists.empty();
+        if (extend) {
+            const auto& following = entry_lists.front();
+            const auto* following_state = following.decode_state
+                                              ? following.decode_state.get()
+                                              : &default_decode_state;
+            u64 following_words = 0;
+            for (const auto& entry : following.entries)
+                following_words = std::min<u64>(optimization::MAX_BATCH_WORDS,
+                                                following_words + entry.size);
+            extend =
+                following.gmmu == batch_space &&
+                following_state == batch_state &&
+                following.flags == GpfifoFlags::None &&
+                !following_state->failed && !following_state->semaphore_wait &&
+                !following_state->syncpoint_wait &&
+                following_words <= optimization::MAX_BATCH_WORDS - batch_words;
+        }
+        if (batch_commands && !extend) {
+            lock.unlock();
+            flush_batch();
+            lock.lock();
+        }
+        // A process cancel must also wait for an uncommitted batch before
+        // freeing its guest allocations. Clear this only after submission.
+        active_gmmu = batch_commands ? batch_space : nullptr;
+        if (!batch_commands)
+            publish_retirements();
         completed_cond_var.notify_all();
     }
+
+    lock.unlock();
+    flush_batch();
+    lock.lock();
+    publish_retirements();
+    active_gmmu = nullptr;
+    completed_cond_var.notify_all();
+    lock.unlock();
 
     DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess()
         .unregisterThisThread();

@@ -88,6 +88,9 @@ class CommandBuffer final : public ICommandBuffer {
     static u64 getCheckpointCount() {
         return checkpoint_total.load(std::memory_order_acquire);
     }
+    static u64 getSubmissionCount() {
+        return submitted_buffers.load(std::memory_order_acquire);
+    }
     // Commands encoded since the last checkpoint on any thread write guest
     // memory (a shader writing a storage buffer, which aliases it). Their
     // results are only visible to the CPU after a checkpoint.

@@ -1,5 +1,9 @@
 # Hydra graphics work: handoff
 
+**P2 source continuation (2026-10-21, Windows):**
+[Bounded native batching, exact range coalescing and source-bound activation](p2-gpu-optimization.md).
+Implemented but unbuilt/unrun; the activation receipt has not been issued here.
+
 **Guest event/PFIFO replay continuation (2026-10-21, Windows):**
 [Event capture, native decoder replay, differential comparison and seeded stress](guest-event-stream.md).
 These source additions have not been built or tested; earlier validation results

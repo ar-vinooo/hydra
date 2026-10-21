@@ -102,8 +102,9 @@ An optional guest event recorder, semantic memory/dependency replay, native
 PFIFO-word replay, differential comparator and seeded ordering stress are now
 implemented; see [guest-event-stream.md](../docs/graphics-handoff/guest-event-stream.md).
 Real-device reference collection and execution of the added checks remain
-unperformed. Barrier/batching optimization remains gated on successful P0
-correctness checks. The existing synchronous scheduler and retained resources
+unperformed. P2 batching/coalescing and redundant-checkpoint reduction are now
+implemented; [activation requires actual baseline/optimized passes](../docs/graphics-handoff/p2-gpu-optimization.md).
+The existing synchronous scheduler and retained resources
 are not replaced with a speculative multi-queue dependency graph. No claim is
 made that metadata alone resolves every alias or unsynchronized access case.
 

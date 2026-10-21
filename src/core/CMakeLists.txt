@@ -8,6 +8,9 @@ add_library(hydra-core
     hot/texture_cache_hot.cpp
     hw/tegra_x1/gpu/visual_diagnostics.cpp
     hw/tegra_x1/gpu/visual_diagnostics.hpp
+    hw/tegra_x1/gpu/optimization_policy.cpp
+    hw/tegra_x1/gpu/optimization_policy.hpp
+    hw/tegra_x1/gpu/resource/range_set.hpp
     video/submit_trace.cpp
     video/submit_trace.hpp
     video/submit.hpp
@@ -777,6 +780,7 @@ if (SDL_ENABLED)
     )
 endif ()
 
+include("${CMAKE_SOURCE_DIR}/cmake/GpuOptimizationGate.cmake")
 target_include_directories(hydra-core SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/externals/libyaz0/include)
 # TODO: only link Apple frameworks if Apple
 target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common libzstd_static)

@@ -1,6 +1,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
 #include "core/hot/table.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
+#include "core/hw/tegra_x1/gpu/resource/range_set.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -157,10 +159,26 @@ void TextureCache::synchronizeStorageWrites(
     {
         ScopedCheckpointReason reason(command_buffer,
                                       CheckpointReason::StorageWrite);
-        renderer.debugSyncCommandBuffer(command_buffer);
+        if (optimization::enabled()) {
+            // The backend's issued/synchronized guest-write epochs prove
+            // whether this checkpoint is redundant. Descriptor/cache identity
+            // alone never proves visibility of pending GPU writes.
+            if (!renderer.synchronizeGuestWrites(command_buffer)) {
+                if (tls_crnt_decode_state)
+                    tls_crnt_decode_state->fail(25);
+                return;
+            }
+        } else {
+            renderer.debugSyncCommandBuffer(command_buffer);
+        }
     }
-    for (const auto& range : ranges)
-        invalidateMemory(range);
+    if (optimization::enabled()) {
+        for (const auto& range : resource::coalesceRanges(ranges))
+            invalidateMemory(range);
+    } else {
+        for (const auto& range : ranges)
+            invalidateMemory(range);
+    }
 }
 
 void TextureCache::markGpuWritesInGuest(ztd::Range<uptr> range) {

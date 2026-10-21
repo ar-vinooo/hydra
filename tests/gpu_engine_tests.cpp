@@ -12,6 +12,7 @@
 #include "core/hw/tegra_x1/gpu/macro/interpreter/driver.hpp"
 #include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
@@ -4690,6 +4691,17 @@ kernel void main_(device uint* values [[buffer(0)]], device uint* alias [[buffer
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 &&
+        std::string_view(argv[1]) == "--check-optimization-policy") {
+        const auto* requested = std::getenv("HYDRA_GPU_OPTIMIZATIONS");
+        const bool expected = requested && std::string_view(requested) == "1";
+        if (optimization::enabled() != expected) {
+            std::cerr << "FAIL: optimization receipt did not select the "
+                         "requested policy\n";
+            return 1;
+        }
+        return 0;
+    }
     if (argc == 2 &&
         (std::string_view(argv[1]) == "--check-compute-ir" ||
          std::string_view(argv[1]) == "--check-compute-ir-profile")) {

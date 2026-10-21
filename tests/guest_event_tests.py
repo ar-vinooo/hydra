@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from replay_guest_events import Replay, Memory, export_native
 from guest_event_format import MAGIC, KINDS, HEADER, write_record
 from compare_gpu_replays import compare
+from gpu_optimization_gate import source_fingerprint, check_build
 
 
 def stream(*events):
@@ -39,6 +40,41 @@ def summary():
 
 
 class GuestEventTests(unittest.TestCase):
+    def test_optimization_fingerprint_normalizes_line_endings_and_detects_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in ("CMakeLists.txt", "src/core/CMakeLists.txt", "cmake/GpuOptimizationGate.cmake",
+                         "src/core/hw/tegra_x1/gpu/example.cpp"):
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"first\nsecond\n")
+            original = source_fingerprint(root)
+            source = root / "src/core/hw/tegra_x1/gpu/example.cpp"
+            source.write_bytes(b"first\r\nsecond\r\n")
+            self.assertEqual(source_fingerprint(root), original)
+            source.write_bytes(b"first\nchanged\n")
+            self.assertNotEqual(source_fingerprint(root), original)
+
+    def test_build_gate_rejects_stale_sources_and_hot_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path in ("CMakeLists.txt", "src/core/CMakeLists.txt", "cmake/GpuOptimizationGate.cmake"):
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("source\n", encoding="utf-8")
+            fingerprint = source_fingerprint(root)
+            build = root / "build"
+            build.mkdir()
+            marker = build / "gpu-optimization-fingerprint.txt"
+            marker.write_text(fingerprint + "\n1\n", encoding="utf-8")
+            self.assertEqual(check_build(root, build), fingerprint)
+            marker.write_text(fingerprint + "\n0\n", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                check_build(root, build)
+            marker.write_text("old-source\n1\n", encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                check_build(root, build)
+
     def test_late_gpu_completion_does_not_replace_partial_cpu_write(self):
         replay = Replay()
         for event in stream(

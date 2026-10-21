@@ -145,6 +145,7 @@ cases. These additions are wired into the existing optional validation script.
 
 Builds and runtime validation of this continuation are deferred at the user's
 request. The native replay, comparator and stress sources are implemented but
-unrun. Real-device evidence remains external. Barrier reduction and batching
-changes are deferred until P0 correctness checks pass, as required by the report;
-no unverified performance mode is enabled by these additions.
+unrun. Real-device evidence remains external. P2 batching/coalescing and redundant
+checkpoint reduction are now implemented with a source-bound P0 validation gate;
+see [p2-gpu-optimization.md](p2-gpu-optimization.md). They remain inactive until
+the baseline and optimized checks actually pass and issue a matching receipt.

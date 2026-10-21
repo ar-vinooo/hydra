@@ -24,6 +24,8 @@ contoh pseudocode di dalamnya bukan bukti bahwa fungsi Hydra tertentu rusak.
 | Native guest replay | `tests/guest_replay_tool.cpp`, `Pfifo::replayWord` | Word rekaman melewati decoder dan engine produksi, method diverifikasi, output native dibandingkan |
 | Trace / differential | `tools/check_gpu_trace.py`, `tools/compare_gpu_replays.py` | Urutan/block/resume dan perbandingan output byte-hash dengan reference eksplisit |
 | Stress / regression source | `tests/guest_event_tests.py`, `tests/shutdown_tests.cpp`, `tests/gpu_engine_tests.cpp`, `tests/content_version_tests.cpp` | Kegagalan format/order, ownership, producer/consumer GPU, partial alias, overwrite CPU, compute dan completion |
+| P2 batching / coalescing | `gpu/pfifo.cpp`, `gpu/resource/range_set.hpp`, `gpu/renderer/renderer.hpp`, `gpu/renderer/texture_cache.cpp` | Native submission berurutan dibatch dengan batas; union rentang tepat; checkpoint redundant dilewati memakai epoch backend |
+| Prasyarat P0 untuk P2 | `gpu/optimization_policy.*`, `cmake/GpuOptimizationGate.cmake`, `tools/gpu_optimization_gate.py`, `tools/validate_gpu_correctness.py` | Aktivasi memerlukan receipt dari pemeriksaan baseline dan optimasi untuk fingerprint source build yang sama |
 
 Path `gpu/...` pada tabel relatif terhadap `src/core/hw/tegra_x1/`;
 `core/hot/...` relatif terhadap `src/`.
@@ -44,7 +46,9 @@ Perangkat guest nyata dan capture reference perangkat tidak tersedia di sesi
 ini. Alat pembanding menerima reference yang dikumpulkan terpisah; tidak ada
 hasil hardware yang diklaim atau dibuat-buat.
 
-Pengurangan barrier dan batching P2 belum diaktifkan. Laporan secara eksplisit
-mensyaratkan test P0 hijau sebelum optimasi tersebut. Karena pengguna menunda
-pengujian, prasyarat itu belum dibuktikan. Jalur konservatif dipertahankan;
-penundaan ini tidak disamarkan sebagai optimasi yang sudah selesai.
+Kode P2 yang sebelumnya tersisa sekarang ditambahkan, termasuk batching native,
+coalescing rentang dan pengurangan checkpoint yang sudah terpenuhi. Mekanisme
+aktivasi mengikuti syarat laporan: receipt hanya diterbitkan sesudah baseline P0
+dan pemeriksaan mode optimasi lulus pada source yang sama. Karena pengujian
+ditunda, tidak ada receipt atau optimasi aktif yang diklaim. Detail ada di
+[p2-gpu-optimization.md](p2-gpu-optimization.md).

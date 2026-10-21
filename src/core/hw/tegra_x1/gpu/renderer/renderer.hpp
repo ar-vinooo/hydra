@@ -1,7 +1,9 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 #include "core/hw/tegra_x1/gpu/resource/content_version.hpp"
+#include "core/hw/tegra_x1/gpu/resource/range_set.hpp"
 #include "core/hw/tegra_x1/gpu/resource/resource_registry.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
@@ -95,7 +97,12 @@ class IRenderer {
         ICommandBuffer* command_buffer,
         std::span<const ztd::Range<uptr>> ranges,
         capture::GuestEventOrigin origin = capture::currentGuestEventOrigin()) {
-        auto write = content_versions.issueGpuWrites(ranges);
+        std::vector<ztd::Range<uptr>> merged;
+        const bool coalesce = optimization::enabled();
+        if (coalesce)
+            merged = resource::coalesceRanges(ranges);
+        auto write = content_versions.issueGpuWrites(
+            coalesce ? std::span<const ztd::Range<uptr>>(merged) : ranges);
         if (write.version() != 0) {
             const auto version = write.version();
             const auto command_identity =
@@ -123,6 +130,13 @@ class IRenderer {
         MemoryInvalidationScope scope = MemoryInvalidationScope::BufferCache |
                                         MemoryInvalidationScope::TextureCache |
                                         MemoryInvalidationScope::ShaderCache) {
+        recordMemoryWrite(range, scope);
+        invalidateMemoryCaches(range, scope);
+    }
+
+  private:
+    void recordMemoryWrite(ztd::Range<uptr> range,
+                           MemoryInvalidationScope scope) {
         // The bytes behind this range changed (guest CPU or DMA write)
         const auto version = content_versions.write(range);
         auto& events = capture::GuestEvents::instance();
@@ -133,6 +147,10 @@ class IRenderer {
                          capture::currentGuestEventOrigin(), range.getBegin(),
                          range.getSize(), version, static_cast<u64>(scope));
         }
+    }
+
+    void invalidateMemoryCaches(ztd::Range<uptr> range,
+                                MemoryInvalidationScope scope) {
         if (any(scope & MemoryInvalidationScope::BufferCache)) {
             std::scoped_lock lock(buffer_cache.getMutex());
             buffer_cache.invalidateMemory(range);
@@ -150,6 +168,7 @@ class IRenderer {
         }
     }
 
+  public:
     // The caches are locked by the GPU thread for whole draws: other threads
     // queue their invalidations for it, it applies them between its entries
     void queueMemoryInvalidation(ztd::Range<uptr> range) {
@@ -172,8 +191,20 @@ class IRenderer {
             ranges.swap(queued_invalidations);
             has_queued_invalidations.store(false, std::memory_order_relaxed);
         }
-        for (const auto& range : ranges)
-            invalidateMemory(range);
+        if (optimization::enabled()) {
+            const auto scope = MemoryInvalidationScope::BufferCache |
+                               MemoryInvalidationScope::TextureCache |
+                               MemoryInvalidationScope::ShaderCache;
+            // Keep each epoch/trace transition in its original order. Only
+            // cache eviction work is coalesced at this existing boundary.
+            for (const auto& range : ranges)
+                recordMemoryWrite(range, scope);
+            for (const auto& range : resource::coalesceRanges(ranges))
+                invalidateMemoryCaches(range, scope);
+        } else {
+            for (const auto& range : ranges)
+                invalidateMemory(range);
+        }
     }
 
     // Writes GPU-rendered textures in the range back to guest memory, from a
