@@ -39,6 +39,10 @@ struct ContentView: View {
                 .navigationDestination(item: $globalState.activeGame) { activeGame in
                     EmulationView(fps: $fps)
                         .aspectRatio(CGSize(width: 16, height: 9), contentMode: .fit)
+                        // Letterbox in black, like a TV, when the window is
+                        // not 16:9 (e.g. full screen on a 16:10 display)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color.black.ignoresSafeArea())
                         #if os(iOS)
                             .onAppear {
                                 // TODO: if virtual controller enabled
@@ -76,7 +80,33 @@ struct ContentView: View {
         }
         #if os(macOS)
             .windowToolbarFullScreenVisibility(.onHover)
+            .background(FillScreenOnAppear())
         #endif
         .navigationTitle(navigationTitle)
     }
 }
+
+#if os(macOS)
+    /// Sizes the window to the screen (between the menu bar and the Dock) when
+    /// it opens, without entering full screen
+    struct FillScreenOnAppear: NSViewRepresentable {
+        final class FillScreenView: NSView {
+            private var filled = false
+
+            override func viewDidMoveToWindow() {
+                super.viewDidMoveToWindow()
+                guard !filled, let window = window else { return }
+                filled = true
+                // After AppKit restored the frame of the previous session
+                DispatchQueue.main.async {
+                    guard let screen = window.screen ?? NSScreen.main else { return }
+                    window.setFrame(screen.visibleFrame, display: true)
+                }
+            }
+        }
+
+        func makeNSView(context: Context) -> NSView { FillScreenView() }
+
+        func updateNSView(_ nsView: NSView, context: Context) {}
+    }
+#endif

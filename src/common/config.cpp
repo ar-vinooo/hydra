@@ -8,10 +8,14 @@ TOML11_DEFINE_CONVERSION_ENUM(hydra::CpuBackend, AppleHypervisor,
                               "Apple Hypervisor", Dynarmic, "dynarmic")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::GpuRenderer, Null, "null", Metal, "Metal")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::ShaderBackend, Msl, "MSL", Air, "AIR")
-TOML11_DEFINE_CONVERSION_ENUM(hydra::Resolution, Auto, "auto", _720p, "720p",
+// The window based resolution used to be stored as "auto", the default. It
+// reported resolutions no Switch has; such configs now get the console's.
+TOML11_DEFINE_CONVERSION_ENUM(hydra::Resolution, Auto, "window", _720p, "720p",
                               _1080p, "1080p", _1440p, "1440p", _2160p, "2160p",
                               _4320p, "4320p", AutoExact, "Auto exact", Custom,
-                              "custom")
+                              "custom", Console, "console")
+TOML11_DEFINE_CONVERSION_ENUM(hydra::UpscalingFilter, Bilinear, "Bilinear",
+                              Nearest, "Nearest", MetalFx, "MetalFX")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::AudioBackend, Null, "null", Cubeb, "Cubeb")
 TOML11_DEFINE_CONVERSION_ENUM(
     hydra::SystemLanguage, AmericanEnglish, "American English", BritishEnglish,
@@ -135,6 +139,7 @@ void Config::loadDefaults() {
     shader_backend = getDefaultShaderBackend();
     display_resolution = getDefaultDisplayResolution();
     custom_display_resolution = getDefaultCustomDisplayResolution();
+    upscaling_filter = getDefaultUpscalingFilter();
     audio_backend = getDefaultAudioBackend();
     user_id = getDefaultUserId();
     device_nickname = getDefaultDeviceNickname();
@@ -202,6 +207,7 @@ void Config::serialize() {
         graphics["display_resolution"] = display_resolution;
         graphics["custom_display_resolution"] =
             CustomResolution(custom_display_resolution);
+        graphics["upscaling_filter"] = upscaling_filter;
     }
 
     {
@@ -297,6 +303,10 @@ void Config::deserialize() {
         custom_display_resolution = toml::find_or<CustomResolution>(
             graphics, "custom_display_resolution",
             getDefaultCustomDisplayResolution());
+        upscaling_filter =
+            toml::find_or<std::optional<UpscalingFilter>>(
+                graphics, "upscaling_filter", getDefaultUpscalingFilter())
+                .value_or(getDefaultUpscalingFilter());
     }
     if (data.contains("Audio")) {
         const auto& audio = data.at("Audio");
@@ -362,6 +372,7 @@ void Config::log() {
     LOG_INFO(Other, "Display resolution: {}", display_resolution);
     LOG_INFO(Other, "Custom display resolution: {}x{}",
              custom_display_resolution.x(), custom_display_resolution.y());
+    LOG_INFO(Other, "Upscaling filter: {}", upscaling_filter);
     LOG_INFO(Other, "Audio backend: {}", audio_backend);
     LOG_INFO(Other, "User ID: {:032x}", user_id);
     LOG_INFO(Other, "Device nickname: {}", device_nickname);

@@ -32,8 +32,11 @@ enum class ShaderBackend : u32 {
     Air,
 };
 
+// The display resolution reported to the guest. A Switch reports 1080p when
+// docked and 720p in handheld mode (Console); the others are debug overrides
+// that no hardware reports.
 enum class Resolution : u32 {
-    Auto,
+    Auto, // The window size rounded up to a standard resolution
     _720p,
     _1080p,
     _1440p,
@@ -41,9 +44,17 @@ enum class Resolution : u32 {
     _4320p,
     AutoExact,
     Custom,
+    Console,
 };
 
 STRONG_TYPEDEF(CustomResolution, uint2);
+
+// How the presented frame is scaled to the window
+enum class UpscalingFilter : u32 {
+    Bilinear,
+    Nearest,
+    MetalFx, // MetalFX spatial upscaling when the window is larger
+};
 
 enum class AudioBackend : u32 {
     Null,
@@ -132,8 +143,13 @@ class Config {
     static ShaderBackend getDefaultShaderBackend() {
         return ShaderBackend::Msl;
     }
-    static Resolution getDefaultDisplayResolution() { return Resolution::Auto; }
+    static Resolution getDefaultDisplayResolution() {
+        return Resolution::Console;
+    }
     static uint2 getDefaultCustomDisplayResolution() { return {1920, 1080}; }
+    static UpscalingFilter getDefaultUpscalingFilter() {
+        return UpscalingFilter::Bilinear;
+    }
     static AudioBackend getDefaultAudioBackend() {
 #ifdef HYDRA_CUBEB_ENABLED
         return AudioBackend::Cubeb;
@@ -189,6 +205,7 @@ class Config {
     ShaderBackend shader_backend;
     Resolution display_resolution;
     uint2 custom_display_resolution;
+    UpscalingFilter upscaling_filter;
     AudioBackend audio_backend;
     uuid_t user_id;
     std::string device_nickname;
@@ -219,6 +236,7 @@ class Config {
     REF_GETTER(shader_backend, getShaderBackend);
     REF_GETTER(display_resolution, getDisplayResolution);
     REF_GETTER(custom_display_resolution, getCustomDisplayResolution);
+    REF_GETTER(upscaling_filter, getUpscalingFilter);
     REF_GETTER(audio_backend, getAudioBackend);
     REF_GETTER(user_id, getUserId);
     REF_GETTER(device_nickname, getDeviceNickname);
@@ -248,10 +266,14 @@ ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, CpuBackend, AppleHypervisor,
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, GpuRenderer, Null, "Null", Metal,
                                    "Metal")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, ShaderBackend, Msl, "MSL", Air, "AIR")
-ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "auto", _720p,
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "window", _720p,
                                    "720p", _1080p, "1080p", _1440p, "1440p",
                                    _2160p, "2160p", _4320p, "4320p", AutoExact,
-                                   "Auto exact", Custom, "custom")
+                                   "Auto exact", Custom, "custom", Console,
+                                   "console")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, UpscalingFilter, Bilinear,
+                                   "Bilinear", Nearest, "Nearest", MetalFx,
+                                   "MetalFX")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, AudioBackend, Null, "Null", Cubeb,
                                    "Cubeb")
 ENABLE_ENUM_FORMATTING_AND_CASTING(

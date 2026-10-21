@@ -3,8 +3,8 @@ import SwiftUI
 struct GraphicsSettingsView: View {
     @State private var gpuRenderer = HydraGpuRenderer(rawValue: configGetGpuRenderer().pointee)
     @State private var shaderBackend = HydraShaderBackend(rawValue: configGetShaderBackend().pointee)
-    @State private var displayResolution = HydraResolution(rawValue: configGetDisplayResolution().pointee)
-    @State private var customDisplayResolution = configGetCustomDisplayResolution().pointee
+    @State private var upscalingFilter = HydraUpscalingFilter(
+        rawValue: configGetUpscalingFilter().pointee)
 
     var body: some View {
         Spacer()
@@ -27,36 +27,24 @@ struct GraphicsSettingsView: View {
                     .onChange(of: self.shaderBackend.rawValue) { _, newValue in
                         configGetShaderBackend().pointee = newValue
                     }
-
-                    Picker("Display resolution", selection: self.$displayResolution.rawValue) {
-                        Text("Auto (recommended)").tag(HYDRA_RESOLUTION_AUTO.rawValue)
-                        Text("720p").tag(HYDRA_RESOLUTION_720P.rawValue)
-                        Text("1080p").tag(HYDRA_RESOLUTION_1080P.rawValue)
-                        Text("1440p").tag(HYDRA_RESOLUTION_1440P.rawValue)
-                        Text("2160p").tag(HYDRA_RESOLUTION_2160P.rawValue)
-                        Text("4320p").tag(HYDRA_RESOLUTION_4320P.rawValue)
-                        Text("Auto exact (not recommended)").tag(
-                            HYDRA_RESOLUTION_AUTO_EXACT.rawValue)
-                        Text("Custom (not recommended)").tag(HYDRA_RESOLUTION_CUSTOM.rawValue)
-                    }
-                    .onChange(of: self.displayResolution.rawValue) { _, newValue in
-                        configGetDisplayResolution().pointee = newValue
-                    }
                 }
 
-                if self.displayResolution == HYDRA_RESOLUTION_CUSTOM {
-                    Section("Custom Resolution") {
-                        TextField(
-                            "Width", value: self.$customDisplayResolution.x,
-                            format: .number)
-                        TextField(
-                            "Height", value: self.$customDisplayResolution.y,
-                            format: .number
-                        )
-                        .onChange(of: self.customDisplayResolution) { _, newValue in
-                            configGetCustomDisplayResolution().pointee = newValue
-                        }
+                Section {
+                    Picker("Upscaling filter", selection: self.$upscalingFilter.rawValue) {
+                        Text("Bilinear").tag(HYDRA_UPSCALING_FILTER_BILINEAR.rawValue)
+                        Text("Nearest (pixel-sharp)").tag(
+                            HYDRA_UPSCALING_FILTER_NEAREST.rawValue)
+                        Text("MetalFX Spatial").tag(HYDRA_UPSCALING_FILTER_METALFX.rawValue)
                     }
+                    .onChange(of: self.upscalingFilter.rawValue) { _, newValue in
+                        configGetUpscalingFilter().pointee = newValue
+                    }
+                } header: {
+                    Text("Upscaling")
+                } footer: {
+                    Text(
+                        "Only changes how the final image is scaled to the window, not the emulation. Games choose their own rendering resolution, as on a Switch: 1080p display when docked, 720p in Handheld mode (System), which renders fewer pixels."
+                    )
                 }
             }
             .formStyle(.grouped)

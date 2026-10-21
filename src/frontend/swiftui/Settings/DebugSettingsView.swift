@@ -19,6 +19,10 @@ struct DebugSettingsView: View {
     @State private var gdbPort = configGetGdbPort().pointee
     @State private var gdbWaitForClient = configGetGdbWaitForClient().pointee
 
+    @State private var displayResolution = HydraResolution(
+        rawValue: configGetDisplayResolution().pointee)
+    @State private var customDisplayResolution = configGetCustomDisplayResolution().pointee
+
     var body: some View {
         Spacer()
         HStack {
@@ -50,6 +54,42 @@ struct DebugSettingsView: View {
                 }
 
                 // TODO: process arguments
+
+                Section {
+                    Picker("Display resolution", selection: self.$displayResolution.rawValue) {
+                        Text("Console (default)").tag(HYDRA_RESOLUTION_CONSOLE.rawValue)
+                        Text("720p").tag(HYDRA_RESOLUTION_720P.rawValue)
+                        Text("1080p").tag(HYDRA_RESOLUTION_1080P.rawValue)
+                        Text("1440p").tag(HYDRA_RESOLUTION_1440P.rawValue)
+                        Text("2160p").tag(HYDRA_RESOLUTION_2160P.rawValue)
+                        Text("4320p").tag(HYDRA_RESOLUTION_4320P.rawValue)
+                        Text("Window size").tag(HYDRA_RESOLUTION_AUTO.rawValue)
+                        Text("Window size, exact").tag(HYDRA_RESOLUTION_AUTO_EXACT.rawValue)
+                        Text("Custom").tag(HYDRA_RESOLUTION_CUSTOM.rawValue)
+                    }
+                    .onChange(of: self.displayResolution.rawValue) { _, newValue in
+                        configGetDisplayResolution().pointee = newValue
+                    }
+
+                    if self.displayResolution == HYDRA_RESOLUTION_CUSTOM {
+                        TextField(
+                            "Width", value: self.$customDisplayResolution.x,
+                            format: .number)
+                        TextField(
+                            "Height", value: self.$customDisplayResolution.y,
+                            format: .number
+                        )
+                        .onChange(of: self.customDisplayResolution) { _, newValue in
+                            configGetCustomDisplayResolution().pointee = newValue
+                        }
+                    }
+                } header: {
+                    Text("Display")
+                } footer: {
+                    Text(
+                        "The display resolution reported to games when docked. A Switch reports 1080p; other values can make games misbehave. Handheld mode always reports 720p."
+                    )
+                }
 
                 Section("Error handling") {
                     Toggle("Recover from segfault", isOn: self.$recoverFromSegfault)

@@ -673,6 +673,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp
     hw/tegra_x1/gpu/renderer/metal/occlusion.cpp
     hw/tegra_x1/gpu/renderer/metal/occlusion.hpp
+    hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.cpp
+    hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.cpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.hpp
     hw/tegra_x1/gpu/renderer/metal/buffer.cpp
@@ -783,7 +785,7 @@ endif ()
 include("${CMAKE_SOURCE_DIR}/cmake/GpuOptimizationGate.cmake")
 target_include_directories(hydra-core SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/externals/libyaz0/include)
 # TODO: only link Apple frameworks if Apple
-target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common libzstd_static)
+target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common libzstd_static)
 
 if (HYPERVISOR_ENABLED)
     target_link_libraries(hydra-core PRIVATE "-framework Hypervisor")

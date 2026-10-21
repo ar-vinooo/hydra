@@ -2,6 +2,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
@@ -143,6 +144,104 @@ vertex float4 main_(uint id [[vertex_id]]) {
             check(missing_vertex.getPipeline() == nullptr,
                   "Pipeline with missing vertex stage was accepted");
             std::cout << "PASS: depth-only pipeline and missing vertex handling\n";
+            return 0;
+        }
+        if (mode == "upscale") {
+            // Left half red, right half blue: the upscaled image keeps both
+            // halves and their colours
+            SpatialUpscaler upscaler(device);
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            const MTL::PixelFormat formats[] = {
+                MTL::PixelFormatRGBA8Unorm, MTL::PixelFormatRGBA8Unorm_sRGB,
+                MTL::PixelFormatBGRA8Unorm, MTL::PixelFormatRGBA16Float,
+                MTL::PixelFormatRGB10A2Unorm};
+            const char* names[] = {"RGBA8Unorm", "RGBA8Unorm_sRGB",
+                                   "BGRA8Unorm", "RGBA16Float", "RGB10A2Unorm"};
+            constexpr hydra::u32 size = 64;
+            bool any_upscaled = false;
+            for (hydra::usize f = 0; f < std::size(formats); f++) {
+                NS_STACK_SCOPED auto descriptor =
+                    MTL::TextureDescriptor::alloc()->init();
+                descriptor->setPixelFormat(formats[f]);
+                descriptor->setWidth(size);
+                descriptor->setHeight(size);
+                descriptor->setStorageMode(MTL::StorageModeShared);
+                descriptor->setUsage(MTL::TextureUsageShaderRead |
+                                     MTL::TextureUsageRenderTarget);
+                NS_STACK_SCOPED auto input = device->newTexture(descriptor);
+                auto pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+                pass->colorAttachments()->object(0)->setTexture(input);
+                pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionClear);
+                pass->colorAttachments()->object(0)->setStoreAction(
+                    MTL::StoreActionStore);
+                // Clear to blue, then the left half to red with a scissor
+                auto* command = queue->commandBuffer();
+                pass->colorAttachments()->object(0)->setClearColor(
+                    MTL::ClearColor(0, 0, 1, 1));
+                command->renderCommandEncoder(pass)->endEncoding();
+                NS_STACK_SCOPED auto blit_source =
+                    device->newTexture(descriptor);
+                pass->colorAttachments()->object(0)->setTexture(blit_source);
+                pass->colorAttachments()->object(0)->setClearColor(
+                    MTL::ClearColor(1, 0, 0, 1));
+                command->renderCommandEncoder(pass)->endEncoding();
+                auto* blit = command->blitCommandEncoder();
+                blit->copyFromTexture(blit_source, 0, 0, MTL::Origin(0, 0, 0),
+                                      MTL::Size(size / 2, size, 1), input, 0,
+                                      0, MTL::Origin(0, 0, 0));
+                blit->endEncoding();
+                auto* output = upscaler.upscale(command, input, size * 2,
+                                                size * 2);
+                std::cout << "MetalFX " << names[f] << ": "
+                          << (output ? "upscaled" : "not supported, bilinear")
+                          << '\n';
+                if (!output) {
+                    command->commit();
+                    command->waitUntilCompleted();
+                    continue;
+                }
+                any_upscaled = true;
+                check(output->width() == size * 2 && output->height() == size * 2,
+                      "Upscaled texture has the wrong size");
+                // Copy the private output to a shared texture to read it
+                NS_STACK_SCOPED auto shared_descriptor =
+                    MTL::TextureDescriptor::alloc()->init();
+                shared_descriptor->setPixelFormat(formats[f]);
+                shared_descriptor->setWidth(size * 2);
+                shared_descriptor->setHeight(size * 2);
+                shared_descriptor->setStorageMode(MTL::StorageModeShared);
+                NS_STACK_SCOPED auto shared =
+                    device->newTexture(shared_descriptor);
+                auto* copy = command->blitCommandEncoder();
+                copy->copyFromTexture(output, shared);
+                copy->endEncoding();
+                command->commit();
+                command->waitUntilCompleted();
+                check(command->status() == MTL::CommandBufferStatusCompleted,
+                      "MetalFX command buffer failed");
+                if (formats[f] != MTL::PixelFormatRGBA8Unorm &&
+                    formats[f] != MTL::PixelFormatBGRA8Unorm)
+                    continue;
+                // Sample well inside each half (edges may blend)
+                std::vector<uint8_t> pixels(size * 2 * size * 2 * 4);
+                shared->getBytes(pixels.data(), size * 2 * 4,
+                                 MTL::Region::Make2D(0, 0, size * 2, size * 2), 0);
+                const bool bgra = formats[f] == MTL::PixelFormatBGRA8Unorm;
+                const auto at = [&](hydra::u32 x, hydra::u32 y, hydra::u32 c) {
+                    const auto channel = bgra && c != 3 ? 2 - c : c;
+                    return pixels[(y * size * 2 + x) * 4 + channel];
+                };
+                for (hydra::u32 y = 8; y < size * 2 - 8; y += 8) {
+                    check(at(16, y, 0) > 240 && at(16, y, 2) < 15,
+                          "Left half is not red after upscaling");
+                    check(at(size * 2 - 16, y, 2) > 240 &&
+                              at(size * 2 - 16, y, 0) < 15,
+                          "Right half is not blue after upscaling");
+                }
+            }
+            check(any_upscaled, "MetalFX upscaled no format");
+            std::cout << "PASS: MetalFX spatial upscaling keeps the image\n";
             return 0;
         }
         if (mode == "recipe-cold" || mode == "recipe-warm") {

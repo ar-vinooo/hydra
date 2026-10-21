@@ -410,6 +410,10 @@ func configGetCustomDisplayResolution() -> UnsafeMutablePointer<HydraUint2> {
     hydraConfigGetCustomDisplayResolution()
 }
 
+func configGetUpscalingFilter() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetUpscalingFilter()
+}
+
 func configGetAudioBackend() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetAudioBackend()
 }

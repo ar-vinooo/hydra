@@ -363,6 +363,8 @@ uint2 OS::getDisplayResolution() const {
         return {1280, 720}; // Handheld display resolution is fixed
     } else {
         switch (CONFIG_INSTANCE.getDisplayResolution()) {
+        case Resolution::Console:
+            return {1920, 1080}; // Docked
         case Resolution::Auto:
             return roundUpToNearestStandardResolution(surface_resolution);
         case Resolution::_720p:

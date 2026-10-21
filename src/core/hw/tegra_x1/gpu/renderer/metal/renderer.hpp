@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_depth_pipeline_cache.hpp"
@@ -244,6 +245,7 @@ class Renderer : public IRenderer {
     // Caches
     BinaryArchiveCache binary_archive_cache;
     ShaderLibraryCache shader_library_cache;
+    SpatialUpscaler spatial_upscaler;
     DepthStencilStateCache depth_stencil_state_cache;
     BlitPipelineCache blit_pipeline_cache;
     ClearColorPipelineCache clear_color_pipeline_cache;
@@ -283,7 +285,9 @@ class Renderer : public IRenderer {
   public:
     GETTER(device, getDevice);
     REF_GETTER(blit_pipeline_cache, getBlitPipelineCache);
+    GETTER(nearest_sampler, getNearestSampler);
     GETTER(linear_sampler, getLinearSampler);
+    SpatialUpscaler& getSpatialUpscaler() { return spatial_upscaler; }
 
   public:
     // ABI-stable implementations selected by the live module.

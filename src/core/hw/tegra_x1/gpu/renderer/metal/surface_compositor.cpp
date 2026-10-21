@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/surface_compositor.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
+#include "common/config.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
@@ -24,6 +25,18 @@ SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
 
 SurfaceCompositor::~SurfaceCompositor() { render_pass_descriptor->release(); }
 
+MTL::RenderCommandEncoder*
+SurfaceCompositor::getEncoder(CommandBuffer* command_buffer) {
+    auto* encoder = command_buffer->getRenderCommandEncoder(render_pass_descriptor);
+    if (!render_pass_started) {
+        // Only the first pass clears the drawable
+        render_pass_started = true;
+        render_pass_descriptor->colorAttachments()->object(0)->setLoadAction(
+            MTL::LoadActionLoad);
+    }
+    return encoder;
+}
+
 void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
                                     const ITextureView* texture,
                                     const FloatRect2D src_rect,
@@ -31,9 +44,32 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
                                     bool transparent, f32 opacity) {
     auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
     auto texture_impl = static_cast<const TextureView*>(texture);
+    const auto& descriptor = texture->getBase()->getDescriptor();
+    const auto filter = CONFIG_INSTANCE.getUpscalingFilter();
 
-    auto encoder =
-        command_buffer_impl->getRenderCommandEncoder(render_pass_descriptor);
+    // MetalFX scales the whole texture so that the source rectangle becomes
+    // the size of the destination. The blit below then samples it 1:1 with the
+    // same normalized coordinates (crop and flips included).
+    MTL::Texture* source = texture_impl->getTexture();
+    if (filter == UpscalingFilter::MetalFx && src_rect.size.x() != 0.0f &&
+        src_rect.size.y() != 0.0f) {
+        const auto scale_x = dst_rect.size.x() / std::abs(src_rect.size.x());
+        const auto scale_y = dst_rect.size.y() / std::abs(src_rect.size.y());
+        if (scale_x > 1.0f || scale_y > 1.0f) {
+            const auto output_width = static_cast<u32>(std::lround(
+                static_cast<f32>(descriptor.width) * std::max(scale_x, 1.0f)));
+            const auto output_height = static_cast<u32>(std::lround(
+                static_cast<f32>(descriptor.height) * std::max(scale_y, 1.0f)));
+            // MetalFX encodes its own pass
+            command_buffer_impl->endEncoding();
+            if (auto* upscaled = renderer.getSpatialUpscaler().upscale(
+                    command_buffer_impl->getCommandBuffer(), source,
+                    output_width, output_height))
+                source = upscaled;
+        }
+    }
+
+    auto encoder = getEncoder(command_buffer_impl);
 
     // Draw
     encoder->setRenderPipelineState(renderer.getBlitPipelineCache().find(
@@ -51,7 +87,6 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
     encoder->setVertexBytes(&zero, sizeof(zero), 0);
 
     // Src rect
-    const auto& descriptor = texture->getBase()->getDescriptor();
     const auto src_width = descriptor.width;
     const auto src_height = descriptor.height;
     BlitParams params = {
@@ -63,9 +98,10 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
     };
 
     encoder->setFragmentBytes(&params, sizeof(params), 0);
-    encoder->setFragmentTexture(texture_impl->getTexture(),
-                                static_cast<NS::UInteger>(0));
-    encoder->setFragmentSamplerState(renderer.getLinearSampler(),
+    encoder->setFragmentTexture(source, static_cast<NS::UInteger>(0));
+    encoder->setFragmentSamplerState(filter == UpscalingFilter::Nearest
+                                         ? renderer.getNearestSampler()
+                                         : renderer.getLinearSampler(),
                                      static_cast<NS::UInteger>(0));
     encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
                             static_cast<NS::UInteger>(0),
@@ -75,7 +111,7 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
 void SurfaceCompositor::present(ICommandBuffer* command_buffer) {
     auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
 
-    command_buffer_impl->getRenderCommandEncoder(render_pass_descriptor);
+    getEncoder(command_buffer_impl);
     command_buffer_impl->endEncoding();
     command_buffer_impl->getCommandBuffer()->presentDrawable(drawable);
 }

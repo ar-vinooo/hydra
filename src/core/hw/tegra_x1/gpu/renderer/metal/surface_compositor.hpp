@@ -23,6 +23,10 @@ class SurfaceCompositor final : public ISurfaceCompositor {
     Renderer& renderer;
     CA::MetalDrawable* drawable;
     MTL::RenderPassDescriptor* render_pass_descriptor;
+    // A render pass after the first one keeps what earlier ones drew
+    bool render_pass_started{false};
+
+    MTL::RenderCommandEncoder* getEncoder(CommandBuffer* command_buffer);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -43,6 +43,7 @@ Renderer::Renderer()
       completions(std::make_shared<CompletionQueue>()),
       occlusion(std::make_unique<OcclusionCounter>(device, completions)),
       binary_archive_cache(device), shader_library_cache(device),
+      spatial_upscaler(device),
       depth_stencil_state_cache(device),
       blit_pipeline_cache(device), clear_color_pipeline_cache(device),
       clear_depth_pipeline_cache(device) {

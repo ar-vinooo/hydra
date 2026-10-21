@@ -62,7 +62,14 @@ typedef enum : uint32_t {
     HYDRA_RESOLUTION_4320P,
     HYDRA_RESOLUTION_AUTO_EXACT,
     HYDRA_RESOLUTION_CUSTOM,
+    HYDRA_RESOLUTION_CONSOLE,
 } HydraResolution;
+
+typedef enum : uint32_t {
+    HYDRA_UPSCALING_FILTER_BILINEAR,
+    HYDRA_UPSCALING_FILTER_NEAREST,
+    HYDRA_UPSCALING_FILTER_METALFX,
+} HydraUpscalingFilter;
 
 typedef enum : uint32_t {
     HYDRA_AUDIO_BACKEND_NULL,
@@ -196,6 +203,7 @@ uint32_t* hydraConfigGetGpuRenderer();
 uint32_t* hydraConfigGetShaderBackend();
 uint32_t* hydraConfigGetDisplayResolution();
 HydraUint2* hydraConfigGetCustomDisplayResolution();
+uint32_t* hydraConfigGetUpscalingFilter();
 uint32_t* hydraConfigGetAudioBackend();
 HydraU128* hydraConfigGetUserId();
 HydraString hydraConfigGetDeviceNickname();
