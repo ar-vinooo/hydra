@@ -216,6 +216,8 @@ class IRenderer {
     }
 
     virtual u64 getAllocatedResourceBytes() const { return 0; }
+    // DEBUG: logs the GPU time per pass since the last call (HYDRA_PERF_STATS)
+    virtual void logPassProfile([[maybe_unused]] f64 frames) {}
 
     // Surface
     virtual void setSurface(void* surface) = 0;

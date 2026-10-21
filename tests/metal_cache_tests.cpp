@@ -1,4 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
@@ -12,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 using namespace hydra::hw::tegra_x1::gpu::renderer::metal;
 
@@ -144,6 +148,129 @@ vertex float4 main_(uint id [[vertex_id]]) {
             check(missing_vertex.getPipeline() == nullptr,
                   "Pipeline with missing vertex stage was accepted");
             std::cout << "PASS: depth-only pipeline and missing vertex handling\n";
+            return 0;
+        }
+        if (mode == "pass-profile") {
+            // Two render passes on the same target (the second continues the
+            // first) and a blit: their GPU times and traffic are reported
+            using hydra::hw::tegra_x1::gpu::PerfStats;
+            check(PerfStats::isEnabled() &&
+                      std::getenv("HYDRA_GPU_PASS_TIMES") != nullptr,
+                  "Run with HYDRA_PERF_STATS=1 HYDRA_GPU_PASS_TIMES=1");
+            auto* profiler = GpuPassProfiler::get(device);
+            check(profiler != nullptr, "GPU pass timestamps are unavailable");
+            const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 v(uint id [[vertex_id]]) {
+    const float2 p[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(p[id], 0, 1);
+}
+fragment float4 red() { return float4(1, 0, 0, 1); }
+)";
+            NS::Error* error = nullptr;
+            NS_STACK_SCOPED auto library =
+                device->newLibrary(toNsString(source), nullptr, &error);
+            check(library != nullptr, "Test shader compilation failed");
+            NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("v"));
+            NS_STACK_SCOPED auto fragment =
+                library->newFunction(toNsString("red"));
+            NS_STACK_SCOPED auto pipeline_descriptor =
+                MTL::RenderPipelineDescriptor::alloc()->init();
+            pipeline_descriptor->setVertexFunction(vertex);
+            pipeline_descriptor->setFragmentFunction(fragment);
+            pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+                MTL::PixelFormatRGBA8Unorm);
+            NS_STACK_SCOPED auto pipeline =
+                device->newRenderPipelineState(pipeline_descriptor, &error);
+            check(pipeline != nullptr, "Test pipeline creation failed");
+            constexpr hydra::u32 size = 256;
+            NS_STACK_SCOPED auto texture_descriptor =
+                MTL::TextureDescriptor::alloc()->init();
+            texture_descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+            texture_descriptor->setWidth(size);
+            texture_descriptor->setHeight(size);
+            texture_descriptor->setStorageMode(MTL::StorageModeShared);
+            texture_descriptor->setUsage(MTL::TextureUsageRenderTarget |
+                                         MTL::TextureUsageShaderRead);
+            NS_STACK_SCOPED auto target = device->newTexture(texture_descriptor);
+            NS_STACK_SCOPED auto copy = device->newTexture(texture_descriptor);
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            auto& stats = PerfStats::instance();
+            stats.render_passes = 0;
+            stats.render_pass_load_bytes = 0;
+            stats.render_pass_store_bytes = 0;
+            stats.render_pass_continuations = 0;
+            for (auto& cause : stats.render_pass_continuation_causes)
+                cause = 0;
+            MTL::CommandBuffer* native;
+            {
+                CommandBuffer commands(queue);
+                NS_STACK_SCOPED auto clear_pass =
+                    MTL::RenderPassDescriptor::alloc()->init();
+                clear_pass->colorAttachments()->object(0)->setTexture(target);
+                clear_pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionClear);
+                clear_pass->colorAttachments()->object(0)->setStoreAction(
+                    MTL::StoreActionStore);
+                NS_STACK_SCOPED auto load_pass = clear_pass->copy();
+                load_pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionLoad);
+                for (auto* pass : {clear_pass, load_pass}) {
+                    auto* encoder = commands.getRenderCommandEncoder(pass);
+                    encoder->setRenderPipelineState(pipeline);
+                    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                                            NS::UInteger(0), NS::UInteger(3),
+                                            NS::UInteger(200));
+                }
+                auto* blit = commands.getBlitCommandEncoder();
+                blit->copyFromTexture(target, copy);
+                native = commands.getCommandBuffer()->retain();
+            }
+            native->waitUntilCompleted();
+            check(native->status() == MTL::CommandBufferStatusCompleted,
+                  "Profiled command buffer failed");
+            native->release();
+            // Completion handlers may still be running
+            GpuPassProfiler::Total kinds[3]{}, total[3]{};
+            std::vector<std::pair<std::string, GpuPassProfiler::Total>> top;
+            for (int attempt = 0; attempt < 200; attempt++) {
+                auto current = profiler->takeTop(8, kinds);
+                for (int k = 0; k < 3; k++) {
+                    total[k].ns += kinds[k].ns;
+                    total[k].count += kinds[k].count;
+                }
+                top.insert(top.end(), current.begin(), current.end());
+                if (total[0].count == 2 && total[2].count == 1)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            check(total[0].count == 2 && total[0].ns > 0,
+                  "Render pass times were not resolved");
+            check(total[2].count == 1, "Blit pass time was not resolved");
+            check(!top.empty() &&
+                      top[0].first.find("render 256x256") == 0,
+                  "Render pass label is wrong");
+            const hydra::u64 bytes = size * size * 4;
+            check(stats.render_passes == 2, "Render passes were not counted");
+            check(stats.render_pass_continuations == 1 &&
+                      stats.render_pass_continuation_causes[0] == 1,
+                  "The loading pass is not a continuation of a render pass");
+            check(stats.render_pass_load_bytes == bytes,
+                  "Load traffic is wrong");
+            check(stats.render_pass_store_bytes == 2 * bytes,
+                  "Store traffic is wrong");
+            std::vector<uint8_t> pixels(bytes);
+            copy->getBytes(pixels.data(), size * 4,
+                           MTL::Region::Make2D(0, 0, size, size), 0);
+            for (hydra::usize i = 0; i < pixels.size(); i += 4)
+                check(pixels[i] == 255 && pixels[i + 1] == 0 &&
+                          pixels[i + 3] == 255,
+                      "Profiling changed rendered pixels");
+            std::cout << "PASS pass-profile: render " << total[0].count
+                      << " passes " << static_cast<double>(total[0].ns) / 1000.0 << " us, blit "
+                      << static_cast<double>(total[2].ns) / 1000.0 << " us | " << top[0].first
+                      << "\n";
             return 0;
         }
         if (mode == "upscale") {

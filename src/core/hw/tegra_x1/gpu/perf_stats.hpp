@@ -110,6 +110,16 @@ struct PerfStats {
     std::atomic<u64> register_writes{0};
     std::atomic<u64> register_write_skips{0};
     std::atomic<u64> render_encoders{0};
+    // Render passes and the attachment memory they read (load) and write
+    // (store), from the attachment sizes. A continuation reopens the
+    // attachments of the previous render pass and loads all of them; it is
+    // counted by what ended that pass: another render pass descriptor, a blit
+    // or compute encoder, or a submission.
+    std::atomic<u64> render_passes{0};
+    std::atomic<u64> render_pass_load_bytes{0};
+    std::atomic<u64> render_pass_store_bytes{0};
+    std::atomic<u64> render_pass_continuations{0};
+    std::array<std::atomic<u64>, 4> render_pass_continuation_causes{};
     std::atomic<u64> blit_encoders{0};
     std::atomic<u64> buffer_snapshots{0};
     std::atomic<u64> buffer_snapshot_bytes{0};

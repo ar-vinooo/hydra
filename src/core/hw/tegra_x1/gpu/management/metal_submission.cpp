@@ -35,8 +35,23 @@ void CommandBuffer::attachGpuCompletionCallbacks() {
     }
 }
 
+void CommandBuffer::attachPassProfiling() {
+    if (profiled_passes.empty())
+        return;
+    auto* profiler = GpuPassProfiler::get(command_buffer->device());
+    command_buffer->addCompletedHandler(
+        [profiler, passes = std::move(profiled_passes)](
+            MTL::CommandBuffer* completed) {
+            profiler->resolve(passes, completed->status() ==
+                                          MTL::CommandBufferStatusCompleted);
+        });
+    profiled_passes.clear();
+}
+
 void CommandBuffer::commitSubmission() {
     attachGpuCompletionCallbacks();
+    attachPassProfiling();
+    render_pass_gap = 3;
     auto& events = capture::GuestEvents::instance();
     if (events.enabled()) {
         static std::atomic<u64> next_capture_submission{1};

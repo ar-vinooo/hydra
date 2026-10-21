@@ -707,6 +707,28 @@ void System::progressFrame(u32 width, u32 height,
                      stats.msaa_draws.exchange(0),
                      stats.alpha_to_coverage_draws.exchange(0),
                      stats.alpha_to_one_draws.exchange(0));
+            LOG_INFO(Other,
+                     "RENDER PASSES: {:.1f}/frame | load {:.1f} MiB/frame, "
+                     "store {:.1f} MiB/frame | continuations {:.1f}/frame "
+                     "(after a render pass {:.1f}, blit {:.1f}, compute "
+                     "{:.1f}, submission {:.1f})",
+                     static_cast<f64>(stats.render_passes.exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_load_bytes.exchange(0)) /
+                         (1024.0 * 1024.0) / std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_store_bytes.exchange(0)) /
+                         (1024.0 * 1024.0) / std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuations.exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[0].exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[1].exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[2].exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[3].exchange(0)) /
+                         std::max(frames, 1.0));
+            gpu.getRenderer().logPassProfile(frames);
             LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
                      static_cast<f64>(stats.compute_dispatches.exchange(0)) /
                          std::max(frames, 1.0),

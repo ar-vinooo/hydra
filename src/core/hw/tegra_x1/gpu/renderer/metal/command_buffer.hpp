@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include <atomic>
@@ -169,6 +170,16 @@ class CommandBuffer final : public ICommandBuffer {
     u64 raster_skips{0};
     u64 render_encoders{0};
     u64 blit_encoders{0};
+    // DEBUG: passes of the Metal command buffer whose GPU time is sampled,
+    // and the attachments of the previous render pass (HYDRA_PERF_STATS)
+    std::vector<GpuPassProfiler::Pass> profiled_passes;
+    std::array<MTL::Texture*, COLOR_TARGET_COUNT + 2> previous_attachments{};
+    // What came after the previous render pass: 0 another render pass, 1 a
+    // blit, 2 a compute encoder, 3 a submission
+    u8 render_pass_gap{0};
+    void profileRenderPass(MTL::RenderPassDescriptor* descriptor);
+    u32 reservePassSamples(GpuPassProfiler::Kind kind, std::string label);
+    void attachPassProfiling();
 
   public:
     // Handlers and drawables attached through this are part of the work

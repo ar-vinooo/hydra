@@ -153,10 +153,15 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
 
     TMP_AUTORELEASE_POOL_BEGIN();
     auto* descriptor = render_pass_descriptor;
-    if (visibility_buffer != nullptr) {
+    // Sampling GPU timestamps changes the descriptor
+    const bool sample = GpuPassProfiler::get(command_buffer->device()) != nullptr;
+    if (visibility_buffer != nullptr || sample) {
         descriptor = render_pass_descriptor->copy();
-        descriptor->setVisibilityResultBuffer(visibility_buffer);
+        if (visibility_buffer != nullptr)
+            descriptor->setVisibilityResultBuffer(visibility_buffer);
     }
+    if (PerfStats::isEnabled())
+        profileRenderPass(descriptor);
     command_encoder = command_buffer->renderCommandEncoder(descriptor)->retain();
     if (descriptor != render_pass_descriptor)
         descriptor->release();
@@ -171,6 +176,144 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     return getRenderCommandEncoderUnchecked();
 }
 
+u32 CommandBuffer::reservePassSamples(GpuPassProfiler::Kind kind,
+                                      std::string label) {
+    auto* profiler = GpuPassProfiler::get(command_buffer->device());
+    if (!profiler)
+        return invalid<u32>();
+    const auto sample = profiler->reserve();
+    if (sample != invalid<u32>())
+        profiled_passes.push_back({kind, sample, std::move(label)});
+    return sample;
+}
+
+void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
+    // Approximate size of the attached level and slices: the whole
+    // allocation without its other mip levels
+    // A texture view may report the allocation of its whole parent, so the
+    // size is computed from the attached level
+    const auto attachment_bytes = [](MTL::RenderPassAttachmentDescriptor* attachment,
+                                     MTL::Texture* texture) -> u64 {
+        u64 bytes_per_pixel;
+        switch (texture->pixelFormat()) {
+        case MTL::PixelFormatR8Unorm:
+        case MTL::PixelFormatR8Snorm:
+        case MTL::PixelFormatR8Uint:
+        case MTL::PixelFormatR8Sint:
+        case MTL::PixelFormatStencil8:
+            bytes_per_pixel = 1;
+            break;
+        case MTL::PixelFormatRG8Unorm:
+        case MTL::PixelFormatRG8Snorm:
+        case MTL::PixelFormatRG8Uint:
+        case MTL::PixelFormatRG8Sint:
+        case MTL::PixelFormatR16Unorm:
+        case MTL::PixelFormatR16Float:
+        case MTL::PixelFormatR16Uint:
+        case MTL::PixelFormatR16Sint:
+        case MTL::PixelFormatB5G6R5Unorm:
+        case MTL::PixelFormatA1BGR5Unorm:
+        case MTL::PixelFormatBGR5A1Unorm:
+        case MTL::PixelFormatDepth16Unorm:
+            bytes_per_pixel = 2;
+            break;
+        case MTL::PixelFormatRG16Unorm:
+        case MTL::PixelFormatRG16Float:
+        case MTL::PixelFormatRGBA16Unorm:
+        case MTL::PixelFormatRGBA16Snorm:
+        case MTL::PixelFormatRGBA16Float:
+        case MTL::PixelFormatRGBA16Uint:
+        case MTL::PixelFormatRGBA16Sint:
+        case MTL::PixelFormatRG32Float:
+        case MTL::PixelFormatRG32Uint:
+        case MTL::PixelFormatRG32Sint:
+        case MTL::PixelFormatDepth32Float_Stencil8:
+            bytes_per_pixel = texture->pixelFormat() == MTL::PixelFormatRG16Unorm ||
+                                      texture->pixelFormat() == MTL::PixelFormatRG16Float
+                                  ? 4
+                                  : 8;
+            break;
+        case MTL::PixelFormatRGBA32Float:
+        case MTL::PixelFormatRGBA32Uint:
+        case MTL::PixelFormatRGBA32Sint:
+            bytes_per_pixel = 16;
+            break;
+        default: // 32-bit colour and depth formats
+            bytes_per_pixel = 4;
+            break;
+        }
+        const auto level = attachment->level();
+        const u64 width = std::max<u64>(texture->width() >> level, 1);
+        const u64 height = std::max<u64>(texture->height() >> level, 1);
+        return width * height * bytes_per_pixel *
+               std::max<u64>(texture->sampleCount(), 1);
+    };
+    std::array<MTL::Texture*, COLOR_TARGET_COUNT + 2> attachments{};
+    u64 load_bytes = 0, store_bytes = 0;
+    bool all_loaded = true;
+    std::string loads, stores, formats;
+    u32 width = 0, height = 0;
+    const auto visit = [&](MTL::RenderPassAttachmentDescriptor* attachment,
+                           usize slot, std::string_view name) {
+        auto* texture = attachment->texture();
+        if (!texture)
+            return;
+        attachments[slot] = texture;
+        if (width == 0) {
+            width = static_cast<u32>(texture->width());
+            height = static_cast<u32>(texture->height());
+        }
+        const auto bytes = attachment_bytes(attachment, texture);
+        formats += fmt::format(" {}:{}", name,
+                               static_cast<u64>(texture->pixelFormat()));
+        if (attachment->loadAction() == MTL::LoadActionLoad) {
+            load_bytes += bytes;
+            loads += fmt::format(" {}", name);
+        } else {
+            all_loaded = false;
+        }
+        if (attachment->storeAction() == MTL::StoreActionStore ||
+            attachment->storeAction() ==
+                MTL::StoreActionStoreAndMultisampleResolve) {
+            store_bytes += bytes;
+            stores += fmt::format(" {}", name);
+        }
+    };
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++)
+        visit(descriptor->colorAttachments()->object(i), i,
+              fmt::format("c{}", i));
+    visit(descriptor->depthAttachment(), COLOR_TARGET_COUNT, "d");
+    visit(descriptor->stencilAttachment(), COLOR_TARGET_COUNT + 1, "s");
+
+    auto& stats = PerfStats::instance();
+    stats.render_passes++;
+    stats.render_pass_load_bytes += load_bytes;
+    stats.render_pass_store_bytes += store_bytes;
+    const bool continuation = all_loaded && attachments == previous_attachments &&
+                              width != 0;
+    if (continuation) {
+        stats.render_pass_continuations++;
+        stats.render_pass_continuation_causes[render_pass_gap]++;
+    }
+    previous_attachments = attachments;
+    render_pass_gap = 0;
+
+    const auto sample = reservePassSamples(
+        GpuPassProfiler::Kind::Render,
+        fmt::format("render {}x{}{} | load{} | store{}", width, height, formats,
+                    loads.empty() ? " -" : loads,
+                    stores.empty() ? " -" : stores));
+    if (sample == invalid<u32>())
+        return;
+    auto* attachment = descriptor->sampleBufferAttachments()->object(0);
+    attachment->setSampleBuffer(
+        GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
+    attachment->setStartOfVertexSampleIndex(sample);
+    attachment->setEndOfVertexSampleIndex(MTL::CounterDontSample);
+    attachment->setStartOfFragmentSampleIndex(MTL::CounterDontSample);
+    attachment->setEndOfFragmentSampleIndex(sample + 1);
+}
+
 MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     if (encoder_type == EncoderType::Blit)
         return getBlitCommandEncoderUnchecked();
@@ -178,10 +321,22 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
-    command_encoder = command_buffer->blitCommandEncoder()->retain();
+    if (const auto sample = reservePassSamples(GpuPassProfiler::Kind::Blit, "blit");
+        sample != invalid<u32>()) {
+        auto* pass = MTL::BlitPassDescriptor::blitPassDescriptor();
+        auto* attachment = pass->sampleBufferAttachments()->object(0);
+        attachment->setSampleBuffer(
+            GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
+        attachment->setStartOfEncoderSampleIndex(sample);
+        attachment->setEndOfEncoderSampleIndex(sample + 1);
+        command_encoder = command_buffer->blitCommandEncoder(pass)->retain();
+    } else {
+        command_encoder = command_buffer->blitCommandEncoder()->retain();
+    }
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Blit;
+    render_pass_gap = 1;
     has_commands = true;
     ++blit_encoders;
 
@@ -196,10 +351,24 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
 
     TMP_AUTORELEASE_POOL_BEGIN();
     // Serial dispatches see the results of previous ones
-    command_encoder = command_buffer->computeCommandEncoder()->retain();
+    if (const auto sample =
+            reservePassSamples(GpuPassProfiler::Kind::Compute, "compute");
+        sample != invalid<u32>()) {
+        auto* pass = MTL::ComputePassDescriptor::computePassDescriptor();
+        pass->setDispatchType(MTL::DispatchTypeSerial);
+        auto* attachment = pass->sampleBufferAttachments()->object(0);
+        attachment->setSampleBuffer(
+            GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
+        attachment->setStartOfEncoderSampleIndex(sample);
+        attachment->setEndOfEncoderSampleIndex(sample + 1);
+        command_encoder = command_buffer->computeCommandEncoder(pass)->retain();
+    } else {
+        command_encoder = command_buffer->computeCommandEncoder()->retain();
+    }
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Compute;
+    render_pass_gap = 2;
     has_commands = true;
 
     return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);

@@ -580,6 +580,30 @@ ShaderBase* Renderer::createShaderHot17(const ShaderDescriptor& descriptor) {
     return new Shader(device, descriptor, shader_library_cache);
 }
 
+void Renderer::logPassProfile(f64 frames) {
+    auto* profiler = GpuPassProfiler::get(device);
+    if (!profiler)
+        return;
+    GpuPassProfiler::Total kinds[3];
+    const auto top = profiler->takeTop(6, kinds);
+    frames = std::max(frames, 1.0);
+    const auto ms = [&](u64 ns) { return static_cast<f64>(ns) / 1e6 / frames; };
+    const auto per_frame = [&](u64 count) {
+        return static_cast<f64>(count) / frames;
+    };
+    LOG_INFO(MetalRenderer,
+             "GPU PASSES: render {:.1f}/frame ({:.2f} ms), compute {:.1f} "
+             "({:.2f} ms), blit {:.1f} ({:.2f} ms) | sum {:.2f} ms/frame",
+             per_frame(kinds[0].count), ms(kinds[0].ns),
+             per_frame(kinds[1].count), ms(kinds[1].ns),
+             per_frame(kinds[2].count), ms(kinds[2].ns),
+             ms(kinds[0].ns + kinds[1].ns + kinds[2].ns));
+    for (usize i = 0; i < top.size(); i++)
+        LOG_INFO(MetalRenderer, "GPU TOP {}: {:.2f} ms/frame, {:.1f}/frame | {}",
+                 i + 1, ms(top[i].second.ns), per_frame(top[i].second.count),
+                 top[i].first);
+}
+
 void Renderer::setTitleId(u64 title_id) {
     // Sources and recipes do not depend on the GPU or the OS, unlike the
     // binaries in the binary archive cache
