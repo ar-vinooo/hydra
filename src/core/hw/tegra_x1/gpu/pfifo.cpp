@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/pfifo.hpp"
+
+#include <limits>
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #ifdef ZTD_PLATFORM_APPLE
@@ -166,7 +168,10 @@ class PushBufferReader {
 
 } // namespace
 
-PfifoDecodeState::PfifoDecodeState() = default;
+PfifoDecodeState::PfifoDecodeState() : channel_id{[] {
+    static std::atomic<u64> next_channel{1};
+    return next_channel.fetch_add(1, std::memory_order_relaxed);
+}()} {}
 PfifoDecodeState::~PfifoDecodeState() {
     if (release_fence)
         release_fence();
@@ -525,6 +530,7 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
             return false;
         }
         ++word_offset;
+        state.source_address = command_address;
         if (decodeTraceEnabled())
             decode_trace.record(state, command_address, *word, gpu_addr, end);
         if (state.remaining != 0) {
@@ -606,6 +612,12 @@ bool Pfifo::submitCommand(u32 raw_header, PfifoDecodeState& state) {
 }
 
 void Pfifo::processMethodArg(u32 arg, PfifoDecodeState& state) {
+    // Fault rather than wrap and make a later command look older.
+    if (state.next_sequence == std::numeric_limits<u64>::max()) {
+        state.fail(25);
+        return;
+    }
+    const auto sequence = state.next_sequence++;
     // Collect macro arguments until the packet is complete, even when it is
     // split across submissions. Incomplete packets must not execute a macro.
     if (!state.subdevice_active) {
@@ -618,19 +630,44 @@ void Pfifo::processMethodArg(u32 arg, PfifoDecodeState& state) {
         return;
     }
     if (state.method >= MACRO_METHODS_REGION)
-        state.macro_args.emplace_back(state.method, arg);
+        state.macro_args.push_back(
+            {state.method, arg, sequence, state.source_address});
     else
-        gpu.subchannelMethod(state.subchannel, state.method, arg);
+        dispatchMethod(state.method, arg, sequence, state.source_address, state);
     if (state.increment)
         ++state.method;
     if (state.one_increment)
         state.increment = false;
     if (--state.remaining == 0 && !state.macro_args.empty()) {
-        for (const auto& [method, value] : state.macro_args)
-            gpu.subchannelMethod(state.subchannel, method, value);
-        gpu.subchannelFlushMacro(state.subchannel);
+        for (const auto& argument : state.macro_args) {
+            if (state.failed)
+                break;
+            dispatchMethod(argument.method, argument.value, argument.sequence,
+                           argument.address, state);
+        }
+        if (!state.failed)
+            gpu.subchannelFlushMacro(state.subchannel);
         state.macro_args.clear();
     }
+}
+
+void Pfifo::dispatchMethod(u32 method, u32 arg, u64 sequence, uptr address,
+                           PfifoDecodeState& state) {
+    ASSERT_DEBUG(sequence > state.last_dispatched_sequence, Gpu,
+                 "Channel {} reordered method sequence {} after {}",
+                 state.channel_id, sequence, state.last_dispatched_sequence);
+    state.last_dispatched_sequence = sequence;
+    state.active_sequence = sequence;
+    auto& diagnostics = VisualDiagnostics::instance();
+    if (diagnostics.enabled())
+        diagnostics.event("pfifo_method", {
+            {"channel", std::to_string(state.channel_id)},
+            {"sequence", std::to_string(sequence)},
+            {"source_address", std::to_string(address)},
+            {"subchannel", std::to_string(state.subchannel)},
+            {"method", std::to_string(method)},
+            {"argument", std::to_string(arg)}});
+    gpu.subchannelMethod(state.subchannel, method, arg);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu

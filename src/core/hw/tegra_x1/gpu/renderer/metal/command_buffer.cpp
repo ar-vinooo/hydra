@@ -18,6 +18,9 @@ CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_,
 
 CommandBuffer::~CommandBuffer() {
     endEncoding();
+    // Register content completion before the callbacks that publish guest
+    // submission fences. Checkpoints attach it in commitSubmission instead.
+    attachGpuCompletionCallbacks();
     if (visibility_buffer != nullptr)
         visibility_buffer->release();
     if (!retired_upload_buffers.empty()) {
@@ -212,6 +215,7 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
         submitted_buffers.load(std::memory_order_acquire) ==
             completed_buffers.load(std::memory_order_acquire)) {
         last_submission_succeeded = true;
+        runGpuCompletionCallbacks(true);
         guest_write_synced.store(guest_write_epoch.load(std::memory_order_acquire),
                                  std::memory_order_release);
         if (profile)

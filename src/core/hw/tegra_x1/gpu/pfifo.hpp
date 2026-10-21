@@ -18,12 +18,18 @@ class Gpu;
 struct GpuChannelContext;
 
 struct PfifoPacket {
+    struct MacroArgument {
+        u32 method;
+        u32 value;
+        u64 sequence;
+        uptr address;
+    };
     u32 method{0};
     u32 subchannel{0};
     u32 remaining{0};
     bool increment{false};
     bool one_increment{false};
-    std::vector<std::pair<u32, u32>> macro_args;
+    std::vector<MacroArgument> macro_args;
 };
 
 struct PfifoSemaphoreWait {
@@ -49,6 +55,12 @@ inline u32* resolveSemaphoreWord(const GMmu& gmmu, u64 address) {
 struct PfifoDecodeState : PfifoPacket {
     PfifoDecodeState();
     ~PfifoDecodeState();
+    const u64 channel_id;
+    // GPU-thread state, retained across packets, submissions and yields.
+    u64 next_sequence{1};
+    u64 last_dispatched_sequence{0};
+    u64 active_sequence{0};
+    uptr source_address{0};
     std::unique_ptr<GpuChannelContext> context;
     // Queued work retains its bound address space even after both FDs close.
     std::shared_ptr<GMmu> address_space;
@@ -155,6 +167,8 @@ class Pfifo {
 
     // Helpers
     void processMethodArg(u32 arg, PfifoDecodeState& state);
+    void dispatchMethod(u32 method, u32 arg, u64 sequence, uptr address,
+                        PfifoDecodeState& state);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

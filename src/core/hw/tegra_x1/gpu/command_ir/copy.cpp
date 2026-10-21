@@ -47,8 +47,7 @@ bool executeCopy(renderer::IRenderer& renderer,
                          command.dst_level, command.dst_layer,
                          command.level_count, command.layer_count,
                          command.options);
-    for (const auto& range : command.resources.contents.writes)
-        renderer.getContentVersions().write(range);
+    renderer.recordGpuWrites(command_buffer, command.resources.contents.writes);
     return true;
 }
 

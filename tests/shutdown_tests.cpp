@@ -1574,6 +1574,8 @@ void testPfifoDecode(System& system, kernel::Process* process) {
     };
     const std::array<u32, 2> bind{header(1, 0, 1), 0xb197};
     run({entry(map_words(bind), 2)}, state);
+    check(state->last_dispatched_sequence == 1 && state->next_sequence == 2,
+          "PFIFO starts a channel's method sequence at one");
     auto& engine = state->context->three_d;
 
     // Bytes after the first entry are mapped but are not part of its payload.
@@ -1584,6 +1586,9 @@ void testPfifoDecode(System& system, kernel::Process* process) {
     run({entry(first_address, 2), entry(last_address, 1)}, state);
     check(engine.getReg(0xd00) == 0x1111 && engine.getReg(0xd01) == 0x2222,
           "Packet continues at the next entry without reading past the first");
+    check(state->last_dispatched_sequence == 3 && state->next_sequence == 4 &&
+              state->source_address == last_address,
+          "Method sequences and source addresses survive split entries and submissions");
 
     // Every byte boundary, including inside a header and inside a payload word.
     std::array<u32, 3> split{header(1, 0xd02, 2), 0xaabbccdd, 0x12345678};
@@ -1714,6 +1719,8 @@ void testPfifoDecode(System& system, kernel::Process* process) {
     check(state->remaining == 2 && engine.getReg(0xd04) == 0x41,
           "Incomplete packet is retained across submissions");
     auto other = std::make_shared<gpu::PfifoDecodeState>();
+    check(other->channel_id != state->channel_id && other->next_sequence == 1,
+          "Each channel owns a distinct trace identity and method sequence");
     run({entry(map_words(bind), 2)}, other);
     const std::array<u32, 1> immediate{header(4, 0xd06, 0x66)};
     run({entry(map_words(immediate), 1)}, other);
@@ -1975,6 +1982,9 @@ void testChannelScheduling(System& system, kernel::Process* process) {
               a->context->three_d.getReg(0xd00) == 0x22 &&
               b->context->three_d.getReg(0xd00) == 0x33,
           "Channels retain independent 3D state and retire only after earlier work");
+    check(a->last_dispatched_sequence == 3 && b->last_dispatched_sequence == 2 &&
+              a->channel_id != b->channel_id,
+          "Blocked submissions retain per-channel method order without consuming another channel's sequence");
 
     alignas(16) std::array<u32, 4> semaphore{};
     constexpr uptr SEMAPHORE = 0x5100000;

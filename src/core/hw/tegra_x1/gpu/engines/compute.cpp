@@ -454,6 +454,11 @@ void Compute::launch(const u32 index, const u32 arg) {
     }
 
     renderer.dispatchCompute(tls_crnt_command_buffer, dispatch);
+    auto writes = storage_writes;
+    for (const auto& image : dispatch.images)
+        if (image.texture && image.texture->getBase())
+            writes.push_back(image.texture->getBase()->getDescriptor().getRange());
+    renderer.recordGpuWrites(tls_crnt_command_buffer, writes);
     renderer.getTextureCache().synchronizeStorageWrites(
         tls_crnt_command_buffer, storage_writes);
 }

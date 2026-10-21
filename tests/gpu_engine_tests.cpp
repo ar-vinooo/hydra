@@ -1273,6 +1273,10 @@ void testDrawContentVersions() {
     expect(rig.renderer.getContentVersions().latest(written) > before,
            "Executing a draw versions the memory it wrote");
     rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+    const auto completed_write = rig.renderer.getContentVersions().inspect(written);
+    expect(completed_write.completed == completed_write.issued &&
+               !completed_write.pending && !completed_write.failed,
+           "A checkpoint completes draw writes before the logical buffer is destroyed");
     std::cout << "PASS: draw content versions track guest writes separately "
                  "from resource identity\n";
 }
@@ -2276,14 +2280,28 @@ void testManagedMetalSubmissions() {
     auto* native_queue = device->newCommandQueue();
     auto completions = std::make_shared<metal::CompletionQueue>();
     std::weak_ptr<int> lifetime;
+    std::atomic<unsigned> gpu_callbacks{0};
+    std::atomic<unsigned> gpu_failures{0};
     {
         metal::CommandBuffer commands(native_queue, completions);
         auto owned = std::make_shared<int>(7);
         lifetime = owned;
         commands.retainResource(owned);
         owned.reset();
+        commands.onGpuCompletedChecked([&](bool succeeded) {
+            if (!succeeded)
+                ++gpu_failures;
+            ++gpu_callbacks;
+        });
         commands.getCompletionToken();
         commands.debugCommitAndWait();
+        expect(gpu_callbacks == 1,
+               "GPU callbacks complete at a checkpoint instead of waiting for destruction");
+        commands.onGpuCompletedChecked([&](bool succeeded) {
+            if (!succeeded)
+                ++gpu_failures;
+            ++gpu_callbacks;
+        });
         commands.getCompletionToken();
     }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2293,6 +2311,8 @@ void testManagedMetalSubmissions() {
     const auto stats = completions->submissions.stats();
     expect(stats.admitted == 2 && stats.succeeded == 2 && stats.pending == 0,
            "Checkpoints and destructor commits both pass through admission and retirement");
+    expect(gpu_callbacks == 2 && gpu_failures == 0,
+           "Each native submission runs its successful GPU callbacks once");
     expect(lifetime.expired(), "GPU completion releases retained resources");
     completions.reset();
     native_queue->release();

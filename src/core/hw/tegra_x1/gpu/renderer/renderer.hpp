@@ -90,6 +90,16 @@ class IRenderer {
           index_cache(*this) {}
     virtual ~IRenderer() = default;
 
+    void recordGpuWrites(ICommandBuffer* command_buffer,
+                         std::span<const ztd::Range<uptr>> ranges) {
+        auto write = content_versions.issueGpuWrites(ranges);
+        if (write.version() != 0)
+            command_buffer->onGpuCompletedChecked(
+                [write = std::move(write)](bool succeeded) {
+                    write.complete(succeeded);
+                });
+    }
+
     void invalidateMemory(
         ztd::Range<uptr> range,
         MemoryInvalidationScope scope = MemoryInvalidationScope::BufferCache |

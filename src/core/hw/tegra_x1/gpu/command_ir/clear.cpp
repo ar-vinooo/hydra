@@ -67,8 +67,7 @@ bool executeClear(renderer::IRenderer& renderer,
     if (command.stencil)
         renderer.clearStencil(command_buffer, command.stencil->layer,
                               command.stencil->value);
-    for (const auto& range : command.resources.contents.writes)
-        renderer.getContentVersions().write(range);
+    renderer.recordGpuWrites(command_buffer, command.resources.contents.writes);
     return true;
 }
 

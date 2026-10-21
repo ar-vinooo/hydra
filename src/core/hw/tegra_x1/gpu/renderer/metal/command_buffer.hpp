@@ -135,6 +135,7 @@ class CommandBuffer final : public ICommandBuffer {
 
   private:
     void commitSubmission();
+    void attachGpuCompletionCallbacks();
     MTL::CommandQueue* command_queue{nullptr};
     MTL::CommandBuffer* command_buffer{nullptr};
     MTL::CommandEncoder* command_encoder{nullptr};

@@ -19,7 +19,10 @@ class ICommandBuffer {
   public:
     // Runs the callbacks once the host finished the commands, if the buffer
     // is destroyed without a host that tracks it they run right away
-    virtual ~ICommandBuffer() { runCompletionCallbacks(true); }
+    virtual ~ICommandBuffer() {
+        runGpuCompletionCallbacks(true);
+        runCompletionCallbacks(true);
+    }
 
     // The callback runs on an arbitrary thread
     void onCompleted(std::function<void()> callback) {
@@ -34,6 +37,13 @@ class ICommandBuffer {
         completion_callbacks.push_back(std::move(callback));
     }
 
+    // Completion of the work encoded so far, including when a backend
+    // checkpoints and continues encoding in a new native command buffer.
+    // These callbacks do not wait for guest report publication.
+    void onGpuCompletedChecked(std::function<void(bool succeeded)> callback) {
+        gpu_completion_callbacks.push_back(std::move(callback));
+    }
+
     void retainResource(const std::shared_ptr<void>& owner) {
         if (owner)
             retained_resources.try_emplace(owner.get(), owner);
@@ -43,6 +53,12 @@ class ICommandBuffer {
     CheckpointReason checkpoint_reason{CheckpointReason::Other};
 
   protected:
+    void runGpuCompletionCallbacks(bool succeeded) {
+        auto callbacks = std::move(gpu_completion_callbacks);
+        gpu_completion_callbacks.clear();
+        for (const auto& callback : callbacks)
+            callback(succeeded);
+    }
     void runCompletionCallbacks(bool succeeded) {
         auto callbacks = std::move(completion_callbacks);
         completion_callbacks.clear();
@@ -50,6 +66,7 @@ class ICommandBuffer {
             callback(succeeded);
     }
     std::vector<std::function<void(bool)>> completion_callbacks;
+    std::vector<std::function<void(bool)>> gpu_completion_callbacks;
     std::unordered_map<const void*, std::shared_ptr<void>> retained_resources;
 };
 

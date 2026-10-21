@@ -235,13 +235,12 @@ bool executeDraw(renderer::IRenderer& renderer,
                       command.count, command.base_instance,
                       command.instance_count);
     }
+    renderer.recordGpuWrites(command_buffer, command.contents.writes);
     if (!command.storage_writes.empty()) {
         auto& cache = renderer.getTextureCache();
         std::scoped_lock lock(cache.getMutex());
         cache.synchronizeStorageWrites(command_buffer, command.storage_writes);
     }
-    for (const auto& range : command.contents.writes)
-        renderer.getContentVersions().write(range);
     return true;
 }
 
