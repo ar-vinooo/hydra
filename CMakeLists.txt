@@ -383,7 +383,8 @@ if (HYDRA_METAL_CACHE_TESTS)
     target_include_directories(hydra-metal-cache-tests PRIVATE src src/ztd/src)
     target_link_libraries(hydra-metal-cache-tests PRIVATE hydra-core hydra-common hydra_compile_options)
     add_executable(hydra-texture-cache-tests tests/texture_cache_tests.cpp
-                   tests/texture_format_tests.cpp)
+                   tests/texture_format_tests.cpp
+                   tests/texture_coherence_fuzz_tests.cpp)
     target_include_directories(hydra-texture-cache-tests PRIVATE src src/ztd/src)
     target_link_libraries(hydra-texture-cache-tests PRIVATE hydra-core hydra-common hydra_compile_options)
     add_executable(hydra-texture-format-reference-tests tests/texture_format_reference_tests.cpp)

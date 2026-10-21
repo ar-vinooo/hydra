@@ -119,6 +119,11 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                     storage.markStale(
                         storage.base->getDescriptor().getRange().clampedTo(
                             range));
+                    // Once a later write back marks this target flushed, the
+                    // stale bytes are only replaced by loading guest memory
+                    if (storage.base->getDescriptor().getRange().intersects(
+                            range))
+                        storage.cpu_modified_timestamp = now;
                     continue;
                 }
                 if (debugFlag("s2_oldinval") &&
@@ -279,7 +284,11 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
             alias_sync_complete = false;
         } else failed_scans.erase(it);
     }
-    if (storage.update_timestamp < mem.info.written_timestamp) {
+    // Right after the upload from guest memory, GPU data that was never
+    // written back is missing from this texture whatever the timestamps say:
+    // the memory timestamps cover the whole (possibly merged) memory, so a
+    // guest write somewhere else in it can look newer than a GPU write here
+    if (storage.update_timestamp < mem.info.written_timestamp || uploaded_cpu) {
         // Scan observations are separate from content freshness. An unsupported
         // alias needs another attempt only after overlapping GPU data changes.
         // Other textures in this memory changed, let's copy them
@@ -337,16 +346,31 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         static const bool disable_range_filter =
             std::getenv("HYDRA_DISABLE_TEXTURE_WRITE_FILTER") != nullptr;
         if (disable_range_filter ||
-            mem.hasGpuWriteSince(range, scan_timestamp)) {
+            mem.hasGpuWriteSince(range, scan_timestamp) ||
+            (uploaded_cpu &&
+             mem.hasGpuWriteSince(range, TextureCacheTimePoint{}))) {
             alias_sync_complete = true;
             if (PerfStats::isEnabled())
                 PerfStats::instance().texture_sync_scans++;
             std::vector<TextureStorage*> sources;
             for (auto& [group_key, group] : mem.cache) {
                 for (auto& [storage_key, candidate] : group.cache) {
-                    if (&candidate != &storage &&
+                    // GPU data that never reached guest memory (outside what
+                    // was written back, and not overwritten by the guest)
+                    bool unflushed = false;
+                    if (uploaded_cpu && &candidate != &storage &&
+                        candidate.base != nullptr &&
                         candidate.gpu_written_timestamp >
-                            std::max(storage.update_timestamp, storage.gpu_written_timestamp) &&
+                            candidate.flushed_timestamp)
+                        candidate.forEachUnflushed(
+                            range.clampedTo(
+                                candidate.base->getDescriptor().getRange()),
+                            [&](ztd::Range<uptr>) { unflushed = true; });
+                    if (&candidate != &storage &&
+                        (candidate.gpu_written_timestamp >
+                             std::max(storage.update_timestamp,
+                                      storage.gpu_written_timestamp) ||
+                         unflushed) &&
                         range.intersects(
                             candidate.base->getDescriptor().getRange())) {
                         scan_timestamp = std::max(scan_timestamp, candidate.gpu_written_timestamp);
@@ -400,6 +424,25 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                                         other_storage.gpu_written_timestamp -
                                         storage.update_timestamp)
                                         .count()));
+                    // The guest overwrote part of this render target since
+                    // the GPU wrote it. A direct GPU copy would carry the
+                    // stale part over the guest's data in the overlap, so
+                    // replay through guest memory: only the fresh parts are
+                    // written back, then everything is loaded from there
+                    {
+                        const auto overlap = range.clampedTo(other_range);
+                        bool partly_stale = false;
+                        for (const auto& stale : other_storage.stale_ranges)
+                            partly_stale |= stale.intersects(overlap);
+                        if (partly_stale) {
+                            if (!sync_via_guest(other_storage)) {
+                                alias_sync_complete = false;
+                                reportUnsupportedAlias(descriptor,
+                                                       other_descriptor);
+                            }
+                            continue;
+                        }
+                    }
                     // Expanded texels have different host byte offsets. Raw
                     // alias copies cannot reinterpret them as guest bytes.
                     const bool expanded =

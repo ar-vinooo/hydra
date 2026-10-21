@@ -27,6 +27,7 @@ void check(bool value, const char* message) {
 }
 
 void runTextureFormatTests();
+void runTextureCoherenceFuzz();
 
 void testGpuOwnedAliasReplay() {
     using hydra::hw::tegra_x1::gpu::getBlockLinearOffset;
@@ -135,6 +136,7 @@ int main() {
         setenv("HYDRA_DISABLE_SHADER_CACHE", "1", 1);
         NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
         runTextureFormatTests();
+        runTextureCoherenceFuzz();
         testGpuOwnedAliasReplay();
         std::vector<u8> guest_memory(65536, 0);
         metal::Renderer renderer;
