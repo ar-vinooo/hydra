@@ -4690,7 +4690,80 @@ kernel void main_(device uint* values [[buffer(0)]], device uint* alias [[buffer
                  "propagation, aliases and mixed capture/replay\n";
 }
 
+// The kinds of GPU thread work are exclusive and add up to the root's time
+void testGpuWorkTracker() {
+    using namespace std::chrono;
+    using namespace hydra::hw::tegra_x1::gpu;
+    auto& stats = PerfStats::instance();
+    for (auto& ns : stats.gpu_work_ns)
+        ns = 0;
+    const auto spin = [](microseconds duration) {
+        const auto end = steady_clock::now() + duration;
+        while (steady_clock::now() < end) {
+        }
+    };
+    {
+        // Without a root (another thread, or stats disabled) nothing counts
+        ScopedGpuWork outside(GpuWork::Encode);
+        spin(milliseconds(2));
+    }
+    steady_clock::time_point begin, end;
+    {
+        begin = steady_clock::now();
+        ScopedGpuWorkRoot root;
+        spin(milliseconds(2)); // Decode
+        {
+            ScopedGpuWork lookup(GpuWork::Lookup);
+            spin(milliseconds(2));
+            {
+                ScopedGpuWork shader(GpuWork::Shader);
+                spin(milliseconds(4));
+            }
+            spin(milliseconds(2));
+        }
+        {
+            ScopedGpuWork wait(GpuWork::Wait);
+            spin(milliseconds(2));
+        }
+        // Back to decode after the nested scopes
+        spin(milliseconds(1));
+        end = steady_clock::now();
+    }
+    const auto ms = [&](GpuWork work) {
+        return static_cast<double>(stats.gpu_work_ns[static_cast<usize>(work)]) /
+               1e6;
+    };
+    const auto near = [](double value, double expected) {
+        return value >= expected && value < expected + 1.0;
+    };
+    double total = 0;
+    for (usize i = 0; i < GPU_WORK_COUNT; i++)
+        total += ms(static_cast<GpuWork>(i));
+    const double elapsed =
+        duration<double, std::milli>(end - begin).count();
+    expect(ms(GpuWork::Encode) == 0.0, "Work outside a root was counted");
+    expect(near(ms(GpuWork::Decode), 3.0), "Root time outside scopes is decode");
+    expect(near(ms(GpuWork::Lookup), 4.0), "Nested time was not subtracted");
+    expect(near(ms(GpuWork::Shader), 4.0), "Nested scope time is wrong");
+    expect(near(ms(GpuWork::Wait), 2.0), "Wait time is wrong");
+    expect(total >= elapsed - 0.05 && total <= elapsed + 0.5,
+           "Kinds do not add up to the root's time");
+    expect(isGpuWorkAsyncCapable(GpuWork::Shader) &&
+               !isGpuWorkAsyncCapable(GpuWork::Lookup) &&
+               !isGpuWorkAsyncCapable(GpuWork::Wait),
+           "Wrong sync/async classification");
+    std::cout << "PASS: GPU thread work kinds are exclusive (total "
+              << total << " ms of " << elapsed << " ms)\n";
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--gpu-work-tracker") {
+        // Statistics are only collected with HYDRA_PERF_STATS
+        expect(hydra::hw::tegra_x1::gpu::PerfStats::isEnabled(),
+               "Run with HYDRA_PERF_STATS=1");
+        testGpuWorkTracker();
+        return 0;
+    }
     if (argc == 2 &&
         std::string_view(argv[1]) == "--check-optimization-policy") {
         const auto* requested = std::getenv("HYDRA_GPU_OPTIMIZATIONS");

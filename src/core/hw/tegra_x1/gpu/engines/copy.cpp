@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/copy.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
@@ -213,6 +214,7 @@ void Copy::remapPitchCopy(const LaunchDMAData data) {
 }
 
 void Copy::launchDma(const u32 index, const LaunchDMAData data) {
+    ScopedGpuWork work(GpuWork::Copy);
     (void)index;
     capture::GuestEvents::instance().event(
         "dma_copy", capture::currentGuestEventOrigin(), 0, 0, 0,

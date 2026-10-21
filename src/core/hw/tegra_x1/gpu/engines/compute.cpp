@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/compute.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/compute.hpp"
 
@@ -111,6 +112,7 @@ std::optional<u32> Compute::readTextureHandle(const ComputeQmd& qmd,
 }
 
 void Compute::launch(const u32 index, const u32 arg) {
+    ScopedGpuWork work(GpuWork::State);
     (void)index;
     (void)arg;
 

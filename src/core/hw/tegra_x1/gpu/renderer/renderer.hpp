@@ -316,6 +316,8 @@ class IRenderer {
                               const u32 value) = 0;
 
     // Shader
+    // The title whose shaders are stored and prewarmed, set before it starts
+    virtual void setTitleId([[maybe_unused]] u64 title_id) {}
     virtual ShaderBase* createShader(const ShaderDescriptor& descriptor) = 0;
 
     // Pipeline

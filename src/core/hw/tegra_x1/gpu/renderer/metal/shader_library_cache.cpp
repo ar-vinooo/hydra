@@ -1,9 +1,12 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/debugger/debugger_manager.hpp"
 #include "core/hot/table.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
 #include <CommonCrypto/CommonDigest.h>
+#include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <optional>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -12,59 +15,129 @@ namespace {
 std::string sourceKey(std::string_view source) {
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(source.data(), static_cast<CC_LONG>(source.size()), digest);
-    std::string key;
+    std::string hex;
     for (auto byte : digest)
-        key += fmt::format("{:02x}", byte);
+        hex += fmt::format("{:02x}", byte);
+    return ShaderLibraryCache::keyFromDigest(hex);
+}
+
+// Live revisions are local to this process: their sources are not stored
+bool isLiveRevisionKey(std::string_view key) {
+    return key.find("-hot-") != std::string_view::npos;
+}
+
+std::optional<std::string> readSource(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error || size > ShaderLibraryCache::MAX_SOURCE_BYTES)
+        return std::nullopt;
+    std::ifstream input(path, std::ios::binary);
+    std::string source((std::istreambuf_iterator<char>(input)), {});
+    if (!input.good() && !input.eof())
+        return std::nullopt;
+    return source;
+}
+} // namespace
+
+std::string ShaderLibraryCache::keyFromDigest(std::string_view hex_digest) {
+    std::string key(hex_digest);
     // Compiler-option changes must not hit libraries from an older image.
-    // Live revisions are local to this process, so don't reuse their disk
-    // entries in a later session that may have different implementation code.
     if (const auto revision = ::hydra::hot::generation(); revision != 0)
         key += fmt::format("-hot-{}-{}", getpid(), revision);
     return key;
 }
-} // namespace
+
 ShaderLibraryCache::ShaderLibraryCache(MTL::Device* device_,
-                                       std::filesystem::path path)
-    : device(device_->retain()),
-      directory(path.empty() ? BinaryArchiveCache::defaultPath(device_) /
-                                   "msl-invariant-ieee-v2"
-                             : std::move(path)) {
-    const char* disabled = std::getenv("HYDRA_DISABLE_SHADER_CACHE");
-    enabled = !(disabled && std::string_view(disabled) == "1");
-    std::error_code error;
-    if (enabled) {
-        std::filesystem::create_directories(directory, error);
-        enabled = !error;
-    }
-    if (enabled)
-        worker = std::thread([this] { run(); });
-    else
-        busy = false;
+                                       std::filesystem::path path,
+                                       Limits limits_)
+    : device(device_->retain()), limits{limits_} {
+    const char* disable = std::getenv("HYDRA_DISABLE_SHADER_CACHE");
+    disabled = disable && std::string_view(disable) == "1";
+    if (!path.empty())
+        setDirectory(std::move(path));
 }
+
 ShaderLibraryCache::~ShaderLibraryCache() {
     {
         std::lock_guard lock(mutex);
         stopping = true;
     }
     condition.notify_all();
+    for (auto& prewarmer : prewarmers)
+        prewarmer.join();
     if (worker.joinable())
         worker.join();
     for (auto& [key, entry] : libraries)
         entry.library->release();
     device->release();
 }
+
+void ShaderLibraryCache::setDirectory(std::filesystem::path path) {
+    std::lock_guard lock(mutex);
+    if (disabled || persistent)
+        return;
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    if (error) {
+        LOG_WARN(MetalRenderer, "Cannot write shader source cache: {}",
+                 error.message());
+        return;
+    }
+    directory = std::move(path);
+    persistent = true;
+
+    // Forget sources that were not used for a long time (e.g. from an older
+    // decompiler) and prewarm the most recently used ones first
+    const auto now = std::filesystem::file_time_type::clock::now();
+    std::vector<std::pair<std::filesystem::file_time_type,
+                          std::filesystem::path>>
+        files;
+    for (std::filesystem::directory_iterator it(directory, error), end;
+         !error && it != end; it.increment(error)) {
+        if (it->path().extension() != ".metal" || !it->is_regular_file(error))
+            continue;
+        const auto time = it->last_write_time(error);
+        if (error)
+            continue;
+        if (now - time > MAX_UNUSED_AGE) {
+            std::filesystem::remove(it->path(), error);
+            continue;
+        }
+        files.emplace_back(time, it->path());
+    }
+    std::sort(files.begin(), files.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::map<std::filesystem::path, StoredFile> stored;
+    std::vector<std::filesystem::path> order;
+    for (const auto& [time, file] : files) {
+        stored_keys.insert(file.stem().string());
+        stored.emplace(file,
+                       StoredFile{std::filesystem::file_size(file, error), time});
+        order.push_back(file);
+    }
+    LOG_INFO(MetalRenderer, "Shader source cache: {} sources in {}",
+             order.size(), directory.string());
+
+    busy = true;
+    worker = std::thread(
+        [this, stored = std::move(stored)]() mutable { run(std::move(stored)); });
+    if (!order.empty())
+        prewarm(std::move(order));
+}
+
 MTL::Library* ShaderLibraryCache::compileHot0(std::string_view source,
-                                          NS::Error** error) {
+                                              NS::Error** error) {
     NS_STACK_SCOPED auto options = MTL::CompileOptions::alloc()->init();
     options->setPreserveInvariance(true);
-    // Guest float comparisons require NaN, infinity, and subnormal semantics.
     options->setFastMathEnabled(false);
     return device->newLibrary(toNsString(std::string(source)), options, error);
 }
+
 void ShaderLibraryCache::insert(const std::string& key, MTL::Library* library) {
     if (libraries.contains(key))
         return;
-    if (libraries.size() >= MAX_LIBRARIES) {
+    if (libraries.size() >= limits.resident_libraries) {
         auto oldest = std::min_element(
             libraries.begin(), libraries.end(),
             [](auto& a, auto& b) { return a.second.used < b.second.used; });
@@ -73,105 +146,185 @@ void ShaderLibraryCache::insert(const std::string& key, MTL::Library* library) {
     }
     libraries.emplace(key, Entry{library->retain(), ++clock});
 }
-MTL::Library* ShaderLibraryCache::getHot1(std::string_view source,
-                                      NS::Error** error) {
-    const auto key = sourceKey(source);
-    if (enabled) {
-        std::lock_guard lock(mutex);
-        if (auto it = libraries.find(key); it != libraries.end()) {
-            it->second.used = ++clock;
-            ++hits;
-            if (PerfStats::isEnabled())
-                PerfStats::instance().shader_library_hits++;
-            if (saves.size() < 128) {
-                saves.push_back(
-                    {key, {}}); // Refresh disk LRU off the draw thread.
-                condition.notify_all();
+
+MTL::Library* ShaderLibraryCache::obtain(const std::string& key,
+                                         std::string_view source,
+                                         NS::Error** error, Use use) {
+    const bool prewarm = use == Use::Prewarm;
+    if (disabled)
+        return compile(source, error);
+
+    std::shared_ptr<Compilation> compilation;
+    {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            if (auto it = libraries.find(key); it != libraries.end()) {
+                it->second.used = ++clock;
+                if (use == Use::Draw) {
+                    ++hits;
+                    if (PerfStats::isEnabled())
+                        PerfStats::instance().shader_library_hits++;
+                }
+                return it->second.library->retain();
             }
-            return it->second.library->retain();
+            // Another thread (usually the prewarm) compiles this source: wait
+            // for it instead of compiling it twice
+            const auto it = compiling.find(key);
+            if (it == compiling.end())
+                break;
+            if (prewarm)
+                return nullptr;
+            const auto other = it->second;
+            compiled.wait(lock, [&] { return other->done; });
+            // A failed compilation is retried below to report its error
+            if (!other->succeeded)
+                break;
         }
+        // Prewarming stops once the resident set is full, so it never evicts
+        // libraries that are in use
+        if (prewarm && libraries.size() >= limits.resident_libraries)
+            return nullptr;
+        compilation = std::make_shared<Compilation>();
+        compiling.emplace(key, compilation);
     }
+
     std::optional<ScopedPerfTimer> timer;
-    if (PerfStats::isEnabled()) {
+    if (use == Use::Draw && PerfStats::isEnabled()) {
         timer.emplace(PerfStats::instance().shader_compile_ns);
         PerfStats::instance().shader_compiles++;
     }
     auto* library = compile(source, error);
-    if (library && enabled) {
+    timer.reset();
+    {
         std::lock_guard lock(mutex);
-        insert(key, library);
-        if (source.size() <= MAX_SOURCE_BYTES && saves.size() < 128 &&
-            queued_bytes + source.size() <= 16 * MAX_SOURCE_BYTES) {
-            saves.push_back({key, std::string(source)});
-            queued_bytes += source.size();
-            condition.notify_all();
+        if (library) {
+            insert(key, library);
+            if (use != Use::Draw)
+                ++prewarmed;
         }
+        compilation->done = true;
+        compilation->succeeded = library != nullptr;
+        compiling.erase(key);
+    }
+    compiled.notify_all();
+    return library;
+}
+
+void ShaderLibraryCache::queueSave(const std::string& key,
+                                   std::string_view source) {
+    if (!persistent || isLiveRevisionKey(key) || used_keys.contains(key))
+        return;
+    // A stored source only needs to be marked as used
+    const bool stored = stored_keys.contains(key);
+    if (!stored && source.size() > MAX_SOURCE_BYTES)
+        return;
+    if (saves.size() >= MAX_QUEUED_SAVES ||
+        (!stored && queued_bytes + source.size() > MAX_QUEUED_BYTES))
+        return;
+    used_keys.insert(key);
+    if (stored) {
+        saves.push_back({key, {}});
+    } else {
+        saves.push_back({key, std::string(source)});
+        queued_bytes += source.size();
+    }
+    condition.notify_all();
+}
+
+MTL::Library* ShaderLibraryCache::getHot1(std::string_view source,
+                                          NS::Error** error) {
+    const auto key = sourceKey(source);
+    auto* library = obtain(key, source, error, Use::Draw);
+    if (library && !disabled) {
+        std::lock_guard lock(mutex);
+        queueSave(key, source);
     }
     return library;
 }
-void ShaderLibraryCache::prewarm() {
-    std::error_code error;
-    std::vector<std::filesystem::directory_entry> files;
-    for (std::filesystem::directory_iterator it(directory, error), end;
-         !error && it != end; it.increment(error)) {
-        if (it->path().extension() == ".metal" && it->is_regular_file(error))
-            files.push_back(*it);
+
+MTL::Library* ShaderLibraryCache::getStored(const std::string& key) {
+    {
+        std::lock_guard lock(mutex);
+        if (disabled || !persistent)
+            return nullptr;
+        if (auto it = libraries.find(key); it != libraries.end()) {
+            it->second.used = ++clock;
+            return it->second.library->retain();
+        }
     }
-    std::sort(files.begin(), files.end(), [](auto& a, auto& b) {
-        std::error_code ea, eb;
-        return a.last_write_time(ea) > b.last_write_time(eb);
-    });
-    usize compiled = 0;
-    for (auto& file : files) {
-        ::hydra::hot::Scope hot_scope;
-        {
-            std::lock_guard lock(mutex);
-            if (stopping || compiled >= MAX_LIBRARIES)
-                break;
-        }
-        const auto size = file.file_size(error);
-        if (error || size > MAX_SOURCE_BYTES)
-            continue;
-        std::ifstream input(file.path(), std::ios::binary);
-        std::string source((std::istreambuf_iterator<char>(input)), {});
-        const auto key = sourceKey(source);
-        if (key != file.path().stem().string())
-            continue;
-        {
-            std::lock_guard lock(mutex);
-            if (libraries.contains(key))
-                continue;
-        }
-        NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
-        NS::Error* compile_error = nullptr;
-        auto* library = compile(source, &compile_error);
-        if (!library)
-            continue;
-        {
-            std::lock_guard lock(mutex);
-            insert(key, library);
-        }
-        library->release();
-        ++compiled;
+    const auto source = readSource(directory / (key + ".metal"));
+    if (!source || sourceKey(*source) != key)
+        return nullptr;
+    NS::Error* error = nullptr;
+    return obtain(key, *source, &error, Use::Dependency);
+}
+
+void ShaderLibraryCache::prewarm(std::vector<std::filesystem::path> files) {
+    // The compiler service runs compilations of different threads in
+    // parallel. Leave most cores to the guest, which is booting meanwhile.
+    const auto count = std::clamp(std::thread::hardware_concurrency() / 4, 2u,
+                                  4u);
+    auto shared = std::make_shared<std::vector<std::filesystem::path>>(
+        std::move(files));
+    auto next = std::make_shared<std::atomic<usize>>(0);
+    auto failed = std::make_shared<std::atomic<u64>>(0);
+    const auto start = std::chrono::steady_clock::now();
+    prewarm_pending = count;
+    for (u32 i = 0; i < count; i++) {
+        prewarmers.emplace_back([this, shared, next, failed, start] {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+            DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess()
+                .registerThisThread("Shader prewarm");
+            for (;;) {
+                ::hydra::hot::Scope hot_scope;
+                {
+                    std::lock_guard lock(mutex);
+                    if (stopping ||
+                        libraries.size() >= limits.resident_libraries)
+                        break;
+                }
+                const auto index = next->fetch_add(1);
+                if (index >= shared->size())
+                    break;
+                const auto& file = (*shared)[index];
+                const auto source = readSource(file);
+                const auto key = file.stem().string();
+                if (!source || sourceKey(*source) != key)
+                    continue;
+                NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+                NS::Error* error = nullptr;
+                if (auto* library = obtain(key, *source, &error, Use::Prewarm))
+                    library->release();
+                else if (error)
+                    (*failed)++;
+            }
+            std::unique_lock lock(mutex);
+            if (--prewarm_pending == 0) {
+                if (!stopping)
+                    LOG_INFO(MetalRenderer,
+                             "Shader prewarm: {} of {} libraries compiled in "
+                             "{} ms ({} failed)",
+                             prewarmed, shared->size(),
+                             std::chrono::duration_cast<
+                                 std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count(),
+                             failed->load());
+                condition.notify_all();
+            }
+            lock.unlock();
+            DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess()
+                .unregisterThisThread();
+        });
     }
 }
-void ShaderLibraryCache::run() {
+
+void ShaderLibraryCache::run(std::map<std::filesystem::path, StoredFile> stored) {
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-    prewarm();
+    usize disk_bytes = 0;
+    for (const auto& [path, file] : stored)
+        disk_bytes += file.size;
     std::unique_lock lock(mutex);
-    // Limit source files to 128 entries / 64 MiB per GPU/OS cache directory.
-    usize file_count = 0, disk_bytes = 0;
-    std::map<std::filesystem::path, usize> stored;
-    std::error_code error;
-    for (std::filesystem::directory_iterator it(directory, error), end;
-         !error && it != end; it.increment(error)) {
-        if (it->path().extension() == ".metal" && it->is_regular_file(error)) {
-            ++file_count;
-            const auto size = it->file_size(error);
-            stored.emplace(it->path(), size);
-            disk_bytes += size;
-        }
-    }
     while (true) {
         busy = false;
         condition.notify_all();
@@ -183,58 +336,70 @@ void ShaderLibraryCache::run() {
         queued_bytes -= save.source.size();
         busy = true;
         lock.unlock();
+        std::error_code error;
         const auto path = directory / (save.key + ".metal");
-        if (std::filesystem::exists(path, error)) {
-            std::filesystem::last_write_time(
-                path, std::filesystem::file_time_type::clock::now(), error);
-        } else if (!save.source.empty()) {
+        const auto now = std::filesystem::file_time_type::clock::now();
+        bool written = false;
+        if (save.source.empty()) {
+            std::filesystem::last_write_time(path, now, error);
+            if (auto it = stored.find(path); it != stored.end())
+                it->second.time = now;
+        } else {
+            // Evict the least recently used sources
             while (!stored.empty() &&
-                   (file_count >= 128 ||
-                    disk_bytes + save.source.size() > 64 * MAX_SOURCE_BYTES)) {
+                   (stored.size() >= limits.disk_files ||
+                    disk_bytes + save.source.size() > limits.disk_bytes)) {
                 auto oldest = std::min_element(
-                    stored.begin(), stored.end(),
-                    [](const auto& a, const auto& b) {
-                        std::error_code ea, eb;
-                        return std::filesystem::last_write_time(a.first, ea) <
-                               std::filesystem::last_write_time(b.first, eb);
+                    stored.begin(), stored.end(), [](const auto& a, const auto& b) {
+                        return a.second.time < b.second.time;
                     });
                 if (!std::filesystem::remove(oldest->first, error) || error)
                     break;
-                --file_count;
-                disk_bytes -= oldest->second;
+                disk_bytes -= oldest->second.size;
                 stored.erase(oldest);
             }
-            if (file_count >= 128 ||
-                disk_bytes + save.source.size() > 64 * MAX_SOURCE_BYTES) {
-                lock.lock();
-                continue;
-            }
-            std::ofstream output(path.string() + ".tmp",
-                                 std::ios::binary | std::ios::trunc);
-            output.write(save.source.data(), save.source.size());
-            output.close();
-            if (output) {
-                std::filesystem::rename(path.string() + ".tmp", path, error);
-                if (!error) {
-                    ++file_count;
-                    disk_bytes += save.source.size();
-                    stored.emplace(path, save.source.size());
+            if (stored.size() < limits.disk_files &&
+                disk_bytes + save.source.size() <= limits.disk_bytes) {
+                std::ofstream output(path.string() + ".tmp",
+                                     std::ios::binary | std::ios::trunc);
+                output.write(save.source.data(), save.source.size());
+                output.close();
+                if (output) {
+                    std::filesystem::rename(path.string() + ".tmp", path, error);
+                    if (!error) {
+                        disk_bytes += save.source.size();
+                        stored[path] = StoredFile{save.source.size(), now};
+                        written = true;
+                    }
                 }
             }
         }
         lock.lock();
+        if (written)
+            stored_keys.insert(save.key);
     }
 }
+
 void ShaderLibraryCache::flush() {
     std::unique_lock lock(mutex);
-    condition.wait(lock, [this] { return !busy && saves.empty(); });
+    condition.wait(lock, [this] {
+        return !busy && saves.empty() && prewarm_pending == 0;
+    });
 }
+
 usize ShaderLibraryCache::getResidentCount() {
     std::lock_guard lock(mutex);
     return libraries.size();
 }
+
 u64 ShaderLibraryCache::getHits() {
     std::lock_guard lock(mutex);
     return hits;
 }
+
+u64 ShaderLibraryCache::getPrewarmed() {
+    std::lock_guard lock(mutex);
+    return prewarmed;
+}
+
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

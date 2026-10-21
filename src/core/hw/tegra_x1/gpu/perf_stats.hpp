@@ -20,6 +20,8 @@ enum class CheckpointReason : u8 {
     PullerOther,
     TextureReadback,
     StorageWrite,
+    PullerSemaphore,
+    ReportWrite,
     Count,
 };
 
@@ -32,8 +34,42 @@ constexpr const char* getCheckpointReasonName(CheckpointReason reason) {
         "report release", "report flush",      "conditional render",
         "acquire",        "puller acquire",    "puller other",
         "texture readback", "storage write",
+        "puller semaphore", "report write",
     };
     return names[static_cast<usize>(reason)];
+}
+
+// What the GPU thread spends its time on, grouped by whether the work has to
+// run in command stream order on that thread (sync) or only depends on data
+// that could be handed to another core (async-capable)
+enum class GpuWork : u8 {
+    // Sync
+    Decode, // Command stream, methods and macros (everything not below)
+    State,  // Register state, draw state snapshots and resource tracking
+    Lookup, // Cache lookups: shaders, pipelines, render targets, resources
+    // Async-capable
+    Encode,  // Metal command encoding of a prepared command
+    Shader,  // Decompilation, library and pipeline compilation
+    Texture, // Guest texture decoding and upload, GPU texture write back
+    Buffer,  // Buffer snapshots
+    Copy,    // DMA, 2D and inline copies done on the CPU
+    // Neither: the GPU thread waits for the host GPU
+    Wait,
+    Count,
+};
+
+constexpr usize GPU_WORK_COUNT = static_cast<usize>(GpuWork::Count);
+
+constexpr const char* getGpuWorkName(GpuWork work) {
+    constexpr const char* names[GPU_WORK_COUNT] = {
+        "decode", "state",  "lookup", "encode", "shader",
+        "texture", "buffer", "copy",   "wait",
+    };
+    return names[static_cast<usize>(work)];
+}
+
+constexpr bool isGpuWorkAsyncCapable(GpuWork work) {
+    return work >= GpuWork::Encode && work < GpuWork::Wait;
 }
 
 // DEBUG: frame timing statistics, logged when HYDRA_PERF_STATS is set
@@ -62,6 +98,9 @@ struct PerfStats {
     std::atomic<u64> shader_compile_ns{0};
     std::atomic<u64> shader_compiles{0};
     std::atomic<u64> shader_library_hits{0};
+    std::atomic<u64> shader_decompile_ns{0};
+    std::atomic<u64> shader_decompiles{0};
+    std::atomic<u64> pipeline_prewarm_hits{0};
     std::atomic<u64> pipeline_compile_ns{0};
     std::atomic<u64> pipeline_compiles{0};
     std::atomic<u64> raster_updates{0};
@@ -77,6 +116,8 @@ struct PerfStats {
     std::atomic<u64> checkpoint_skips{0};
     std::array<std::atomic<u64>, CHECKPOINT_REASON_COUNT> checkpoint_count{};
     std::array<std::atomic<u64>, CHECKPOINT_REASON_COUNT> checkpoint_ns{};
+    // Exclusive time of the GPU thread per kind of work, see ScopedGpuWork
+    std::array<std::atomic<u64>, GPU_WORK_COUNT> gpu_work_ns{};
     // Occlusion reports queued, and how often a consumer had to wait for them
     std::atomic<u64> reports_queued{0};
     std::atomic<u64> report_waits{0};
@@ -115,6 +156,72 @@ class ScopedPerfTimer {
     std::atomic<u64>& counter;
     bool enabled;
     std::chrono::steady_clock::time_point start;
+};
+
+// Attributes the time of the current thread to kinds of work while a
+// ScopedGpuWorkRoot is active on it. Scopes nest: an inner scope's time is
+// subtracted from the outer one, so the kinds add up to the root's time.
+struct GpuWorkTracker {
+    bool active{false};
+    GpuWork work{GpuWork::Decode};
+    std::chrono::steady_clock::time_point since;
+
+    // Charge the time since the last switch to the current kind, then switch
+    void switchTo(GpuWork next, std::chrono::steady_clock::time_point now) {
+        PerfStats::instance().gpu_work_ns[static_cast<usize>(work)] +=
+            static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - since)
+                    .count());
+        work = next;
+        since = now;
+    }
+};
+
+inline thread_local GpuWorkTracker gpu_work_tracker;
+
+class ScopedGpuWorkRoot {
+  public:
+    ScopedGpuWorkRoot() : enabled{PerfStats::isEnabled() &&
+                                  !gpu_work_tracker.active} {
+        if (!enabled)
+            return;
+        gpu_work_tracker.active = true;
+        gpu_work_tracker.work = GpuWork::Decode;
+        gpu_work_tracker.since = std::chrono::steady_clock::now();
+    }
+    ~ScopedGpuWorkRoot() {
+        if (!enabled)
+            return;
+        gpu_work_tracker.switchTo(GpuWork::Decode,
+                                  std::chrono::steady_clock::now());
+        gpu_work_tracker.active = false;
+    }
+    ScopedGpuWorkRoot(const ScopedGpuWorkRoot&) = delete;
+    ScopedGpuWorkRoot& operator=(const ScopedGpuWorkRoot&) = delete;
+
+  private:
+    bool enabled;
+};
+
+class ScopedGpuWork {
+  public:
+    explicit ScopedGpuWork(GpuWork work) : enabled{gpu_work_tracker.active} {
+        if (!enabled)
+            return;
+        previous = gpu_work_tracker.work;
+        gpu_work_tracker.switchTo(work, std::chrono::steady_clock::now());
+    }
+    ~ScopedGpuWork() {
+        if (enabled)
+            gpu_work_tracker.switchTo(previous,
+                                      std::chrono::steady_clock::now());
+    }
+    ScopedGpuWork(const ScopedGpuWork&) = delete;
+    ScopedGpuWork& operator=(const ScopedGpuWork&) = delete;
+
+  private:
+    bool enabled;
+    GpuWork previous{GpuWork::Decode};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu

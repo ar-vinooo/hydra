@@ -13,6 +13,7 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
                    const PipelineDescriptor& descriptor,
                    BinaryArchiveCache& binary_archive_cache)
     : PipelineBase(descriptor) {
+    ScopedGpuWork work(GpuWork::Shader);
     MTL::RenderPipelineDescriptor* pipeline_descriptor =
         MTL::RenderPipelineDescriptor::alloc()->init();
 
@@ -189,11 +190,18 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         PerfStats::instance().pipeline_compiles++;
     }
     NS::Error* error = nullptr;
+    const PipelineSources sources{
+        vertex_shader->getLibraryKey(),
+        fragment_shader != nullptr ? fragment_shader->getLibraryKey() : ""};
+    // A fragment shader without a stored source cannot be rebuilt
+    const bool rebuildable =
+        fragment_shader == nullptr || !sources.fragment.empty();
     pipeline = binary_archive_cache.createPipeline(
         pipeline_descriptor, &error,
         fmt::format("{}:{}", vertex_shader->getCacheKey(),
                     fragment_shader != nullptr ? fragment_shader->getCacheKey()
-                                               : "no-fragment"));
+                                               : "no-fragment"),
+        rebuildable ? &sources : nullptr);
     if (auto& visual = VisualDiagnostics::instance(); visual.selected())
         visual.event("metal_pipeline_result", {{"available", pipeline ? "1" : "0"},
             {"vertex_key", vertex_shader->getCacheKey()},

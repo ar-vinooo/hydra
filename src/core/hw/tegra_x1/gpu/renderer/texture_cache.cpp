@@ -986,6 +986,7 @@ void TextureCache::encodeTexture(ICommandBuffer* command_buffer,
 
 void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                                  TextureStorage& storage) {
+    ScopedGpuWork work(GpuWork::Texture);
     const auto& descriptor = storage.base->getDescriptor();
 
     // Calculate size

@@ -145,6 +145,109 @@ vertex float4 main_(uint id [[vertex_id]]) {
             std::cout << "PASS: depth-only pipeline and missing vertex handling\n";
             return 0;
         }
+        if (mode == "recipe-cold" || mode == "recipe-warm") {
+            using namespace hydra::hw::tegra_x1::gpu;
+            using namespace hydra::hw::tegra_x1::gpu::renderer;
+            const bool warm = mode == "recipe-warm";
+            const std::string vertex_source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    const float2 p[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(p[id], 0, 1);
+}
+)";
+            const std::string fragment_source = R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_() { return float4(0, 1, 0, 1); }
+)";
+            ShaderLibraryCache libraries(device, path / "sources");
+            cache.startPrewarm(path / "recipes", libraries);
+            // Waits for the prewarm
+            libraries.flush();
+            cache.flush();
+            check(cache.getPrewarmed() == (warm ? 1u : 0u),
+                  "Unexpected number of prewarmed pipelines");
+            const auto make_shader = [&](ShaderType type,
+                                         const std::string& source) {
+                ShaderDescriptor shader_descriptor{};
+                shader_descriptor.type = type;
+                shader_descriptor.backend = hydra::ShaderBackend::Msl;
+                shader_descriptor.code.assign(source.begin(), source.end());
+                shader_descriptor.resource_mapping.fragment_output_mask = 0xf;
+                return std::make_unique<Shader>(device, shader_descriptor,
+                                                libraries);
+            };
+            const auto vertex_shader =
+                make_shader(ShaderType::Vertex, vertex_source);
+            const auto fragment_shader =
+                make_shader(ShaderType::Fragment, fragment_source);
+            check(libraries.getHits() == (warm ? 2u : 0u),
+                  "Shaders did not use the prewarmed libraries");
+            PipelineDescriptor descriptor{};
+            descriptor.shaders[static_cast<unsigned>(ShaderType::Vertex)] =
+                vertex_shader.get();
+            descriptor.shaders[static_cast<unsigned>(ShaderType::Fragment)] =
+                fragment_shader.get();
+            descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+            descriptor.color_target_states[0].write_mask =
+                engines::ColorWriteMask::All;
+            Pipeline pipeline(device, descriptor, cache);
+            check(pipeline.getPipeline() != nullptr,
+                  "Pipeline creation failed");
+            check(cache.getPrewarmHits() == (warm ? 1u : 0u),
+                  "Draw did not use the prewarmed pipeline");
+
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            NS_STACK_SCOPED auto texture_descriptor =
+                MTL::TextureDescriptor::alloc()->init();
+            texture_descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+            texture_descriptor->setWidth(4);
+            texture_descriptor->setHeight(4);
+            texture_descriptor->setStorageMode(MTL::StorageModeShared);
+            texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+            NS_STACK_SCOPED auto texture =
+                device->newTexture(texture_descriptor);
+            auto pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+            auto attachment = pass->colorAttachments()->object(0);
+            attachment->setTexture(texture);
+            attachment->setLoadAction(MTL::LoadActionClear);
+            attachment->setStoreAction(MTL::StoreActionStore);
+            attachment->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+            auto command = queue->commandBuffer();
+            auto encoder = command->renderCommandEncoder(pass);
+            encoder->setRenderPipelineState(pipeline.getPipeline());
+            encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                                    NS::UInteger(3));
+            encoder->endEncoding();
+            command->commit();
+            command->waitUntilCompleted();
+            check(command->status() == MTL::CommandBufferStatusCompleted,
+                  "Test render failed");
+            uint8_t pixels[4 * 4 * 4]{};
+            texture->getBytes(pixels, 4 * 4, MTL::Region::Make2D(0, 0, 4, 4),
+                              0);
+            for (int pixel = 0; pixel < 16; pixel++)
+                for (int channel = 0; channel < 4; channel++)
+                    check(pixels[pixel * 4 + channel] ==
+                              (channel == 1 || channel == 3 ? 255 : 0),
+                          "Prewarmed pipeline changed rendered pixels");
+
+            libraries.flush();
+            cache.flush();
+            hydra::usize recipes = 0;
+            for (const auto& entry :
+                 std::filesystem::directory_iterator(path / "recipes"))
+                recipes += entry.path().extension() == ".recipe";
+            check(recipes == 1, "Pipeline recipe was not stored once");
+            std::cout << "PASS " << mode
+                      << ": prewarmed=" << cache.getPrewarmed()
+                      << " prewarm_hits=" << cache.getPrewarmHits()
+                      << " library_hits=" << libraries.getHits()
+                      << " pixels=identical\n";
+            return 0;
+        }
         NS_STACK_SCOPED auto queue = device->newCommandQueue();
         const std::string source = R"(
 #include <metal_stdlib>

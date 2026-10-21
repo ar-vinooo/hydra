@@ -489,6 +489,7 @@ void Pfifo::threadFunc() {
             // TODO: flags
             {
                 ScopedPerfTimer timer(PerfStats::instance().pfifo_busy_ns);
+                ScopedGpuWorkRoot work_root;
                 PerfStats::instance().pfifo_lists++;
                 VisualDiagnostics::instance().beginSubmission(entry_list.correlation_id);
                 tls_crnt_gmmu = entry_list.gmmu;

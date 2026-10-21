@@ -621,6 +621,7 @@ void TextureCache::flushMemoryImpl(ICommandBuffer* command_buffer,
 void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                  TextureStorage& storage,
                                  ztd::Range<uptr> range) {
+    ScopedGpuWork work(GpuWork::Texture);
     const auto& descriptor = storage.base->getDescriptor();
     logTextureEvent("writeback_to_guest", descriptor,
                     fmt::format("range={:#x}+{:#x}", range.getBegin(),

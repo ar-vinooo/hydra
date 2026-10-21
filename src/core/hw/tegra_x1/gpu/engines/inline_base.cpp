@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/inline_base.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
@@ -36,6 +37,7 @@ void forEachHostRange(uptr gpu_addr, u64 size, F&& f) {
 
 void InlineBase::launchDmaImpl(Gpu& gpu, RegsInline& regs, const u32* regs_raw,
                                const u32 index, const u32 data) {
+    ScopedGpuWork work(GpuWork::Copy);
     (void)index;
     // cla140.h: SET_I2M_SEMAPHORE_A (address bits 39:32), B (31:0), C
     // (payload); LAUNCH_DMA DST_MEMORY_LAYOUT[0], REDUCTION_ENABLE[1],
@@ -61,6 +63,7 @@ void InlineBase::launchDmaImpl(Gpu& gpu, RegsInline& regs, const u32* regs_raw,
 
 void InlineBase::loadInlineDataImpl(Gpu& gpu, RegsInline& regs, const u32 index,
                                     const u32 data) {
+    ScopedGpuWork work(GpuWork::Copy);
     (void)index;
     if (!active) {
         ONCE(LOG_WARN(Engines, "Inline data without LAUNCH_DMA"));

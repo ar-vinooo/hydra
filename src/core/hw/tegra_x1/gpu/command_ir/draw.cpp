@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
@@ -106,6 +107,7 @@ void captureDrawAddressSpace(renderer::IRenderer& renderer,
 bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command) {
     ScopedPerfTimer timer(PerfStats::instance().draw_prepare_ns,
                           PerfStats::isEnabled());
+    ScopedGpuWork work(GpuWork::State);
     command.resources_sealed = false;
     command.resource_refs.clear();
     auto previous_owners = std::move(command.resource_owners);
@@ -195,6 +197,7 @@ bool executeDraw(renderer::IRenderer& renderer,
         return true;
     ScopedPerfTimer timer(PerfStats::instance().draw_command_ns,
                           PerfStats::isEnabled());
+    ScopedGpuWork work(GpuWork::Encode);
     const bool indexed = command.index_type != engines::IndexType::None;
     if (!command.pipeline || !command.render_pass || !command_buffer ||
         (indexed && !command.indices.isValid()) ||

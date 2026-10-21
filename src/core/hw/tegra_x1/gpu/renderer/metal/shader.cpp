@@ -16,13 +16,15 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor,
                ShaderLibraryCache& library_cache)
     : ShaderBase(descriptor) {
+    ScopedGpuWork work(GpuWork::Shader);
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(descriptor.code.data(),
               static_cast<CC_LONG>(descriptor.code.size()), digest);
-    cache_key = fmt::format("{}:{}:invariant-no-fast-math:", descriptor.type,
-                            descriptor.backend);
+    std::string digest_hex;
     for (const auto byte : digest)
-        cache_key += fmt::format("{:02x}", byte);
+        digest_hex += fmt::format("{:02x}", byte);
+    cache_key = fmt::format("{}:{}:invariant-no-fast-math:{}", descriptor.type,
+                            descriptor.backend, digest_hex);
     // Library
     MTL::Library* library;
     switch (descriptor.backend) {
@@ -44,6 +46,7 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor,
 
         NS::Error* error = nullptr;
         library = library_cache.get(source, &error);
+        library_key = ShaderLibraryCache::keyFromDigest(digest_hex);
         if (auto& visual = VisualDiagnostics::instance(); visual.selected())
             visual.event("metal_library_result", {{"cache_key", cache_key},
                 {"source_fnv1a64", VisualDiagnostics::contentId(descriptor.code)},

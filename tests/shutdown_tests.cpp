@@ -2146,7 +2146,7 @@ void testGpuOrderingStress(System& system, kernel::Process* process,
             target.addr = {0, static_cast<u32>(BASE)};
             target.width_or_stride = 64;
             target.height = 16;
-            target.format = gpu::engines::ColorSurfaceFormat::RGBA8Unorm;
+            target.format = gpu::ColorSurfaceFormat::RGBA8Unorm;
             target.tile_mode.is_linear = 1;
             target.array_mode.layers = 1;
             emit(filling, 0, 0xb197);

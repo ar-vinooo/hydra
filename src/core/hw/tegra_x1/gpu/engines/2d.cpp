@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
 
@@ -168,6 +169,7 @@ DEFINE_METHOD_TABLE(TwoD, 0x237, 1, copy, u32)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 void TwoD::copy(const u32 index, const u32 pixels_from_memory_src_y0_int) {
+    ScopedGpuWork work(GpuWork::Copy);
     auto& pixels = regs.pixels_from_memory;
     pixels.src_y0.integer = pixels_from_memory_src_y0_int;
     const auto region = getBlitRegion(regs);

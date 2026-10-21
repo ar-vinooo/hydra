@@ -111,6 +111,7 @@ class Renderer : public IRenderer {
 
     // Shader
     u64 getAllocatedResourceBytes() const override { return device->currentAllocatedSize(); }
+    void setTitleId(u64 title_id) override;
     ShaderBase* createShader(const ShaderDescriptor& descriptor) override;
 
     // Pipeline

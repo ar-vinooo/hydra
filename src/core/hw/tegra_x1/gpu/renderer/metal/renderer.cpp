@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/compute_limits.hpp"
 #include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
@@ -45,6 +46,10 @@ Renderer::Renderer()
       depth_stencil_state_cache(device),
       blit_pipeline_cache(device), clear_color_pipeline_cache(device),
       clear_depth_pipeline_cache(device) {
+    // Compile shaders and pipelines of different threads (draws, prewarm) in
+    // parallel
+    device->setShouldMaximizeConcurrentCompilation(true);
+
     // Resources
 
     // Depth stencil states
@@ -111,6 +116,10 @@ Renderer::~Renderer() {
     depth_stencil_state_clear_stencil->release();
     depth_stencil_state_disabled->release();
 
+    // The pipeline prewarm uses the shader library cache, which is destroyed
+    // first
+    binary_archive_cache.stopPrewarm();
+
     // TODO: destroy caches here?
 
     command_queue->release();
@@ -163,6 +172,7 @@ BufferBase* Renderer::createCpuBufferSnapshotHot3(ztd::Range<uptr> range) {
         std::getenv("HYDRA_DISABLE_BUFFER_SNAPSHOTS") != nullptr;
     if (disabled || range.getSize() > 64 * 1024)
         return nullptr;
+    ScopedGpuWork work(GpuWork::Buffer);
     BufferBase* snapshot =
         new Buffer(snapshotBufferPool(device)->acquire(range.getSize()));
     snapshot->copyFrom(range.getBegin());
@@ -567,6 +577,18 @@ void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
 
 ShaderBase* Renderer::createShaderHot17(const ShaderDescriptor& descriptor) {
     return new Shader(device, descriptor, shader_library_cache);
+}
+
+void Renderer::setTitleId(u64 title_id) {
+    // Sources and recipes do not depend on the GPU or the OS, unlike the
+    // binaries in the binary archive cache
+    const auto directory = std::filesystem::path(
+                               CONFIG_INSTANCE.getAppDataPath()) /
+                           "cache" / "metal" / "titles" /
+                           fmt::format("{:016x}", title_id);
+    shader_library_cache.setDirectory(directory / "msl");
+    binary_archive_cache.startPrewarm(directory / "pipelines",
+                                      shader_library_cache);
 }
 
 PipelineBase* Renderer::createPipelineHot18(const PipelineDescriptor& descriptor) {
@@ -1177,6 +1199,7 @@ void Renderer::flushReports(ICommandBuffer* command_buffer,
                 : command_buffer->checkpoint_reason);
         synchronize(command_buffer);
     }
+    ScopedGpuWork work(GpuWork::Wait);
     if (!completions->wait(sequence, std::chrono::seconds(2)))
         LOG_WARN(MetalRenderer, "A queued report did not reach guest memory "
                                 "within 2 seconds");
@@ -1293,6 +1316,7 @@ f64 Renderer::debugSyncCommandBufferHot40(ICommandBuffer* command_buffer) {
 
 bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                                     const ComputeDispatch& dispatch) {
+    ScopedGpuWork work(GpuWork::Encode);
     if (!command_buffer)
         return false;
     if (command_ir::emptyComputeGrid(dispatch.grid_size.width,
@@ -1314,6 +1338,7 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         compute_pipelines.try_emplace(shader->getFunction(), nullptr);
     if (inserted) {
         NS::Error* error = nullptr;
+        ScopedGpuWork shader_work(GpuWork::Shader);
         it->second =
             device->newComputePipelineState(shader->getFunction(), &error);
         if (it->second == nullptr)
@@ -1631,6 +1656,7 @@ bool Renderer::canDrawHot52() const {
 }
 
 void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
+    ScopedGpuWork work(GpuWork::Encode);
     const auto start = PerfStats::isEnabled()
                            ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};

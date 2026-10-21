@@ -1044,13 +1044,21 @@ bool ThreeD::prepareReportWrite(u64 address, usize size,
         return false;
     writes.reserve(report->count);
     // GPU written textures in the memory reach it before the report does,
-    // they would overwrite it otherwise. This also waits for reports queued
-    // earlier to the same memory.
+    // they would overwrite it otherwise. Flushing them also waits for the
+    // reports queued earlier to the same memory, which must land before the
+    // texture data. Without such textures nothing has to wait: the report is
+    // queued behind the earlier ones and lands after them, as on hardware.
+    // DEBUG: HYDRA_REPORT_WRITE_WAIT=1 always waits, for comparisons
+    static const bool always_wait =
+        std::getenv("HYDRA_REPORT_WRITE_WAIT") != nullptr;
     auto& cache = gpu.getRenderer().getTextureCache();
     std::scoped_lock lock(cache.getMutex());
+    renderer::ScopedCheckpointReason reason(tls_crnt_command_buffer,
+                                            CheckpointReason::ReportWrite);
     for (usize i = 0; i < report->count; i++) {
         writes.push_back(getReportSpanRange(report->spans[i]));
-        cache.flushMemory(tls_crnt_command_buffer, writes.back());
+        if (always_wait || cache.hasUnflushedGpuWrites(writes.back()))
+            cache.flushMemory(tls_crnt_command_buffer, writes.back());
     }
     return true;
 }
@@ -1059,7 +1067,7 @@ void ThreeD::queueCounterReport(u64 address, bool short_query) {
     const usize size = short_query ? 4 : 16;
     capture::GuestEvents::instance().event(
         "semaphore_release_queued", capture::currentGuestEventOrigin(),
-        semaphore_address, size, 0, value, data);
+        address, size, 0, 0, short_query ? 1 : 0);
     std::vector<ztd::Range<uptr>> writes;
     if (!prepareReportWrite(address, size, writes))
         return;
@@ -3484,6 +3492,7 @@ void ThreeD::noteUnimplementedMultisample() {
 renderer::DrawState ThreeD::prepareDrawState() {
     ScopedPerfTimer timer(PerfStats::instance().draw_snapshot_ns,
                           PerfStats::isEnabled());
+    ScopedGpuWork work(GpuWork::State);
     renderer::DrawState state{};
     auto& visual = VisualDiagnostics::instance();
     static const bool highlight_keep_depth =
@@ -3574,6 +3583,7 @@ renderer::DrawState ThreeD::prepareDrawState() {
 renderer::RenderPassBase* ThreeD::resolveDrawTargets() {
     ScopedPerfTimer timer(PerfStats::instance().draw_targets_ns,
                           PerfStats::isEnabled());
+    ScopedGpuWork work(GpuWork::Lookup);
     auto& texture_cache = gpu.getRenderer().getTextureCache();
     // Resolve previous texture writes before this draw marks its targets as
     // written. Storage buffers read and modify the guest allocation directly.
@@ -3626,6 +3636,7 @@ renderer::RenderPassBase* ThreeD::resolveDrawTargets() {
 bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
     ScopedPerfTimer timer(PerfStats::instance().draw_prepare_ns,
                           PerfStats::isEnabled());
+    ScopedGpuWork work(GpuWork::State);
     command = {};
     command_ir::captureDrawAddressSpace(gpu.getRenderer(), command, tls_crnt_gmmu);
     auto& visual = VisualDiagnostics::instance();
@@ -3666,6 +3677,7 @@ bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
     auto* pipeline = [&] {
         ScopedPerfTimer pipeline_timer(PerfStats::instance().draw_pipeline_ns,
                                        PerfStats::isEnabled());
+        ScopedGpuWork pipeline_work(GpuWork::Lookup);
         return getPipeline();
     }();
     auto* render_pass = resolveDrawTargets();
@@ -3681,6 +3693,7 @@ bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
 
     ScopedPerfTimer bindings_timer(PerfStats::instance().draw_resources_ns,
                                    PerfStats::isEnabled());
+    ScopedGpuWork bindings_work(GpuWork::Lookup);
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++) {
         const auto& vertex_array = regs.vertex_arrays[i];
         // HACK: Super Meat Boy contains invalid vertex arrays with address 4096

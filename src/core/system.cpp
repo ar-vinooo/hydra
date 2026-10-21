@@ -405,6 +405,8 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
 
     LOG_INFO(Other, "-------- Title info --------");
     LOG_INFO(Other, "Title ID: {:016x}", loader->getTitleId());
+    // Start compiling the shaders the title used before while it boots
+    gpu.getRenderer().setTitleId(loader->getTitleId());
 
     // Patch
     const auto target_patch_filename =
@@ -710,8 +712,48 @@ void System::progressFrame(u32 width, u32 height,
                          std::max(frames, 1.0),
                      static_cast<f64>(stats.compute_threads.exchange(0)) /
                          std::max(frames, 1.0));
-            LOG_INFO(Other, "Shader libraries: {} prewarmed/reused hits",
-                     stats.shader_library_hits.exchange(0));
+            LOG_INFO(Other,
+                     "SHADERS: decompiled {} ({:.2f} ms) | library hits {} | "
+                     "prewarmed pipelines used {}",
+                     stats.shader_decompiles.exchange(0),
+                     static_cast<f64>(stats.shader_decompile_ns.exchange(0)) /
+                         1e6,
+                     stats.shader_library_hits.exchange(0),
+                     stats.pipeline_prewarm_hits.exchange(0));
+            {
+                // Where the GPU thread's time goes: sync work has to stay on
+                // it, async-capable work could move to other cores
+                using hw::tegra_x1::gpu::GpuWork;
+                f64 work_ms[hw::tegra_x1::gpu::GPU_WORK_COUNT];
+                f64 sync_ms = 0.0, async_ms = 0.0;
+                for (usize i = 0; i < hw::tegra_x1::gpu::GPU_WORK_COUNT; i++) {
+                    work_ms[i] = per_frame_ms(stats.gpu_work_ns[i]);
+                    const auto work = static_cast<GpuWork>(i);
+                    if (hw::tegra_x1::gpu::isGpuWorkAsyncCapable(work))
+                        async_ms += work_ms[i];
+                    else if (work != GpuWork::Wait)
+                        sync_ms += work_ms[i];
+                }
+                const auto ms = [&](GpuWork work) {
+                    return work_ms[static_cast<usize>(work)];
+                };
+                const auto total_ms =
+                    std::max(sync_ms + async_ms + ms(GpuWork::Wait), 1e-9);
+                LOG_INFO(Other,
+                         "GPU THREAD: sync {:.2f} ms ({:.0f}%: decode {:.2f}, "
+                         "state {:.2f}, lookup {:.2f}) | async-capable {:.2f} "
+                         "ms ({:.0f}%: encode {:.2f}, shader {:.2f}, texture "
+                         "{:.2f}, buffer {:.2f}, copy {:.2f}) | waiting for "
+                         "GPU {:.2f} ms ({:.0f}%) per frame",
+                         sync_ms, 100.0 * sync_ms / total_ms,
+                         ms(GpuWork::Decode), ms(GpuWork::State),
+                         ms(GpuWork::Lookup), async_ms,
+                         100.0 * async_ms / total_ms, ms(GpuWork::Encode),
+                         ms(GpuWork::Shader), ms(GpuWork::Texture),
+                         ms(GpuWork::Buffer), ms(GpuWork::Copy),
+                         ms(GpuWork::Wait),
+                         100.0 * ms(GpuWork::Wait) / total_ms);
+            }
 #ifdef ZTD_PLATFORM_APPLE
             task_vm_info_data_t memory_info{};
             mach_msg_type_number_t memory_count = TASK_VM_INFO_COUNT;

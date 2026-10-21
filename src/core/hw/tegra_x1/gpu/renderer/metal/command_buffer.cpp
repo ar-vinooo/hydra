@@ -206,6 +206,7 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
 }
 
 f64 CommandBuffer::debugCommitAndWaitHot5() {
+    ScopedGpuWork work(GpuWork::Wait);
     const bool profile = PerfStats::isEnabled();
     const auto start = profile ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};

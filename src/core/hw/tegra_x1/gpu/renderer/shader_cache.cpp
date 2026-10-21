@@ -5,11 +5,13 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 #include <fstream>
 #include <iterator>
 #include <chrono>
@@ -407,10 +409,18 @@ ShaderBase* ShaderCache::createHot1(const GuestShaderDescriptor& descriptor) {
                   static_cast<std::streamsize>(code.size()));
     }
     ztd::io::MemoryStream code_stream(code);
-    shader_decomp::decompile(
-        code_stream, host_descriptor.type, descriptor.state,
-        host_descriptor.backend, host_descriptor.code,
-        host_descriptor.resource_mapping, descriptor.read_const_word);
+    {
+        ScopedGpuWork work(GpuWork::Shader);
+        std::optional<ScopedPerfTimer> timer;
+        if (PerfStats::isEnabled()) {
+            timer.emplace(PerfStats::instance().shader_decompile_ns);
+            PerfStats::instance().shader_decompiles++;
+        }
+        shader_decomp::decompile(
+            code_stream, host_descriptor.type, descriptor.state,
+            host_descriptor.backend, host_descriptor.code,
+            host_descriptor.resource_mapping, descriptor.read_const_word);
+    }
     host_descriptor.writes_layer |= host_descriptor.resource_mapping.writes_layer;
     if (!host_descriptor.resource_mapping.unsupported.empty()) {
         std::string features;

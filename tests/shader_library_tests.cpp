@@ -2495,14 +2495,19 @@ using namespace metal;
 kernel void main_(device uint* output [[buffer(0)]]) { output[0] = 123456; }
 )";
         NS::Error* error = nullptr;
+        // Small limits to exercise eviction
+        const ShaderLibraryCache::Limits limits{
+            .resident_libraries = 64,
+            .disk_files = 128,
+            .disk_bytes = 64 * ShaderLibraryCache::MAX_SOURCE_BYTES};
         {
-            ShaderLibraryCache cache(device, dir);
+            ShaderLibraryCache cache(device, dir, limits);
             NS_STACK_SCOPED auto first = cache.get(source, &error);
             check(first != nullptr, "Cold shader compilation succeeds");
             cache.flush();
         }
         {
-            ShaderLibraryCache cache(device, dir);
+            ShaderLibraryCache cache(device, dir, limits);
             cache.flush();
             NS_STACK_SCOPED auto library = cache.get(source, &error);
             check(library && cache.getHits() == 1,
@@ -2534,7 +2539,7 @@ kernel void main_(device uint* output [[buffer(0)]]) { output[0] = 123456; }
                 if (i % 32 == 31)
                     cache.flush();
             }
-            check(cache.getResidentCount() == ShaderLibraryCache::MAX_LIBRARIES,
+            check(cache.getResidentCount() == limits.resident_libraries,
                   "Resident library count stays bounded");
             cache.flush();
             NS_STACK_SCOPED auto bad =
@@ -2548,11 +2553,10 @@ kernel void main_(device uint* output [[buffer(0)]]) { output[0] = 123456; }
                 bytes += file.file_size();
             }
         }
-        check(files == 128 &&
-                  bytes <= 64 * ShaderLibraryCache::MAX_SOURCE_BYTES,
+        check(files == limits.disk_files && bytes <= limits.disk_bytes,
               "Disk cache evicts old entries within count/byte limits");
         {
-            ShaderLibraryCache cache(device, dir);
+            ShaderLibraryCache cache(device, dir, limits);
             cache.flush();
             NS_STACK_SCOPED auto newest =
                 cache.get(source + "\n// variant 131", &error);

@@ -191,6 +191,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
         }
         auto* ptr = reinterpret_cast<u8*>(as->ptr + (address - base));
         // A report queued earlier in the stream may still be on its way here
+        renderer::ScopedCheckpointReason reason(
+            tls_crnt_command_buffer, CheckpointReason::PullerSemaphore);
         renderer->flushReports(
             tls_crnt_command_buffer,
             ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
