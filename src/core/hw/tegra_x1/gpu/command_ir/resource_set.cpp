@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/command_ir/resource_set.hpp"
 
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/pfifo.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
@@ -9,7 +10,16 @@ namespace hydra::hw::tegra_x1::gpu::command_ir {
 
 using resource::ResourceKind;
 
+CommandOrigin currentCommandOrigin() {
+    const auto* state = tls_crnt_decode_state;
+    if (!state || state->active_sequence == 0)
+        return {};
+    return {state->channel_id, state->active_sequence,
+            state->dispatch_source_address};
+}
+
 void ResourceSet::clear() {
+    origin = {};
     refs.clear();
     owners.clear();
     address_space = nullptr;
@@ -22,6 +32,7 @@ void ResourceSet::clear() {
 
 void ResourceSet::capture(renderer::IRenderer& renderer, GMmu* gmmu) {
     clear();
+    origin = currentCommandOrigin();
     address_space = gmmu;
     if (gmmu) {
         address_space_handle = renderer.getResourceRegistry().track(

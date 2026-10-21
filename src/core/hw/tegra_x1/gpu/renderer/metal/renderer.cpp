@@ -1,6 +1,7 @@
-#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/compute_limits.hpp"
 #include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
+#include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include <cmath>
 #include <fstream>
@@ -1123,6 +1124,17 @@ void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
                                     std::vector<ztd::Range<uptr>> writes) {
     if (PerfStats::isEnabled())
         PerfStats::instance().reports_queued++;
+    const auto trace = capture::GuestEvents::instance().beginReport(
+        capture::currentGuestEventOrigin());
+    if (trace != 0) {
+        auto original = std::move(publish);
+        publish = [original = std::move(original),
+                   trace](std::optional<u64> value) {
+            original(value);
+            capture::GuestEvents::instance().completeReport(trace,
+                                                            value.has_value());
+        };
+    }
     occlusion->queueReport(*static_cast<CommandBuffer*>(command_buffer),
                            std::move(publish), std::move(writes));
 }
@@ -1131,6 +1143,15 @@ void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
                                std::function<void(bool succeeded)> write,
                                std::vector<ztd::Range<uptr>> writes) {
     auto* impl = static_cast<CommandBuffer*>(command_buffer);
+    const auto trace = capture::GuestEvents::instance().beginReport(
+        capture::currentGuestEventOrigin());
+    if (trace != 0) {
+        auto original = std::move(write);
+        write = [original = std::move(original), trace](bool succeeded) {
+            original(succeeded);
+            capture::GuestEvents::instance().completeReport(trace, succeeded);
+        };
+    }
     // The callbacks of the submission follow the write
     impl->noteQueuedCompletionWork();
     completions->push(impl->shareCompletionToken(), std::move(write),
@@ -1270,14 +1291,23 @@ f64 Renderer::debugSyncCommandBufferHot40(ICommandBuffer* command_buffer) {
     return static_cast<CommandBuffer*>(command_buffer)->debugCommitAndWait();
 }
 
-void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
-                               const ComputeDispatch& dispatch) {
+bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
+                                    const ComputeDispatch& dispatch) {
+    if (!command_buffer)
+        return false;
+    if (command_ir::emptyComputeGrid(dispatch.grid_size.width,
+                                     dispatch.grid_size.height,
+                                     dispatch.grid_size.depth) ||
+        command_ir::emptyComputeGrid(dispatch.block_size.width,
+                                     dispatch.block_size.height,
+                                     dispatch.block_size.depth))
+        return true;
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
 
     const auto shader = static_cast<Shader*>(dispatch.shader);
     if (shader == nullptr || shader->getFunction() == nullptr)
-        return;
+        return false;
 
     // Pipeline
     auto [it, inserted] =
@@ -1293,21 +1323,21 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     }
     const auto pipeline = it->second;
     if (pipeline == nullptr)
-        return;
+        return false;
 
     const auto& block = dispatch.block_size;
     const auto& grid = dispatch.grid_size;
-    if (block.width * block.height * block.depth == 0 ||
-        grid.width * grid.height * grid.depth == 0)
-        return;
-    if (block.width * block.height * block.depth >
-        pipeline->maxTotalThreadsPerThreadgroup()) {
+    if (!command_ir::validComputeGrid(grid.width, grid.height, grid.depth))
+        return false;
+    if (!command_ir::validComputeBlock(
+            block.width, block.height, block.depth,
+            pipeline->maxTotalThreadsPerThreadgroup())) {
         ONCE(LOG_ERROR(MetalRenderer,
                        "Compute block {}x{}x{} exceeds the maximum of {} "
                        "threads",
                        block.width, block.height, block.depth,
                        pipeline->maxTotalThreadsPerThreadgroup()));
-        return;
+        return false;
     }
 
     if (PerfStats::isEnabled()) {
@@ -1317,9 +1347,26 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
             block.depth;
     }
 
+    static const bool profile = std::getenv("HYDRA_PROFILE_COMPUTE") != nullptr;
+    if (profile) {
+        command_buffer_impl->debugCommitAndWait();
+        if (!command_buffer_impl->lastSubmissionSucceeded())
+            return false;
+    }
+    for (const auto& binding : dispatch.storage_buffers)
+        if (binding.index >= BUFFER_COUNT)
+            return false;
+    const auto sampler_encoder = shader->getSamplerEncoder();
+    for (const auto& binding : dispatch.textures)
+        if (binding.index >= TEXTURE_COUNT ||
+            (!sampler_encoder && binding.sampler &&
+             binding.index >= SAMPLER_COUNT))
+            return false;
+    for (const auto& binding : dispatch.images)
+        if (binding.index >= TEXTURE_COUNT)
+            return false;
     auto encoder = command_buffer_impl->getComputeCommandEncoder();
     encoder->setComputePipelineState(pipeline);
-    const auto sampler_encoder = shader->getSamplerEncoder();
     BufferBase* sampler_buffer = nullptr;
     if (sampler_encoder != nullptr) {
         sampler_buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
@@ -1378,48 +1425,12 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     encoder->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
                                   MTL::Size(block.width, block.height, block.depth));
 
-    // DEBUG: measure the GPU time of each dispatch in isolation
-    static const bool profile = std::getenv("HYDRA_PROFILE_COMPUTE") != nullptr;
+    // Profile the actual dispatch once, in queue order. Re-encoding the
+    // kernel on a second buffer would execute storage/image side effects twice.
     if (profile) {
-        command_buffer_impl->endEncoding();
-        auto cb = command_queue->commandBuffer();
-        auto enc = cb->computeCommandEncoder();
-        enc->setComputePipelineState(pipeline);
-        for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
-            const auto& buffer = dispatch.uniform_buffers[i];
-            if (buffer.getBase() != nullptr)
-                enc->setBuffer(
-                    static_cast<Buffer*>(buffer.getBase())->getBuffer(),
-                    buffer.getOffset(), i);
-        }
-        for (const auto& binding : dispatch.storage_buffers) {
-            if (binding.buffer.getBase() != nullptr)
-                enc->setBuffer(
-                    static_cast<Buffer*>(binding.buffer.getBase())->getBuffer(),
-                    binding.buffer.getOffset(), binding.index);
-        }
-        for (const auto& binding : dispatch.textures) {
-            if (binding.texture != nullptr)
-                enc->setTexture(
-                    static_cast<TextureView*>(binding.texture)->getTexture(),
-                    binding.index);
-            if (binding.sampler != nullptr)
-                enc->setSamplerState(
-                    static_cast<Sampler*>(binding.sampler)->getSampler(),
-                    binding.index);
-        }
-        for (const auto& binding : dispatch.images) {
-            if (binding.texture != nullptr)
-                enc->setTexture(
-                    static_cast<TextureView*>(binding.texture)->getTexture(),
-                    binding.index);
-        }
-        enc->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
-                                  MTL::Size(block.width, block.height, block.depth));
-        enc->endEncoding();
-        commitManagedSubmission(cb, completions);
-        cb->waitUntilCompleted();
-        const auto ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        const auto ms = command_buffer_impl->debugCommitAndWait();
+        if (!command_buffer_impl->lastSubmissionSucceeded())
+            return false;
         static std::map<u64, double> max_ms;
         auto& max = max_ms[dispatch.debug_program_addr];
         if (ms > max * 1.5 + 0.01) {
@@ -1429,9 +1440,10 @@ void Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                      "{:.3f} ms (status {})",
                      dispatch.debug_program_addr, grid.width, grid.height,
                      grid.depth, block.width, block.height, block.depth, ms,
-                     static_cast<int>(cb->status()));
+                     static_cast<int>(MTL::CommandBufferStatusCompleted));
         }
     }
+    return true;
 }
 
 void Renderer::getColorPixelFormatsHot42(

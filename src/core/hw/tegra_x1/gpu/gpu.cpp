@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
@@ -216,14 +217,21 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     // Submit prior work before polling: it may produce the semaphore itself.
     // A pending acquire blocks later methods until satisfied or shutdown.
     const auto acquire = [&](u32 payload, u32 operation, auto&& satisfied) {
+        capture::GuestEvents::instance().event(
+            "semaphore_acquire", capture::currentGuestEventOrigin(),
+            semaphore_address(), 4, 0, payload, operation);
         auto* ptr = resolve(sizeof(u32));
         if (ptr == nullptr || !wait_for_gpu())
             return;
         while (!pfifo.isStopping()) {
             const u32 word = std::atomic_ref<u32>(
                 *reinterpret_cast<u32*>(ptr)).load(std::memory_order_acquire);
-            if (satisfied(word))
+            if (satisfied(word)) {
+                capture::GuestEvents::instance().event(
+                    "semaphore_acquired", capture::currentGuestEventOrigin(),
+                    semaphore_address(), 4, payload, word, operation);
                 return;
+            }
             if (tls_crnt_decode_state) {
                 tls_crnt_decode_state->semaphore_wait = PfifoSemaphoreWait{
                     semaphore_address(), payload, operation};
@@ -299,6 +307,9 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             std::atomic_ref<u32>(*reinterpret_cast<u32*>(ptr))
                 .store(payload, std::memory_order_release);
             invalidate(ptr, sizeof(u32));
+            capture::GuestEvents::instance().event(
+                "semaphore_release", capture::currentGuestEventOrigin(),
+                semaphore_address(), size, 0, payload, arg);
             break;
         }
         case 0x10: { // REDUCTION: atomic read-modify-write of the 4-byte word

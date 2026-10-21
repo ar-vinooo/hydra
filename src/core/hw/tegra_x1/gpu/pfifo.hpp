@@ -60,7 +60,13 @@ struct PfifoDecodeState : PfifoPacket {
     u64 next_sequence{1};
     u64 last_dispatched_sequence{0};
     u64 active_sequence{0};
+    uptr dispatch_source_address{0};
     uptr source_address{0};
+    // Optional observer for offline replay. Normal guest submissions leave it
+    // empty; replay compares the real decoder output with captured methods.
+    std::function<void(u32 method, u32 argument, u64 sequence, uptr source,
+                       u32 subchannel)>
+        replay_method_observer;
     std::unique_ptr<GpuChannelContext> context;
     // Queued work retains its bound address space even after both FDs close.
     std::shared_ptr<GMmu> address_space;
@@ -136,6 +142,12 @@ class Pfifo {
     execution::WorkStats getWorkStats() const { return dispatches.stats(); }
     // Waits till the first `count` entry lists have been executed
     bool waitForCompletion(u64 count);
+
+    // Offline replay of a word already fetched from a pushbuffer. Uses the
+    // production packet decoder and engines, retaining packet/macro state.
+    // The caller owns the GPU-thread TLS context and must not submit live work
+    // concurrently. false means end-of-segment or a channel fault.
+    bool replayWord(u32 word, uptr source, PfifoDecodeState& state);
 
   private:
     Gpu& gpu;

@@ -18,6 +18,13 @@ class ITextureView;
 
 namespace hydra::hw::tegra_x1::gpu::command_ir {
 
+struct CommandOrigin {
+    u64 channel{0};
+    u64 sequence{0};
+    u64 source_address{0};
+};
+CommandOrigin currentCommandOrigin();
+
 struct ResourceReference {
     const void* object;
     resource::ResourceKind kind;
@@ -29,6 +36,7 @@ struct ResourceReference {
 // reads and writes. Sealed once the command is complete; valid while none of
 // them was retired, invalidated or remapped.
 struct ResourceSet {
+    CommandOrigin origin;
     std::vector<ResourceReference> refs;
     std::vector<std::shared_ptr<void>> owners;
     GMmu* address_space{nullptr};

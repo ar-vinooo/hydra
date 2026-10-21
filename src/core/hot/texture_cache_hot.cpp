@@ -1,6 +1,7 @@
 // Hot reloadable texture cache policies (HYDRA_HOT_RELOAD). Compiled into
 // hydra-core and into the hydra-hot module.
 #include "core/hot/table.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include <chrono>
@@ -703,6 +704,9 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                 in_data + static_cast<usize>(row) * stride +
                                     (piece.getBegin() - row_begin),
                                 piece.getSize());
+                    capture::GuestEvents::instance().memory(
+                        "memory_writeback", piece.getBegin(), piece.getSize(),
+                        0, capture::currentGuestEventOrigin());
                 });
         }
     } else {
@@ -774,6 +778,10 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                         std::memcpy(reinterpret_cast<void*>(piece.getBegin()),
                                     tiled.data() + (piece.getBegin() - level_begin),
                                     piece.getSize());
+                        capture::GuestEvents::instance().memory(
+                            "memory_writeback", piece.getBegin(),
+                            piece.getSize(), 0,
+                            capture::currentGuestEventOrigin());
                     });
                 offset += static_cast<u32>(dims.depth) * rows * stride;
             }

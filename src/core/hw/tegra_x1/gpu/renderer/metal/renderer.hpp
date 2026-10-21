@@ -184,7 +184,7 @@ class Renderer : public IRenderer {
     void drainReports() override;
 
     // Compute
-    void dispatchCompute(ICommandBuffer* command_buffer,
+    bool dispatchCompute(ICommandBuffer* command_buffer,
                          const ComputeDispatch& dispatch) override;
 
     // Draw
@@ -350,7 +350,7 @@ class Renderer : public IRenderer {
                           const u32 base_vertex, const u32 base_instance,
                           const u32 instance_count);
     f64 debugSyncCommandBufferHot40(ICommandBuffer* command_buffer);
-    void dispatchComputeHot41(ICommandBuffer* command_buffer,
+    bool dispatchComputeHot41(ICommandBuffer* command_buffer,
                               const ComputeDispatch& dispatch);
     void getColorPixelFormatsHot42(
         MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const;

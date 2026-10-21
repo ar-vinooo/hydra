@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/copy.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
@@ -143,6 +144,17 @@ void Copy::remapPitchCopy(const LaunchDMAData data) {
         LOG_WARN(Engines, "Remapped copy spans several mappings, skipped");
         return;
     }
+    if (capture::GuestEvents::instance().enabled()) {
+        resource::ContentManifest accesses;
+        if (reads_src)
+            accesses.addRead(gpu.getRenderer().getContentVersions(),
+                             ztd::Range<uptr>::fromSize(
+                                 reinterpret_cast<uptr>(src), src_span));
+        accesses.addWrite(
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(dst), dst_span));
+        capture::recordGuestCommand(
+            "dma_access", capture::currentGuestEventOrigin(), accesses);
+    }
 
     {
         auto& texture_cache = gpu.getRenderer().getTextureCache();
@@ -202,6 +214,9 @@ void Copy::remapPitchCopy(const LaunchDMAData data) {
 
 void Copy::launchDma(const u32 index, const LaunchDMAData data) {
     (void)index;
+    capture::GuestEvents::instance().event(
+        "dma_copy", capture::currentGuestEventOrigin(), 0, 0, 0,
+        static_cast<u32>(data.type));
     // A launch without a transfer only releases its semaphore
     if (data.type != TransferType::None)
         executeCopy(data);
@@ -238,6 +253,9 @@ void Copy::releaseSemaphore(const LaunchDMAData data) {
     // range are stale
     gpu.getRenderer().invalidateMemory(
         ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
+    capture::GuestEvents::instance().event("semaphore_release",
+                                           capture::currentGuestEventOrigin(),
+                                           address, size, 0, payload);
 }
 
 void Copy::executeCopy(const LaunchDMAData data) {
@@ -422,6 +440,14 @@ void Copy::executeCopy(const LaunchDMAData data) {
                               "DMA tiled copy requires mapped host spans"));
                 return;
             }
+        }
+        if (capture::GuestEvents::instance().enabled()) {
+            resource::ContentManifest accesses;
+            accesses.addRead(gpu.getRenderer().getContentVersions(),
+                             ztd::Range<uptr>::fromSize(src_ptr, src_size));
+            accesses.addWrite(ztd::Range<uptr>::fromSize(dst_ptr, dst_size));
+            capture::recordGuestCommand(
+                "dma_access", capture::currentGuestEventOrigin(), accesses);
         }
         // DEBUG: summary of the copies per 2 s (to correlate with readbacks)
         {

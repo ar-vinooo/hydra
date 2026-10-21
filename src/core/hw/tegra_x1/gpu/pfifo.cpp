@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/pfifo.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
 #include <limits>
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
@@ -173,6 +174,8 @@ PfifoDecodeState::PfifoDecodeState() : channel_id{[] {
     return next_channel.fetch_add(1, std::memory_order_relaxed);
 }()} {}
 PfifoDecodeState::~PfifoDecodeState() {
+    capture::GuestEvents::instance().event("channel_destroy",
+                                           {channel_id, 0, 0});
     if (release_fence)
         release_fence();
 }
@@ -184,6 +187,8 @@ void PfifoDecodeState::fail(u32 code) {
     fault_time = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
     failed.store(true, std::memory_order_release);
+    capture::GuestEvents::instance().event("channel_fault", {channel_id, 0, 0},
+                                           0, 0, 0, code);
     if (on_fault)
         on_fault();
 }
@@ -242,6 +247,7 @@ void Pfifo::shutdown() {
     completed_cond_var.notify_all();
     if (thread.joinable())
         thread.join();
+    capture::GuestEvents::instance().finish();
     std::scoped_lock lock(mutex);
     entry_lists.clear();
 }
@@ -314,6 +320,7 @@ bool Pfifo::waitForCompletion(u64 count) {
 
 bool Pfifo::ready(GpfifoEntryList& list) {
     auto& state = list.decode_state ? *list.decode_state : default_decode_state;
+    const bool was_waiting = state.semaphore_wait || state.syncpoint_wait;
     if (list.gmmu->gpuWorkCancelled())
         state.failed = true;
     if (state.failed)
@@ -327,6 +334,11 @@ bool Pfifo::ready(GpfifoEntryList& list) {
         }
         if (!video::Syncpoints::reached(*value, wait.value))
             return false;
+        capture::GuestEvents::instance().event("syncpoint_resume",
+                                               {state.channel_id,
+                                                state.active_sequence,
+                                                state.dispatch_source_address},
+                                               wait.id, 0, wait.value, *value);
         state.syncpoint_wait.reset();
     }
     if (any(list.flags & GpfifoFlags::FenceWait) && list.wait_fence.id != 0) {
@@ -355,8 +367,18 @@ bool Pfifo::ready(GpfifoEntryList& list) {
             : (word & wait.payload) != 0;
         if (!satisfied)
             return false;
+        capture::GuestEvents::instance().event(
+            "semaphore_resume",
+            {state.channel_id, state.active_sequence,
+             state.dispatch_source_address},
+            wait.address, 4, wait.payload, word, wait.operation);
         state.semaphore_wait.reset();
     }
+    if (was_waiting && VisualDiagnostics::instance().enabled())
+        VisualDiagnostics::instance().event(
+            "pfifo_resumed",
+            {{"channel", std::to_string(state.channel_id)},
+             {"sequence", std::to_string(state.active_sequence)}});
     return true;
 }
 
@@ -418,6 +440,10 @@ void Pfifo::threadFunc() {
                 if (entry_list.decode_state && !decode.context)
                     decode.context = std::make_unique<GpuChannelContext>(gpu);
                 tls_crnt_decode_state = &decode;
+                capture::GuestEvents::instance().channel(
+                    *entry_list.gmmu,
+                    {decode.channel_id, decode.active_sequence,
+                     decode.dispatch_source_address});
                 while (entry_list.entry_index < entry_list.entries.size()) {
                     if (!submitEntry(entry_list.entries[entry_list.entry_index],
                                      decode, entry_list.word_offset))
@@ -426,6 +452,27 @@ void Pfifo::threadFunc() {
                     entry_list.word_offset = 0;
                 }
                 yielded = (decode.semaphore_wait || decode.syncpoint_wait) && !decode.failed;
+                if (yielded) {
+                    const auto origin = capture::currentGuestEventOrigin();
+                    if (decode.semaphore_wait) {
+                        const auto& wait = *decode.semaphore_wait;
+                        capture::GuestEvents::instance().event(
+                            "semaphore_wait", origin, wait.address, 4, 0,
+                            wait.payload, wait.operation);
+                    } else {
+                        const auto& wait = *decode.syncpoint_wait;
+                        capture::GuestEvents::instance().event(
+                            "syncpoint_wait", origin, wait.id, 0, 0,
+                            wait.value);
+                    }
+                }
+                if (yielded && VisualDiagnostics::instance().enabled())
+                    VisualDiagnostics::instance().event(
+                        "pfifo_blocked",
+                        {{"channel", std::to_string(decode.channel_id)},
+                         {"sequence", std::to_string(decode.active_sequence)},
+                         {"kind",
+                          decode.semaphore_wait ? "semaphore" : "syncpoint"}});
 #ifdef ZTD_PLATFORM_APPLE
                 if (VisualDiagnostics::instance().enabled() &&
                     CONFIG_INSTANCE.getGpuRenderer() == GpuRenderer::Metal) {
@@ -516,6 +563,10 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
                     (static_cast<u64>(entry.gpu_addr_hi) << 32);
     gpu_addr &= ~0x3llu; // Clear the 2 lsb
     uptr end = gpu_addr + entry.size * sizeof(u32);
+    capture::GuestEvents::instance().event(
+        "pfifo_entry", {state.channel_id, state.active_sequence, gpu_addr},
+        gpu_addr, entry.size * sizeof(u32), 0, std::bit_cast<u64>(entry),
+        word_offset);
 
     PushBufferReader reader(*tls_crnt_gmmu, gpu_addr + word_offset * sizeof(u32), end);
     while (reader.address < end) {
@@ -530,6 +581,10 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
             return false;
         }
         ++word_offset;
+        capture::GuestEvents::instance().event(
+            "pfifo_word",
+            {state.channel_id, state.active_sequence, command_address},
+            command_address, sizeof(u32), 0, *word, state.remaining);
         state.source_address = command_address;
         if (decodeTraceEnabled())
             decode_trace.record(state, command_address, *word, gpu_addr, end);
@@ -546,6 +601,20 @@ bool Pfifo::submitEntry(GpfifoEntry entry, PfifoDecodeState& state,
             return false;
     }
     return true;
+}
+
+bool Pfifo::replayWord(u32 word, uptr source, PfifoDecodeState& state) {
+    if (tls_crnt_decode_state != &state || tls_crnt_gmmu == nullptr ||
+        tls_crnt_command_buffer == nullptr || !state.context || state.failed ||
+        state.semaphore_wait || state.syncpoint_wait)
+        return false;
+    gpu.getRenderer().applyQueuedMemoryInvalidations();
+    state.source_address = source;
+    if (state.remaining != 0) {
+        processMethodArg(word, state);
+        return !state.failed;
+    }
+    return submitCommand(word, state);
 }
 
 bool Pfifo::submitCommand(u32 raw_header, PfifoDecodeState& state) {
@@ -645,8 +714,12 @@ void Pfifo::processMethodArg(u32 arg, PfifoDecodeState& state) {
             dispatchMethod(argument.method, argument.value, argument.sequence,
                            argument.address, state);
         }
-        if (!state.failed)
+        if (!state.failed) {
+            capture::GuestEvents::instance().event(
+                "macro_flush", capture::currentGuestEventOrigin(), 0, 0, 0,
+                state.subchannel);
             gpu.subchannelFlushMacro(state.subchannel);
+        }
         state.macro_args.clear();
     }
 }
@@ -658,6 +731,22 @@ void Pfifo::dispatchMethod(u32 method, u32 arg, u64 sequence, uptr address,
                  state.channel_id, sequence, state.last_dispatched_sequence);
     state.last_dispatched_sequence = sequence;
     state.active_sequence = sequence;
+    state.dispatch_source_address = address;
+    if (state.replay_method_observer)
+        state.replay_method_observer(method, arg, sequence, address,
+                                     state.subchannel);
+    auto& events = capture::GuestEvents::instance();
+    if (events.enabled()) {
+        const auto origin = capture::currentGuestEventOrigin();
+        events.channel(*tls_crnt_gmmu, origin, false);
+        for (u32 id = 1; id < 192; ++id) {
+            const auto value = gpu.getVideoSyncpoints().read(id);
+            if (!value)
+                break;
+            events.initialSyncpoint(id, *value);
+        }
+        events.event("method", origin, method, 0, 0, arg, state.subchannel);
+    }
     auto& diagnostics = VisualDiagnostics::instance();
     if (diagnostics.enabled())
         diagnostics.event("pfifo_method", {

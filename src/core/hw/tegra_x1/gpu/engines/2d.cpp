@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
@@ -263,15 +264,22 @@ void TwoD::copy(const u32 index, const u32 pixels_from_memory_src_y0_int) {
     blit.dst_size = {region->width, region->height, 1};
     blit.dst_layer = regs.dst.layer;
     blit.options = options;
-    if (!command_ir::sealCopy(gpu.getRenderer(), blit) ||
-        !command_ir::executeCopy(gpu.getRenderer(), tls_crnt_command_buffer,
-                                 blit)) {
+    const bool sealed = command_ir::sealCopy(gpu.getRenderer(), blit);
+    auto& capture = capture::LiveCapture::instance();
+    if (sealed && capture.active())
+        capture.copy(gpu.getRenderer(), tls_crnt_command_buffer, blit);
+    if (!sealed || !command_ir::executeCopy(gpu.getRenderer(),
+                                            tls_crnt_command_buffer, blit)) {
+        if (capture.active())
+            capture.abort("Copy encoding failed");
         LOG_ERROR(Gpu, "2D copy rejected: resource lifetime or GPU mapping "
                        "changed");
         if (tls_crnt_decode_state)
             tls_crnt_decode_state->fail(25);
         return;
     }
+    if (capture.active())
+        capture.commandExecuted(tls_crnt_command_buffer);
 
     // Small and pitch linear destinations are typically staging copies the CPU
     // reads back directly (e.g. UE4's sky light average brightness), without a

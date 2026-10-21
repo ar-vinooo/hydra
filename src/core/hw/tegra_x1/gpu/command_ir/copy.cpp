@@ -39,6 +39,10 @@ bool executeCopy(renderer::IRenderer& renderer,
                  const CopyCommand& command) {
     if (!command_buffer || !command.resources.valid(renderer))
         return false;
+    const auto& origin = command.resources.origin;
+    capture::recordGuestCommand(
+        "blit", {origin.channel, origin.sequence, origin.source_address},
+        command.resources.contents);
     for (const auto& owner : command.resources.owners)
         command_buffer->retainResource(owner);
     renderer.blitTexture(command_buffer, command.src, command.src_origin,
@@ -47,7 +51,9 @@ bool executeCopy(renderer::IRenderer& renderer,
                          command.dst_level, command.dst_layer,
                          command.level_count, command.layer_count,
                          command.options);
-    renderer.recordGpuWrites(command_buffer, command.resources.contents.writes);
+    renderer.recordGpuWrites(
+        command_buffer, command.resources.contents.writes,
+        {origin.channel, origin.sequence, origin.source_address});
     return true;
 }
 

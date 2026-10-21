@@ -516,6 +516,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/engines/3d.hpp
     hw/tegra_x1/gpu/capture/draw_capture.cpp
     hw/tegra_x1/gpu/capture/draw_capture.hpp
+    hw/tegra_x1/gpu/capture/guest_events.cpp
+    hw/tegra_x1/gpu/capture/guest_events.hpp
     hw/tegra_x1/gpu/command_ir/draw.cpp
     hw/tegra_x1/gpu/command_ir/draw.hpp
     hw/tegra_x1/gpu/command_ir/resource_set.cpp
@@ -524,6 +526,9 @@ add_library(hydra-core
     hw/tegra_x1/gpu/command_ir/clear.hpp
     hw/tegra_x1/gpu/command_ir/copy.cpp
     hw/tegra_x1/gpu/command_ir/copy.hpp
+    hw/tegra_x1/gpu/command_ir/compute.cpp
+    hw/tegra_x1/gpu/command_ir/compute.hpp
+    hw/tegra_x1/gpu/command_ir/compute_limits.hpp
     hw/tegra_x1/gpu/resource/resource_lifetime.hpp
     hw/tegra_x1/gpu/resource/resource_registry.hpp
     hw/tegra_x1/gpu/resource/resource_registry.cpp

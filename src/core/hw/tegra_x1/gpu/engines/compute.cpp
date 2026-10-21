@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/engines/compute.hpp"
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/compute.hpp"
 
 #include <fstream>
 #include <set>
@@ -114,6 +116,10 @@ void Compute::launch(const u32 index, const u32 arg) {
 
     auto& renderer = gpu.getRenderer();
     auto& three_d = gpu.get3DEngine();
+    command_ir::ComputeCommand command;
+    command.resources.capture(renderer, tls_crnt_gmmu);
+    resource::MappingCaptureScope mappings(
+        tls_crnt_gmmu, command.resources.mapping_dependencies);
 
     // Same order as draws: the buffer cache, then the texture cache
     std::scoped_lock caches_lock(renderer.getBufferCache().getMutex(),
@@ -262,7 +268,7 @@ void Compute::launch(const u32 index, const u32 arg) {
     }
     const auto& resource_mapping = shader->getDescriptor().resource_mapping;
 
-    renderer::ComputeDispatch dispatch{};
+    auto& dispatch = command.dispatch;
     dispatch.shader = shader;
     dispatch.debug_program_addr = program_addr;
     dispatch.grid_size =
@@ -275,6 +281,15 @@ void Compute::launch(const u32 index, const u32 arg) {
         const auto host_index = resource_mapping.uniform_buffers[i];
         if (host_index == invalid<u32>())
             continue;
+        if (host_index >= dispatch.uniform_buffers.size()) {
+            LOG_ERROR(
+                Gpu,
+                "Compute uniform binding {} exceeds the host binding array",
+                host_index);
+            if (tls_crnt_decode_state)
+                tls_crnt_decode_state->fail(25);
+            return;
+        }
 
         const auto range = getConstBuffer(qmd, i);
         if (range.getBegin() == 0x0) {
@@ -453,14 +468,28 @@ void Compute::launch(const u32 index, const u32 arg) {
         FrameTracer::instance().write(str);
     }
 
-    renderer.dispatchCompute(tls_crnt_command_buffer, dispatch);
-    auto writes = storage_writes;
-    for (const auto& image : dispatch.images)
-        if (image.texture && image.texture->getBase())
-            writes.push_back(image.texture->getBase()->getDescriptor().getRange());
-    renderer.recordGpuWrites(tls_crnt_command_buffer, writes);
+    if (!command_ir::sealCompute(renderer, command)) {
+        LOG_ERROR(Gpu, "Compute command rejected before encoding");
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return;
+    }
+    auto& capture = capture::LiveCapture::instance();
+    if (capture.active())
+        capture.compute(renderer, tls_crnt_command_buffer, command);
+    if (!command_ir::executeCompute(renderer, tls_crnt_command_buffer,
+                                    command)) {
+        if (capture.active())
+            capture.abort("Compute encoding failed");
+        LOG_ERROR(Gpu, "Compute command failed validation or backend encoding");
+        if (tls_crnt_decode_state)
+            tls_crnt_decode_state->fail(25);
+        return;
+    }
     renderer.getTextureCache().synchronizeStorageWrites(
         tls_crnt_command_buffer, storage_writes);
+    if (capture.active())
+        capture.commandExecuted(tls_crnt_command_buffer);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

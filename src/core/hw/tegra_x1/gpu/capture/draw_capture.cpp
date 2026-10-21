@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/compute_limits.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
@@ -351,6 +352,9 @@ std::vector<u8> CaptureFile::serialize() const {
     w.put<u64>(commands.size());
     for (const auto& c : commands) {
         w.put(c.kind);
+        w.put(c.origin.channel);
+        w.put(c.origin.sequence);
+        w.put(c.origin.source_address);
         if (c.kind == CommandRecord::Kind::Draw) {
             const auto& d = c.draw;
             w.put(d.pipeline);
@@ -379,7 +383,7 @@ std::vector<u8> CaptureFile::serialize() const {
             w.put(d.base_vertex);
             w.put(d.base_instance);
             w.put(d.instance_count);
-        } else {
+        } else if (c.kind == CommandRecord::Kind::Clear) {
             const auto& d = c.clear;
             w.put(d.pass);
             w.putBytes(d.state);
@@ -394,6 +398,48 @@ std::vector<u8> CaptureFile::serialize() const {
             w.put(d.depth_value);
             w.put(d.stencil_layer);
             w.put(d.stencil_value);
+        } else if (c.kind == CommandRecord::Kind::Copy) {
+            const auto& d = c.copy;
+            w.put(d.src);
+            w.put(d.dst);
+            w.put(d.src_origin);
+            w.put(d.dst_origin);
+            w.put(d.src_size);
+            w.put(d.dst_size);
+            w.put(d.src_level);
+            w.put(d.src_layer);
+            w.put(d.dst_level);
+            w.put(d.dst_layer);
+            w.put(d.level_count);
+            w.put(d.layer_count);
+            w.putBytes(d.options);
+        } else if (c.kind == CommandRecord::Kind::Compute) {
+            const auto& d = c.compute;
+            w.put(d.shader);
+            w.put(d.grid);
+            w.put(d.block);
+            writeBufferRefs(w, d.uniforms);
+            w.put<u64>(d.storage.size());
+            for (const auto& binding : d.storage) {
+                w.put(binding.index);
+                writeBufferRef(w, binding.buffer);
+                w.put(binding.written);
+                w.putBytes(binding.expected);
+            }
+            w.put<u64>(d.textures.size());
+            for (const auto& binding : d.textures) {
+                w.put(binding.index);
+                w.put(binding.view);
+                w.put(binding.sampler);
+            }
+            w.put<u64>(d.images.size());
+            for (const auto& binding : d.images) {
+                w.put(binding.index);
+                w.put(binding.view);
+            }
+        } else {
+            throw std::runtime_error(
+                "Cannot serialize an unknown capture command");
         }
     }
     return std::move(w.out);
@@ -404,7 +450,8 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
     for (const char expected : MAGIC)
         if (r.get<char>() != expected)
             throw std::runtime_error("Not a Hydra GPU capture");
-    if (r.get<u32>() != VERSION)
+    const auto version = r.get<u32>();
+    if (version != 3 && version != VERSION)
         throw std::runtime_error("Unsupported capture version");
 
     CaptureFile f;
@@ -468,6 +515,11 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
     f.commands.resize(r.count());
     for (auto& c : f.commands) {
         c.kind = r.get<CommandRecord::Kind>();
+        if (version >= 4) {
+            c.origin.channel = r.get<u64>();
+            c.origin.sequence = r.get<u64>();
+            c.origin.source_address = r.get<u64>();
+        }
         if (c.kind == CommandRecord::Kind::Draw) {
             auto& d = c.draw;
             d.pipeline = r.get<i32>();
@@ -511,6 +563,45 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
             d.depth_value = r.get<f32>();
             d.stencil_layer = r.get<u32>();
             d.stencil_value = r.get<u32>();
+        } else if (version >= 4 && c.kind == CommandRecord::Kind::Copy) {
+            auto& d = c.copy;
+            d.src = r.get<i32>();
+            d.dst = r.get<i32>();
+            d.src_origin = r.get<std::array<f32, 3>>();
+            d.dst_origin = r.get<std::array<f32, 3>>();
+            d.src_size = r.get<std::array<u64, 3>>();
+            d.dst_size = r.get<std::array<u64, 3>>();
+            d.src_level = r.get<u32>();
+            d.src_layer = r.get<u32>();
+            d.dst_level = r.get<u32>();
+            d.dst_layer = r.get<u32>();
+            d.level_count = r.get<u32>();
+            d.layer_count = r.get<u32>();
+            d.options = r.getRaw<BlitOptions>();
+        } else if (version >= 4 && c.kind == CommandRecord::Kind::Compute) {
+            auto& d = c.compute;
+            d.shader = r.get<i32>();
+            d.grid = r.get<std::array<u64, 3>>();
+            d.block = r.get<std::array<u64, 3>>();
+            d.uniforms = readBufferRefs(r);
+            d.storage.resize(r.count());
+            for (auto& binding : d.storage) {
+                binding.index = r.get<u32>();
+                binding.buffer = readBufferRef(r);
+                binding.written = r.get<bool>();
+                binding.expected = r.getBytes();
+            }
+            d.textures.resize(r.count());
+            for (auto& binding : d.textures) {
+                binding.index = r.get<u32>();
+                binding.view = r.get<i32>();
+                binding.sampler = r.get<i32>();
+            }
+            d.images.resize(r.count());
+            for (auto& binding : d.images) {
+                binding.index = r.get<u32>();
+                binding.view = r.get<i32>();
+            }
         } else {
             throw std::runtime_error("Capture holds an unknown command");
         }
@@ -714,6 +805,7 @@ BufferRef Recorder::buffer(const BufferView& view) {
 
 bool Recorder::recordDraw(ICommandBuffer* command_buffer,
                           const command_ir::DrawCommand& command) {
+    commandExecuted(command_buffer);
     if (!error.empty())
         return false;
     if (capture_bytes >= limit_bytes) {
@@ -723,9 +815,11 @@ bool Recorder::recordDraw(ICommandBuffer* command_buffer,
     if (!command.pipeline || !command.render_pass)
         return fail("Draw without a pipeline or render pass");
     // Earlier work may still be writing the buffers it reads
-    renderer.synchronize(command_buffer);
+    if (!renderer.synchronize(command_buffer))
+        return fail("Earlier GPU work failed before draw capture");
     CommandRecord record;
     record.kind = CommandRecord::Kind::Draw;
+    record.origin = command.origin;
     auto& d = record.draw;
     d.pipeline = pipeline(command_buffer, command.pipeline);
     d.pass = pass(command_buffer, command.render_pass, true);
@@ -763,6 +857,7 @@ bool Recorder::recordDraw(ICommandBuffer* command_buffer,
 
 bool Recorder::recordClear(ICommandBuffer* command_buffer,
                            const command_ir::ClearCommand& command) {
+    commandExecuted(command_buffer);
     if (!error.empty())
         return false;
     if (!command.render_pass)
@@ -773,6 +868,7 @@ bool Recorder::recordClear(ICommandBuffer* command_buffer,
     }
     CommandRecord record;
     record.kind = CommandRecord::Kind::Clear;
+    record.origin = command.resources.origin;
     auto& d = record.clear;
     d.pass = pass(command_buffer, command.render_pass, true);
     d.state = raw(command.state);
@@ -800,8 +896,169 @@ bool Recorder::recordClear(ICommandBuffer* command_buffer,
     return true;
 }
 
+bool Recorder::recordCopy(ICommandBuffer* commands,
+                          const command_ir::CopyCommand& command) {
+    commandExecuted(commands);
+    if (!error.empty())
+        return false;
+    if (capture_bytes >= limit_bytes) {
+        reached_limit = true;
+        return false;
+    }
+    if (!command.src || !command.dst || !command.resources.valid(renderer))
+        return fail("Copy capture requires sealed live resources");
+    if (!renderer.synchronize(commands))
+        return fail("Earlier GPU work failed before copy capture");
+    CommandRecord record;
+    record.kind = CommandRecord::Kind::Copy;
+    record.origin = command.resources.origin;
+    auto& d = record.copy;
+    d.src = view(commands, command.src);
+    d.dst = view(commands, command.dst);
+    d.src_origin = {command.src_origin[0], command.src_origin[1],
+                    command.src_origin[2]};
+    d.dst_origin = {command.dst_origin[0], command.dst_origin[1],
+                    command.dst_origin[2]};
+    d.src_size = {command.src_size.width, command.src_size.height,
+                  command.src_size.depth};
+    d.dst_size = {command.dst_size.width, command.dst_size.height,
+                  command.dst_size.depth};
+    d.src_level = command.src_level;
+    d.src_layer = command.src_layer;
+    d.dst_level = command.dst_level;
+    d.dst_layer = command.dst_layer;
+    d.level_count = command.level_count;
+    d.layer_count = command.layer_count;
+    d.options = raw(command.options);
+    if (!error.empty() || d.src < 0 || d.dst < 0)
+        return fail("A copied texture could not be captured");
+    written[static_cast<usize>(file.views[static_cast<usize>(d.dst)].texture)] =
+        true;
+    file.commands.push_back(std::move(record));
+    return true;
+}
+
+bool Recorder::recordCompute(ICommandBuffer* commands,
+                             const command_ir::ComputeCommand& command) {
+    commandExecuted(commands);
+    if (!error.empty())
+        return false;
+    const auto& dispatch = command.dispatch;
+    if (command_ir::emptyComputeGrid(dispatch.grid_size.width,
+                                     dispatch.grid_size.height,
+                                     dispatch.grid_size.depth) ||
+        command_ir::emptyComputeGrid(dispatch.block_size.width,
+                                     dispatch.block_size.height,
+                                     dispatch.block_size.depth))
+        return true;
+    if (capture_bytes >= limit_bytes) {
+        reached_limit = true;
+        return false;
+    }
+    if (!command_ir::validateCompute(renderer, command))
+        return fail("Compute capture requires sealed live resources");
+    if (!renderer.synchronize(commands))
+        return fail("Earlier GPU work failed before compute capture");
+    CommandRecord record;
+    record.kind = CommandRecord::Kind::Compute;
+    record.origin = command.resources.origin;
+    auto& d = record.compute;
+    d.shader = shader(dispatch.shader);
+    d.grid = {dispatch.grid_size.width, dispatch.grid_size.height,
+              dispatch.grid_size.depth};
+    d.block = {dispatch.block_size.width, dispatch.block_size.height,
+               dispatch.block_size.depth};
+    // Read whole native buffers so overlapping bindings of the same buffer
+    // retain one backing allocation and their original offsets in replay.
+    std::unordered_map<BufferBase*, BufferRef> captured_buffers;
+    const auto capture_buffer = [&](const BufferView& source) -> BufferRef {
+        if (!source.isValid())
+            return {};
+        if (const auto found = captured_buffers.find(source.getBase());
+            found != captured_buffers.end())
+            return {found->second.buffer, source.getOffset(), source.getSize()};
+        const auto ptr = source.getBase()->getPtr();
+        for (const auto& [base, ref] : captured_buffers) {
+            (void)ref;
+            const auto other = base->getPtr();
+            if (ptr != 0 && other != 0 &&
+                (ptr <= other ? other - ptr < source.getBase()->getSize()
+                              : ptr - other < base->getSize())) {
+                fail("Compute capture cannot restore aliases spanning "
+                     "different native buffers");
+                return {};
+            }
+        }
+        if (source.getBase()->getSize() >
+            limit_bytes - std::min(limit_bytes, capture_bytes)) {
+            fail("A compute buffer exceeds the remaining capture budget");
+            return {};
+        }
+        auto ref = buffer(BufferView(source.getBase()));
+        captured_buffers.emplace(source.getBase(), ref);
+        ref.offset = source.getOffset();
+        ref.size = source.getSize();
+        return ref;
+    };
+    for (u32 i = 0; i < dispatch.uniform_buffers.size(); ++i)
+        if (dispatch.uniform_buffers[i].isValid())
+            d.uniforms.emplace_back(
+                i, capture_buffer(dispatch.uniform_buffers[i]));
+    for (const auto& binding : dispatch.storage_buffers) {
+        d.storage.push_back({binding.index,
+                             capture_buffer(binding.buffer),
+                             binding.written,
+                             {}});
+        if (binding.written)
+            pending_compute_buffers.emplace_back(d.storage.size() - 1,
+                                                 binding.buffer);
+    }
+    for (const auto& binding : dispatch.textures)
+        d.textures.push_back({binding.index, view(commands, binding.texture),
+                              sampler(binding.sampler)});
+    for (const auto& binding : dispatch.images) {
+        const auto id = view(commands, binding.texture);
+        d.images.push_back({binding.index, id});
+        if (id >= 0)
+            written[static_cast<usize>(
+                file.views[static_cast<usize>(id)].texture)] = true;
+    }
+    if (!error.empty()) {
+        pending_compute_buffers.clear();
+        return false;
+    }
+    file.commands.push_back(std::move(record));
+    return true;
+}
+
+void Recorder::commandExecuted(ICommandBuffer* commands) {
+    if (pending_compute_buffers.empty() || !error.empty())
+        return;
+    if (!renderer.synchronize(commands)) {
+        fail("GPU work failed before compute results could be captured");
+        pending_compute_buffers.clear();
+        return;
+    }
+    auto& compute = file.commands.back().compute;
+    for (const auto& [index, source] : pending_compute_buffers) {
+        auto& expected = compute.storage[index].expected;
+        if (source.getSize() >
+                limit_bytes - std::min(limit_bytes, capture_bytes) ||
+            !renderer.readBufferContents(source, expected) ||
+            expected.size() != source.getSize()) {
+            fail("A compute storage result cannot be captured within the "
+                 "budget");
+            break;
+        }
+        capture_bytes += expected.size();
+    }
+    pending_compute_buffers.clear();
+}
+
 CaptureFile Recorder::finish(ICommandBuffer* command_buffer) {
-    renderer.synchronize(command_buffer);
+    commandExecuted(command_buffer);
+    if (!renderer.synchronize(command_buffer))
+        fail("GPU work failed while finishing the capture");
     for (usize i = 0; i < texture_objects.size(); i++) {
         if (!written[i])
             continue;
@@ -906,9 +1163,14 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
         const auto buffer_view = [&](const BufferRef& ref) {
             if (ref.buffer < 0)
                 return BufferView{};
-            return BufferView(at(buffers, ref.buffer).get(), ref.offset,
-                              ref.size);
+            auto* base = at(buffers, ref.buffer).get();
+            if (ref.offset > base->getSize() ||
+                ref.size > base->getSize() - ref.offset)
+                throw std::runtime_error(
+                    "Capture buffer reference is out of bounds");
+            return BufferView(base, ref.offset, ref.size);
         };
+        result.matches = true;
         usize executed = 0;
         const auto report = [&] {
             renderer.synchronize(commands.get());
@@ -959,7 +1221,7 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
                 if (!command_ir::sealDrawResources(renderer, command) ||
                     !command_ir::executeDraw(renderer, commands.get(), command))
                     throw std::runtime_error("A captured draw was rejected");
-            } else {
+            } else if (c.kind == CommandRecord::Kind::Clear) {
                 const auto& d = c.clear;
                 command_ir::ClearCommand command;
                 command.resources.capture(renderer, nullptr);
@@ -979,6 +1241,84 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
                 if (!command_ir::sealClear(renderer, command) ||
                     !command_ir::executeClear(renderer, commands.get(), command))
                     throw std::runtime_error("A captured clear was rejected");
+            } else if (c.kind == CommandRecord::Kind::Copy) {
+                const auto& d = c.copy;
+                command_ir::CopyCommand command;
+                command.src = at(views, d.src).get();
+                command.dst = at(views, d.dst).get();
+                command.src_origin = {d.src_origin[0], d.src_origin[1],
+                                      d.src_origin[2]};
+                command.dst_origin = {d.dst_origin[0], d.dst_origin[1],
+                                      d.dst_origin[2]};
+                command.src_size = {d.src_size[0], d.src_size[1],
+                                    d.src_size[2]};
+                command.dst_size = {d.dst_size[0], d.dst_size[1],
+                                    d.dst_size[2]};
+                command.src_level = d.src_level;
+                command.src_layer = d.src_layer;
+                command.dst_level = d.dst_level;
+                command.dst_layer = d.dst_layer;
+                command.level_count = d.level_count;
+                command.layer_count = d.layer_count;
+                command.options = fromRaw<BlitOptions>(d.options);
+                if (!command_ir::sealCopy(renderer, command) ||
+                    !command_ir::executeCopy(renderer, commands.get(), command))
+                    throw std::runtime_error("A captured copy was rejected");
+            } else if (c.kind == CommandRecord::Kind::Compute) {
+                const auto& d = c.compute;
+                command_ir::ComputeCommand command;
+                auto& dispatch = command.dispatch;
+                dispatch.shader = at(shaders, d.shader).get();
+                dispatch.grid_size = {d.grid[0], d.grid[1], d.grid[2]};
+                dispatch.block_size = {d.block[0], d.block[1], d.block[2]};
+                for (const auto& [index, ref] : d.uniforms) {
+                    if (index >= dispatch.uniform_buffers.size())
+                        throw std::runtime_error(
+                            "Capture compute uniform index is out of bounds");
+                    dispatch.uniform_buffers[index] = buffer_view(ref);
+                }
+                for (const auto& binding : d.storage)
+                    dispatch.storage_buffers.push_back(
+                        {binding.index, buffer_view(binding.buffer),
+                         binding.written});
+                for (const auto& binding : d.textures)
+                    dispatch.textures.push_back(
+                        {binding.index,
+                         binding.view < 0 ? nullptr
+                                          : at(views, binding.view).get(),
+                         binding.sampler < 0
+                             ? nullptr
+                             : at(samplers, binding.sampler).get()});
+                for (const auto& binding : d.images)
+                    dispatch.images.push_back(
+                        {binding.index, at(views, binding.view).get()});
+                if (!command_ir::sealCompute(renderer, command) ||
+                    !command_ir::executeCompute(renderer, commands.get(),
+                                                command) ||
+                    !renderer.synchronize(commands.get()))
+                    throw std::runtime_error(
+                        "A captured compute was rejected or failed");
+                for (const auto& binding : d.storage) {
+                    if (!binding.written)
+                        continue;
+                    if (binding.expected.size() != binding.buffer.size)
+                        throw std::runtime_error(
+                            "Capture lacks a complete compute storage result");
+                    std::vector<u8> actual;
+                    if (!renderer.readBufferContents(
+                            buffer_view(binding.buffer), actual))
+                        throw std::runtime_error(
+                            "A replayed storage buffer cannot be read");
+                    if (actual != binding.expected) {
+                        result.matches = false;
+                        if (result.mismatch.empty())
+                            result.mismatch = fmt::format(
+                                "compute command {} storage {} differs",
+                                executed, binding.index);
+                    }
+                }
+            } else {
+                throw std::runtime_error("Capture holds an unknown command");
             }
             ++executed;
             if (step != 0 && on_step && executed >= first_step &&
@@ -988,9 +1328,9 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
         if (step != 0 && on_step && executed >= first_step &&
             executed % step != 0)
             report();
-        renderer.synchronize(commands.get());
-
-        result.matches = true;
+        if (!renderer.synchronize(commands.get()))
+            throw std::runtime_error(
+                "GPU replay did not complete successfully");
         result.contents.resize(file.textures.size());
         const bool partial = command_limit < file.commands.size();
         for (usize i = 0; i < file.textures.size(); i++) {
@@ -1137,10 +1477,47 @@ void LiveCapture::clear(IRenderer&, ICommandBuffer* command_buffer,
         complete(command_buffer);
 }
 
+void LiveCapture::copy(IRenderer&, ICommandBuffer* command_buffer,
+                       const command_ir::CopyCommand& command) {
+    std::scoped_lock lock(mutex);
+    if (!recorder || recorder->commandCount() >= limit)
+        return;
+    if (to_skip != 0) {
+        --to_skip;
+        return;
+    }
+    recorder->recordCopy(command_buffer, command);
+    if (recorder->full())
+        complete(command_buffer);
+}
+
+void LiveCapture::compute(IRenderer&, ICommandBuffer* command_buffer,
+                          const command_ir::ComputeCommand& command) {
+    std::scoped_lock lock(mutex);
+    if (!recorder || recorder->commandCount() >= limit)
+        return;
+    if (to_skip != 0) {
+        --to_skip;
+        return;
+    }
+    recorder->recordCompute(command_buffer, command);
+    if (recorder->full())
+        complete(command_buffer);
+}
+
+void LiveCapture::abort(std::string_view reason) {
+    std::scoped_lock lock(mutex);
+    if (recorder)
+        LOG_ERROR(Gpu, "GPU capture dropped: {}", reason);
+    recorder.reset();
+    running.store(false, std::memory_order_release);
+}
+
 void LiveCapture::commandExecuted(ICommandBuffer* command_buffer) {
     std::scoped_lock lock(mutex);
     if (!recorder)
         return;
+    recorder->commandExecuted(command_buffer);
     // A failed recording ends the capture at once; otherwise the capture ends
     // with the execution of its last command
     last_executed = recorder->commandCount() >= limit;

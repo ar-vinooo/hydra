@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -220,6 +221,8 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
                                  std::memory_order_release);
         if (profile)
             PerfStats::instance().checkpoint_skips++;
+        capture::GuestEvents::instance().event(
+            "checkpoint", capture::currentGuestEventOrigin(), 0, 0, 0, 1);
         return 0.0;
     }
     const u64 write_epoch = guest_write_epoch.load(std::memory_order_acquire);
@@ -293,6 +296,9 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     TMP_AUTORELEASE_POOL_BEGIN();
     command_buffer = command_queue->commandBuffer()->retain();
     TMP_AUTORELEASE_POOL_END();
+    capture::GuestEvents::instance().event(
+        "checkpoint", capture::currentGuestEventOrigin(), 0, 0, 0,
+        last_submission_succeeded ? 1 : 0);
     return ms;
 }
 

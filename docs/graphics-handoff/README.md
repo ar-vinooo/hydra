@@ -1,5 +1,12 @@
 # Hydra graphics work: handoff
 
+**Guest event/PFIFO replay continuation (2026-10-21, Windows):**
+[Event capture, native decoder replay, differential comparison and seeded stress](guest-event-stream.md).
+These source additions have not been built or tested; earlier validation results
+in historical notes do not cover this continuation. Performance changes remain
+gated on P0 correctness evidence.
+[Pemetaan rekomendasi laporan ke fungsi source dan batas penyelesaian](report-implementation-status.md).
+
 **Command IR Clear/Copy, versi isi, capture/replay, saturasi (2026-10-21):**
 [Ringkasan, cara memakai `HYDRA_GPU_CAPTURE` dan `hydra-gpu-replay`, batasnya](p1-p2-command-ir-capture-2026-10-21.md).
 

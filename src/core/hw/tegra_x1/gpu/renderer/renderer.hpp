@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/resource/content_version.hpp"
 #include "core/hw/tegra_x1/gpu/resource/resource_registry.hpp"
 
@@ -90,14 +91,31 @@ class IRenderer {
           index_cache(*this) {}
     virtual ~IRenderer() = default;
 
-    void recordGpuWrites(ICommandBuffer* command_buffer,
-                         std::span<const ztd::Range<uptr>> ranges) {
+    void recordGpuWrites(
+        ICommandBuffer* command_buffer,
+        std::span<const ztd::Range<uptr>> ranges,
+        capture::GuestEventOrigin origin = capture::currentGuestEventOrigin()) {
         auto write = content_versions.issueGpuWrites(ranges);
-        if (write.version() != 0)
+        if (write.version() != 0) {
+            const auto version = write.version();
+            const auto command_identity =
+                reinterpret_cast<uptr>(command_buffer);
+            auto& events = capture::GuestEvents::instance();
+            if (events.enabled())
+                for (const auto& range : ranges)
+                    if (range.getBegin() < range.getEnd())
+                        events.event("gpu_write_issued", origin,
+                                     range.getBegin(), range.getSize(), version,
+                                     0, command_identity);
             command_buffer->onGpuCompletedChecked(
-                [write = std::move(write)](bool succeeded) {
+                [write = std::move(write), origin, version,
+                 command_identity](bool succeeded) {
                     write.complete(succeeded);
+                    capture::GuestEvents::instance().event(
+                        "gpu_complete", origin, 0, 0, version,
+                        succeeded ? 1 : 0, command_identity);
                 });
+        }
     }
 
     void invalidateMemory(
@@ -106,7 +124,15 @@ class IRenderer {
                                         MemoryInvalidationScope::TextureCache |
                                         MemoryInvalidationScope::ShaderCache) {
         // The bytes behind this range changed (guest CPU or DMA write)
-        content_versions.write(range);
+        const auto version = content_versions.write(range);
+        auto& events = capture::GuestEvents::instance();
+        if (events.enabled() && range.getBegin() < range.getEnd()) {
+            events.memory("memory_write", range.getBegin(), range.getSize(),
+                          version, capture::currentGuestEventOrigin());
+            events.event("resource_invalidate",
+                         capture::currentGuestEventOrigin(), range.getBegin(),
+                         range.getSize(), version, static_cast<u64>(scope));
+        }
         if (any(scope & MemoryInvalidationScope::BufferCache)) {
             std::scoped_lock lock(buffer_cache.getMutex());
             buffer_cache.invalidateMemory(range);
@@ -127,6 +153,12 @@ class IRenderer {
     // The caches are locked by the GPU thread for whole draws: other threads
     // queue their invalidations for it, it applies them between its entries
     void queueMemoryInvalidation(ztd::Range<uptr> range) {
+        // Reports publish from a completion thread. Preserve their bytes at
+        // publication, before a later decoder consumes the invalidation.
+        auto& events = capture::GuestEvents::instance();
+        if (events.enabled() && range.getBegin() < range.getEnd())
+            events.memory("memory_published", range.getBegin(),
+                          range.getSize());
         std::scoped_lock lock(queued_invalidation_mutex);
         queued_invalidations.push_back(range);
         has_queued_invalidations.store(true, std::memory_order_release);
@@ -332,9 +364,13 @@ class IRenderer {
     }
 
     // Compute
-    virtual void
+    // True for a successfully encoded dispatch or an empty no-op. False must
+    // not be treated as an issued write by command/resource tracking.
+    virtual bool
     dispatchCompute([[maybe_unused]] ICommandBuffer* command_buffer,
-                    [[maybe_unused]] const ComputeDispatch& dispatch) {}
+                    [[maybe_unused]] const ComputeDispatch& dispatch) {
+        return false;
+    }
 
     // Draw
     virtual void draw(ICommandBuffer* command_buffer,

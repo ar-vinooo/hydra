@@ -27,6 +27,8 @@ class GMmu : public GenericMmu<GMmu, AddressSpace>,
     ~GMmu();
     void cancelGpuWork() { gpu_cancelled.store(true, std::memory_order_release); }
     bool gpuWorkCancelled() const { return gpu_cancelled.load(std::memory_order_acquire); }
+    u64 getCaptureId() const { return capture_id; }
+    std::vector<std::pair<uptr, AddressSpace>> snapshotMappings() const;
 
     static u64 implGetSize(const AddressSpace& as) { return as.size; }
 
@@ -100,6 +102,9 @@ class GMmu : public GenericMmu<GMmu, AddressSpace>,
 
   private:
     cpu::IMmu* mmu;
+    inline static std::atomic<u64> next_capture_id{1};
+    const u64 capture_id{
+        next_capture_id.fetch_add(1, std::memory_order_relaxed)};
     std::shared_ptr<cpu::DeviceMappingState> device_mappings;
     void publishDeviceMappings(uptr excluded = invalid<uptr>());
     std::atomic<bool> gpu_cancelled{false};

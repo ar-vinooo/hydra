@@ -1,41 +1,43 @@
 // Engine-level GPU tests: the macro (MME) interpreter and renderer operations
 // the engines issue (clears), checked on Metal where pixels are involved.
-#include "core/hw/tegra_x1/gpu/macro/interpreter/driver.hpp"
-#include "core/hw/tegra_x1/gpu/memory_util.hpp"
-#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
+#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/compute.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
 #include "core/hw/tegra_x1/gpu/engines/2d.hpp"
 #include "core/hw/tegra_x1/gpu/engines/compute.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
-#include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
-#include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
-#include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
-#include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
-#include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
+#include "core/hw/tegra_x1/gpu/macro/interpreter/driver.hpp"
+#include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
+#include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
-#include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/pipeline_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
-#include <sys/mman.h>
-#include <unistd.h>
 #include <chrono>
 #include <fstream>
 #include <future>
 #include <iostream>
-#include <sstream>
-#include <thread>
+#include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace hydra;
@@ -4541,7 +4543,166 @@ int runChannelMethodCases(const char* input_path, const char* output_path) {
     return 0;
 }
 
+void testComputeCommandsAndCapture() {
+    using namespace renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    metal::Renderer renderer;
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    ShaderDescriptor descriptor{};
+    descriptor.type = ShaderType::Compute;
+    descriptor.backend = ShaderBackend::Msl;
+    const std::string code = R"(
+#include <metal_stdlib>
+using namespace metal;
+kernel void main_(device uint* values [[buffer(0)]], device uint* alias [[buffer(1)]]) {
+    values[0] += 1;
+    alias[0] = values[0] + 5;
+})";
+    descriptor.code.assign(code.begin(), code.end());
+    std::shared_ptr<ShaderBase> kernel(renderer.createShader(descriptor));
+    kernel->setResourceOwner(kernel);
+    std::shared_ptr<BufferBase> storage(renderer.allocateTemporaryBuffer(64));
+    std::array<u32, 16> zeros{};
+    storage->copyFrom(reinterpret_cast<uptr>(zeros.data()));
+    const auto ptr = storage->getPtr();
+    command_ir::ComputeCommand compute;
+    compute.dispatch.shader = kernel.get();
+    compute.dispatch.grid_size = {1, 1, 1};
+    compute.dispatch.block_size = {1, 1, 1};
+    compute.dispatch.storage_buffers.push_back(
+        {0, BufferView(storage).withGuestRange({ptr, ptr + 64}), true});
+    compute.dispatch.storage_buffers.push_back(
+        {1, BufferView(storage, 4, 60).withGuestRange({ptr + 4, ptr + 64}),
+         true});
+    expect(command_ir::sealCompute(renderer, compute),
+           "Compute resources seal");
+    expect(compute.resources.contents.reads.size() == 2 &&
+               compute.resources.contents.writes.size() == 2,
+           "Compute records overlapping storage reads and writes");
+    compute.dispatch.storage_buffers[0].index = 3;
+    expect(!command_ir::executeCompute(renderer, commands.get(), compute),
+           "A binding changed after sealing cannot execute");
+    compute.dispatch.storage_buffers[0].index = 0;
+    compute.dispatch.block_size.width = 2;
+    expect(!command_ir::validateCompute(renderer, compute),
+           "Dispatch shape is sealed");
+    compute.dispatch.block_size.width = 1;
+    expect(command_ir::validateCompute(renderer, compute),
+           "Restored bindings validate");
+    compute.resources.origin = {7, 11, 0x1000};
+    auto empty = compute;
+    empty.dispatch.grid_size.width = 0;
+    const auto before = renderer.getContentVersions().current();
+    expect(command_ir::sealCompute(renderer, empty) &&
+               command_ir::executeCompute(renderer, commands.get(), empty) &&
+               renderer.getContentVersions().current() == before,
+           "A zero-sized dispatch succeeds without publishing writes");
+    auto invalid = compute;
+    invalid.dispatch.storage_buffers[0].buffer = BufferView(storage, 63, 8);
+    expect(!command_ir::sealCompute(renderer, invalid),
+           "Compute rejects a buffer range outside its allocation");
+    auto invalid_binding = compute;
+    invalid_binding.dispatch.storage_buffers[0].index = 100;
+    expect(command_ir::sealCompute(renderer, invalid_binding) &&
+               !command_ir::executeCompute(renderer, commands.get(),
+                                           invalid_binding) &&
+               renderer.getContentVersions().current() == before,
+           "Backend binding failure does not publish a successful GPU write");
+
+    capture::Recorder recorder(renderer);
+    expect(recorder.recordCompute(commands.get(), compute),
+           "Compute enters capture");
+    kernel.reset();
+    expect(command_ir::executeCompute(renderer, commands.get(), compute),
+           "The sealed command retains its shader after caller release");
+    recorder.commandExecuted(commands.get());
+    std::vector<u8> actual;
+    expect(renderer.readBufferContents(BufferView(storage), actual),
+           "Read actual compute output");
+    std::array<u32, 2> values{};
+    std::memcpy(values.data(), actual.data(), sizeof(values));
+    expect(values[0] == 1 && values[1] == 6,
+           "Compute executes exactly once and bindings preserve shared backing "
+           "and offsets");
+
+    auto source = std::unique_ptr<ITexture>(renderer.createTexture(
+        TextureDescriptor(0, MTL::TextureType2D, TextureFormat::RGBA8Unorm,
+                          false, 0, 4, 4, 1, 1, 1, 0, 0, 0)));
+    auto destination = std::unique_ptr<ITexture>(
+        renderer.createTexture(source->getDescriptor()));
+    const capture::Contents pixels{std::vector<u8>(64, 0x5a)};
+    expect(renderer.writeTextureContents(source.get(), pixels) &&
+               renderer.writeTextureContents(destination.get(),
+                                             {std::vector<u8>(64, 0)}),
+           "Initialize copy capture textures");
+    TextureViewDescriptor view_descriptor(
+        MTL::TextureType2D, TextureFormat::RGBA8Unorm, {0, 1}, {0, 1});
+    std::unique_ptr<ITextureView> src(source->createView(view_descriptor));
+    std::unique_ptr<ITextureView> dst(destination->createView(view_descriptor));
+    command_ir::CopyCommand copy;
+    copy.src = src.get();
+    copy.dst = dst.get();
+    copy.src_size = {4, 4, 1};
+    copy.dst_size = {4, 4, 1};
+    expect(command_ir::sealCopy(renderer, copy) &&
+               recorder.recordCopy(commands.get(), copy) &&
+               command_ir::executeCopy(renderer, commands.get(), copy),
+           "A texture copy enters the same ordered capture as compute");
+    auto file = recorder.finish(commands.get());
+    expect(recorder.failure().empty() && file.commands.size() == 2 &&
+               file.commands[0].kind == capture::CommandRecord::Kind::Compute &&
+               file.commands[1].kind == capture::CommandRecord::Kind::Copy,
+           "Capture preserves mixed command order");
+    const auto& captured_storage = file.commands[0].compute.storage;
+    expect(
+        captured_storage[0].buffer.buffer ==
+                captured_storage[1].buffer.buffer &&
+            captured_storage[1].buffer.offset == 4 &&
+            !captured_storage[0].expected.empty(),
+        "Capture preserves storage aliases, offsets and per-command results");
+    auto decoded = capture::CaptureFile::deserialize(file.serialize());
+    expect(decoded.commands[0].origin.channel == 7 &&
+               decoded.commands[0].origin.sequence == 11 &&
+               decoded.commands[0].origin.source_address == 0x1000,
+           "Guest command origin survives capture serialization");
+    metal::Renderer replay_renderer;
+    const auto replayed = capture::replay(replay_renderer, decoded);
+    expect(replayed.ok && replayed.matches,
+           "Mixed compute/copy replay matches actual GPU results");
+    decoded.commands[0].compute.storage[0].expected[0] ^= 1;
+    const auto mismatch = capture::replay(replay_renderer, decoded);
+    expect(
+        mismatch.ok && !mismatch.matches && !mismatch.mismatch.empty(),
+        "Storage result corruption is detected even when final textures match");
+    decoded = file;
+    decoded.commands[0].compute.storage[0].buffer.offset =
+        std::numeric_limits<u64>::max();
+    expect(!capture::replay(replay_renderer, decoded).ok,
+           "Malformed captured buffer offsets are rejected");
+    auto legacy = capture::CaptureFile{}.serialize();
+    const u32 old_version = 3;
+    std::memcpy(legacy.data() + sizeof(capture::MAGIC), &old_version,
+                sizeof(old_version));
+    expect(capture::CaptureFile::deserialize(legacy).commands.empty(),
+           "Version 3 captures remain readable");
+    std::cout << "PASS: compute IR validation, leases, no-op, failure "
+                 "propagation, aliases and mixed capture/replay\n";
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 &&
+        (std::string_view(argv[1]) == "--check-compute-ir" ||
+         std::string_view(argv[1]) == "--check-compute-ir-profile")) {
+        try {
+            if (std::string_view(argv[1]) == "--check-compute-ir-profile")
+                setenv("HYDRA_PROFILE_COMPUTE", "1", 1);
+            testComputeCommandsAndCapture();
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "FAIL: " << error.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 4 && std::string_view(argv[1]) == "--channel-method-cases") {
         try {
             return runChannelMethodCases(argv[2], argv[3]);
@@ -4581,6 +4742,7 @@ int main(int argc, char** argv) {
         testDrawResourceValidation();
         testDrawContentVersions();
         testClearAndCopyCommands();
+        testComputeCommandsAndCapture();
         testCaptureAndReplay();
         testBufferTextureContents();
         if (std::getenv("HYDRA_GPU_BENCH"))

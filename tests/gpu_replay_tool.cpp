@@ -432,10 +432,17 @@ int main(int argc, char** argv) {
                 const auto& command = file.commands[c];
                 if (command.kind == capture::CommandRecord::Kind::Clear)
                     index << "  command " << c << ": clear pass " << command.clear.pass << '\n';
-                else
+                else if (command.kind == capture::CommandRecord::Kind::Draw)
                     index << "  command " << c << ": draw pipeline " << command.draw.pipeline
                           << " pass " << command.draw.pass << " count " << command.draw.count
                           << " instances " << command.draw.instance_count << '\n';
+                else if (command.kind == capture::CommandRecord::Kind::Copy)
+                    index << "  command " << c << ": copy view "
+                          << command.copy.src << " -> " << command.copy.dst
+                          << '\n';
+                else if (command.kind == capture::CommandRecord::Kind::Compute)
+                    index << "  command " << c << ": compute shader "
+                          << command.compute.shader << '\n';
             }
             if (watch[0] >= 0 && size_t(watch[0]) < contents.size() &&
                 !contents[size_t(watch[0])].empty()) {
@@ -503,6 +510,18 @@ int main(int argc, char** argv) {
                           << (c.clear.has_color ? " color" : "")
                           << (c.clear.has_depth ? " depth" : "")
                           << (c.clear.has_stencil ? " stencil" : "") << '\n';
+                continue;
+            }
+            if (c.kind == capture::CommandRecord::Kind::Copy) {
+                std::cout << "command " << i << ": copy view " << c.copy.src
+                          << " -> " << c.copy.dst << '\n';
+                continue;
+            }
+            if (c.kind == capture::CommandRecord::Kind::Compute) {
+                std::cout << "command " << i << ": compute shader "
+                          << c.compute.shader << " storage "
+                          << c.compute.storage.size() << " images "
+                          << c.compute.images.size() << '\n';
                 continue;
             }
             const auto& d = c.draw;

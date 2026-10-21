@@ -1,5 +1,6 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
@@ -1056,6 +1057,9 @@ bool ThreeD::prepareReportWrite(u64 address, usize size,
 
 void ThreeD::queueCounterReport(u64 address, bool short_query) {
     const usize size = short_query ? 4 : 16;
+    capture::GuestEvents::instance().event(
+        "semaphore_release_queued", capture::currentGuestEventOrigin(),
+        semaphore_address, size, 0, value, data);
     std::vector<ztd::Range<uptr>> writes;
     if (!prepareReportWrite(address, size, writes))
         return;
@@ -1131,14 +1135,24 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
         }
         const u32 payload = regs.report_semaphore_payload;
         const bool greater_equal = extractBits(data, 16, 1) != 0;
+        capture::GuestEvents::instance().event(
+            "semaphore_acquire", capture::currentGuestEventOrigin(),
+            semaphore_address, 4, 0, payload, greater_equal ? 4u : 1u);
+        u32 observed = 0;
         const auto satisfied = [&] {
             const u32 current = std::atomic_ref<u32>(*word).load(
                 std::memory_order_acquire);
+            observed = current;
             return greater_equal ? static_cast<i32>(current - payload) >= 0
                                  : current == payload;
         };
-        if (satisfied())
+        if (satisfied()) {
+            capture::GuestEvents::instance().event(
+                "semaphore_acquired", capture::currentGuestEventOrigin(),
+                semaphore_address, 4, payload, observed,
+                greater_equal ? 4u : 1u);
             return;
+        }
         // Under PFIFO the channel yields and resumes after this method once
         // the condition holds, so it cannot block the channel that releases
         // it (operations 1 and 4 as in the puller's semaphore acquire)
@@ -1160,6 +1174,9 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+        capture::GuestEvents::instance().event(
+            "semaphore_acquired", capture::currentGuestEventOrigin(),
+            semaphore_address, 4, payload, observed, greater_equal ? 4u : 1u);
         return;
     }
     case 2: // Counter

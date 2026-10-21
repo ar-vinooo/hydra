@@ -1,22 +1,25 @@
 #pragma once
 
 #include "core/hw/tegra_x1/gpu/command_ir/clear.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/compute.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/copy.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 
 #include <atomic>
-#include <limits>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-// Capture and replay of a short run of host-resolved commands (draws and
-// clears) without the guest: the shaders as translated, the pipeline, pass
+// Capture and replay of a short run of host-resolved draw, clear, copy and
+// compute commands without the guest: translated shaders, pipeline, pass
 // and draw state, the bytes of every buffer, and the pixels of every texture
 // the commands touch. Replaying them on a fresh renderer must produce the
 // same pixels. The files are tied to the build that wrote them.
@@ -24,7 +27,7 @@
 namespace hydra::hw::tegra_x1::gpu::capture {
 
 constexpr char MAGIC[8] = {'H', 'Y', 'D', 'R', 'A', 'C', 'A', 'P'};
-constexpr u32 VERSION = 3;
+constexpr u32 VERSION = 4;
 
 using Contents = std::vector<std::vector<u8>>;
 
@@ -131,9 +134,38 @@ struct ClearRecord {
 };
 
 struct CommandRecord {
-    enum class Kind : u32 { Draw, Clear } kind{Kind::Draw};
+    struct Copy {
+        i32 src{-1}, dst{-1};
+        std::array<f32, 3> src_origin{}, dst_origin{};
+        std::array<u64, 3> src_size{}, dst_size{};
+        u32 src_level{0}, src_layer{0}, dst_level{0}, dst_layer{0};
+        u32 level_count{1}, layer_count{1};
+        std::vector<u8> options;
+    };
+    struct Compute {
+        i32 shader{-1};
+        std::array<u64, 3> grid{}, block{};
+        std::vector<std::pair<u32, BufferRef>> uniforms;
+        struct Storage {
+            u32 index;
+            BufferRef buffer;
+            bool written;
+            std::vector<u8> expected;
+        };
+        std::vector<Storage> storage;
+        std::vector<StageRecord::Texture> textures;
+        struct Image {
+            u32 index;
+            i32 view;
+        };
+        std::vector<Image> images;
+    };
+    enum class Kind : u32 { Draw, Clear, Copy, Compute } kind{Kind::Draw};
+    command_ir::CommandOrigin origin;
     DrawRecord draw;
     ClearRecord clear;
+    Copy copy;
+    Compute compute;
 };
 
 struct CaptureFile {
@@ -168,6 +200,12 @@ class Recorder {
                     const command_ir::DrawCommand& command);
     bool recordClear(renderer::ICommandBuffer* command_buffer,
                      const command_ir::ClearCommand& command);
+    bool recordCopy(renderer::ICommandBuffer* command_buffer,
+                    const command_ir::CopyCommand& command);
+    bool recordCompute(renderer::ICommandBuffer* command_buffer,
+                       const command_ir::ComputeCommand& command);
+    // Captures storage-buffer results immediately after compute execution.
+    void commandExecuted(renderer::ICommandBuffer* command_buffer);
     // Reads back what the commands wrote. Call once, after the last command
     // has been encoded.
     CaptureFile finish(renderer::ICommandBuffer* command_buffer);
@@ -190,6 +228,7 @@ class Recorder {
     std::map<std::tuple<const void*, u64, u64, u64>, i32> buffers;
     std::vector<renderer::ITexture*> texture_objects;
     std::vector<bool> written;
+    std::vector<std::pair<usize, renderer::BufferView>> pending_compute_buffers;
     u64 capture_bytes{0};
     u64 limit_bytes{1ull << 30};
     bool reached_limit{false};
@@ -264,6 +303,13 @@ class LiveCapture {
     void clear(renderer::IRenderer& renderer,
                renderer::ICommandBuffer* command_buffer,
                const command_ir::ClearCommand& command);
+    void copy(renderer::IRenderer& renderer,
+              renderer::ICommandBuffer* command_buffer,
+              const command_ir::CopyCommand& command);
+    void compute(renderer::IRenderer& renderer,
+                 renderer::ICommandBuffer* command_buffer,
+                 const command_ir::ComputeCommand& command);
+    void abort(std::string_view reason);
     // Called after the command was encoded. When the requested number of
     // commands has been recorded this reads back what they wrote and writes
     // the file.

@@ -1,32 +1,33 @@
-#include "core/horizon/services/socket/resolver/resolver.hpp"
-#include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl_gpu.hpp"
+#include "core/horizon/kernel/event.hpp"
 #include "core/horizon/kernel/hipc/client_session.hpp"
 #include "core/horizon/kernel/hipc/cmif.hpp"
 #include "core/horizon/kernel/host_thread.hpp"
-#include "core/horizon/kernel/event.hpp"
 #include "core/horizon/kernel/process.hpp"
-#include "core/horizon/services/server.hpp"
+#include "core/horizon/services/aocsrv/add_on_content_manager.hpp"
 #include "core/horizon/services/audio/audio_out.hpp"
 #include "core/horizon/services/audio/audio_renderer.hpp"
 #include "core/horizon/services/mmnv/request.hpp"
-#include "core/horizon/services/aocsrv/add_on_content_manager.hpp"
-#include "core/video/submit_trace.hpp"
-#include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_as_gpu.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl_gpu.hpp"
+#include "core/horizon/services/nvdrv/ioctl/nvhost_gpu.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_nvdec.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_vic.hpp"
-#include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl.hpp"
-#include "core/horizon/services/nvdrv/ioctl/nvhost_gpu.hpp"
-#include "core/horizon/services/nvdrv/ioctl/nvhost_as_gpu.hpp"
-#include <filesystem>
-#include <fstream>
+#include "core/horizon/services/server.hpp"
+#include "core/horizon/services/socket/resolver/resolver.hpp"
 #include "core/horizon/ui/handler_base.hpp"
-#include "core/system.hpp"
 #include "core/hw/tegra_x1/cpu/cpu.hpp"
+#include "core/hw/tegra_x1/gpu/memory_util.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/system.hpp"
+#include "core/video/submit_trace.hpp"
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <thread>
 using namespace hydra;
@@ -2037,6 +2038,189 @@ void testChannelScheduling(System& system, kernel::Process* process) {
     std::cout << "PASS: cross-channel dependencies, engine state, semaphore resume and fences\n";
 }
 
+// Real PFIFO worker stress: channel B waits while A fills backing memory (and
+// on alternating iterations overwrites it with native GPU clears), then
+// B copies through a partially overlapping mapping. A later CPU overwrite must
+// be visible to the next copy. The seed perturbs producer admission timing.
+void testGpuOrderingStress(System& system, kernel::Process* process,
+                           u32 iterations, u64 seed) {
+    namespace gpu = hw::tegra_x1::gpu;
+    auto& device = system.getGpu();
+    auto& gmmu = process->getGMmu();
+    auto producer = std::make_shared<gpu::PfifoDecodeState>();
+    auto consumer = std::make_shared<gpu::PfifoDecodeState>();
+    constexpr uptr BASE = 0x72000000, ALIAS = 0x73000000;
+    std::vector<u32> memory(4096, 0);
+    gmmu.map(BASE, {reinterpret_cast<uptr>(memory.data()),
+                    memory.size() * sizeof(u32)});
+    gmmu.map(ALIAS, {reinterpret_cast<uptr>(memory.data()) + 128, 1024});
+    std::mt19937_64 random(seed);
+    std::deque<std::vector<u32>> pushbuffers;
+    std::vector<uptr> mapped_commands;
+    bool completed = false;
+    struct Cleanup {
+        std::function<void()> run;
+        ~Cleanup() { run(); }
+    } cleanup{[&] {
+        if (completed)
+            return;
+        device.getPfifo().cancel(gmmu);
+        for (const auto address : mapped_commands)
+            gmmu.unmap(address);
+        gmmu.unmap(ALIAS);
+        gmmu.unmap(BASE);
+    }};
+    uptr next = 0x74000000;
+    const auto emit = [](std::vector<u32>& words, u32 method, u32 value) {
+        words.push_back((3u << 29) | (1u << 16) | method);
+        words.push_back(value);
+    };
+    const auto copy = [&](u32 destination) {
+        std::vector<u32> words;
+        emit(words, 0, 0xb0b5);
+        emit(words, 0x100, 0);
+        emit(words, 0x101, static_cast<u32>(ALIAS));
+        emit(words, 0x102, 0);
+        emit(words, 0x103, static_cast<u32>(BASE + destination));
+        emit(words, 0x106, 512);
+        emit(words, 0x107, 1);
+        emit(words, 0xc0, 1u | (1u << 7) | (1u << 8));
+        return words;
+    };
+    const auto enqueue =
+        [&](const std::shared_ptr<gpu::PfifoDecodeState>& channel,
+            std::vector<u32> words) {
+            pushbuffers.push_back(std::move(words));
+            const auto& buffer = pushbuffers.back();
+            const uptr address = next;
+            next += 0x1000;
+            gmmu.map(address, {reinterpret_cast<uptr>(buffer.data()),
+                               buffer.size() * sizeof(u32)});
+            mapped_commands.push_back(address);
+            const auto entry = std::bit_cast<gpu::GpfifoEntry>(
+                static_cast<u64>(address) |
+                (static_cast<u64>(buffer.size()) << 42));
+            auto promise = std::make_shared<std::promise<void>>();
+            auto done = promise->get_future();
+            check(device.getPfifo().submitEntries(
+                      gmmu, {&entry, 1}, gpu::GpfifoFlags::None,
+                      [promise] { promise->set_value(); }, {}, channel),
+                  "Stress submission admitted");
+            return done;
+        };
+    const auto finish = [&](std::future<void>& done) {
+        check(done.wait_for(std::chrono::seconds(5)) ==
+                  std::future_status::ready,
+              "Stress channels complete without deadlock");
+        check(!producer->failed && !consumer->failed,
+              "Stress channels remain healthy");
+    };
+    for (u32 iteration = 0; iteration < iterations; ++iteration) {
+        const u32 threshold = iteration + 1;
+        std::vector<u32> waiting;
+        emit(waiting, 4, 0);
+        emit(waiting, 5, static_cast<u32>(BASE + 0x1000));
+        emit(waiting, 0x1a, threshold);
+        const auto copying = copy(0x2000);
+        waiting.insert(waiting.end(), copying.begin(), copying.end());
+        auto waited = enqueue(consumer, std::move(waiting));
+        std::this_thread::sleep_for(std::chrono::microseconds(random() % 501));
+        std::vector<u32> filling;
+        emit(filling, 0, 0xa140);
+        emit(filling, 0x60, 1024);
+        emit(filling, 0x61, 1);
+        emit(filling, 0x62, 0);
+        emit(filling, 0x63, static_cast<u32>(BASE));
+        emit(filling, 0x64, 0);
+        emit(filling, 0x6c, 1);
+        filling.push_back((3u << 29) | (256u << 16) | 0x6d);
+        std::array<u32, 256> expected;
+        for (u32 index = 0; index < expected.size(); ++index) {
+            expected[index] = (threshold * 0x9e3779b9u) ^ (index * 0x01010101u);
+            filling.push_back(expected[index]);
+        }
+        if ((iteration & 1u) != 0) {
+            using gpu::engines::Regs3D;
+            gpu::engines::RenderTarget target{};
+            target.addr = {0, static_cast<u32>(BASE)};
+            target.width_or_stride = 64;
+            target.height = 16;
+            target.format = gpu::engines::ColorSurfaceFormat::RGBA8Unorm;
+            target.tile_mode.is_linear = 1;
+            target.array_mode.layers = 1;
+            emit(filling, 0, 0xb197);
+            const auto registers = [&](usize byte_offset, const void* source,
+                                       usize size) {
+                const auto* bytes = static_cast<const u8*>(source);
+                for (usize offset = 0; offset < size; offset += sizeof(u32)) {
+                    u32 value;
+                    std::memcpy(&value, bytes + offset, sizeof(value));
+                    emit(filling,
+                         static_cast<u32>((byte_offset + offset) / sizeof(u32)),
+                         value);
+                }
+            };
+            registers(offsetof(Regs3D, color_targets), &target, sizeof(target));
+            emit(filling, 0x487,
+                 1); // One colour target, logical target 0 -> physical 0.
+            emit(filling,
+                 static_cast<u32>(offsetof(Regs3D, depth_target_enabled) / 4),
+                 0);
+            emit(filling, 0x651, 1); // Unconditional render enable override.
+            emit(filling, 0x43e, 1u << 4);
+            emit(filling, 0x35b, 16u << 16);
+            emit(filling, 0x35c, 16u << 16);
+            std::array<u32, 4> color{};
+            u32 packed = 0;
+            for (u32 component = 0; component < 4; ++component) {
+                const bool one =
+                    component == 3 || ((threshold >> component) & 1u) != 0;
+                color[component] = std::bit_cast<u32>(one ? 1.0f : 0.0f);
+                if (one)
+                    packed |= 0xffu << (component * 8);
+            }
+            registers(offsetof(Regs3D, clear_color), color.data(),
+                      sizeof(color));
+            // Keep real Metal work ahead of the release. The consumer's DMA
+            // must also write back this GPU texture through the partial alias.
+            for (u32 clear = 0; clear < 8; ++clear)
+                emit(filling, 0x674, 0xfu << 2);
+            expected.fill(packed);
+        }
+        emit(filling, 4, 0);
+        emit(filling, 5, static_cast<u32>(BASE + 0x1000));
+        emit(filling, 0x1b, threshold);
+        auto released = enqueue(producer, std::move(filling));
+        finish(released);
+        finish(waited);
+        check(memory[0x1000 / 4] == threshold &&
+                  std::memcmp(memory.data() + 0x2000 / 4, expected.data() + 32,
+                              512) == 0,
+              "Consumer sees producer bytes through the partial alias after "
+              "acquire");
+        const u32 replacement = threshold ^ 0xdeadbeefu;
+        memory[40] = replacement;
+        expected[40] = replacement;
+        device.getRenderer().invalidateMemory(ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(&memory[40]), sizeof(u32)));
+        auto overwritten = enqueue(consumer, copy(0x2400));
+        finish(overwritten);
+        check(std::memcmp(memory.data() + 0x2400 / 4, expected.data() + 32,
+                          512) == 0,
+              "CPU overwrite wins over the earlier aliased producer data");
+        for (const auto address : mapped_commands)
+            gmmu.unmap(address);
+        mapped_commands.clear();
+        pushbuffers.clear();
+    }
+    gmmu.unmap(ALIAS);
+    gmmu.unmap(BASE);
+    completed = true;
+    std::cout << "PASS: " << iterations
+              << " cross-channel inline/DMA/partial-alias iterations, seed "
+              << seed << '\n';
+}
+
 void testChannelFaults(System& system, kernel::Process* process) {
     namespace gpu = hw::tegra_x1::gpu;
     namespace nv = services::nvdrv;
@@ -2349,6 +2533,29 @@ int main(int argc, char** argv) {
             unsetenv("HYDRA_GPU_SYNC");
             System system(ui);
             testGpuProcessCancellation(system);
+            return 0;
+        }
+        if (argc == 4 &&
+            std::string_view(argv[1]) == "--check-gpu-ordering-stress") {
+            size_t iterations_end = 0, seed_end = 0;
+            const std::string iterations_text(argv[2]), seed_text(argv[3]);
+            check(!iterations_text.empty() && !seed_text.empty() &&
+                      iterations_text.front() != '-' &&
+                      seed_text.front() != '-',
+                  "Stress arguments must be unsigned");
+            const auto iterations =
+                std::stoull(iterations_text, &iterations_end);
+            const auto seed = std::stoull(seed_text, &seed_end);
+            check(iterations_end == iterations_text.size() &&
+                      seed_end == seed_text.size() && iterations > 0 &&
+                      iterations <= 100000,
+                  "Stress iteration count must be 1..100000");
+            System system(ui);
+            auto* process =
+                system.getOs().getKernel().getProcessManager().createProcess(
+                    "GPU ordering stress");
+            testGpuOrderingStress(system, process, static_cast<u32>(iterations),
+                                  seed);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--check-channel-scheduling") {

@@ -16,7 +16,8 @@ are not treated as confirmed bugs or hardware specifications.
 | Shared content authority | `ContentVersions`, draw/clear/copy content manifests | Extended with GPU status; compute image/storage writes now participate |
 | Native GPU completion | `CommandBuffer::attachGpuCompletionCallbacks`, `commitSubmission`, `debugCommitAndWaitHot5` | Added separate callbacks for native submissions, including checkpoints |
 | Resource lifetime | Resource leases, `retainResource`, `commitManagedSubmission` | Existing resources retained through completion |
-| Capture/replay | `capture/draw_capture.*` | Existing host-resolved draw/clear replay; **not full guest-event replay** |
+| Compute IR | `command_ir/compute.*` | Added sealed bindings, resource/mapping checks, leases, access manifests and encoding failure propagation |
+| Capture/replay | `capture/draw_capture.*` | Host-resolved draw/clear/copy/compute replay; **not full guest-event replay** |
 
 Sequences count consumed method arguments, including filtered arguments. Headers
 and skipped conditional segments do not count. Deferred macro arguments retain
@@ -97,9 +98,98 @@ validation result and does not establish complete Maxwell compatibility.
 
 ## Remaining report work
 
-Full guest-event capture/replay (CPU memory snapshots, semaphore dependencies,
-DMA, compute, channel switches and completion), a complete compute command IR,
-device-backed differential ordering tests, and barrier/batching optimization
-remain separate work. The existing synchronous scheduler and retained resources
+An optional guest event recorder, semantic memory/dependency replay, native
+PFIFO-word replay, differential comparator and seeded ordering stress are now
+implemented; see [guest-event-stream.md](../docs/graphics-handoff/guest-event-stream.md).
+Real-device reference collection and execution of the added checks remain
+unperformed. Barrier/batching optimization remains gated on successful P0
+correctness checks. The existing synchronous scheduler and retained resources
 are not replaced with a speculative multi-queue dependency graph. No claim is
 made that metadata alone resolves every alias or unsynchronized access case.
+
+## Compute, capture and validation continuation
+
+Compute now follows `sealCompute` / `validateCompute` / `executeCompute`. A seal
+tracks shader, buffer, sampled texture, sampler and image lifetimes, retains
+owners, records guest mappings, and builds conservative read/write manifests.
+Validation checks the exact resolved binding pointers, offsets, sizes, indices,
+write qualifiers and dispatch dimensions. Mutating those after sealing rejects
+execution. Zero-sized dispatches keep their previous no-op behavior and issue
+no write epoch. Nonempty dispatch dimensions use checked multiplication, and
+buffer ranges are checked with subtraction to avoid overflow.
+
+The backend returns whether it encoded the compute operation. Pipeline creation,
+threadgroup-size or binding-index failures cannot publish successful write
+metadata; the engine faults the channel with Hydra's existing generic error 25.
+`HYDRA_PROFILE_COMPUTE` now measures the actual kernel once on the ordered queue:
+the previous profiling branch encoded another dispatch on a separate command
+buffer, which could duplicate storage/image side effects.
+
+Capture format 4 adds copy/compute commands and guest origin metadata for all
+command kinds. Version 3 remains readable. Compute capture normalizes bindings
+of the same native buffer onto one allocation, preserving alias offsets, and
+records written storage bytes immediately after that compute operation. Replay
+compares these bytes as well as final textures. Cross-allocation aliases that
+cannot be restored are explicitly rejected. Backend failures abort the live
+capture. The replay tool identifies all four command kinds.
+
+This remains a snapshot-based host command replay. It does not claim to replay
+PFIFO scheduling, guest memory mappings or CPU/GPU races. Capturing snapshots
+requires synchronization and can change timing. The separate guest event stream
+reconstructs captured memory and ordering evidence without executing shaders.
+The native `hydra-guest-replay` separately executes consumed PFIFO words through
+the production decoder and engines with conservative checkpoints. It compares
+decoded methods and recorded memory outputs; neither replay reconstructs
+unobserved CPU execution or the original asynchronous timing. This continuation
+was not built or tested at the user's request.
+
+The origin fields carry channel, guest method sequence and source address through
+draw, clear, copy and compute IR into captures. Visual diagnostics additionally
+record `pfifo_blocked` and `pfifo_resumed` events. Check observed method ordering:
+
+```sh
+python3 tools/check_gpu_trace.py path/to/events.jsonl
+```
+
+The checker rejects duplicate/reversed method sequences, dispatch from a blocked
+channel and inconsistent wakeups. It allows gaps from filtered methods and marks
+partial capture boundaries. `--require-complete` rejects unmatched wakeups and
+unfinished blocking. It checks scheduling evidence, not Maxwell hardware or
+memory visibility.
+
+Run all available checks with one command:
+
+```powershell
+uv run --no-project python tools/validate_gpu_correctness.py
+```
+
+The script compiles production C++ with warnings as errors, runs the content
+version tests, compares compute dimension guards against Python arbitrary-
+precision integers, checks the trace checker's failure cases, and checks the
+diff. It uses clang++/g++ when available or pinned Zig 0.16.0 through uv, without
+changing project dependencies. It writes per-check logs and a machine-readable
+result to `build/correctness/validation.json`. A missing compiler, failed check
+or timed-out subprocess exits nonzero. `--compiler` chooses an explicit compiler;
+`--timeout-seconds` bounds each subprocess (default 900).
+
+On Windows, the successful status is explicitly
+`portable_passed_metal_unverified`. For the native merge gate, use a configured
+macOS build:
+
+```sh
+python3 tools/validate_gpu_correctness.py --require-metal --build-dir build/swiftui-release
+```
+
+That gate also builds the replay tool and runs the native GPU, registry, PFIFO,
+channel scheduling and process cancellation suites with Metal validation. A
+separate `--check-compute-ir-profile` GPU-engine invocation verifies that profiling
+does not execute the kernel twice. Native tests cover sealed-binding mutation,
+invalid ranges, no-op dispatch, backend failure propagation, resource leases,
+storage aliases and offsets, mixed compute/copy replay, corrupted expected
+storage bytes, invalid captured offsets and version 3 compatibility.
+
+Executed here: **128,000 content differential steps, 8,000 concurrent writes,
+26,916 compute dimension cases and 7 trace-checker tests**, all passing. Missing-
+compiler and unavailable-required-Metal paths were also checked to exit nonzero
+and record failure. The native suites are implemented but remain **unrun on this
+Windows host**; portable success is not a full-app compile or Metal runtime result.

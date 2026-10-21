@@ -41,6 +41,7 @@ struct StageBindings {
 // change. Cache resources and owned buffers carry leases; external raw
 // resources still require caller ownership through encoding.
 struct DrawCommand {
+    CommandOrigin origin;
     renderer::PipelineBase* pipeline{nullptr};
     renderer::RenderPassBase* render_pass{nullptr};
     renderer::DrawState state{};

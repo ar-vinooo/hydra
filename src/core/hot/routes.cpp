@@ -283,7 +283,7 @@ f64 Renderer::debugSyncCommandBuffer(ICommandBuffer* command_buffer) {
         command_buffer);
 }
 
-void Renderer::dispatchCompute(ICommandBuffer* command_buffer,
+bool Renderer::dispatchCompute(ICommandBuffer* command_buffer,
                                const ComputeDispatch& dispatch) {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_dispatchComputeHot41)(

@@ -53,6 +53,10 @@ bool executeClear(renderer::IRenderer& renderer,
         return true;
     if (!command_buffer || !command.resources.valid(renderer))
         return false;
+    const auto& origin = command.resources.origin;
+    capture::recordGuestCommand(
+        "clear", {origin.channel, origin.sequence, origin.source_address},
+        command.resources.contents);
     for (const auto& owner : command.resources.owners)
         command_buffer->retainResource(owner);
     renderer.bindRenderPass(command.render_pass);
@@ -67,7 +71,9 @@ bool executeClear(renderer::IRenderer& renderer,
     if (command.stencil)
         renderer.clearStencil(command_buffer, command.stencil->layer,
                               command.stencil->value);
-    renderer.recordGpuWrites(command_buffer, command.resources.contents.writes);
+    renderer.recordGpuWrites(
+        command_buffer, command.resources.contents.writes,
+        {origin.channel, origin.sequence, origin.source_address});
     return true;
 }
 

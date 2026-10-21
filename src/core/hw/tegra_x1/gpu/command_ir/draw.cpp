@@ -90,6 +90,7 @@ void buildDrawContents(renderer::IRenderer& renderer, DrawCommand& command) {
 
 void captureDrawAddressSpace(renderer::IRenderer& renderer,
                              DrawCommand& command, GMmu* address_space) {
+    command.origin = currentCommandOrigin();
     command.resources_sealed = false;
     command.address_space = address_space;
     command.address_space_handle = {};
@@ -199,6 +200,11 @@ bool executeDraw(renderer::IRenderer& renderer,
         (indexed && !command.indices.isValid()) ||
         !validateDrawResources(renderer, command))
         return false;
+    capture::recordGuestCommand("draw",
+                                {command.origin.channel,
+                                 command.origin.sequence,
+                                 command.origin.source_address},
+                                command.contents);
 
     for (const auto& owner : command.resource_owners)
         command_buffer->retainResource(owner);
@@ -235,7 +241,9 @@ bool executeDraw(renderer::IRenderer& renderer,
                       command.count, command.base_instance,
                       command.instance_count);
     }
-    renderer.recordGpuWrites(command_buffer, command.contents.writes);
+    renderer.recordGpuWrites(command_buffer, command.contents.writes,
+                             {command.origin.channel, command.origin.sequence,
+                              command.origin.source_address});
     if (!command.storage_writes.empty()) {
         auto& cache = renderer.getTextureCache();
         std::scoped_lock lock(cache.getMutex());

@@ -1,5 +1,6 @@
-#include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
+#include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
 
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 
@@ -10,6 +11,11 @@ namespace hydra::hw::tegra_x1::gpu {
 
 GMmu::GMmu(cpu::IMmu* mmu_) : mmu(mmu_),
     device_mappings(mmu ? mmu->getDeviceMappings() : nullptr) {}
+
+std::vector<std::pair<uptr, AddressSpace>> GMmu::snapshotMappings() const {
+    std::shared_lock lock(mutex);
+    return {mapped_ranges.begin(), mapped_ranges.end()};
+}
 
 void GMmu::publishDeviceMappings(uptr excluded) {
     if (!device_mappings)
@@ -32,6 +38,7 @@ void GMmu::unmapImpl(uptr base, AddressSpace as) {
 }
 
 GMmu::~GMmu() {
+    capture::GuestEvents::instance().addressSpaceDestroyed(capture_id);
     if (device_mappings) {
         std::scoped_lock lock(device_mappings->mutex);
         device_mappings->spaces.erase(this);
