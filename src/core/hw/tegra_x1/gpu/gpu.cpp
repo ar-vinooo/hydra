@@ -352,6 +352,10 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                     break;
             }
             invalidate(ptr, sizeof(u32));
+            // The trigger argument (auxiliary) tells a reduction from a release
+            capture::GuestEvents::instance().event(
+                "semaphore_release", capture::currentGuestEventOrigin(),
+                semaphore_address(), 4, 0, payload, arg);
             break;
         }
         case 0x4: // Acquire greater or equal
@@ -378,6 +382,9 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             std::atomic_ref<u32>(*reinterpret_cast<u32*>(ptr))
                 .store(arg, std::memory_order_release);
             invalidate(ptr, sizeof(u32));
+            capture::GuestEvents::instance().event(
+                "semaphore_release", capture::currentGuestEventOrigin(),
+                semaphore_address(), 4, 0, arg);
         }
         break;
     case SYNCPOINT_OPERATION: {

@@ -17,6 +17,34 @@ inline u64 getGpuTimestamp() {
     return ns / 625 * 384;
 }
 
+// Reductions of the DMA semaphores (copy engine NVB0B5 and inline engine
+// NVA140 REDUCTION_OP): IMIN, IMAX, IXOR, IAND, IOR, IADD, INC, DEC
+inline u32 reduceDmaSemaphoreWord(u32 operation, bool is_signed, u32 old,
+                                  u32 payload) {
+    switch (operation) {
+    case 0:
+        return is_signed ? static_cast<u32>(std::min(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::min(old, payload);
+    case 1:
+        return is_signed ? static_cast<u32>(std::max(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::max(old, payload);
+    case 2:
+        return old ^ payload;
+    case 3:
+        return old & payload;
+    case 4:
+        return old | payload;
+    case 6:
+        return old >= payload ? 0u : old + 1;
+    case 7:
+        return (old == 0 || old > payload) ? payload : old - 1;
+    default:
+        return old + payload;
+    }
+}
+
 struct Iova {
     u32 hi;
     u32 lo;

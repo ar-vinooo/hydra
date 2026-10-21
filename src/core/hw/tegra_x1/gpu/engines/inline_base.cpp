@@ -1,5 +1,6 @@
 #include "core/hw/tegra_x1/gpu/engines/inline_base.hpp"
 
+#include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
@@ -33,12 +34,29 @@ void forEachHostRange(uptr gpu_addr, u64 size, F&& f) {
 
 } // namespace
 
-void InlineBase::launchDmaImpl(Gpu& gpu, RegsInline& regs, const u32 index,
-                               const u32 data) {
-    (void)gpu;
+void InlineBase::launchDmaImpl(Gpu& gpu, RegsInline& regs, const u32* regs_raw,
+                               const u32 index, const u32 data) {
     (void)index;
-    // TODO: completion type and semaphores
+    // cla140.h: SET_I2M_SEMAPHORE_A (address bits 39:32), B (31:0), C
+    // (payload); LAUNCH_DMA DST_MEMORY_LAYOUT[0], REDUCTION_ENABLE[1],
+    // REDUCTION_FORMAT[3:2], COMPLETION_TYPE[5:4], SEMAPHORE_STRUCT_SIZE[12],
+    // REDUCTION_OP[15:13]
+    constexpr u32 REG_SEMAPHORE_A = 0x77;
+    constexpr u32 COMPLETION_TYPE_RELEASE_SEMAPHORE = 2;
+    pending_semaphore.reset();
+    if (extractBits(data, 4, 2) == COMPLETION_TYPE_RELEASE_SEMAPHORE)
+        pending_semaphore = Semaphore{
+            (static_cast<u64>(regs_raw[REG_SEMAPHORE_A] & 0xff) << 32) |
+                regs_raw[REG_SEMAPHORE_A + 1],
+            regs_raw[REG_SEMAPHORE_A + 2],
+            extractBits(data, 12, 1) != 0,
+            extractBits(data, 1, 1) != 0,
+            static_cast<u32>(extractBits(data, 13, 3)),
+            extractBits(data, 2, 2) == 0};
     startTransfer(regs, (data & 0x1) != 0);
+    // Without inline data to wait for, the launch completes now
+    if (!active)
+        releaseSemaphore(gpu);
 }
 
 void InlineBase::loadInlineDataImpl(Gpu& gpu, RegsInline& regs, const u32 index,
@@ -58,7 +76,50 @@ void InlineBase::loadInlineDataImpl(Gpu& gpu, RegsInline& regs, const u32 index,
     if (inline_data.size() == copy_size) {
         writeTransfer(gpu, regs);
         active = false;
+        releaseSemaphore(gpu);
     }
+}
+
+void InlineBase::releaseSemaphore(Gpu& gpu) {
+    if (!pending_semaphore)
+        return;
+    const auto semaphore = *pending_semaphore;
+    pending_semaphore.reset();
+
+    const u64 size = semaphore.one_word ? 4 : 16;
+    uptr base;
+    const auto as = tls_crnt_gmmu->findAddr(semaphore.address, base);
+    if (!as || as->ptr == 0 || semaphore.address - base + size > as->size ||
+        (as->ptr + (semaphore.address - base)) %
+                std::atomic_ref<u32>::required_alignment != 0) {
+        ONCE(LOG_WARN(Engines, "Inline semaphore release to unmapped memory {:#x}",
+                      semaphore.address));
+        return;
+    }
+    auto* ptr = reinterpret_cast<u8*>(as->ptr + (semaphore.address - base));
+    if (!semaphore.one_word) {
+        const u64 timestamp = getGpuTimestamp();
+        std::memcpy(ptr + 8, &timestamp, sizeof(timestamp));
+    }
+    // The payload is published last: a waiter that sees it also sees the data
+    std::atomic_ref<u32> word(*reinterpret_cast<u32*>(ptr));
+    if (semaphore.reduction) {
+        u32 old = word.load(std::memory_order_relaxed);
+        while (!word.compare_exchange_weak(
+            old,
+            reduceDmaSemaphoreWord(semaphore.reduction_op,
+                                   semaphore.reduction_signed, old,
+                                   semaphore.payload),
+            std::memory_order_acq_rel)) {
+        }
+    } else {
+        word.store(semaphore.payload, std::memory_order_release);
+    }
+    gpu.getRenderer().invalidateMemory(
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
+    capture::GuestEvents::instance().event(
+        "semaphore_release", capture::currentGuestEventOrigin(),
+        semaphore.address, size, 0, semaphore.payload);
 }
 
 void InlineBase::startTransfer(const RegsInline& regs, bool pitch) {

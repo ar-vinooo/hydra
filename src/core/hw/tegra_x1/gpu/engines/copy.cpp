@@ -238,16 +238,30 @@ void Copy::releaseSemaphore(const LaunchDMAData data) {
     const auto as = tls_crnt_gmmu->findAddr(address, base);
     const bool four_words = data.semaphore_type == SemaphoreType::ReleaseFourWords;
     const u64 size = four_words ? 16 : 4;
-    if (!as || as->ptr == 0 || address - base + size > as->size) {
+    if (!as || as->ptr == 0 || address - base + size > as->size ||
+        (as->ptr + (address - base)) %
+                std::atomic_ref<u32>::required_alignment != 0) {
         ONCE(LOG_WARN(Engines, "Semaphore release to unmapped memory {:#x}",
                       address));
         return;
     }
     auto* ptr = reinterpret_cast<u8*>(as->ptr + (address - base));
-    std::memcpy(ptr, &payload, sizeof(payload));
     if (four_words) {
         const u64 timestamp = getGpuTimestamp();
         std::memcpy(ptr + 8, &timestamp, sizeof(timestamp));
+    }
+    // The payload is published last: a waiter that sees it also sees the copy
+    std::atomic_ref<u32> word(*reinterpret_cast<u32*>(ptr));
+    if (data.semaphore_reduction_enable) {
+        const auto operation = static_cast<u32>(data.semaphore_reduction);
+        const bool is_signed = !data.semaphore_reduction_unsigned;
+        u32 old = word.load(std::memory_order_relaxed);
+        while (!word.compare_exchange_weak(
+            old, reduceDmaSemaphoreWord(operation, is_signed, old, payload),
+            std::memory_order_acq_rel)) {
+        }
+    } else {
+        word.store(payload, std::memory_order_release);
     }
     // A CPU reading the semaphore sees fresh bytes; GPU caches mirroring the
     // range are stale
