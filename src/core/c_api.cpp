@@ -944,6 +944,14 @@ HYDRA_EXPORT bool hydraSystemIsRunning(void* system) {
     return reinterpret_cast<hydra::System*>(system)->isRunning();
 }
 
+HYDRA_EXPORT float hydraSystemGetLastShownFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastShownFps();
+}
+
+HYDRA_EXPORT float hydraSystemGetLastGeneratedFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastGeneratedFps();
+}
+
 HYDRA_EXPORT float hydraSystemGetLastDeltaTimeAverage(void* system) {
     return reinterpret_cast<hydra::System*>(system)->getLastDeltaTimeAverage();
 }

@@ -43,6 +43,7 @@ class IGeneralService : public IService {
 
   private:
     // Commands
+    result_t getClientId(OutBuffer<BufferAttr::HipcPointer> out_buffer);
     result_t createRequest(RequestContext* ctx, i32 requirement_preset);
     result_t
     getCurrentNetworkProfile(OutBuffer<BufferAttr::HipcPointer> out_buffer);

@@ -1085,6 +1085,15 @@ class HydraSystem: MutableHandleClass {
         hydraSystemGetLastDeltaTimeAverage(self.handle)
     }
 
+    // New images per second the display showed, game frames and generated
+    func getLastShownFps() -> Float {
+        hydraSystemGetLastShownFps(self.handle)
+    }
+
+    func getLastGeneratedFps() -> Float {
+        hydraSystemGetLastGeneratedFps(self.handle)
+    }
+
     func takeScreenshot() {
         hydraSystemTakeScreenshot(self.handle)
     }

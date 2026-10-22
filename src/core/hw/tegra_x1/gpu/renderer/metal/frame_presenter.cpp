@@ -494,7 +494,7 @@ void FramePresenter::present(CommandBuffer* command_buffer,
     MTL::Texture* source = slots[canvas_slot].color;
     if (mode != FrameGeneration::Off) {
         if (new_frame) {
-            pushFrame(command_buffer, mode == FrameGeneration::MetalFx);
+            pushFrame(command_buffer);
         } else if (history != 0) {
             refreshes_since_frame++;
             // A long gap (loading, pause): interpolating from the stale frame
@@ -507,11 +507,23 @@ void FramePresenter::present(CommandBuffer* command_buffer,
     } else {
         history = 0;
     }
+    // The canvas (frame generation off) or the current frame is a game frame;
+    // anything else was generated
+    const bool game_frame = mode == FrameGeneration::Off || history == 0 ||
+                            source == slots[current_slot].color;
+    if (!game_frame) {
+        last_shown = Shown::Generated;
+    } else if (mode == FrameGeneration::Off || history == 0) {
+        last_shown = new_frame ? Shown::GameFrame : Shown::Repeated;
+    } else {
+        last_shown = shown_frame_index != frame_index ? Shown::GameFrame
+                                                      : Shown::Repeated;
+        shown_frame_index = frame_index;
+    }
     encodePresent(command_buffer, source, drawable);
 }
 
-void FramePresenter::pushFrame(CommandBuffer* command_buffer,
-                               bool metalfx_enabled) {
+void FramePresenter::pushFrame(CommandBuffer* command_buffer) {
     const auto now = std::chrono::steady_clock::now();
     if (history != 0 && refreshes_since_frame > MAX_REFRESHES_PER_FRAME)
         history = 0;
@@ -535,9 +547,9 @@ void FramePresenter::pushFrame(CommandBuffer* command_buffer,
     refreshes_since_frame = 1;
     frame_index++;
 
+    // The motion between this frame and the previous one is searched once a
+    // refresh needs a generated frame (getFrameForRefresh)
     encodeLuma(command_buffer, slots[current_slot]);
-    if (history >= 2)
-        encodeFlow(command_buffer, metalfx_enabled && metalfx != nullptr);
 }
 
 MTL::Texture* FramePresenter::getFrameForRefresh(CommandBuffer* command_buffer,
@@ -553,6 +565,12 @@ MTL::Texture* FramePresenter::getFrameForRefresh(CommandBuffer* command_buffer,
 
     const f32 t =
         static_cast<f32>(refreshes_since_frame) / static_cast<f32>(refreshes);
+    const bool use_metalfx = mode == FrameGeneration::MetalFx && metalfx;
+    if (flow_frame_index != frame_index || (use_metalfx && !flow_has_metalfx)) {
+        encodeFlow(command_buffer, use_metalfx);
+        flow_frame_index = frame_index;
+        flow_has_metalfx = use_metalfx;
+    }
     if (mode == FrameGeneration::MetalFx && metalfx &&
         std::abs(t - 0.5f) < 1e-3f && encodeMetalFx(command_buffer))
         return metalfx_output;

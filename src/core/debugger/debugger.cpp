@@ -86,7 +86,13 @@ void Debugger::breakpointHit(horizon::kernel::GuestThread* thread) {
 }
 
 void Debugger::logOnThisThread(const LogMessage& msg) {
-    GET_THIS_THREAD();
+    std::unique_lock lock(mutex);
+    const auto it = threads.find(std::this_thread::get_id());
+    // Host callbacks and background workers may log without a debugger entry.
+    // The logger has already written their message to its normal output.
+    if (it == threads.end())
+        return;
+    auto& thread = it->second;
     lock.unlock();
     auto stack_trace = getStackTrace(thread);
     lock.lock();

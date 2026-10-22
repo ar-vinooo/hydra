@@ -377,6 +377,8 @@ void hydraSystemProgressFrame(void* system, uint32_t width, uint32_t height,
 
 bool hydraSystemIsRunning(void* system);
 float hydraSystemGetLastDeltaTimeAverage(void* system);
+float hydraSystemGetLastShownFps(void* system);
+float hydraSystemGetLastGeneratedFps(void* system);
 
 void hydraSystemTakeScreenshot(void* system);
 void hydraSystemCaptureGpuFrame(void* system);

@@ -1,5 +1,7 @@
 #include "core/system.hpp"
 
+#include "core/hw/tegra_x1/gpu/display_stats.hpp"
+
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
@@ -737,6 +739,48 @@ void System::progressFrame(u32 width, u32 height,
                      static_cast<f64>(stats.render_pass_merges.exchange(0)) /
                          std::max(frames, 1.0));
             gpu.getRenderer().logPassProfile(frames);
+            {
+                const auto presents = stats.presents.exchange(0);
+                const auto gpu_count = stats.present_gpu_count.exchange(0);
+                LOG_INFO(Other,
+                         "PRESENT: filter {}, sharpening {}, frame generation "
+                         "{} | {}x{} -> {}x{} | GPU {:.3f} ms, CPU encode "
+                         "{:.3f} ms per present | {:.1f} presents/s",
+                         CONFIG_INSTANCE.getUpscalingFilter(),
+                         CONFIG_INSTANCE.getSharpening(),
+                         CONFIG_INSTANCE.getFrameGeneration(),
+                         stats.present_input_width.load(),
+                         stats.present_input_height.load(),
+                         stats.present_output_width.load(),
+                         stats.present_output_height.load(),
+                         static_cast<f64>(stats.present_gpu_ns.exchange(0)) /
+                             1e6 / std::max<f64>(static_cast<f64>(gpu_count), 1.0),
+                         static_cast<f64>(stats.present_encode_ns.exchange(0)) /
+                             1e6 / std::max<f64>(static_cast<f64>(presents), 1.0),
+                         static_cast<f64>(presents) / elapsed);
+            }
+            {
+                // Displayed since the last statistics
+                const auto& display = hw::tegra_x1::gpu::DisplayStats::instance();
+                static u64 last_counts[4] = {};
+                const u64 now_counts[4] = {display.game_frames.load(),
+                                           display.generated_frames.load(),
+                                           display.repeated_frames.load(),
+                                           display.dropped.load()};
+                f64 per_second[4];
+                for (usize i = 0; i < 4; i++) {
+                    per_second[i] =
+                        static_cast<f64>(now_counts[i] - last_counts[i]) / elapsed;
+                    last_counts[i] = now_counts[i];
+                }
+                LOG_INFO(Other,
+                         "DISPLAYED: {:.1f} images/s on screen ({:.1f} new "
+                         "game frames, {:.1f} generated, {:.1f} repeated) | "
+                         "{:.1f} dropped/s",
+                         per_second[0] + per_second[1] + per_second[2],
+                         per_second[0], per_second[1], per_second[2],
+                         per_second[3]);
+            }
             LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
                      static_cast<f64>(stats.compute_dispatches.exchange(0)) /
                          std::max(frames, 1.0),
@@ -883,6 +927,20 @@ void System::progressFrame(u32 width, u32 height,
             else
                 last_dt_average = 0.f;
             accumulated_dt = {};
+            // New images the display showed: game frames and generated ones
+            const auto& display = hw::tegra_x1::gpu::DisplayStats::instance();
+            const u64 game = display.game_frames.load();
+            const u64 generated = display.generated_frames.load();
+            const auto seconds =
+                std::chrono::duration<f32>(time_since_last_dt_averaging).count();
+            last_shown_fps =
+                static_cast<f32>((game - last_display_game) +
+                                 (generated - last_display_generated)) /
+                seconds;
+            last_generated_fps =
+                static_cast<f32>(generated - last_display_generated) / seconds;
+            last_display_game = game;
+            last_display_generated = generated;
             last_dt_averaging_time = now;
 
             out_dt_average_updated = true;

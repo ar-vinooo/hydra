@@ -44,6 +44,10 @@ class System {
 
     bool isRunning() const;
     f32 getLastDeltaTimeAverage() const { return last_dt_average; }
+    // New images per second the display showed (game frames and generated
+    // ones), and the generated ones among them, over the same period
+    f32 getLastShownFps() const { return last_shown_fps; }
+    f32 getLastGeneratedFps() const { return last_generated_fps; }
 
     void takeScreenshot();
     void captureGpuFrame();
@@ -73,6 +77,10 @@ class System {
 
     // Delta time
     f32 last_dt_average{0.0f};
+    f32 last_shown_fps{0.0f};
+    f32 last_generated_fps{0.0f};
+    u64 last_display_game{0};
+    u64 last_display_generated{0};
     horizon::display::AccumulatedTime accumulated_dt;
     clock_t::time_point last_dt_averaging_time{clock_t::now()};
 

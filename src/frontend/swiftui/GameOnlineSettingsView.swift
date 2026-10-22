@@ -128,6 +128,76 @@ struct GameOnlineSettingsView: View {
 
     @State private var settings = GameOnlineSettings()
     @State private var errorMessage: String?
+    // The nickname's account on the server
+    @State private var accountStatus: String?
+    @State private var accountBusy = false
+
+    private var account: RyuNetAccount {
+        RyuNetAccount(host: self.settings.server, port: self.settings.httpPort)
+    }
+
+    private func describe(_ status: RyuNetAccount.Status) -> String {
+        var text: String
+        switch status.status {
+        case "yours": text = "Yours on this Mac"
+        case "free": text = "Free: claimed when the game boots online"
+        case "taken": text = "Taken by another installation"
+        case "reserved": text = "Reserved, choose another nickname"
+        case "invalid": text = "Not a valid nickname"
+        default: text = status.status
+        }
+        if status.linked {
+            text += status.discord.map { ", linked to Discord \($0)" } ?? ", linked to Discord"
+        } else if status.status == "yours" {
+            text += ", not linked to Discord (unlinked nicknames expire after 60 unused days)"
+        }
+        return text
+    }
+
+    // Runs an account request, showing its result as the account status
+    private func runAccount(_ work: @escaping () async throws -> String) {
+        self.accountBusy = true
+        Task {
+            let text: String
+            do {
+                text = try await work()
+            } catch {
+                text = error.localizedDescription
+            }
+            await MainActor.run {
+                self.accountStatus = text
+                self.accountBusy = false
+            }
+        }
+    }
+
+    private func checkAccount() {
+        let account = self.account
+        let nickname = self.settings.nickname
+        runAccount { describe(try await account.status(nickname: nickname)) }
+    }
+
+    private func linkDiscord(recover: Bool) {
+        let account = self.account
+        let nickname = recover ? "" : self.settings.nickname
+        runAccount {
+            let answer = try await account.linkDiscord(nickname: nickname)
+            let status = answer["status"] as? String ?? "unknown"
+            if recover, let recovered = answer["nick"] as? String, !recovered.isEmpty {
+                await MainActor.run { self.settings.nickname = recovered }
+                return "Recovered \(recovered): save to use it"
+            }
+            switch status {
+            case "linked", "own_nick":
+                return describe(try await account.status(nickname: nickname))
+            case "no_nick": return "This Discord account has no nickname to recover"
+            case "other_nick":
+                return "This Discord account is linked to another nickname"
+            case "taken": return "The nickname belongs to another installation"
+            default: return "The server answered: \(status)"
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -156,6 +226,37 @@ struct GameOnlineSettingsView: View {
                 TextField("Demonware key (hex)", text: self.$settings.demonwareKey)
             }
             .disabled(!self.settings.enabled)
+
+            GroupBox("Account") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        if self.accountBusy {
+                            ProgressView().controlSize(.small)
+                        }
+                        Text(self.accountStatus ?? "Not checked")
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                    }
+                    HStack {
+                        Button("Check") { self.checkAccount() }
+                        Button("Link with Discord") { self.linkDiscord(recover: false) }
+                        Button("Recover with Discord") { self.linkDiscord(recover: true) }
+                    }
+                    .disabled(
+                        self.accountBusy || !self.settings.enabled
+                            || self.settings.problem != nil)
+                    Text(
+                        "Linking opens Discord in the browser. A linked nickname never expires and can be recovered on another Mac."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .onChange(of: self.settings.nickname) { _, _ in self.accountStatus = nil }
+            .onChange(of: self.settings.server) { _, _ in self.accountStatus = nil }
 
             Text(
                 "The redirected hosts resolve to the server, and TLS to the server's ports 80 and 443 reaches its HTTP port without encryption. The settings apply when the game boots."
@@ -201,6 +302,9 @@ struct GameOnlineSettingsView: View {
         .frame(minWidth: 460)
         .onAppear {
             self.settings = GameOnlineSettings.load(titleId: self.game.loader.titleId)
+            if self.settings.enabled && self.settings.problem == nil {
+                self.checkAccount()
+            }
         }
     }
 }

@@ -76,6 +76,9 @@ class HostSockets {
         bool is_stream;
         bool non_blocking;
         const online::Config* config;
+        bool logged_receive{false};
+        // DEBUG: datagrams logged with their bytes
+        u32 logged_datagrams{0};
         i64 recv_timeout_ms{-1};
         i64 send_timeout_ms{-1};
         std::optional<online::HttpProofInjector> http;

@@ -110,6 +110,17 @@ struct PerfStats {
     std::atomic<u64> register_writes{0};
     std::atomic<u64> register_write_skips{0};
     std::atomic<u64> render_encoders{0};
+    // Presentation (upscaling, sharpening, frame generation and the draw to
+    // the drawable): GPU time of its command buffers and CPU encoding time,
+    // per present, and the size it scaled from and to
+    std::atomic<u64> present_gpu_ns{0};
+    std::atomic<u64> present_gpu_count{0};
+    std::atomic<u64> present_encode_ns{0};
+    std::atomic<u64> presents{0};
+    std::atomic<u32> present_input_width{0};
+    std::atomic<u32> present_input_height{0};
+    std::atomic<u32> present_output_width{0};
+    std::atomic<u32> present_output_height{0};
     // Render passes and the attachment memory they read (load) and write
     // (store), from the attachment sizes. A continuation reopens the
     // attachments of the previous render pass and loads all of them; it is

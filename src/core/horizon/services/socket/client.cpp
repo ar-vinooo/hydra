@@ -120,9 +120,9 @@ result_t IClient::poll(System* system, kernel::Process* process, u32 nfds,
     }
 
     const auto in_span = getSpan(in_fds);
-    std::vector<u8> fds(in_span.begin(),
-                        in_span.begin() + std::min<usize>(in_span.size(),
-                                                          usize{nfds} * 8));
+    const auto poll_span = in_span.first(
+        std::min<usize>(in_span.size(), usize{nfds} * 8));
+    std::vector<u8> fds(poll_span.begin(), poll_span.end());
     setResult(sockets->poll(fds, timeout), out_ret, out_errno);
 
     const auto out_span = getSpan(out_fds);

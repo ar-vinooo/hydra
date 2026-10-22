@@ -362,7 +362,8 @@ void ShaderLibraryCache::run(std::map<std::filesystem::path, StoredFile> stored)
                 disk_bytes + save.source.size() <= limits.disk_bytes) {
                 std::ofstream output(path.string() + ".tmp",
                                      std::ios::binary | std::ios::trunc);
-                output.write(save.source.data(), save.source.size());
+                output.write(save.source.data(),
+                             static_cast<std::streamsize>(save.source.size()));
                 output.close();
                 if (output) {
                     std::filesystem::rename(path.string() + ".tmp", path, error);

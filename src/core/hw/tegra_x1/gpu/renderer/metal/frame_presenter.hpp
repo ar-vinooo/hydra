@@ -54,6 +54,10 @@ class FramePresenter {
                  bool new_frame);
     // Forgets the guest frames seen so far (the presenter was not used)
     void reset() { history = 0; }
+    // What the last present showed: a game frame shown for the first time,
+    // a generated frame, or an image shown before
+    enum class Shown { GameFrame, Generated, Repeated };
+    Shown lastShown() const { return last_shown; }
 
   private:
     // Guest frames interpolated at most this many refreshes apart. Longer
@@ -125,6 +129,14 @@ class FramePresenter {
     // Guest frames in the slots (0 to 2)
     u32 history{0};
     u64 frame_index{0};
+    Shown last_shown{Shown::Repeated};
+    // The game frame shown last, to tell a repeat from a first showing
+    u64 shown_frame_index{~0ull};
+    // The guest frame the motion was searched for, and whether it includes
+    // MetalFX's motion texture. The search only runs when a refresh shows a
+    // generated frame: a game that keeps up with the display needs none.
+    u64 flow_frame_index{~0ull};
+    bool flow_has_metalfx{false};
     // Display refreshes since the current frame arrived, counting the one it
     // arrived on
     u32 refreshes_since_frame{0};
@@ -140,7 +152,7 @@ class FramePresenter {
                              MTL::PixelFormat texture_format,
                              MTL::TextureUsage usage, u32 mip_count = 1);
 
-    void pushFrame(CommandBuffer* command_buffer, bool metalfx_enabled);
+    void pushFrame(CommandBuffer* command_buffer);
     MTL::Texture* getFrameForRefresh(CommandBuffer* command_buffer,
                                      FrameGeneration mode);
     void encodeLuma(CommandBuffer* command_buffer, const Slot& slot);

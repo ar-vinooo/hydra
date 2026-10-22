@@ -8,7 +8,7 @@ struct ContentView: View {
     @EnvironmentObject var globalState: GlobalState
 
     @AppStorage("viewMode") private var viewMode: ViewMode = .list
-    @State private var fps: Int = 0
+    @State private var fps = FrameRate()
 
     #if os(iOS)
         @State private var virtualController: GCVirtualController? = nil
@@ -29,7 +29,12 @@ struct ContentView: View {
         var gitInsert = ""
         if gitVersion != "" { gitInsert = " (\(gitVersion))" }
         var fpsInsert = ""
-        if globalState.system != nil { fpsInsert = "  |  \(fps) FPS" }
+        if globalState.system != nil {
+            // With generated frames on screen, the game's own rate too
+            fpsInsert =
+                fps.shown > fps.game + 1
+                ? "  |  \(fps.shown) FPS (\(fps.game) game)" : "  |  \(fps.shown) FPS"
+        }
         return "Hydra v\(appVersion)\(gitInsert)\(titleInsert)\(fpsInsert)"
     }
 

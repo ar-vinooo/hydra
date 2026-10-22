@@ -1,16 +1,24 @@
 import MetalKit
 import SwiftUI
 
+// The frame rate in the window title
+struct FrameRate: Equatable {
+    // New images per second on screen: game frames and generated ones
+    var shown = 0
+    // The game's own frames per second
+    var game = 0
+}
+
 class MetalLayerCoordinator: NSObject {
     @Binding var system: HydraSystem?
-    @Binding var fps: Int
+    @Binding var fps: FrameRate
 
     private var layer: CAMetalLayer? = nil
     private var displayLink: CADisplayLink? = nil
     private var surfaceSet = false
     private var hudShown: Bool? = nil
 
-    init(system: Binding<HydraSystem?>, fps: Binding<Int>) {
+    init(system: Binding<HydraSystem?>, fps: Binding<FrameRate>) {
         self._system = system
         self._fps = fps
         super.init()
@@ -79,11 +87,11 @@ class MetalLayerCoordinator: NSObject {
             // Update
             if dtAverageUpdated {
                 let dt = system.getLastDeltaTimeAverage()
-                if dt != 0.0 {
-                    fps = Int((1.0 / dt).rounded())
-                } else {
-                    fps = 0
-                }
+                let game = dt != 0.0 ? Int((1.0 / dt).rounded()) : 0
+                // Shown counts what the display really showed; before the
+                // display reports anything, the game's rate stands in
+                let shown = Int(system.getLastShownFps().rounded())
+                fps = FrameRate(shown: shown != 0 ? shown : game, game: game)
             }
         }
     }
@@ -93,7 +101,7 @@ class MetalLayerCoordinator: NSObject {
     struct MetalView: NSViewRepresentable {
         @EnvironmentObject var globalState: GlobalState
 
-        @Binding var fps: Int
+        @Binding var fps: FrameRate
 
         func makeNSView(context: Context) -> NSView {
             let view = NSView(frame: .zero)
@@ -136,7 +144,7 @@ class MetalLayerCoordinator: NSObject {
     struct MetalView: UIViewRepresentable {
         @EnvironmentObject var globalState: GlobalState
 
-        @Binding var fps: Int
+        @Binding var fps: FrameRate
 
         func makeUIView(context: Context) -> UIView {
             let view = MetalBackedView(frame: .zero)

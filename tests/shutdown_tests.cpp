@@ -9,6 +9,7 @@
 #include "core/horizon/services/audio/audio_out.hpp"
 #include "core/horizon/services/audio/audio_renderer.hpp"
 #include "core/horizon/services/mmnv/request.hpp"
+#include "core/horizon/services/nifm/general_service.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_as_gpu.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl_gpu.hpp"
@@ -556,12 +557,44 @@ void testAudioMixUpdates(System& system, kernel::Process* process) {
 }
 
 void testResolverAndCharacteristics(System& system, kernel::Process* process) {
+    {
+        class Nifm : public services::nifm::IGeneralService {
+          public:
+            using IGeneralService::requestImpl;
+        } nifm;
+        alignas(16) std::array<u8, 0x1000> tls{}, output{}, objects{}, copies{}, handles{};
+        std::array<u8, 8> client_id;
+        client_id.fill(0xa5);
+        const auto parsed = kernel::hipc::parseRequest(tls.data());
+        kernel::hipc::Streams streams(process->getMmu(), parsed, output.data(),
+                                     objects.data(), copies.data(), handles.data());
+        services::RequestContext context{system, process, streams};
+        streams.recv_list_streams = {ztd::io::MemoryStream(std::span(client_id))};
+        check(nifm.requestImpl(context, 1) == RESULT_SUCCESS,
+              "NIFM GetClientId command succeeds");
+        u32 id = 0;
+        std::memcpy(&id, client_id.data(), sizeof(id));
+        check(id != 0 && client_id[4] == 0xa5,
+              "NIFM writes a nonzero 32-bit ID to the pointer buffer");
+        client_id.fill(0xa5);
+        check(nifm.requestImpl(context, 1) == RESULT_SUCCESS,
+              "Repeated GetClientId succeeds");
+        u32 repeated_id = 0;
+        std::memcpy(&repeated_id, client_id.data(), sizeof(repeated_id));
+        check(repeated_id == id, "NIFM client identity is stable");
+        streams.recv_list_streams = {std::nullopt};
+        check(nifm.requestImpl(context, 1) != RESULT_SUCCESS,
+              "NIFM rejects a missing client ID output buffer");
+        std::cout << "PASS: NIFM client ID IPC buffer and stable identity\n";
+    }
     namespace hipc = kernel::hipc;
     services::socket::resolver::IResolver resolver;
     for (const u32 command : {6u, 12u}) {
         alignas(16) std::array<u8, 0x2000> tls{};
         const auto request = hipc::makeRequest(tls.data(),
             {.type = static_cast<u32>(hipc::cmif::CommandType::Request),
+             .num_send_buffers = command == 6 ? 3u : 4u,
+             .num_recv_buffers = 1,
              .num_data_words = 16});
         auto* data = hipc::cmif::alignDataStart(request.data_words);
         const hipc::cmif::InHeader input{hipc::cmif::IN_HEADER_MAGIC, 0, command, 0};

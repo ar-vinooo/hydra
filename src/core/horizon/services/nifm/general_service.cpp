@@ -53,12 +53,23 @@ struct SfNetworkProfileData {
 
 } // namespace
 
-DEFINE_SERVICE_COMMAND_TABLE(IGeneralService, 4, createRequest, 5,
+DEFINE_SERVICE_COMMAND_TABLE(IGeneralService, 1, getClientId, 4, createRequest, 5,
                              getCurrentNetworkProfile, 12, getCurrentIpAddress,
                              15, getCurrentIpConfigInfo, 18,
                              getInternetConnectionStatus, 21,
                              isAnyInternetRequestAccepted, 22,
                              isAnyForegroundRequestAccepted)
+
+result_t IGeneralService::getClientId(
+    OutBuffer<BufferAttr::HipcPointer> out_buffer) {
+    // nifmGetClientId returns a nonzero 32-bit ID through a pointer buffer.
+    // This service instance represents the single emulated network client.
+    if (!out_buffer.isValid() || out_buffer.stream->getSize() < sizeof(u32))
+        return MAKE_RESULT(Svc, 0);
+    out_buffer.stream->write<u32>(1);
+    LOG_INFO(Services, "Online: network client ID returned");
+    return RESULT_SUCCESS;
+}
 
 result_t IGeneralService::createRequest(RequestContext* ctx,
                                         i32 requirement_preset) {

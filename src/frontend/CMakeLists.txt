@@ -43,6 +43,7 @@ elseif (FRONTEND STREQUAL "SwiftUI")
         swiftui/GamePreviewContainer.swift
         swiftui/GameExtractButton.swift
         swiftui/GameOnlineSettingsView.swift
+        swiftui/RyuNetAccount.swift
         swiftui/GameListView.swift
         swiftui/GameStopView.swift
         swiftui/helpers/Error.swift

@@ -322,7 +322,7 @@ void CommandBuffer::track(const MTL::Texture* texture) {
     if (mtl4_context == nullptr || texture == nullptr)
         return;
     // Drawables are made resident through their layer
-    if (texture->framebufferOnly())
+    if (texture->isFramebufferOnly())
         return;
     auto& submission = *mtl4_submission;
     if (!submission.tracked.insert(texture).second)
