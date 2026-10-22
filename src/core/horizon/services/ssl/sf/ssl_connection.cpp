@@ -150,10 +150,11 @@ result_t ISslConnection::read(u32* out_size,
     if (!handshake_done)
         return RESULT_INTERNAL_ERROR;
 
+    // The I/O mode decides, not the socket's own flag
+    const bool blocking = io_mode == IoMode::Blocking;
     const auto result =
-        sockets.recv(fd, getSpan(out_buffer),
-                     io_mode == IoMode::NonBlocking ? MSG_DONTWAIT_ : 0, {},
-                     nullptr);
+        sockets.recv(fd, getSpan(out_buffer), blocking ? 0 : MSG_DONTWAIT_,
+                     {}, nullptr, blocking);
     if (result.ret > 0)
         *out_size = static_cast<u32>(result.ret);
     return toResult(result);
@@ -165,9 +166,9 @@ result_t ISslConnection::write(InBuffer<BufferAttr::MapAlias> buffer,
     if (!handshake_done)
         return RESULT_INTERNAL_ERROR;
 
-    const auto result =
-        sockets.send(fd, getSpan(buffer),
-                     io_mode == IoMode::NonBlocking ? MSG_DONTWAIT_ : 0, {});
+    const bool blocking = io_mode == IoMode::Blocking;
+    const auto result = sockets.send(fd, getSpan(buffer),
+                                     blocking ? 0 : MSG_DONTWAIT_, {}, blocking);
     if (result.ret > 0)
         *out_size = static_cast<u32>(result.ret);
     return toResult(result);

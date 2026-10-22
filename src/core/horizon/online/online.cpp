@@ -649,7 +649,16 @@ std::string HttpProofInjector::feed(std::span<const u8> data) {
             continue;
         }
 
-        // Request head
+        // Request head. A request starts with its method; anything else
+        // (0x16: TLS of the title's own) cannot be followed.
+        if (head.empty() && !(rest[0] >= 'A' && rest[0] <= 'Z')) {
+            LOG_WARN(Services,
+                     "Online: no HTTP to the server's HTTP port (first byte "
+                     "{:#04x}), passed through",
+                     rest[0]);
+            raw = true;
+            continue;
+        }
         const auto old_size = head.size();
         head.append(reinterpret_cast<const char*>(rest.data()), rest.size());
         const auto end =

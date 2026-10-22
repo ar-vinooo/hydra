@@ -334,7 +334,7 @@ CallResult HostSockets::wait(const Socket& socket, short events,
 }
 
 template <typename Op>
-CallResult HostSockets::run(Socket& socket, short events, bool dont_wait,
+CallResult HostSockets::run(const Socket& socket, short events, bool may_wait,
                             i64 timeout_ms, Op op) {
     while (true) {
         const auto ret = op();
@@ -343,7 +343,7 @@ CallResult HostSockets::run(Socket& socket, short events, bool dont_wait,
         const int error = errno;
         if (error != EAGAIN && error != EWOULDBLOCK)
             return {-1, translateErrno(error)};
-        if (socket.non_blocking || dont_wait)
+        if (!may_wait)
             return {-1, E_AGAIN};
         if (const auto result = wait(socket, events, timeout_ms);
             result.ret < 0)
@@ -494,8 +494,8 @@ CallResult HostSockets::accept(i32 fd, std::span<u8> out_addr,
 
     sockaddr_in addr{};
     socklen_t addr_size = sizeof(addr);
-    const auto result =
-        run(*socket, POLLIN, false, socket->recv_timeout_ms, [&] {
+    const auto result = run(
+        *socket, POLLIN, !socket->non_blocking, socket->recv_timeout_ms, [&] {
             return ::accept(socket->host_fd, reinterpret_cast<sockaddr*>(&addr),
                             &addr_size);
         });
@@ -516,16 +516,19 @@ CallResult HostSockets::accept(i32 fd, std::span<u8> out_addr,
 }
 
 CallResult HostSockets::recv(i32 fd, std::span<u8> buffer, i32 flags,
-                             std::span<u8> out_addr, u32* out_addr_size) {
+                             std::span<u8> out_addr, u32* out_addr_size,
+                             bool force_wait) {
     auto* socket = get(fd);
     if (!socket)
         return {-1, E_BADF};
 
     const int host_flags = ((flags & GUEST_MSG_PEEK) ? MSG_PEEK : 0) |
                            ((flags & GUEST_MSG_OOB) ? MSG_OOB : 0);
+    const bool may_wait = (flags & GUEST_MSG_DONTWAIT) == 0 &&
+                          (!socket->non_blocking || force_wait);
     sockaddr_in addr{};
     socklen_t addr_size = sizeof(addr);
-    const auto result = run(*socket, POLLIN, (flags & GUEST_MSG_DONTWAIT) != 0,
+    const auto result = run(*socket, POLLIN, may_wait,
                             socket->recv_timeout_ms, [&] {
                                 return ::recvfrom(
                                     socket->host_fd, buffer.data(),
@@ -553,7 +556,7 @@ CallResult HostSockets::recv(i32 fd, std::span<u8> buffer, i32 flags,
 }
 
 CallResult HostSockets::send(i32 fd, std::span<const u8> buffer, i32 flags,
-                             std::span<const u8> addr) {
+                             std::span<const u8> addr, bool force_wait) {
     auto* socket = get(fd);
     if (!socket)
         return {-1, E_BADF};
@@ -582,8 +585,9 @@ CallResult HostSockets::send(i32 fd, std::span<const u8> buffer, i32 flags,
     }
 
     const int host_flags = ((flags & GUEST_MSG_OOB) ? MSG_OOB : 0) | SEND_FLAGS;
-    return run(*socket, POLLOUT, (flags & GUEST_MSG_DONTWAIT) != 0,
-               socket->send_timeout_ms, [&] {
+    const bool may_wait = (flags & GUEST_MSG_DONTWAIT) == 0 &&
+                          (!socket->non_blocking || force_wait);
+    return run(*socket, POLLOUT, may_wait, socket->send_timeout_ms, [&] {
                    return host_addr
                               ? ::sendto(socket->host_fd, buffer.data(),
                                          buffer.size(), host_flags,

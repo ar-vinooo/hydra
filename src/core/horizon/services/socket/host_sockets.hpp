@@ -38,12 +38,14 @@ class HostSockets {
     CallResult connect(i32 fd, std::span<const u8> addr);
     CallResult listen(i32 fd, i32 backlog);
     CallResult accept(i32 fd, std::span<u8> out_addr, u32& out_addr_size);
-    // out_addr_size: nullptr for recv
+    // out_addr_size: nullptr for recv. force_wait: wait even when the title
+    // made the socket non-blocking (nn::ssl's blocking I/O mode).
     CallResult recv(i32 fd, std::span<u8> buffer, i32 flags,
-                    std::span<u8> out_addr, u32* out_addr_size);
+                    std::span<u8> out_addr, u32* out_addr_size,
+                    bool force_wait = false);
     // addr: empty for send
     CallResult send(i32 fd, std::span<const u8> buffer, i32 flags,
-                    std::span<const u8> addr);
+                    std::span<const u8> addr, bool force_wait = false);
     CallResult getSockName(i32 fd, std::span<u8> out_addr,
                            u32& out_addr_size);
     CallResult getPeerName(i32 fd, std::span<u8> out_addr,
@@ -88,8 +90,10 @@ class HostSockets {
     Socket* get(i32 fd);
     i32 add(Socket socket);
     CallResult wait(const Socket& socket, short events, i64 timeout_ms);
+    // Runs op until it does not report EAGAIN, waiting for events between the
+    // tries when may_wait
     template <typename Op>
-    CallResult run(Socket& socket, short events, bool dont_wait,
+    CallResult run(const Socket& socket, short events, bool may_wait,
                    i64 timeout_ms, Op op);
     CallResult sendAll(Socket& socket, std::span<const u8> data);
 };
