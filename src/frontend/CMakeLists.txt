@@ -42,6 +42,7 @@ elseif (FRONTEND STREQUAL "SwiftUI")
         swiftui/GridGamePreview.swift
         swiftui/GamePreviewContainer.swift
         swiftui/GameExtractButton.swift
+        swiftui/GameOnlineSettingsView.swift
         swiftui/GameListView.swift
         swiftui/GameStopView.swift
         swiftui/helpers/Error.swift

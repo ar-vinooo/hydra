@@ -8,6 +8,7 @@
 #include "core/horizon/services/irsensor/internal/ir_sensor_manager.hpp"
 #include "core/horizon/services/pl/internal/shared_font_manager.hpp"
 #include "core/horizon/services/server.hpp"
+#include "core/horizon/services/socket/host_sockets.hpp"
 #include "core/horizon/services/timesrv/internal/time_manager.hpp"
 
 namespace hydra::audio {
@@ -30,6 +31,10 @@ class OS {
         display_server.stop();
         nvservices_server.stop();
         others_server.stop();
+        // A socket call may be waiting for the network
+        host_sockets.interrupt();
+        socket_server.stop();
+        host_sockets.closeAll();
     }
 
     void setAddOnContent(std::map<u64, std::shared_ptr<filesystem::IFile>> content) {
@@ -66,9 +71,11 @@ class OS {
     services::Server nvservices_server;
     services::Server others_server;
     services::Server display_server;
+    services::Server socket_server;
 
     // Managers
     display::Driver display_driver;
+    services::socket::HostSockets host_sockets;
     services::hid::internal::ResourceManager hid_resource_manager;
     services::account::internal::UserManager user_manager;
     services::pl::internal::SharedFontManager shared_font_manager;
@@ -91,6 +98,7 @@ class OS {
     REF_GETTER(shared_font_manager, getSharedFontManager);
     REF_GETTER(time_manager, getTimeManager);
     REF_GETTER(ir_sensor_manager, getIrSensorManager);
+    REF_GETTER(host_sockets, getHostSockets);
 };
 
 } // namespace hydra::horizon

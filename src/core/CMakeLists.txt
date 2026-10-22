@@ -19,6 +19,8 @@ add_library(hydra-core
     horizon/const.hpp
     horizon/handle_pool.hpp
     horizon/os.cpp
+    horizon/online/online.cpp
+    horizon/online/online.hpp
     horizon/os.hpp
     horizon/kernel/const.hpp
     horizon/kernel/applet_resource.hpp
@@ -315,6 +317,8 @@ add_library(hydra-core
     horizon/services/account/notifier.cpp
     horizon/services/account/notifier.hpp
     horizon/services/account/account_service.cpp
+    horizon/services/account/async_context.cpp
+    horizon/services/account/async_context.hpp
     horizon/services/account/account_service.hpp
     horizon/services/account/account_service_for_administrator.cpp
     horizon/services/account/account_service_for_administrator.hpp
@@ -336,6 +340,8 @@ add_library(hydra-core
     horizon/services/apm/session.cpp
     horizon/services/apm/session.hpp
     horizon/services/socket/client.cpp
+    horizon/services/socket/host_sockets.cpp
+    horizon/services/socket/host_sockets.hpp
     horizon/services/socket/client.hpp
     horizon/services/socket/resolver/resolver.cpp
     horizon/services/socket/resolver/resolver.hpp
@@ -351,6 +357,8 @@ add_library(hydra-core
     horizon/services/audio/audio_renderer_manager.cpp
     horizon/services/audio/audio_renderer_manager.hpp
     horizon/services/ssl/sf/const.hpp
+    horizon/services/ssl/sf/ssl_connection.cpp
+    horizon/services/ssl/sf/ssl_connection.hpp
     horizon/services/ssl/sf/ssl_context.cpp
     horizon/services/ssl/sf/ssl_context.hpp
     horizon/services/ssl/sf/ssl_service.cpp

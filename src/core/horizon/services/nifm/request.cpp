@@ -9,12 +9,18 @@ DEFINE_SERVICE_COMMAND_TABLE(IRequest, 0, getRequestState, 1, getResult, 2,
                              submit, 6, setRequirementPreset, 11,
                              setConnectionConfirmationOption)
 
-IRequest::IRequest()
-    : events{
+IRequest::IRequest(bool online_)
+    : online{online_},
+      events{
           std::make_unique<kernel::Event>(false, "IRequest system event 0"),
           std::make_unique<kernel::Event>(false, "IRequest system event 1")} {}
 
 result_t IRequest::getRequestState(RequestState* out_state) {
+    if (online) {
+        *out_state = RequestState::Accepted;
+        return RESULT_SUCCESS;
+    }
+
     LOG_FUNC_STUBBED(Services);
 
     // HACK
@@ -28,6 +34,18 @@ result_t IRequest::getSystemEventReadableHandles(
     OutHandle<HandleAttr::Copy> out_handle1) {
     out_handle0 = process->addHandle(events[0].get());
     out_handle1 = process->addHandle(events[1].get());
+    return RESULT_SUCCESS;
+}
+
+result_t IRequest::submit() {
+    // Online, the request is accepted at once
+    if (online) {
+        for (auto& event : events)
+            event->signal();
+        return RESULT_SUCCESS;
+    }
+
+    ONCE(LOG_FUNC_STUBBED(Services));
     return RESULT_SUCCESS;
 }
 

@@ -4,6 +4,7 @@
 #include "core/horizon/filesystem/directory.hpp"
 #include "core/horizon/kernel/kernel.hpp"
 #include "core/horizon/kernel/process.hpp"
+#include "core/horizon/online/online.hpp"
 #include "elf.h"
 
 namespace hydra::horizon::loader {
@@ -155,6 +156,14 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
         readSegment(stream, ptr, segment.seg, segment.file_size,
                     segment.compressed);
     }
+
+    // Online settings, which may patch the main module's read-only data
+    if (name == "main")
+        online::loadTitle(
+            process->getTitleId(),
+            std::span(reinterpret_cast<u8*>(ptr) +
+                          segments[1].seg.memory_offset,
+                      static_cast<usize>(segments[1].seg.size)));
 
     // Arg data
     // TODO: don't hardcode

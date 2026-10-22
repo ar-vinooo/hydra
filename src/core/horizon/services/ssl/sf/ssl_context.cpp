@@ -1,9 +1,26 @@
 #include "core/horizon/services/ssl/sf/ssl_context.hpp"
 
+#include "core/horizon/os.hpp"
+#include "core/horizon/services/ssl/sf/ssl_connection.hpp"
+#include "core/system.hpp"
+
 namespace hydra::horizon::services::ssl::sf {
 
-DEFINE_SERVICE_COMMAND_TABLE(ISslContext, 4, importServerPki, 5,
-                             importClientPki, 8, registerInternalPki)
+DEFINE_SERVICE_COMMAND_TABLE(ISslContext, 0, setOption, 2, createConnection, 4,
+                             importServerPki, 5, importClientPki, 8,
+                             registerInternalPki)
+
+result_t ISslContext::setOption(u32 option, i32 value) {
+    LOG_FUNC_WITH_ARGS_STUBBED(Services, "option: {}, value: {}", option,
+                               value);
+    return RESULT_SUCCESS;
+}
+
+result_t ISslContext::createConnection(RequestContext* ctx) {
+    addService(*ctx,
+               new ISslConnection(ctx->system.getOs().getHostSockets()));
+    return RESULT_SUCCESS;
+}
 
 result_t ISslContext::importServerPki(CertificateFormat cert_format,
                                       InBuffer<BufferAttr::MapAlias> in_buffer,
