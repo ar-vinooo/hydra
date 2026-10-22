@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -429,32 +431,63 @@ std::string urlEncode(std::string_view str) {
 
 // Registers this installation for a free nickname before the title logs in
 // with it (OCTR's claim_nick): the title's own requests cannot register
+void claimNicknameNow(const Config& config) {
+    const auto key_hash = getKeyHash(config.server);
+    if (key_hash.empty())
+        return;
+
+    const auto query = "name=" + urlEncode(config.nickname);
+    const auto [status, body] =
+        requestServer(config, "GET", "/ryunet/nick?" + query, "");
+    if (status == 0) {
+        LOG_WARN(Services, "Online: {}:{} did not answer", config.server,
+                 config.http_port);
+        return;
+    }
+    if (body.find("\"free\"") == std::string::npos) {
+        LOG_INFO(Services, "Online: nickname {}: HTTP {} {}", config.nickname,
+                 status, body.substr(0, 200));
+        return;
+    }
+
+    const auto [claim_status, claim_body] = requestServer(
+        config, "POST", "/ryunet/nick/claim?" + query,
+        fmt::format("X-RyuNET-Key-Hash: {}\r\n", key_hash));
+    LOG_INFO(Services, "Online: nickname {} claimed: HTTP {} {}",
+             config.nickname, claim_status, claim_body.substr(0, 200));
+}
+
+// OCTR claims the nickname before it starts the game; here the claim runs
+// while the title boots and the title's requests to the server wait for it
+std::mutex g_claim_mutex;
+std::condition_variable g_claim_done;
+bool g_claim_pending{false};
+
 void claimNickname(const Config& config) {
+    {
+        std::lock_guard lock(g_claim_mutex);
+        g_claim_pending = true;
+    }
     std::thread([config] {
-        const auto key_hash = getKeyHash(config.server);
-        if (key_hash.empty())
-            return;
-
-        const auto query = "name=" + urlEncode(config.nickname);
-        const auto [status, body] =
-            requestServer(config, "GET", "/ryunet/nick?" + query, "");
-        if (status == 0) {
-            LOG_WARN(Services, "Online: {}:{} did not answer", config.server,
-                     config.http_port);
-            return;
+        claimNicknameNow(config);
+        {
+            std::lock_guard lock(g_claim_mutex);
+            g_claim_pending = false;
         }
-        if (body.find("\"free\"") == std::string::npos) {
-            LOG_INFO(Services, "Online: nickname {}: HTTP {} {}",
-                     config.nickname, status, body.substr(0, 200));
-            return;
-        }
-
-        const auto [claim_status, claim_body] = requestServer(
-            config, "POST", "/ryunet/nick/claim?" + query,
-            fmt::format("X-RyuNET-Key-Hash: {}\r\n", key_hash));
-        LOG_INFO(Services, "Online: nickname {} claimed: HTTP {} {}",
-                 config.nickname, claim_status, claim_body.substr(0, 200));
+        g_claim_done.notify_all();
     }).detach();
+}
+
+void waitForClaim() {
+    // Two requests with 4-second timeouts
+    constexpr auto TIMEOUT = std::chrono::seconds(10);
+
+    std::unique_lock lock(g_claim_mutex);
+    if (!g_claim_done.wait_for(lock, TIMEOUT,
+                               [] { return !g_claim_pending; }))
+        LOG_WARN(Services,
+                 "Online: the nickname claim is still running, the request "
+                 "goes out before it");
 }
 
 // The Demonware SDK checks the auth replies against an RSA-2048 public key
@@ -701,6 +734,7 @@ std::string HttpProofInjector::feed(std::span<const u8> data) {
             raw = true; // Chunked: the next head cannot be found
 
         LOG_INFO(Services, "Online: HTTP request {}", line);
+        waitForClaim();
         if (const auto proof = makeProof(config, method, target);
             !proof.empty()) {
             out.append(head, 0, head_size - 2);

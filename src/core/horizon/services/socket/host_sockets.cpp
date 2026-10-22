@@ -566,8 +566,10 @@ CallResult HostSockets::send(i32 fd, std::span<const u8> buffer, i32 flags,
         const auto result = sendAll(
             *socket, std::span(reinterpret_cast<const u8*>(data.data()),
                                data.size()));
+        // The title's bytes are taken already: a request that cannot go out
+        // fails the connection rather than being sent again (EAGAIN)
         if (result.ret < 0)
-            return result;
+            return {-1, result.error == E_AGAIN ? E_TIMEDOUT : result.error};
         return {static_cast<i32>(buffer.size()), 0};
     }
 
