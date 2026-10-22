@@ -32,6 +32,11 @@ class OS {
         others_server.stop();
     }
 
+    void setAddOnContent(std::map<u64, std::shared_ptr<filesystem::IFile>> content) {
+        add_on_content = std::move(content);
+    }
+    const auto& getAddOnContent() const { return add_on_content; }
+
     void notifyOperationModeChanged();
 
     void setSurfaceResolution(uint2 resolution);
@@ -51,6 +56,7 @@ class OS {
 
   private:
     System& system;
+    std::map<u64, std::shared_ptr<filesystem::IFile>> add_on_content;
 
     kernel::Kernel kernel;
     filesystem::Filesystem filesystem;

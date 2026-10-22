@@ -57,10 +57,12 @@ OcclusionCounter::prepareDraw(CommandBuffer& command_buffer,
                               MTL::RenderPassDescriptor* render_pass) {
     if (!enabled)
         return std::nullopt;
-    // Every page belongs to one encoder of one Metal command buffer
+    // Every page belongs to one encoder of one Metal command buffer. A pass
+    // that continues the open encoder keeps its page: a new one would end the
+    // encoder.
     if (open.page == nullptr || open.page->used == OcclusionPage::SLOTS ||
         open.token.get() != command_buffer.getCompletionToken() ||
-        !command_buffer.hasRenderPass(render_pass) ||
+        !command_buffer.continuesOpenRenderPass(render_pass) ||
         command_buffer.getVisibilityResultBuffer() != open.page->buffer) {
         closeSegment();
         open.page = pool->acquire();

@@ -72,6 +72,13 @@ class CommandBuffer final : public ICommandBuffer {
     getRenderCommandEncoder(MTL::RenderPassDescriptor* render_pass_descriptor);
     MTL::RenderCommandEncoder* createRenderCommandEncoder(
         MTL::RenderPassDescriptor* render_pass_descriptor);
+    // Encoder for draws that set their state on the encoder directly instead
+    // of through the state setters below (e.g. texture blits). When it
+    // continues the open pass, the state earlier draws left that such draws
+    // do not set is reset to that of a new encoder.
+    MTL::RenderCommandEncoder* getDirectRenderCommandEncoder(
+        MTL::RenderPassDescriptor* render_pass_descriptor,
+        MTL::DepthStencilState* depth_stencil_disabled);
 
     MTL::BlitCommandEncoder* getBlitCommandEncoderUnchecked() {
         ASSERT_DEBUG(encoder_type == EncoderType::Blit, MetalRenderer,
@@ -117,6 +124,9 @@ class CommandBuffer final : public ICommandBuffer {
         return encoder_type == EncoderType::Render &&
                encoder_state.render_pass == descriptor;
     }
+    // A render pass on the descriptor would use the open encoder: it is the
+    // open pass, or only continues it (see getRenderCommandEncoder)
+    bool continuesOpenRenderPass(MTL::RenderPassDescriptor* descriptor) const;
     bool lastSubmissionSucceeded() const { return last_submission_succeeded; }
     void retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
                             MTL::Buffer* buffer);
@@ -174,8 +184,12 @@ class CommandBuffer final : public ICommandBuffer {
     // and the attachments of the previous render pass (HYDRA_PERF_STATS)
     std::vector<GpuPassProfiler::Pass> profiled_passes;
     std::array<MTL::Texture*, COLOR_TARGET_COUNT + 2> previous_attachments{};
-    // What came after the previous render pass: 0 another render pass, 1 a
-    // blit, 2 a compute encoder, 3 a submission
+    // DEBUG: the previous render pass, to show why a continuation of it was
+    // not merged
+    std::string previous_pass_description;
+    // What ended the previous render pass: 0 another render pass, 1 a blit,
+    // 2 a compute encoder, 3 a submission, 4 a new visibility buffer, 5 an
+    // explicit end elsewhere
     u8 render_pass_gap{0};
     void profileRenderPass(MTL::RenderPassDescriptor* descriptor);
     u32 reservePassSamples(GpuPassProfiler::Kind kind, std::string label);

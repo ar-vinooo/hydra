@@ -4,6 +4,7 @@
 #include "core/horizon/filesystem/content_archive.hpp"
 #include "core/horizon/filesystem/disk_file.hpp"
 #include "core/horizon/loader/nca_loader.hpp"
+#include "core/horizon/loader/content_package.hpp"
 #include "core/horizon/loader/plugins/manager.hpp"
 #include "core/horizon/services/timesrv/internal/time_zone_manager.hpp"
 #include "core/horizon/ui/handler_base.hpp"
@@ -19,6 +20,7 @@ namespace {
 thread_local std::string system_error;
 thread_local std::string filesystem_error;
 thread_local std::string input_error;
+thread_local std::string content_install_result;
 
 HydraString hydraStringFromStringView(std::string_view str) {
     return HydraString{.data = str.data(), .size = str.size()};
@@ -395,6 +397,19 @@ hydraLoaderPluginOptionConfigGetPathContentTypes(const void* config) {
     return &reinterpret_cast<
                 const hydra::horizon::loader::plugins::OptionConfig*>(config)
                 ->path_content_types;
+}
+
+HYDRA_EXPORT bool hydraInstallContentPackage(HydraString path) {
+    try {
+        content_install_result = hydra::horizon::loader::installContentPackage(stringViewFromHydraString(path));
+        return true;
+    } catch (const std::exception& error) {
+        content_install_result = error.what();
+        return false;
+    }
+}
+HYDRA_EXPORT HydraString hydraContentInstallGetResult() {
+    return hydraStringFromStringView(content_install_result);
 }
 
 // Filesystem

@@ -26,6 +26,11 @@ struct GameListToolbarItems: ToolbarContent {
     @State private var isFirmwareFilePickerPresented = false
     @State private var isGameFilePickerPresented = false
     @State private var showingFirmwareImportError = false
+    @State private var isContentPickerPresented = false
+    @State private var isInstallingContent = false
+    @State private var showingContentInstallResult = false
+    @State private var contentInstallSucceeded = false
+    @State private var contentInstallMessage = ""
 
     var body: some ToolbarContent {
         #if os(macOS)
@@ -98,6 +103,47 @@ struct GameListToolbarItems: ToolbarContent {
 
         ToolbarItem(placement: addGamePlacement) {
             KeysImportButton()
+        }
+
+        ToolbarItem(placement: addGamePlacement) {
+            Button(isInstallingContent ? "Installing…" : "Install Update / DLC", systemImage: "shippingbox") {
+                isContentPickerPresented = true
+            }
+            .disabled(isInstallingContent || globalState.system != nil)
+            .help("Install an NSP or XCI containing game updates or DLC")
+            .fileImporter(isPresented: $isContentPickerPresented,
+                          allowedContentTypes: [nspType, xciType],
+                          allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    isInstallingContent = true
+                    Task {
+                        let outcome = await Task.detached(priority: .userInitiated) { () -> (Bool, String) in
+                            let access = url.startAccessingSecurityScopedResource()
+                            defer { if access { url.stopAccessingSecurityScopedResource() } }
+                            let success = url.path(percentEncoded: false).withHydraString { hydraInstallContentPackage($0) }
+                            // Copy the thread-local result before leaving this synchronous call.
+                            return (success, String(withHydraString: hydraContentInstallGetResult()))
+                        }.value
+                        contentInstallSucceeded = outcome.0
+                        contentInstallMessage = outcome.1
+                        isInstallingContent = false
+                        showingContentInstallResult = true
+                        if outcome.0 { globalState.loaderPluginRefreshID += 1 }
+                    }
+                case .failure(let error):
+                    contentInstallSucceeded = false
+                    contentInstallMessage = error.localizedDescription
+                    showingContentInstallResult = true
+                }
+            }
+            .alert(contentInstallSucceeded ? "Content installed" : "Installation failed",
+                   isPresented: $showingContentInstallResult) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(contentInstallMessage)
+            }
         }
 
         ToolbarItem(placement: addGamePlacement) {

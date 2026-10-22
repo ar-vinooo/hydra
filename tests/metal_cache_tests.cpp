@@ -2,6 +2,7 @@
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/occlusion.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
@@ -148,6 +149,199 @@ vertex float4 main_(uint id [[vertex_id]]) {
             check(missing_vertex.getPipeline() == nullptr,
                   "Pipeline with missing vertex stage was accepted");
             std::cout << "PASS: depth-only pipeline and missing vertex handling\n";
+            return 0;
+        }
+        if (mode == "occlusion-merge" || mode == "pass-lifetime") {
+            const bool release_descriptors = mode == "pass-lifetime";
+            // Occlusion counting across two render passes on the same target
+            // (descriptors differ, the second loads): merged into one encoder
+            // or not, every sample of both draws counts
+            using hydra::hw::tegra_x1::gpu::PerfStats;
+            const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 v(uint id [[vertex_id]]) {
+    const float2 p[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(p[id], 0, 1);
+}
+fragment float4 red() { return float4(1, 0, 0, 1); }
+)";
+            NS::Error* error = nullptr;
+            NS_STACK_SCOPED auto library =
+                device->newLibrary(toNsString(source), nullptr, &error);
+            check(library != nullptr, "Test shader compilation failed");
+            NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("v"));
+            NS_STACK_SCOPED auto fragment =
+                library->newFunction(toNsString("red"));
+            NS_STACK_SCOPED auto pipeline_descriptor =
+                MTL::RenderPipelineDescriptor::alloc()->init();
+            pipeline_descriptor->setVertexFunction(vertex);
+            pipeline_descriptor->setFragmentFunction(fragment);
+            pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+                MTL::PixelFormatRGBA8Unorm);
+            NS_STACK_SCOPED auto pipeline =
+                device->newRenderPipelineState(pipeline_descriptor, &error);
+            check(pipeline != nullptr, "Test pipeline creation failed");
+            constexpr hydra::u32 size = 64;
+            NS_STACK_SCOPED auto texture_descriptor =
+                MTL::TextureDescriptor::alloc()->init();
+            texture_descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+            texture_descriptor->setWidth(size);
+            texture_descriptor->setHeight(size);
+            texture_descriptor->setStorageMode(MTL::StorageModePrivate);
+            texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+            NS_STACK_SCOPED auto target = device->newTexture(texture_descriptor);
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            auto completions = std::make_shared<CompletionQueue>();
+            OcclusionCounter occlusion(device, completions);
+            occlusion.setEnabled(true);
+            auto result = std::make_shared<std::optional<hydra::u64>>();
+            auto& stats = PerfStats::instance();
+            stats.render_pass_merges = 0;
+            hydra::u64 sequence;
+            {
+                CommandBuffer commands(queue, completions);
+                NS_STACK_SCOPED auto clear_pass =
+                    MTL::RenderPassDescriptor::alloc()->init();
+                clear_pass->colorAttachments()->object(0)->setTexture(target);
+                clear_pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionClear);
+                clear_pass->colorAttachments()->object(0)->setStoreAction(
+                    MTL::StoreActionStore);
+                NS_STACK_SCOPED auto load_pass = clear_pass->copy();
+                load_pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionLoad);
+                std::vector<MTL::RenderPassDescriptor*> passes{clear_pass, load_pass};
+                if (release_descriptors)
+                    passes = {clear_pass->copy(), load_pass->copy(), load_pass->copy()};
+                for (auto* pass : passes) {
+                    // As the renderer does: the query before the encoder
+                    const auto offset = occlusion.prepareDraw(commands, pass);
+                    check(offset.has_value(), "Counting draw has no slot");
+                    auto* encoder = commands.getRenderCommandEncoder(pass);
+                    encoder->setRenderPipelineState(pipeline);
+                    encoder->setVisibilityResultMode(
+                        MTL::VisibilityResultModeCounting, *offset);
+                    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                                            NS::UInteger(0), NS::UInteger(3));
+                    // Model a transient pass or eviction of the renderer cache
+                    // entry before the next occlusion/merge comparison.
+                    if (release_descriptors) pass->release();
+                }
+                sequence = occlusion.queueReport(
+                    commands,
+                    [result](std::optional<hydra::u64> value) {
+                        *result = value;
+                    },
+                    {});
+            }
+            check(completions->wait(sequence, std::chrono::seconds(5)),
+                  "Occlusion report did not complete");
+            const bool merging = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
+            const auto draws = release_descriptors ? 3u : 2u;
+            check(result->has_value() && **result == draws * size * size,
+                  "Occlusion count across the passes is wrong");
+            if (PerfStats::isEnabled())
+                check(stats.render_pass_merges == (merging ? draws - 1 : 0u),
+                      "Passes were not merged as expected");
+            std::cout << "PASS " << mode << ": " << **result
+                      << " samples, merged passes " << stats.render_pass_merges
+                      << "\n";
+            return 0;
+        }
+        if (mode == "direct-merge") {
+            // A pass leaves a small scissor and back-face culling; a direct
+            // draw (as a texture blit) on the same target continues it and
+            // must still cover the whole target, as on a new encoder
+            using hydra::hw::tegra_x1::gpu::PerfStats;
+            const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 v(uint id [[vertex_id]]) {
+    const float2 p[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    return float4(p[id], 0, 1);
+}
+fragment float4 green() { return float4(0, 1, 0, 1); }
+)";
+            NS::Error* error = nullptr;
+            NS_STACK_SCOPED auto library =
+                device->newLibrary(toNsString(source), nullptr, &error);
+            check(library != nullptr, "Test shader compilation failed");
+            NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("v"));
+            NS_STACK_SCOPED auto fragment =
+                library->newFunction(toNsString("green"));
+            NS_STACK_SCOPED auto pipeline_descriptor =
+                MTL::RenderPipelineDescriptor::alloc()->init();
+            pipeline_descriptor->setVertexFunction(vertex);
+            pipeline_descriptor->setFragmentFunction(fragment);
+            pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+                MTL::PixelFormatRGBA8Unorm);
+            NS_STACK_SCOPED auto pipeline =
+                device->newRenderPipelineState(pipeline_descriptor, &error);
+            check(pipeline != nullptr, "Test pipeline creation failed");
+            NS_STACK_SCOPED auto depth_descriptor =
+                MTL::DepthStencilDescriptor::alloc()->init();
+            NS_STACK_SCOPED auto no_depth =
+                device->newDepthStencilState(depth_descriptor);
+            constexpr hydra::u32 size = 64;
+            NS_STACK_SCOPED auto texture_descriptor =
+                MTL::TextureDescriptor::alloc()->init();
+            texture_descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+            texture_descriptor->setWidth(size);
+            texture_descriptor->setHeight(size);
+            texture_descriptor->setStorageMode(MTL::StorageModeShared);
+            texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+            NS_STACK_SCOPED auto target = device->newTexture(texture_descriptor);
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            auto& stats = PerfStats::instance();
+            stats.render_pass_merges = 0;
+            MTL::CommandBuffer* native;
+            {
+                CommandBuffer commands(queue);
+                NS_STACK_SCOPED auto clear_pass =
+                    MTL::RenderPassDescriptor::alloc()->init();
+                clear_pass->colorAttachments()->object(0)->setTexture(target);
+                clear_pass->colorAttachments()->object(0)->setLoadAction(
+                    MTL::LoadActionClear);
+                clear_pass->colorAttachments()->object(0)->setClearColor(
+                    MTL::ClearColor(0, 0, 1, 1));
+                clear_pass->colorAttachments()->object(0)->setStoreAction(
+                    MTL::StoreActionStore);
+                auto* encoder = commands.getRenderCommandEncoder(clear_pass);
+                // State a direct draw does not set
+                encoder->setScissorRect(MTL::ScissorRect{0, 0, 4, 4});
+                encoder->setCullMode(MTL::CullModeFront);
+                encoder->setFrontFacingWinding(MTL::WindingClockwise);
+                {
+                    // Separately allocated, released after use, like a blit
+                    NS_STACK_SCOPED auto blit_pass = clear_pass->copy();
+                    blit_pass->colorAttachments()->object(0)->setLoadAction(
+                        MTL::LoadActionLoad);
+                    auto* direct =
+                        commands.getDirectRenderCommandEncoder(blit_pass, no_depth);
+                    direct->setRenderPipelineState(pipeline);
+                    direct->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                                           NS::UInteger(0), NS::UInteger(3));
+                }
+                native = commands.getCommandBuffer()->retain();
+            }
+            native->waitUntilCompleted();
+            check(native->status() == MTL::CommandBufferStatusCompleted,
+                  "Command buffer failed");
+            native->release();
+            const bool merging = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
+            if (PerfStats::isEnabled())
+                check(stats.render_pass_merges == (merging ? 1u : 0u),
+                      "The direct pass was not merged as expected");
+            std::vector<uint8_t> pixels(size * size * 4);
+            target->getBytes(pixels.data(), size * 4,
+                             MTL::Region::Make2D(0, 0, size, size), 0);
+            for (hydra::usize i = 0; i < pixels.size(); i += 4)
+                check(pixels[i] == 0 && pixels[i + 1] == 255 &&
+                          pixels[i + 2] == 0 && pixels[i + 3] == 255,
+                      "Direct draw did not cover the whole target");
+            std::cout << "PASS direct-merge: merged passes "
+                      << stats.render_pass_merges << ", all pixels drawn\n";
             return 0;
         }
         if (mode == "pass-profile") {

@@ -113,13 +113,14 @@ struct PerfStats {
     // Render passes and the attachment memory they read (load) and write
     // (store), from the attachment sizes. A continuation reopens the
     // attachments of the previous render pass and loads all of them; it is
-    // counted by what ended that pass: another render pass descriptor, a blit
-    // or compute encoder, or a submission.
+    // counted by what ended that pass: another render pass descriptor while it
+    // was open, a blit or compute encoder, a submission, a new occlusion
+    // visibility buffer, or an explicit end elsewhere.
     std::atomic<u64> render_passes{0};
     std::atomic<u64> render_pass_load_bytes{0};
     std::atomic<u64> render_pass_store_bytes{0};
     std::atomic<u64> render_pass_continuations{0};
-    std::array<std::atomic<u64>, 4> render_pass_continuation_causes{};
+    std::array<std::atomic<u64>, 6> render_pass_continuation_causes{};
     // Passes continued in the open encoder instead of a new one
     std::atomic<u64> render_pass_merges{0};
     std::atomic<u64> blit_encoders{0};

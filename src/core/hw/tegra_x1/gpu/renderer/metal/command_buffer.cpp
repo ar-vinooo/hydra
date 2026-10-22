@@ -132,6 +132,8 @@ CompletionToken* CommandBuffer::getCompletionToken() {
 void CommandBuffer::setVisibilityResultBuffer(MTL::Buffer* buffer) {
     if (buffer == visibility_buffer)
         return;
+    if (encoder_type == EncoderType::Render)
+        render_pass_gap = 4;
     endEncoding();
     if (visibility_buffer != nullptr)
         visibility_buffer->release();
@@ -144,6 +146,30 @@ namespace {
 // same attachments, all of them loaded and stored the same way. Ending the
 // open pass and starting a new one would store and load every attachment for
 // the same result.
+std::string describeRenderPass(MTL::RenderPassDescriptor* descriptor) {
+    std::string text = fmt::format(
+        "{}x{} layers {} samples {}", descriptor->renderTargetWidth(),
+        descriptor->renderTargetHeight(), descriptor->renderTargetArrayLength(),
+        descriptor->defaultRasterSampleCount());
+    const auto add = [&](MTL::RenderPassAttachmentDescriptor* attachment,
+                         std::string_view name) {
+        if (!attachment->texture())
+            return;
+        text += fmt::format(
+            " | {} {} level {} slice {} plane {} resolve {} load {} store {}",
+            name, fmt::ptr(attachment->texture()), attachment->level(),
+            attachment->slice(), attachment->depthPlane(),
+            fmt::ptr(attachment->resolveTexture()),
+            static_cast<u64>(attachment->loadAction()),
+            static_cast<u64>(attachment->storeAction()));
+    };
+    for (u32 i = 0; i < COLOR_TARGET_COUNT; i++)
+        add(descriptor->colorAttachments()->object(i), fmt::format("c{}", i));
+    add(descriptor->depthAttachment(), "d");
+    add(descriptor->stencilAttachment(), "s");
+    return text;
+}
+
 bool continuesRenderPass(MTL::RenderPassDescriptor* current,
                          MTL::RenderPassDescriptor* next) {
     if (current->renderTargetWidth() != next->renderTargetWidth() ||
@@ -173,30 +199,81 @@ bool continuesRenderPass(MTL::RenderPassDescriptor* current,
            same(current->stencilAttachment(), next->stencilAttachment()) && any;
 }
 
+// DEBUG: HYDRA_NO_PASS_MERGE=1 always starts a new pass, for comparisons
+bool mergesRenderPasses() {
+    static const bool merge = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
+    return merge;
+}
+
 } // namespace
+
+bool CommandBuffer::continuesOpenRenderPass(
+    MTL::RenderPassDescriptor* descriptor) const {
+    if (encoder_type != EncoderType::Render ||
+        encoder_state.render_pass == nullptr)
+        return false;
+    return descriptor == encoder_state.render_pass ||
+           (mergesRenderPasses() &&
+            continuesRenderPass(encoder_state.render_pass, descriptor));
+}
 
 MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     if (render_pass_descriptor == encoder_state.render_pass)
         return getRenderCommandEncoderUnchecked();
 
-    // DEBUG: HYDRA_NO_PASS_MERGE=1 always starts a new pass, for comparisons
-    static const bool merge = std::getenv("HYDRA_NO_PASS_MERGE") == nullptr;
-    if (merge && encoder_type == EncoderType::Render &&
-        encoder_state.render_pass != nullptr &&
-        continuesRenderPass(encoder_state.render_pass, render_pass_descriptor)) {
-        encoder_state.render_pass = render_pass_descriptor;
-        if (PerfStats::isEnabled())
-            PerfStats::instance().render_pass_merges++;
-        return getRenderCommandEncoderUnchecked();
+    if (mergesRenderPasses() && encoder_type == EncoderType::Render &&
+        encoder_state.render_pass != nullptr) {
+        if (continuesRenderPass(encoder_state.render_pass,
+                                render_pass_descriptor)) {
+            // Pass-cache eviction or a transient blit may release the caller's
+            // descriptor while this encoder is still open. Keep the descriptor
+            // alive for subsequent merge and occlusion comparisons.
+            auto* previous = encoder_state.render_pass;
+            encoder_state.render_pass = render_pass_descriptor->retain();
+            previous->release();
+            if (PerfStats::isEnabled())
+                PerfStats::instance().render_pass_merges++;
+            return getRenderCommandEncoderUnchecked();
+        }
     }
 
     // Creating the encoder already resets all cached render state.
     return createRenderCommandEncoder(render_pass_descriptor);
 }
 
+MTL::RenderCommandEncoder* CommandBuffer::getDirectRenderCommandEncoder(
+    MTL::RenderPassDescriptor* render_pass_descriptor,
+    MTL::DepthStencilState* depth_stencil_disabled) {
+    const bool continues =
+        render_pass_descriptor != encoder_state.render_pass &&
+        continuesOpenRenderPass(render_pass_descriptor);
+    auto* encoder = getRenderCommandEncoder(render_pass_descriptor);
+    if (continues) {
+        // Defaults of a new encoder. Visibility counting is already off
+        // between draws.
+        encoder->setDepthStencilState(depth_stencil_disabled);
+        encoder->setCullMode(MTL::CullModeNone);
+        encoder->setFrontFacingWinding(MTL::WindingClockwise);
+        encoder->setDepthBias(0.0f, 0.0f, 0.0f);
+        encoder->setDepthClipMode(MTL::DepthClipModeClip);
+        encoder->setTriangleFillMode(MTL::TriangleFillModeFill);
+        const auto* texture =
+            render_pass_descriptor->colorAttachments()->object(0)->texture();
+        if (texture != nullptr)
+            encoder->setScissorRect(MTL::ScissorRect{
+                0, 0, texture->width(), texture->height()});
+    }
+    // The state cache does not know what these draws set
+    encoder_state.render = {};
+    return encoder;
+}
+
 MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
+    // What ended the previous pass, when it is not this one
+    if (render_pass_gap == 0 && encoder_type != EncoderType::Render)
+        render_pass_gap = 5;
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
@@ -218,7 +295,7 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     encoder_type = EncoderType::Render;
     has_commands = true;
     ++render_encoders;
-    encoder_state.render_pass = render_pass_descriptor;
+    encoder_state.render_pass = render_pass_descriptor->retain();
     encoder_state.render = {};
 
     return getRenderCommandEncoderUnchecked();
@@ -339,11 +416,23 @@ void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
     stats.render_pass_store_bytes += store_bytes;
     const bool continuation = all_loaded && attachments == previous_attachments &&
                               width != 0;
+    const auto description = describeRenderPass(descriptor);
     if (continuation) {
         stats.render_pass_continuations++;
         stats.render_pass_continuation_causes[render_pass_gap]++;
+        // DEBUG: continuations that were not merged, with what differs
+        static std::atomic<u32> logged{0};
+        if ((render_pass_gap == 0 || render_pass_gap == 4) &&
+            logged.fetch_add(1) < 6)
+            LOG_INFO(MetalRenderer,
+                     "Render pass continuation not merged (ended by {}):\n  "
+                     "previous {}\n  next     {}",
+                     render_pass_gap == 0 ? "a new descriptor"
+                                          : "a visibility buffer",
+                     previous_pass_description, description);
     }
     previous_attachments = attachments;
+    previous_pass_description = description;
     render_pass_gap = 0;
 
     const auto sample = reservePassSamples(
@@ -534,7 +623,9 @@ void CommandBuffer::endEncodingHot6() {
         visibility_buffer->release();
         visibility_buffer = nullptr;
     }
-    // Reset the render pass
+    // Release the descriptor retained for the lifetime of the open encoder.
+    if (encoder_state.render_pass != nullptr)
+        encoder_state.render_pass->release();
     encoder_state.render_pass = nullptr;
 }
 

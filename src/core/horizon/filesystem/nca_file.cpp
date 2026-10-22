@@ -1,4 +1,5 @@
 #include "core/horizon/filesystem/nca_file.hpp"
+#include "core/horizon/filesystem/bktr.hpp"
 
 #include <CommonCrypto/CommonCryptor.h>
 #include <algorithm>
@@ -353,9 +354,11 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
         }
         const auto fs = 0x400 + i * 0x200;
         auto encryption = plaintext ? u8{1} : header[fs + 4];
-        if (encryption < 1 || encryption > 3)
-            throw std::runtime_error("XCI update/patch sections are not "
-                                     "supported. Load the base game instead.");
+        if (encryption < 1 || encryption > 4)
+            throw std::runtime_error("Unsupported NCA section encryption.");
+        // BKTR tables use ordinary CTR; data subsections are split below.
+        if (encryption == 4)
+            encryption = 3;
         if (valueAt<u32>(header, fs + 0x148) != 0 ||
             valueAt<u64>(header, fs + 0x160) != 0 ||
             valueAt<u64>(header, fs + 0x178) != 0)
@@ -370,6 +373,71 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
             section.counter.begin());
         state->sections.push_back(section);
     }
+    std::vector<State::Section> physical_sections;
+    for (usize i = 0; i < 4; ++i) {
+        const auto fs = 0x400 + i * 0x200;
+        const u64 start = u64(valueAt<u32>(header, 0x240 + i * 16)) * 0x200;
+        if (!start)
+            continue;
+        const auto found =
+            std::ranges::find(state->sections, start, &State::Section::offset);
+        const auto section = *found;
+        if (valueAt<u64>(header, fs + 0x108) == 0) {
+            if (header[fs + 4] == 4)
+                throw std::runtime_error(
+                    "AES-CTREx section has no BKTR tables.");
+            physical_sections.push_back(section);
+            continue;
+        }
+        const auto ro = valueAt<u64>(header, fs + 0x100);
+        const auto rs = valueAt<u64>(header, fs + 0x108);
+        const auto so = valueAt<u64>(header, fs + 0x120);
+        const auto ss = valueAt<u64>(header, fs + 0x128);
+        if (valueAt<u32>(header, fs + 0x110) !=
+                makeMagic4('B', 'K', 'T', 'R') ||
+            valueAt<u32>(header, fs + 0x130) !=
+                makeMagic4('B', 'K', 'T', 'R') ||
+            valueAt<u32>(header, fs + 0x114) != 1 ||
+            valueAt<u32>(header, fs + 0x134) != 1 || ro > section.size ||
+            rs > section.size - ro || so != ro + rs || ss > section.size - so ||
+            so + ss != section.size)
+            throw std::runtime_error("Invalid BKTR table layout.");
+        const auto table = readBktrTable(
+            *this, start + so, ss, valueAt<u32>(header, fs + 0x138), false);
+        if (table.end != so || table.entries.back().offset >= ro)
+            throw std::runtime_error("Invalid BKTR subsection bounds.");
+        // Validate relocation metadata before any patch reads can reach a
+        // guest.
+        const auto relocations = readBktrTable(
+            *this, start + ro, rs, valueAt<u32>(header, fs + 0x118), true);
+        for (usize j = 0; j < relocations.entries.size(); j++) {
+            const auto& entry = relocations.entries[j];
+            const auto end = j + 1 < relocations.entries.size()
+                                 ? relocations.entries[j + 1].offset
+                                 : relocations.end;
+            if (entry.source &&
+                (entry.value > ro || end - entry.offset > ro - entry.value))
+                throw std::runtime_error("BKTR relocation exceeds patch data.");
+        }
+        for (usize j = 0; j < table.entries.size(); j++) {
+            const auto& e = table.entries[j];
+            const auto end =
+                j + 1 < table.entries.size() ? table.entries[j + 1].offset : ro;
+            if (end > ro || end <= e.offset)
+                throw std::runtime_error("Invalid BKTR subsection range.");
+            auto part = section;
+            part.offset = start + e.offset;
+            part.size = end - e.offset;
+            for (usize k = 0; k < 4; k++)
+                part.counter[7 - k] = u8(e.value >> (k * 8));
+            physical_sections.push_back(part);
+        }
+        auto metadata = section;
+        metadata.offset = start + ro;
+        metadata.size = section.size - ro;
+        physical_sections.push_back(metadata);
+    }
+    state->sections = std::move(physical_sections);
 }
 
 ztd::io::IStream* NcaFile::open(FileOpenFlags flags) {

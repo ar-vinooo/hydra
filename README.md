@@ -10,7 +10,7 @@ The emulator is still in very early stages. A few games and homebrew apps work p
 
 NRO, decrypted NCA, NX and XCI formats are supported. You can convert an NSP file to NCA with [this tool](https://github.com/SamoZ256/switch-extract-macos), and NSP to NX with [this tool](https://github.com/SamoZ256/herakles).
 
-For XCI gamecards, use **Import Keys** in the SwiftUI toolbar or Settings > General to import `prod.keys` from your console, then use **Add Game** to select the XCI. The loader reads and decrypts the base game directly from the cartridge file, without extracting a second copy. Keys are stored locally at `~/Library/Application Support/Hydra/keys/prod.keys`; `~/.switch/prod.keys` is also supported. The key file must contain `header_key` and the matching `key_area_key_application_XX` (or ocean/system) entries. NCA3 with AES-CTR, AES-XTS or plaintext sections is supported. Bundled updates, DLC, title-key encrypted content, compressed/sparse sections and multi-game selection are not supported yet. Loading a gamecard does not guarantee emulation compatibility.
+For XCI gamecards, use **Import Keys** in the SwiftUI toolbar or Settings > General to import `prod.keys` from your console, then use **Add Game** to select the XCI. The loader reads and decrypts the base game directly from the cartridge file, without extracting a second copy. Keys are stored locally at `~/Library/Application Support/Hydra/keys/prod.keys`; `~/.switch/prod.keys` is also supported. The key file must contain `header_key` and the matching `key_area_key_application_XX` (or ocean/system) entries. NCA3 with AES-CTR, AES-XTS or plaintext sections is supported. Common tickets in NSP/XCI packages are supported with the matching titlekek in `prod.keys`; personalized tickets, compressed/sparse NCA sections and multi-game selection are not supported. Loading a gamecard does not guarantee emulation compatibility.
 
 In order to run official games, you will need to download a set of patches to prevent crashes. You can get the patches together with a guide on how to install them [here](https://github.com/SamoZ256/hydra-patches).
 
@@ -77,6 +77,27 @@ cp build/bin/hydra-xci-tests build/bin/Hydra.app/Contents/MacOS/
 ```
 
 This also checks firmware font lifetime, incomplete firmware errors, heap accounting, Hypervisor physical address limits, controller availability, GPU map handle reuse and GPU address lookup boundaries/overlap precedence. For performance testing, disable **Debug logging** in Settings > Debug; normal and error logs remain available. Use a Release build to measure gameplay speed. The Debug build is intended for diagnostics.
+
+### Game updates and DLC
+
+Stop emulation, then choose **Install Update / DLC** in the game library toolbar
+and select an uncompressed `.nsp` or `.xci` package. Hydra validates its content
+metadata and SHA-256 content hashes, copies it to the app data directory under
+`content/packages`, and automatically applies the newest matching installed
+update and DLC when the base XCI/NSP (including XCZ/NSZ) is next opened. The base
+game stays in its original location. Reinstalling the same package is harmless.
+Updates and DLC bundled in the base package are also selected through their metadata.
+
+NCA3 updates support full replacement sections and BKTR RomFS overlays with
+AES-CTREx subsections; DLC Data/PublicData RomFS is exposed through `aoc:u` and
+filesystem data storage. A DLC requiring a newer game update reports the required
+version. Import the matching keys before installing encrypted packages.
+
+Installation currently excludes compressed update/DLC packages, personalized
+tickets, sparse/compressed sections, multi-program updates and DLC data patches.
+Installed content is applied to container-based games; extracted folders and
+standalone NCA/NX games do not use this content store. Compatibility with every
+game is not guaranteed. See [update/DLC tests and limitations](tests/README-content.md).
 
 ## Contributing
 

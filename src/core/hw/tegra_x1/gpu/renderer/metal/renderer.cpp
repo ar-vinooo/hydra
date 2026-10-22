@@ -355,8 +355,10 @@ void Renderer::blitTextureHot9(ICommandBuffer* command_buffer, ITextureView* src
     render_pass_descriptor->setRenderTargetArrayLength(
         getRenderTargetArrayLength(dst_impl->getTexture()));
 
-    auto encoder =
-        command_buffer_impl->createRenderCommandEncoder(render_pass_descriptor);
+    // A blit to the target of the open pass continues it instead of storing
+    // and loading the target
+    auto encoder = command_buffer_impl->getDirectRenderCommandEncoder(
+        render_pass_descriptor, depth_stencil_state_disabled);
 
     // Draw
     const auto data_type = [](ITextureView* view) {

@@ -269,6 +269,10 @@ void hydraTimeZoneManagerDestroy(void* manager);
 uint32_t hydraTimeZoneManagerGetLocationCount(void* manager);
 HydraString hydraTimeZoneManagerGetLocation(void* manager, uint32_t index);
 
+// Update and DLC installation (result text valid until the next call on this thread).
+bool hydraInstallContentPackage(HydraString path);
+HydraString hydraContentInstallGetResult(void);
+
 // Loader
 void* hydraCreateLoaderFromPath(HydraString path, void* plugin_manager);
 HydraString hydraLoaderGetLastError(void);

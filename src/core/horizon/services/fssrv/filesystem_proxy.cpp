@@ -176,15 +176,24 @@ result_t IFileSystemProxy::openDataStorageByProgramId(RequestContext* ctx,
     return RESULT_SUCCESS;
 }
 
-result_t
-IFileSystemProxy::openDataStorageByDataId(RequestContext* ctx, System* system,
-                                          Aligned<ncm::StorageID, 8> storage_id,
-                                          u64 data_id) {
-    LOG_FUNC_NOT_IMPLEMENTED(Services);
-
+result_t IFileSystemProxy::openDataStorageByDataId(
+    RequestContext* ctx, System* system, kernel::Process* process,
+    Aligned<ncm::StorageID, 8> storage_id, u64 data_id) {
     LOG_DEBUG(Services, "Storage ID: {}, data ID: 0x{:016x}", storage_id,
               data_id);
 
+    // Installed DLC is scoped to the running application by the loader.
+    const auto& dlcs = system->getOs().getAddOnContent();
+    if (storage_id.get() != ncm::StorageID::BuiltInSystem) {
+        const auto found = dlcs.find(data_id);
+        const u64 base_id = process->getTitleId() + 0x1000;
+        if (data_id < base_id || data_id - base_id > 0xfff ||
+            found == dlcs.end())
+            return MAKE_RESULT(Fs, filesystem::FsResult::DoesNotExist);
+        addService(*ctx, new IStorage(found->second.get(),
+                                      filesystem::FileOpenFlags::Read));
+        return RESULT_SUCCESS;
+    }
     filesystem::IFile* file;
     // NOLINTNEXTLINE(readability-trivial-switch)
     switch (storage_id.get()) {

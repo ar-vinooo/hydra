@@ -710,8 +710,9 @@ void System::progressFrame(u32 width, u32 height,
             LOG_INFO(Other,
                      "RENDER PASSES: {:.1f}/frame | load {:.1f} MiB/frame, "
                      "store {:.1f} MiB/frame | continuations {:.1f}/frame "
-                     "(after a render pass {:.1f}, blit {:.1f}, compute "
-                     "{:.1f}, submission {:.1f}) | merged into the open pass "
+                     "(open pass {:.1f}, blit {:.1f}, compute {:.1f}, "
+                     "submission {:.1f}, visibility buffer {:.1f}, ended "
+                     "elsewhere {:.1f}) | merged into the open pass "
                      "{:.1f}/frame",
                      static_cast<f64>(stats.render_passes.exchange(0)) /
                          std::max(frames, 1.0),
@@ -728,6 +729,10 @@ void System::progressFrame(u32 width, u32 height,
                      static_cast<f64>(stats.render_pass_continuation_causes[2].exchange(0)) /
                          std::max(frames, 1.0),
                      static_cast<f64>(stats.render_pass_continuation_causes[3].exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[4].exchange(0)) /
+                         std::max(frames, 1.0),
+                     static_cast<f64>(stats.render_pass_continuation_causes[5].exchange(0)) /
                          std::max(frames, 1.0),
                      static_cast<f64>(stats.render_pass_merges.exchange(0)) /
                          std::max(frames, 1.0));

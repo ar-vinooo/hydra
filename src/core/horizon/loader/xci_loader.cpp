@@ -1,11 +1,17 @@
 #include "core/horizon/loader/xci_loader.hpp"
 
+#include <CommonCrypto/CommonDigest.h>
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <unistd.h>
+
+#include "core/horizon/filesystem/bktr.hpp"
+#include "core/horizon/filesystem/file_view.hpp"
+#include "core/horizon/loader/content_package.hpp"
+#include "core/system.hpp"
 
 #include "core/horizon/filesystem/disk_file.hpp"
-#include "core/horizon/filesystem/file_view.hpp"
 #include "core/horizon/filesystem/ncz_file.hpp"
 #include "core/horizon/loader/npdm.hpp"
 
@@ -140,7 +146,7 @@ Region sectionRegion(const NcaFile::Header& header, usize index, bool romfs) {
     return {start + offset, size};
 }
 
-void validateProgram(NcaFile& file, const NcaFile::Header& header) {
+void validateProgram(IFile& file, const NcaFile::Header& header) {
     const auto code = sectionRegion(header, 0, false);
     const auto entries = partition(file, code.offset, code.size, false);
     const auto npdm = std::ranges::find(entries, "main.npdm", &Entry::name);
@@ -220,18 +226,20 @@ std::vector<Entry> controlEntries(NcaFile& file,
 
 } // namespace
 
-XciLoader::XciLoader(std::shared_ptr<NcaFile> program)
+XciLoader::XciLoader(std::shared_ptr<IFile> program)
     : NcaLoader(program.get()), program_file{std::move(program)} {}
 
-XciLoader* XciLoader::create(std::string_view path) {
-    return createPackage(path, false);
+XciLoader* XciLoader::create(std::string_view path,
+                             std::filesystem::path content_root) {
+    return createPackage(path, false, std::move(content_root));
 }
 
-XciLoader* XciLoader::createNsp(std::string_view path) {
-    return createPackage(path, true);
+XciLoader* XciLoader::createNsp(std::string_view path,
+                                std::filesystem::path content_root) {
+    return createPackage(path, true, std::move(content_root));
 }
 
-XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
+ContentPackage ContentPackage::open(std::string_view path, bool nsp) {
     auto container = std::make_shared<filesystem::DiskFile>(path);
     std::vector<Entry> entries;
     if (nsp) {
@@ -251,7 +259,7 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
         entries = partition(*container, secure->offset, secure->size, true);
     }
     auto keys = NcaFile::loadDefaultKeys();
-    if (nsp) {
+    {
         for (const auto& entry : entries) {
             if (!std::string_view(entry.name).ends_with(".tik"))
                 continue;
@@ -294,21 +302,7 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
                     "NSP contains conflicting tickets for the same content.");
         }
     }
-    struct Content {
-        // Location of the NCA inside `source`.
-        Entry entry;
-        std::shared_ptr<IFile> source;
-        NcaFile::Header header;
-        bool plaintext;
-        bool compressed;
-
-        std::shared_ptr<NcaFile> open(const NcaFile::Keys& keys) const {
-            return std::make_shared<NcaFile>(source, entry.offset, entry.size,
-                                             header, plaintext, keys,
-                                             compressed);
-        }
-    };
-    std::vector<Content> content;
+    std::vector<PackageContent> content;
     for (const auto& entry : entries) {
         const std::string_view name(entry.name);
         const bool compressed = name.ends_with(".ncz");
@@ -319,7 +313,8 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
         auto nca_header = NcaFile::readHeader(*container, entry.offset,
                                               entry.size, keys, plaintext);
         if (!compressed) {
-            content.push_back({entry, container, nca_header, plaintext, false});
+            content.push_back({entry.name, entry.offset, entry.size, container,
+                               nca_header, plaintext, false});
             continue;
         }
         const auto nca_size = valueAt<u64>(nca_header, 0x208);
@@ -330,16 +325,30 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
                         entry.size);
         auto ncz = std::make_shared<filesystem::NczFile>(
             container, entry.offset, entry.size, nca_size, cache_path);
-        content.push_back({{entry.name, 0, nca_size},
-                           std::move(ncz),
-                           nca_header,
-                           plaintext,
-                           true});
+        content.push_back({entry.name, 0, nca_size, std::move(ncz), nca_header,
+                           plaintext, true});
     }
+    return {std::move(keys), std::move(content)};
+}
+
+XciLoader* XciLoader::createPackage(std::string_view path, bool nsp,
+                                    std::filesystem::path content_root) {
+    auto package = ContentPackage::open(path, nsp);
+    const auto& keys = package.keys;
+    const auto& content = package.content;
     // Updates may carry the same program ID. Select a base Program NCA, never
     // the largest archive or an update that requires a BKTR overlay.
-    const Content* program = nullptr;
+    const auto bundled_metadata = package.metadata();
+    std::set<usize> patch_programs;
+    for (const auto& meta : bundled_metadata)
+        if (meta.type == 0x81)
+            for (const auto& record : meta.records)
+                if (record.type == 1)
+                    patch_programs.insert(record.content);
+    const PackageContent* program = nullptr;
     for (const auto& item : content) {
+        if (patch_programs.contains(static_cast<usize>(&item - content.data())))
+            continue;
         if (item.header[0x205] != 0 ||
             (valueAt<u64>(item.header, 0x210) & 0x800) != 0)
             continue;
@@ -358,19 +367,101 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
         program = &item;
     }
     if (program == nullptr)
-        throw std::runtime_error("Package has no supported base Program NCA; "
-                                 "update-only packages are not supported.");
-    auto program_file = program->open(keys);
-    validateProgram(*program_file, program->header);
+        throw std::runtime_error(
+            "Package has no supported base Program NCA; "
+            "use Install Update / DLC for update-only packages.");
+    std::shared_ptr<IFile> program_file = program->open(keys);
+    auto effective_header = program->header;
+    // Metadata identifies the matching update; file size and package order do
+    // not.
+    auto installed = installedContentPackages(std::move(content_root));
+    installed.push_back(package);
+    const auto title_id = valueAt<u64>(program->header, 0x210);
+    const ContentPackage* update_package = nullptr;
+    std::optional<ContentMeta> update;
+    std::map<u64, std::pair<usize, ContentMeta>> dlcs;
+    for (usize index = 0; index < installed.size(); index++) {
+        for (const auto& meta : installed[index].metadata()) {
+            if (meta.application_id != title_id)
+                continue;
+            if (meta.type == 0x81 &&
+                (!update || meta.version > update->version)) {
+                update = meta;
+                update_package = &installed[index];
+            } else if (meta.type == 0x82) {
+                const auto it = dlcs.find(meta.title_id);
+                if (it == dlcs.end() ||
+                    meta.version > it->second.second.version)
+                    dlcs.insert_or_assign(meta.title_id,
+                                          std::make_pair(index, meta));
+            }
+        }
+    }
+    if (update) {
+        const auto record =
+            std::ranges::find_if(update->records, [](const ContentRecord& r) {
+                return r.type == 1 && r.id_offset == 0;
+            });
+        if (record == update->records.end())
+            throw std::runtime_error("Update has no main Program NCA.");
+        auto patch =
+            update_package->content[record->content].open(update_package->keys);
+        program_file = filesystem::applyNcaPatch(program_file, patch);
+        std::unique_ptr<ztd::io::IStream> header_stream(
+            program_file->open(filesystem::FileOpenFlags::Read));
+        header_stream->readToSpan(std::span<u8>(effective_header));
+        LOG_INFO(Loader, "Applying update {:016x} version {}", update->title_id,
+                 update->version);
+    }
+    // The final virtual NCA must be valid before NcaLoader parses its
+    // filesystems. Base validation uses the same checks as updated programs.
+    validateProgram(*program_file, effective_header);
     auto loader =
         std::unique_ptr<XciLoader>(new XciLoader(std::move(program_file)));
-    // Match Control metadata by title ID; never use DLC/update metadata.
-    for (const auto& item : content) {
-        if (item.header[0x205] != 2 ||
-            valueAt<u64>(item.header, 0x210) != loader->getTitleId())
-            continue;
+    loader->content_version = update ? update->version : 0;
+    for (const auto& meta : bundled_metadata)
+        if (meta.type == 0x80 && meta.application_id == title_id)
+            loader->content_version =
+                std::max(loader->content_version, meta.version);
+    for (const auto& [dlc_id, selected] : dlcs) {
+        const auto& [index, meta] = selected;
+        if (meta.required_application_version > loader->content_version)
+            throw std::runtime_error(fmt::format(
+                "DLC {:016x} requires game update version {} or newer.", dlc_id,
+                meta.required_application_version));
+        const auto record =
+            std::ranges::find_if(meta.records, [](const ContentRecord& r) {
+                return r.type == 2 && r.id_offset == 0;
+            });
+        if (record == meta.records.end())
+            throw std::runtime_error("DLC has no Data NCA.");
+        const auto& item = installed[index].content[record->content];
+        auto data = item.open(installed[index].keys);
+        const auto region = sectionRegion(item.header, 0, true);
+        const auto magic = read(*data, region.offset, 8);
+        if (valueAt<u64>(magic, 0) != 0x50)
+            throw std::runtime_error("Cannot read DLC RomFS. Check prod.keys.");
+        loader->add_on_content.emplace(
+            dlc_id, std::make_shared<filesystem::FileView>(data, region.offset,
+                                                           region.size));
+    }
+    // Prefer the selected update's Control NCA (display version and metadata).
+    std::vector<std::pair<const PackageContent*, const NcaFile::Keys*>>
+        controls;
+    if (update)
+        for (const auto& record : update->records)
+            if (record.type == 3 && record.id_offset == 0)
+                controls.emplace_back(&update_package->content[record.content],
+                                      &update_package->keys);
+    for (const auto& item : content)
+        if (item.header[0x205] == 2 &&
+            valueAt<u64>(item.header, 0x210) == title_id)
+            controls.emplace_back(&item, &keys);
+    for (const auto& [ptr, control_keys] : controls) {
+        const auto& item = *ptr;
+
         try {
-            auto control = item.open(keys);
+            auto control = item.open(*control_keys);
             const auto files = controlEntries(*control, item.header);
             for (const auto& file : files) {
                 if (file.name == "control.nacp" &&
@@ -397,12 +488,267 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp) {
     }
     LOG_INFO(Loader, "Loaded {} base game {:016x} directly from container",
              nsp ? "NSP" : "XCI", loader->getTitleId());
-    if (std::ranges::any_of(content, [](const Content& item) {
-            return item.header[0x205] == 0 && item.header[0x604] == 4;
-        }))
-        LOG_WARN(Loader,
-                 "Bundled updates/DLC are not applied; loading the base game");
     return loader.release();
+}
+
+namespace {
+std::array<u8, 32> digest(IFile& file, u64 offset, u64 size) {
+    checkRange(offset, size, file.getSize());
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    std::vector<u8> buffer(1024 * 1024);
+    std::unique_ptr<ztd::io::IStream> stream(
+        file.open(filesystem::FileOpenFlags::Read));
+    stream->seekTo(offset);
+    while (size) {
+        const auto n = std::min<u64>(size, buffer.size());
+        stream->readToSpan(std::span(buffer).first(n));
+        CC_SHA256_Update(&context, buffer.data(), static_cast<CC_LONG>(n));
+        size -= n;
+    }
+    std::array<u8, 32> result;
+    CC_SHA256_Final(result.data(), &context);
+    return result;
+}
+std::filesystem::path contentRoot() {
+    return std::filesystem::path(CONFIG_INSTANCE.getAppDataPath()) /
+           "content/packages";
+}
+} // namespace
+
+std::shared_ptr<NcaFile> PackageContent::open(const NcaFile::Keys& keys) const {
+    return std::make_shared<NcaFile>(source, offset, size, header, plaintext,
+                                     keys, compressed);
+}
+
+std::vector<ContentMeta> ContentPackage::metadata(bool verify_hashes) const {
+    std::vector<ContentMeta> result;
+    std::set<u64> ids;
+    for (const auto& item : content) {
+        if (item.header[0x205] != 1)
+            continue;
+        auto file = item.open(keys);
+        const auto region = sectionRegion(item.header, 0, false);
+        const auto entries =
+            partition(*file, region.offset, region.size, false);
+        for (const auto& entry : entries) {
+            if (!std::string_view(entry.name).ends_with(".cnmt"))
+                continue;
+            const auto bytes = read(*file, entry.offset, entry.size);
+            checkRange(0, 0x20, bytes.size());
+            const auto type = bytes[0xc];
+            if (type != 0x80 && type != 0x81 && type != 0x82)
+                throw std::runtime_error("Unsupported content metadata type "
+                                         "(delta/data-patch/system package).");
+            const auto ext = valueAt<u16>(bytes, 0xe);
+            const auto count = valueAt<u16>(bytes, 0x10);
+            const auto meta_count = valueAt<u16>(bytes, 0x12);
+            if (ext < (type == 0x81 ? 0x18 : 0x10) || count > 4096 ||
+                bytes[0xd] != 0 || bytes[0x16] != 0)
+                throw std::runtime_error(
+                    "Unsupported or incomplete content metadata.");
+            checkRange(0x20, ext, bytes.size());
+            checkRange(0x20 + ext,
+                       u64(count) * 0x38 + u64(meta_count) * 0x10 + 32,
+                       bytes.size());
+            const u64 extended_data_size =
+                type == 0x81 ? valueAt<u32>(bytes, 0x2c) : 0;
+            const u64 end = 0x20 + ext + u64(count) * 0x38 +
+                            u64(meta_count) * 0x10 + extended_data_size;
+            if (end > bytes.size() || bytes.size() - end != 32)
+                throw std::runtime_error(
+                    "Truncated or oversized content metadata.");
+            // The footer is an opaque content-meta digest. Retail CNMT retains
+            // the development build's digest, so it is not a checksum of the
+            // production CNMT bytes. Referenced NCAs are hashed below.
+            ContentMeta meta{valueAt<u64>(bytes, 0),
+                             type == 0x80 ? valueAt<u64>(bytes, 0)
+                                          : valueAt<u64>(bytes, 0x20),
+                             valueAt<u32>(bytes, 8),
+                             type == 0x82 ? valueAt<u32>(bytes, 0x28) : 0,
+                             type,
+                             {}};
+            if (valueAt<u64>(item.header, 0x210) != meta.title_id ||
+                !ids.insert(meta.title_id).second ||
+                (meta.application_id & 0x1fff) != 0 ||
+                (type == 0x81 &&
+                 meta.title_id != (meta.application_id | 0x800)) ||
+                (type == 0x82 &&
+                 (meta.title_id < meta.application_id + 0x1000 ||
+                  meta.title_id > meta.application_id + 0x1fff)))
+                throw std::runtime_error(
+                    "Content metadata has invalid or conflicting title IDs.");
+            if (type == 0x82 && ext >= 0x18 && valueAt<u64>(bytes, 0x30) != 0)
+                throw std::runtime_error(
+                    "DLC data-patch dependencies are not supported yet.");
+            std::set<std::pair<u8, u8>> record_ids;
+            for (u32 j = 0; j < count; j++) {
+                const u64 p = 0x20 + ext + j * 0x38;
+                std::string id;
+                for (usize k = 0; k < 16; k++)
+                    id += fmt::format("{:02x}", bytes[p + 0x20 + k]);
+                const u8 record_type = bytes[p + 0x36],
+                         id_offset = bytes[p + 0x37];
+                // Delta fragments are not required to apply a complete patch.
+                if (record_type == 6)
+                    continue;
+                const auto found =
+                    std::ranges::find_if(content, [&](const PackageContent& c) {
+                        return c.name == id + ".nca" || c.name == id + ".ncz";
+                    });
+                if (found == content.end())
+                    throw std::runtime_error("Package is missing content " +
+                                             id + ".nca.");
+                u64 expected_size = 0;
+                for (usize k = 0; k < 6; k++)
+                    expected_size |= u64(bytes[p + 0x30 + k]) << (8 * k);
+                constexpr std::array<u8, 7> nca_types{1, 0, 4, 2, 3, 3, 4};
+                if (record_type > 5 || found->size != expected_size ||
+                    (found->header[0x205] != nca_types[record_type] &&
+                     !(record_type == 2 && found->header[0x205] == 5)))
+                    throw std::runtime_error(
+                        fmt::format("Content {} does not match metadata (size "
+                                    "{} vs {}, content type {}, NCA type {}).",
+                                    id, found->size, expected_size, record_type,
+                                    found->header[0x205]));
+                if (!record_ids.emplace(record_type, id_offset).second)
+                    throw std::runtime_error(
+                        "Duplicate content type/index in metadata.");
+                if ((record_type == 1 || record_type == 2 ||
+                     record_type == 3) &&
+                    valueAt<u64>(found->header, 0x210) !=
+                        (type == 0x82 ? meta.title_id : meta.application_id))
+                    throw std::runtime_error(
+                        "Content NCA belongs to another title.");
+                if (record_type == 1 && id_offset != 0)
+                    throw std::runtime_error(
+                        "Multi-program updates are not supported yet.");
+                ContentRecord record{
+                    static_cast<usize>(found - content.begin()),
+                    record_type,
+                    id_offset,
+                    {}};
+                std::copy_n(bytes.data() + p, 32, record.hash.begin());
+                if (verify_hashes) {
+                    if (found->compressed)
+                        throw std::runtime_error(
+                            "Install uncompressed NSP/XCI content; compressed "
+                            "update/DLC installation is not supported yet.");
+                    if (digest(*found->source, found->offset, found->size) !=
+                        record.hash)
+                        throw std::runtime_error(
+                            "Content SHA-256 does not match its metadata: " +
+                            found->name);
+                    // Check keys, section ranges and BKTR trees before
+                    // installation.
+                    auto decoded = found->open(keys);
+                    if (record_type == 2) {
+                        const auto data = sectionRegion(found->header, 0, true);
+                        if (valueAt<u64>(read(*decoded, data.offset, 8), 0) !=
+                            0x50)
+                            throw std::runtime_error(
+                                "Cannot decrypt DLC RomFS. Check prod.keys.");
+                    }
+                }
+                meta.records.push_back(record);
+            }
+            if (type == 0x81 && !record_ids.contains({1, 0}))
+                throw std::runtime_error(
+                    "Update is missing its main Program NCA.");
+            if (type == 0x82 && !record_ids.contains({2, 0}))
+                throw std::runtime_error("DLC is missing its Data NCA.");
+            result.push_back(std::move(meta));
+        }
+    }
+    return result;
+}
+
+std::string installContentPackage(std::string_view path,
+                                  std::filesystem::path root) {
+    std::string extension = std::filesystem::path(path).extension().string();
+    std::ranges::transform(extension, extension.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+    if (extension != ".nsp" && extension != ".xci")
+        throw std::runtime_error(
+            "Choose an update or DLC package in NSP or XCI format.");
+    if (root.empty())
+        root = contentRoot();
+    std::filesystem::create_directories(root);
+    // Unique staging file on the same filesystem; only validated packages
+    // become visible.
+    auto pattern = (root / ".install-XXXXXX").string();
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back(0);
+    const int fd = mkstemp(name.data());
+    if (fd < 0)
+        throw std::runtime_error(
+            "Cannot create a content installation staging file.");
+    close(fd);
+    const std::filesystem::path temporary(name.data());
+    try {
+        std::filesystem::copy_file(
+            std::filesystem::path(path), temporary,
+            std::filesystem::copy_options::overwrite_existing);
+        auto package =
+            ContentPackage::open(temporary.string(), extension == ".nsp");
+        const auto metadata = package.metadata(true);
+        usize updates = 0, dlcs = 0;
+        for (const auto& m : metadata) {
+            updates += m.type == 0x81;
+            dlcs += m.type == 0x82;
+        }
+        if (!updates && !dlcs)
+            throw std::runtime_error("This package contains no installable "
+                                     "game update or DLC metadata.");
+        filesystem::DiskFile file(temporary.string());
+        const auto hash = digest(file, 0, file.getSize());
+        std::string id;
+        for (const auto byte : hash)
+            id += fmt::format("{:02x}", byte);
+        const auto destination = root / (id + extension);
+        if (std::filesystem::exists(destination)) {
+            std::filesystem::remove(temporary);
+            return "This content is already installed.";
+        }
+        std::filesystem::rename(temporary, destination);
+        return fmt::format("Installed {} game update(s) and {} DLC item(s). "
+                           "The newest installed version is selected "
+                           "automatically. Restart the game to apply.",
+                           updates, dlcs);
+    } catch (...) {
+        std::error_code error;
+        std::filesystem::remove(temporary, error);
+        throw;
+    }
+}
+
+std::vector<ContentPackage>
+installedContentPackages(std::filesystem::path root) {
+    std::vector<ContentPackage> result;
+    if (root.empty())
+        root = contentRoot();
+    if (!std::filesystem::exists(root))
+        return result;
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        if (entry.is_regular_file() &&
+            !entry.path().filename().string().starts_with(".") &&
+            (entry.path().extension() == ".nsp" ||
+             entry.path().extension() == ".xci"))
+            paths.push_back(entry.path());
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const auto& path : paths) {
+        auto package =
+            ContentPackage::open(path.string(), path.extension() == ".nsp");
+        result.push_back(std::move(package));
+    }
+    return result;
+}
+
+void XciLoader::loadProcess(System& system, kernel::Process* process) {
+    NcaLoader::loadProcess(system, process);
+    system.getOs().setAddOnContent(add_on_content);
 }
 
 } // namespace hydra::horizon::loader

@@ -109,3 +109,24 @@ timings; they do not establish an FPS improvement in a game.
 
 `hydra-shader-library-tests` covers source persistence, the warm-session GPU
 output, the resident limit and disk eviction with small limits.
+
+## Open render-pass descriptor lifetime
+
+`pass-lifetime` draws three full-screen triangles with separately allocated
+clear/load/load descriptors, releasing each caller-owned descriptor immediately
+after its draw. The following draw runs the same occlusion and merge comparisons
+as the renderer. The open command encoder must retain its current descriptor
+through cache eviction or transient-pass destruction, including after a merge,
+and release it when encoding ends.
+
+```sh
+NSZombieEnabled=YES MTL_DEBUG_LAYER=1 HYDRA_PERF_STATS=1 \
+  build/swiftui-release/bin/hydra-metal-cache-tests build/pass-lifetime-cache pass-lifetime
+NSZombieEnabled=YES MTL_DEBUG_LAYER=1 HYDRA_PERF_STATS=1 HYDRA_NO_PASS_MERGE=1 \
+  build/swiftui-release/bin/hydra-metal-cache-tests build/pass-lifetime-cache pass-lifetime
+```
+
+Both runs must report 12,288 occlusion samples. The normal run merges twice;
+`HYDRA_NO_PASS_MERGE=1` merges zero times. Before the lifetime fix, the first run
+fails with a message sent to a deallocated `MTLRenderPassDescriptorInternal`
+instance in `renderTargetWidth`, matching the startup crash observed in CTR.

@@ -4,6 +4,8 @@
 #include "core/horizon/kernel/host_thread.hpp"
 #include "core/horizon/kernel/process.hpp"
 #include "core/horizon/services/aocsrv/add_on_content_manager.hpp"
+#include "core/horizon/services/fssrv/filesystem_proxy.hpp"
+#include "core/horizon/filesystem/memory_file.hpp"
 #include "core/horizon/services/audio/audio_out.hpp"
 #include "core/horizon/services/audio/audio_renderer.hpp"
 #include "core/horizon/services/mmnv/request.hpp"
@@ -594,6 +596,101 @@ void testResolverAndCharacteristics(System& system, kernel::Process* process) {
     check(size == 0xa0 && characteristics.arch == 0x120 && characteristics.impl == 0xb,
           "Characteristics returns the GM20B payload and full required size");
     std::cout << "PASS: resolver IPC failures and inline GPU characteristics\n";
+}
+
+void testInstalledDlc(System& system, kernel::Process* process) {
+    namespace hipc = kernel::hipc;
+    class Aoc : public services::aocsrv::IAddOnContentManager {
+      public: using IAddOnContentManager::requestImpl;
+    } aoc;
+    class Proxy : public services::fssrv::IFileSystemProxy {
+      public:
+        using IFileSystemProxy::requestImpl;
+        using IService::getService;
+    } proxy;
+    services::Server server(system);
+    proxy.setServer(&server);
+    constexpr u64 app = 0x0100000000002000;
+    const auto old_title = process->getTitleId();
+    process->setTitleId(app);
+    system.getOs().setAddOnContent({
+        {app + 0x1001, std::make_shared<filesystem::MemoryFile>(std::vector<u8>{1, 2, 3})},
+        {app + 0x1003, std::make_shared<filesystem::MemoryFile>(std::vector<u8>{4, 5})},
+        {app + 0x5001, std::make_shared<filesystem::MemoryFile>(std::vector<u8>{9})}});
+    alignas(16) std::array<u8, 0x1000> tls{}, output{}, objects{}, copies{}, handles{};
+    std::array<u8, 32> input{};
+    std::array<u8, 4> buffer{};
+    const auto parsed = hipc::parseRequest(tls.data());
+    hipc::Streams streams(process->getMmu(), parsed, output.data(), objects.data(), copies.data(), handles.data());
+    services::RequestContext context{system, process, streams};
+    const auto reset = [&] {
+        input.fill(0); output.fill(0); handles.fill(0); buffer.fill(0);
+        streams.in_stream = ztd::io::MemoryStream(std::span(input));
+        streams.out_stream.seekTo(0);
+        streams.out_move_handles_stream.seekTo(0);
+        streams.recv_buffers_streams = {ztd::io::MemoryStream(std::span(buffer))};
+    };
+    reset();
+    check(aoc.requestImpl(context, 2) == RESULT_SUCCESS, "DLC count IPC succeeds");
+    streams.out_stream.seekTo(0);
+    check(streams.out_stream.read<u32>() == 2 && streams.out_stream.getSeek() == 4, "DLC count is u32 and scoped to caller title");
+    reset();
+    const u32 start = 1, requested = 99;
+    std::memcpy(input.data(), &start, 4);
+    std::memcpy(input.data() + 4, &requested, 4);
+    check(aoc.requestImpl(context, 3) == RESULT_SUCCESS, "DLC list IPC succeeds");
+    u32 index;
+    std::memcpy(&index, buffer.data(), 4);
+    streams.out_stream.seekTo(0);
+    check(index == 3 && streams.out_stream.read<u32>() == 1, "DLC list respects pagination and output capacity");
+    reset();
+    streams.recv_buffers_streams = {std::nullopt};
+    std::memcpy(input.data() + 4, &requested, 4);
+    check(aoc.requestImpl(context, 3) != RESULT_SUCCESS, "DLC list rejects missing output buffer");
+    reset();
+    check(aoc.requestImpl(context, 5) == RESULT_SUCCESS, "DLC base ID IPC succeeds");
+    streams.out_stream.seekTo(0);
+    check(streams.out_stream.read<u64>() == app + 0x1000, "DLC base ID matches application");
+    reset();
+    std::memcpy(input.data(), &index, 4);
+    check(aoc.requestImpl(context, 7) == RESULT_SUCCESS, "Installed DLC can be prepared");
+    reset();
+    index = 2;
+    std::memcpy(input.data(), &index, 4);
+    check(aoc.requestImpl(context, 7) != RESULT_SUCCESS, "Missing DLC cannot be prepared");
+    for (const u64 id : {app + 0x1001, app + 0x1002, app + 0x5001}) {
+        reset();
+        const u64 storage_id = 0;
+        std::memcpy(input.data(), &storage_id, 8);
+        std::memcpy(input.data() + 8, &id, 8);
+        const auto result = proxy.requestImpl(context, 202);
+        if (id != app + 0x1001) {
+            check(result != RESULT_SUCCESS, "Missing/foreign DLC storage must fail");
+            continue;
+        }
+        check(result == RESULT_SUCCESS, "Installed DLC storage opens by data ID");
+        hydra::Handle handle;
+        std::memcpy(&handle, handles.data(), sizeof(handle));
+        auto* storage = proxy.getService(context, handle);
+        check(storage != nullptr, "DLC open returns a real storage service");
+        tls.fill(0);
+        const auto request = hipc::makeRequest(tls.data(), {
+            .type = static_cast<u32>(hipc::cmif::CommandType::Request), .num_data_words = 8});
+        const hipc::cmif::InHeader in{hipc::cmif::IN_HEADER_MAGIC, 0, 4, 0};
+        std::memcpy(hipc::cmif::alignDataStart(request.data_words), &in, sizeof(in));
+        storage->handleRequest(system, process, reinterpret_cast<uptr>(tls.data()));
+        const auto response = hipc::parseRequest(tls.data());
+        const auto* data = reinterpret_cast<const u8*>(hipc::cmif::alignDataStart(response.data.data_words));
+        hipc::cmif::OutHeader out;
+        u64 size;
+        std::memcpy(&out, data, sizeof(out));
+        std::memcpy(&size, data + sizeof(out), sizeof(size));
+        check(out.result == RESULT_SUCCESS && size == 3, "DLC storage exposes DLC data rather than base RomFS");
+        check(process->freeHandle(handle), "DLC storage handle can be closed");
+    }
+    system.getOs().setAddOnContent({});
+    process->setTitleId(old_title);
+    std::cout << "PASS: DLC IPC count/list/base/prepare, pagination, missing/foreign IDs and real data storage\n";
 }
 
 void testAddOnContentEvent(System& system, kernel::Process* process) {
@@ -2560,6 +2657,13 @@ int runDeviceSharedCases(System& system, const char* input_path, const char* out
 int main(int argc, char** argv) {
     try {
         Ui ui;
+        if (argc == 2 && std::string_view(argv[1]) == "--check-installed-dlc") {
+            System system(ui);
+            auto* process = system.getOs().getKernel().getProcessManager().createProcess("DLC service test");
+            testInstalledDlc(system, process);
+            testAddOnContentEvent(system, process);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--check-stage-a-memory") {
             System system(ui);
             testStageAMemory(system);

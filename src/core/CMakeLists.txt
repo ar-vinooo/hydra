@@ -78,6 +78,8 @@ add_library(hydra-core
     horizon/filesystem/partition_filesystem.hpp
     horizon/filesystem/content_archive.cpp
     horizon/filesystem/content_archive.hpp
+    horizon/filesystem/bktr.cpp
+    horizon/filesystem/bktr.hpp
     horizon/filesystem/nca_file.cpp
     horizon/filesystem/nca_file.hpp
     horizon/filesystem/ncz_file.cpp
@@ -99,6 +101,7 @@ add_library(hydra-core
     horizon/loader/nca_loader.hpp
     horizon/loader/xci_loader.cpp
     horizon/loader/xci_loader.hpp
+    horizon/loader/content_package.hpp
     horizon/loader/nx_loader.cpp
     horizon/loader/nx_loader.hpp
     horizon/loader/homebrew_loader.cpp
