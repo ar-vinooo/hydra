@@ -22,6 +22,8 @@ TOML11_DEFINE_CONVERSION_ENUM(hydra::UpscalingFilter, Bilinear, "Bilinear",
                               Nearest, "Nearest", MetalFx, "MetalFX")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::FrameGeneration, Off, "Off", Interpolate,
                               "Interpolate", MetalFx, "MetalFX")
+TOML11_DEFINE_CONVERSION_ENUM(hydra::FrameGenerationRateMode, Variable,
+                              "Variable", Multiple, "Multiple")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::AudioBackend, Null, "null", Cubeb, "Cubeb")
 TOML11_DEFINE_CONVERSION_ENUM(
     hydra::SystemLanguage, AmericanEnglish, "American English", BritishEnglish,
@@ -149,6 +151,9 @@ void Config::loadDefaults() {
     upscaling_filter = getDefaultUpscalingFilter();
     frame_rate_limit = getDefaultFrameRateLimit();
     frame_generation = getDefaultFrameGeneration();
+    frame_generation_rate_mode = getDefaultFrameGenerationRateMode();
+    frame_generation_target_fps = getDefaultFrameGenerationTargetFps();
+    frame_generation_multiplier = getDefaultFrameGenerationMultiplier();
     sharpening = getDefaultSharpening();
     metal_hud = getDefaultMetalHud();
     audio_backend = getDefaultAudioBackend();
@@ -222,6 +227,9 @@ void Config::serialize() {
         graphics["upscaling_filter"] = upscaling_filter;
         graphics["frame_rate_limit"] = frame_rate_limit;
         graphics["frame_generation"] = frame_generation;
+        graphics["frame_generation_rate_mode"] = frame_generation_rate_mode;
+        graphics["frame_generation_target_fps"] = frame_generation_target_fps;
+        graphics["frame_generation_multiplier"] = frame_generation_multiplier;
         graphics["sharpening"] = sharpening;
         graphics["metal_hud"] = metal_hud;
     }
@@ -332,6 +340,17 @@ void Config::deserialize() {
             toml::find_or<std::optional<FrameGeneration>>(
                 graphics, "frame_generation", getDefaultFrameGeneration())
                 .value_or(getDefaultFrameGeneration());
+        frame_generation_rate_mode =
+            toml::find_or<std::optional<FrameGenerationRateMode>>(
+                graphics, "frame_generation_rate_mode",
+                getDefaultFrameGenerationRateMode())
+                .value_or(getDefaultFrameGenerationRateMode());
+        frame_generation_target_fps = std::max(1u, toml::find_or<u32>(
+            graphics, "frame_generation_target_fps",
+            getDefaultFrameGenerationTargetFps()));
+        frame_generation_multiplier = std::max(1u, toml::find_or<u32>(
+            graphics, "frame_generation_multiplier",
+            getDefaultFrameGenerationMultiplier()));
         sharpening = std::min(
             toml::find_or<u32>(graphics, "sharpening", getDefaultSharpening()),
             100u);
@@ -406,6 +425,9 @@ void Config::log() {
     LOG_INFO(Other, "Upscaling filter: {}", upscaling_filter);
     LOG_INFO(Other, "Frame rate limit: {}", frame_rate_limit);
     LOG_INFO(Other, "Frame generation: {}", frame_generation);
+    LOG_INFO(Other, "Frame generation rate: {}, target {} FPS, multiplier {}x",
+             frame_generation_rate_mode, frame_generation_target_fps,
+             frame_generation_multiplier);
     LOG_INFO(Other, "Sharpening: {}", sharpening);
     LOG_INFO(Other, "Metal HUD: {}", metal_hud);
     LOG_INFO(Other, "Audio backend: {}", audio_backend);

@@ -25,7 +25,7 @@ class CommandBuffer;
 class Mtl4Context;
 
 // Post-processes the presented frame before it reaches the drawable:
-// - Frame generation: display refreshes without a new guest frame show a frame
+// - Frame generation: presentation ticks without a new guest frame show a frame
 //   interpolated between the last two guest frames, from optical flow computed
 //   on the GPU (games give no motion vectors). Each guest frame is shown one
 //   guest frame late, in exchange for the smoother motion.
@@ -60,9 +60,6 @@ class FramePresenter {
     Shown lastShown() const { return last_shown; }
 
   private:
-    // Guest frames interpolated at most this many refreshes apart. Longer
-    // gaps (loading, pauses) show the new frame at once.
-    static constexpr u32 MAX_REFRESHES_PER_FRAME = 8;
     // Smallest canvas dimension to generate frames for
     static constexpr u32 MIN_SIZE = 64;
     // Luma level the final motion field is at (luma is half size, so 1/8)
@@ -137,13 +134,13 @@ class FramePresenter {
     // generated frame: a game that keeps up with the display needs none.
     u64 flow_frame_index{~0ull};
     bool flow_has_metalfx{false};
-    // Display refreshes since the current frame arrived, counting the one it
-    // arrived on
-    u32 refreshes_since_frame{0};
-    // Average display refreshes per guest frame
-    f32 refreshes_per_frame{1.0f};
     std::chrono::steady_clock::time_point last_frame_time{};
     f32 frame_delta_time{1.0f / 30.0f};
+    u64 generated_frame_index{~0ull};
+    f32 generated_fraction{-1.0f};
+    bool generated_with_metalfx{false};
+    MTL::Texture* generated_source{nullptr};
+    bool repeated_generated{false};
 
     bool createPipelines();
     bool resize(u32 width, u32 height, MTL::PixelFormat format);

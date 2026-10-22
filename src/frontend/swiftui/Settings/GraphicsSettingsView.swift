@@ -9,6 +9,10 @@ struct GraphicsSettingsView: View {
     @State private var frameRateLimit = configGetFrameRateLimit().pointee
     @State private var frameGeneration = HydraFrameGeneration(
         rawValue: configGetFrameGeneration().pointee)
+    @State private var frameGenerationRateMode = HydraFrameGenerationRateMode(
+        rawValue: configGetFrameGenerationRateMode().pointee)
+    @State private var frameGenerationTargetFps = configGetFrameGenerationTargetFps().pointee
+    @State private var frameGenerationMultiplier = configGetFrameGenerationMultiplier().pointee
     @State private var sharpening = Double(configGetSharpening().pointee)
     @State private var metalHud = configGetMetalHud().pointee
 
@@ -80,7 +84,7 @@ struct GraphicsSettingsView: View {
                 }
 
                 Section {
-                    Picker("Frame rate limit", selection: self.$frameRateLimit) {
+                    Picker("Native render FPS limit", selection: self.$frameRateLimit) {
                         Text("60 (console)").tag(UInt32(60))
                         Text("90").tag(UInt32(90))
                         Text("120").tag(UInt32(120))
@@ -90,10 +94,10 @@ struct GraphicsSettingsView: View {
                         configGetFrameRateLimit().pointee = newValue
                     }
                 } header: {
-                    Text("Frame rate")
+                    Text("Native rendering")
                 } footer: {
                     Text(
-                        "Above 60, the game's display refreshes faster than a Switch's and the window shows the newest frame, for lower input latency. Games that time themselves by display refreshes run too fast. Applies when a game boots."
+                        "Limits the game's own frames, independently of frame generation. For example, 60 native FPS with Multiple 2× targets 120 output FPS. Above 60, games that time themselves by console display refreshes can run too fast. Applies when a game boots."
                     )
                 }
 
@@ -107,11 +111,35 @@ struct GraphicsSettingsView: View {
                     .onChange(of: self.frameGeneration.rawValue) { _, newValue in
                         configGetFrameGeneration().pointee = newValue
                     }
+                    Picker("Output mode", selection: self.$frameGenerationRateMode.rawValue) {
+                        Text("Variable (target FPS)").tag(HYDRA_FRAME_GENERATION_RATE_VARIABLE.rawValue)
+                        Text("Multiple (native FPS × multiplier)").tag(HYDRA_FRAME_GENERATION_RATE_MULTIPLE.rawValue)
+                    }
+                    .onChange(of: self.frameGenerationRateMode.rawValue) { _, newValue in
+                        configGetFrameGenerationRateMode().pointee = newValue
+                    }
+                    .disabled(self.frameGeneration.rawValue == HYDRA_FRAME_GENERATION_OFF.rawValue)
+
+                    if self.frameGenerationRateMode.rawValue == HYDRA_FRAME_GENERATION_RATE_VARIABLE.rawValue {
+                        TextField("Target output FPS", value: self.$frameGenerationTargetFps, format: .number)
+                            .onChange(of: self.frameGenerationTargetFps) { _, newValue in
+                                self.frameGenerationTargetFps = max(newValue, 1)
+                                configGetFrameGenerationTargetFps().pointee = self.frameGenerationTargetFps
+                            }
+                            .disabled(self.frameGeneration.rawValue == HYDRA_FRAME_GENERATION_OFF.rawValue)
+                    } else {
+                        TextField("Multiplier", value: self.$frameGenerationMultiplier, format: .number)
+                            .onChange(of: self.frameGenerationMultiplier) { _, newValue in
+                                self.frameGenerationMultiplier = max(newValue, 1)
+                                configGetFrameGenerationMultiplier().pointee = self.frameGenerationMultiplier
+                            }
+                            .disabled(self.frameGeneration.rawValue == HYDRA_FRAME_GENERATION_OFF.rawValue)
+                    }
                 } header: {
                     Text("Frame generation")
                 } footer: {
                     Text(
-                        "Fills display refreshes the game has no frame for with frames interpolated from the motion between its last two frames, e.g. a 30 FPS game shown at 60, or a 60 FPS game at 120 on ProMotion displays. Each game frame is shown one frame later. MetalFX needs macOS 26 or iOS 26 and falls back to Interpolate."
+                        "Variable targets the output FPS you enter. Multiple targets the current native FPS multiplied by your value: 60 FPS × 2 = 120 FPS. Neither target is capped to the screen refresh rate. A target below native FPS adds no frames. Actual throughput depends on rendering performance and the platform's presentation system. Each game frame is shown one frame later. MetalFX needs macOS 26 or iOS 26 and falls back to Interpolate. Applies immediately."
                     )
                 }
 

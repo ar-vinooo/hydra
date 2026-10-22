@@ -167,6 +167,11 @@ ISurfaceCompositor* Renderer::acquireNextSurfaceHot1() {
     if (ca_layer == nullptr)
         return nullptr;
 
+#ifdef ZTD_PLATFORM_MACOS
+    // FG presentation has its own clock, independent of guest vsync/render FPS.
+    ca_layer->setDisplaySyncEnabled(
+        CONFIG_INSTANCE.getFrameGeneration() == FrameGeneration::Off);
+#endif
     ca_drawable = ca_layer->nextDrawable();
     if (ca_drawable == nullptr)
         return nullptr;

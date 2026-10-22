@@ -233,13 +233,68 @@ kernel void patch(device ulong* code [[buffer(0)]], constant ulong* words [[buff
         const auto resources = saved_shader->getDescriptor().resource_mapping;
         check(resources.code_read_size >= 88 && resources.code_read_size < 0x10000,
               "Decoded shader prefix was not recorded");
-        const auto start = std::chrono::steady_clock::now();
-        for (u32 i = 0; i < 1000; ++i)
-            check(cache.find(descriptor) == saved_shader, "Warm lookup changed identity");
-        std::cout << "Warm shader lookup: "
-                  << std::chrono::duration<double, std::micro>(
-                         std::chrono::steady_clock::now() - start).count() / 1000
-                  << " us/lookup (decoded prefix validation)\n";
+        // Normalizing a lookup must not mutate caller-owned state or change
+        // which fields participate in the resident artifact key.
+        auto normalized_probe = descriptor;
+        normalized_probe.code_revision = 123;
+        normalized_probe.state.branch_constants[std::pair{0u, 0u}] = 456;
+        check(cache.find(normalized_probe) == saved_shader,
+              "Caller revision/branch metadata changed normalized lookup identity");
+        check(normalized_probe.code_revision == 123 &&
+                  normalized_probe.state.branch_constants.at(std::pair{0u, 0u}) == 456,
+              "Shader lookup mutated caller-owned descriptor state");
+        auto alternate_state = descriptor;
+        alternate_state.state.point_coord_origin_bottom =
+            !descriptor.state.point_coord_origin_bottom;
+        auto* alternate_shader = cache.find(alternate_state);
+        check(alternate_shader && alternate_shader != saved_shader,
+              "Different fixed-function state reused the previous lookup key");
+        for (u32 i = 0; i < 32; ++i) {
+            check(cache.find(descriptor) == saved_shader &&
+                      cache.find(alternate_state) == alternate_shader,
+                  "Reused key storage changed an earlier cache entry");
+        }
+        check(draw(saved_shader) == saved_pixels && draw(alternate_shader) == saved_pixels,
+              "Lookup-key reuse changed Metal pixels");
+        const auto distinct_state = [&](const GuestShaderDescriptor& probe) {
+            auto* shader = cache.find(probe);
+            check(shader && shader != saved_shader,
+                  "Packed lookup key lost a specialization field");
+            check(cache.find(probe) == shader && cache.find(descriptor) == saved_shader,
+                  "Packed key storage changed resident shader identity");
+            return shader;
+        };
+        auto scalar_probe = descriptor;
+        scalar_probe.state.alpha_test_ref = -0.0f;
+        auto* negative_zero = distinct_state(scalar_probe);
+        scalar_probe.state.alpha_test_ref = 0.25f;
+        check(distinct_state(scalar_probe) != negative_zero,
+              "Packed float keys preserve all bits, including signed zero");
+        scalar_probe = descriptor;
+        scalar_probe.state.alpha_test_func = engines::CompareOp::Never;
+        distinct_state(scalar_probe);
+        scalar_probe = descriptor;
+        scalar_probe.state.texture_lod_bias[1] = 0.25f;
+        distinct_state(scalar_probe);
+        scalar_probe = descriptor;
+        scalar_probe.state.border_samplers[1] = {};
+        scalar_probe.state.border_samplers[1].border_color_u = {1, 2, 3, 4};
+        auto* border_before = distinct_state(scalar_probe);
+        scalar_probe.state.border_samplers[1].border_color_u[2] = 0x80000003u;
+        check(distinct_state(scalar_probe) != border_before,
+              "Packed sampler colors retain high component bits");
+        std::array<double, 5> samples{};
+        constexpr u32 LOOKUPS = 20000;
+        for (auto& sample : samples) {
+            const auto start = std::chrono::steady_clock::now();
+            for (u32 i = 0; i < LOOKUPS; ++i)
+                check(cache.find(descriptor) == saved_shader, "Warm lookup changed identity");
+            sample = std::chrono::duration<double, std::micro>(
+                         std::chrono::steady_clock::now() - start).count() / LOOKUPS;
+        }
+        std::sort(samples.begin(), samples.end());
+        std::cout << "Warm shader lookup: " << samples[samples.size() / 2]
+                  << " us/lookup (median of 5 x 20000, decoded prefix validation)\n";
         // Changing a compile-time cbuf jump target must select a new artifact
         // even when no instruction bytes change.
         std::vector<u64> jump_words(10);

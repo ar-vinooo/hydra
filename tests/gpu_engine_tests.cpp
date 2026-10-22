@@ -666,12 +666,10 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
     };
     encode(scattered_before, 0);
     encode(scattered_after, 32);
-    auto* native = metal_commands->getCommandBuffer()->retain();
+    metal_commands->debugCommitAndWait();
+    const bool completed = metal_commands->lastSubmissionSucceeded();
     tls_crnt_command_buffer = nullptr;
     commands.reset();
-    native->waitUntilCompleted();
-    const bool completed = native->status() == MTL::CommandBufferStatusCompleted;
-    native->release();
     expect(completed, "GPU reads gathered uniform snapshots successfully");
     const auto* words = static_cast<const u32*>(output->contents());
     for (u32 i = 0; i < 16; ++i)
@@ -701,14 +699,13 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
         prefix_upload.getOffset(), 0);
     prefix_encoder->setBuffer(output, 0, 1);
     prefix_encoder->dispatchThreads(MTL::Size(4, 1, 1), MTL::Size(4, 1, 1));
-    auto* prefix_native = prefix_commands->getCommandBuffer()->retain();
+    prefix_commands->debugCommitAndWait();
+    const bool prefix_completed = prefix_commands->lastSubmissionSucceeded();
     tls_crnt_command_buffer = nullptr;
     commands.reset();
-    prefix_native->waitUntilCompleted();
-    expect(prefix_native->status() == MTL::CommandBufferStatusCompleted &&
+    expect(prefix_completed &&
                std::memcmp(output->contents(), replacement.data() + 4, 16) == 0,
            "Metal reads the complete required prefix despite an unmapped selector tail");
-    prefix_native->release();
     commands.reset(renderer.createCommandBuffer());
     tls_crnt_command_buffer = commands.get();
     expect(engine.getConstBuffer(STAGE, SLOT, 0x10001).getSize() == 0 &&

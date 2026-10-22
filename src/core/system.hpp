@@ -44,6 +44,8 @@ class System {
 
     bool isRunning() const;
     f32 getLastDeltaTimeAverage() const { return last_dt_average; }
+    // Requested presentation rate, independent of the native rendering limit.
+    f64 getPresentationFrameRate() const;
     // New images per second the display showed (game frames and generated
     // ones), and the generated ones among them, over the same period
     f32 getLastShownFps() const { return last_shown_fps; }

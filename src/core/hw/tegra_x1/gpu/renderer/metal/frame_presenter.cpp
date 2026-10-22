@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/frame_presenter.hpp"
 
 #include "common/config.hpp"
+#include "common/frame_generation_timing.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp"
 
@@ -368,6 +369,8 @@ void FramePresenter::releaseResources() {
     width = 0;
     height = 0;
     resources_valid = false;
+    generated_source = nullptr;
+    generated_frame_index = ~0ull;
     format = MTL::PixelFormatInvalid;
     history = 0;
 }
@@ -491,16 +494,18 @@ MTL::Texture* FramePresenter::getCanvas(u32 canvas_width, u32 canvas_height,
 void FramePresenter::present(CommandBuffer* command_buffer,
                              MTL::Texture* drawable, bool new_frame) {
     const auto mode = CONFIG_INSTANCE.getFrameGeneration();
+    repeated_generated = false;
     MTL::Texture* source = slots[canvas_slot].color;
     if (mode != FrameGeneration::Off) {
         if (new_frame) {
             pushFrame(command_buffer);
-        } else if (history != 0) {
-            refreshes_since_frame++;
-            // A long gap (loading, pause): interpolating from the stale frame
-            // would show it again
-            if (refreshes_since_frame > MAX_REFRESHES_PER_FRAME)
-                history = std::min(history, 1u);
+        } else if (history >= 2) {
+            const auto elapsed = std::chrono::duration<f32>(
+                std::chrono::steady_clock::now() - last_frame_time).count();
+            // Loading/pause invalidates motion by elapsed time, regardless of
+            // how many generated frames the requested rate produces.
+            if (elapsed > std::max(0.25f, frame_delta_time * 4.0f))
+                history = 1;
         }
         if (history != 0)
             source = getFrameForRefresh(command_buffer, mode);
@@ -512,7 +517,7 @@ void FramePresenter::present(CommandBuffer* command_buffer,
     const bool game_frame = mode == FrameGeneration::Off || history == 0 ||
                             source == slots[current_slot].color;
     if (!game_frame) {
-        last_shown = Shown::Generated;
+        last_shown = repeated_generated ? Shown::Repeated : Shown::Generated;
     } else if (mode == FrameGeneration::Off || history == 0) {
         last_shown = new_frame ? Shown::GameFrame : Shown::Repeated;
     } else {
@@ -525,16 +530,12 @@ void FramePresenter::present(CommandBuffer* command_buffer,
 
 void FramePresenter::pushFrame(CommandBuffer* command_buffer) {
     const auto now = std::chrono::steady_clock::now();
-    if (history != 0 && refreshes_since_frame > MAX_REFRESHES_PER_FRAME)
-        history = 0;
     if (history != 0) {
-        const auto refreshes = static_cast<f32>(refreshes_since_frame);
-        refreshes_per_frame =
-            history >= 2
-                ? refreshes_per_frame + (refreshes - refreshes_per_frame) * 0.25f
-                : refreshes;
-        frame_delta_time =
-            std::chrono::duration<f32>(now - last_frame_time).count();
+        const auto delta = std::chrono::duration<f32>(now - last_frame_time).count();
+        if (delta > std::max(0.25f, frame_delta_time * 4.0f))
+            history = 0;
+        else
+            frame_delta_time = std::max(delta, 1e-6f);
     }
     last_frame_time = now;
 
@@ -544,7 +545,6 @@ void FramePresenter::pushFrame(CommandBuffer* command_buffer) {
     current_slot = canvas_slot;
     canvas_slot = free_slot;
     history = std::min(history + 1, 2u);
-    refreshes_since_frame = 1;
     frame_index++;
 
     // The motion between this frame and the previous one is searched once a
@@ -557,25 +557,37 @@ MTL::Texture* FramePresenter::getFrameForRefresh(CommandBuffer* command_buffer,
     auto* current = slots[current_slot].color;
     if (history < 2)
         return current;
-    const auto refreshes = std::clamp(
-        static_cast<u32>(std::lround(refreshes_per_frame)), 1u,
-        MAX_REFRESHES_PER_FRAME);
-    if (refreshes_since_frame >= refreshes)
+    const auto output_fps = frameGenerationOutputRate(
+        CONFIG_INSTANCE.getFrameGenerationRateMode() == FrameGenerationRateMode::Multiple,
+        CONFIG_INSTANCE.getFrameGenerationTargetFps(),
+        CONFIG_INSTANCE.getFrameGenerationMultiplier(), static_cast<f64>(frame_delta_time));
+    const auto elapsed = std::chrono::duration<f64>(
+        std::chrono::steady_clock::now() - last_frame_time).count();
+    const f32 t = static_cast<f32>(frameGenerationFraction(
+        elapsed, static_cast<f64>(frame_delta_time), output_fps));
+    if (t >= 1.0f)
         return current;
-
-    const f32 t =
-        static_cast<f32>(refreshes_since_frame) / static_cast<f32>(refreshes);
     const bool use_metalfx = mode == FrameGeneration::MetalFx && metalfx;
+    if (generated_source && generated_frame_index == frame_index &&
+        generated_fraction == t && generated_with_metalfx == use_metalfx) {
+        repeated_generated = true;
+        return generated_source;
+    }
     if (flow_frame_index != frame_index || (use_metalfx && !flow_has_metalfx)) {
         encodeFlow(command_buffer, use_metalfx);
         flow_frame_index = frame_index;
         flow_has_metalfx = use_metalfx;
     }
-    if (mode == FrameGeneration::MetalFx && metalfx &&
-        std::abs(t - 0.5f) < 1e-3f && encodeMetalFx(command_buffer))
-        return metalfx_output;
-    encodeInterpolation(command_buffer, t);
-    return generated;
+    if (use_metalfx && std::abs(t - 0.5f) < 1e-3f && encodeMetalFx(command_buffer)) {
+        generated_source = metalfx_output;
+    } else {
+        encodeInterpolation(command_buffer, t);
+        generated_source = generated;
+    }
+    generated_frame_index = frame_index;
+    generated_fraction = t;
+    generated_with_metalfx = use_metalfx;
+    return generated_source;
 }
 
 void FramePresenter::encodeLuma(CommandBuffer* command_buffer,

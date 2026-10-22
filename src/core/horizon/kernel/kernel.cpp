@@ -30,7 +30,7 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
     u32 tmp_u32;
     u64 tmp_u64;
     uptr tmp_uptr;
-    // DEBUG: HYDRA_TRACE_SVC traces memory SVCs and failed SVCs
+    // DEBUG: HYDRA_TRACE_SVC traces memory SVCs, waits and failed SVCs
     static const bool trace_svc = std::getenv("HYDRA_TRACE_SVC") != nullptr;
     const std::array<u64, 4> trace_args = {state.r[0], state.r[1], state.r[2],
                                            state.r[3]};
@@ -178,8 +178,8 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             sync_objs[i] =
                 crnt_process->getHandle<SynchronizationObject>(handles[i]);
 
-        // DEBUG: report guest waits that block for a long time
-        if (std::bit_cast<i64>(state.r[3]) < 0) {
+        // An infinite timeout is normal for vsync/event waits, not a stall.
+        if (trace_svc && std::bit_cast<i64>(state.r[3]) < 0) {
             std::string names;
             for (auto i = 0; i < num_handles; i++)
                 names += fmt::format(

@@ -426,6 +426,18 @@ func configGetFrameGeneration() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetFrameGeneration()
 }
 
+func configGetFrameGenerationRateMode() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationRateMode()
+}
+
+func configGetFrameGenerationTargetFps() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationTargetFps()
+}
+
+func configGetFrameGenerationMultiplier() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationMultiplier()
+}
+
 func configGetSharpening() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetSharpening()
 }
@@ -1086,6 +1098,10 @@ class HydraSystem: MutableHandleClass {
     }
 
     // New images per second the display showed, game frames and generated
+    func getPresentationFrameRate() -> Double {
+        hydraSystemGetPresentationFrameRate(self.handle)
+    }
+
     func getLastShownFps() -> Float {
         hydraSystemGetLastShownFps(self.handle)
     }

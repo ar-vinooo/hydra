@@ -1,5 +1,7 @@
 #include "core/system.hpp"
 
+#include "common/frame_generation_timing.hpp"
+
 #include "core/hw/tegra_x1/gpu/display_stats.hpp"
 
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
@@ -537,6 +539,8 @@ void System::resume() {
 
 void System::progressFrame(u32 width, u32 height,
                            bool& out_dt_average_updated) {
+    out_dt_average_updated = false;
+
     // DEBUG: dump guest threads when the trigger file appears
     static const char* thread_dump_trigger = std::getenv("HYDRA_THREAD_DUMP");
     if (thread_dump_trigger != nullptr && main_process != nullptr) {
@@ -954,6 +958,13 @@ void System::progressFrame(u32 width, u32 height,
     delete command_buffer;
     delete compositor;
 
+}
+
+f64 System::getPresentationFrameRate() const {
+    return frameGenerationOutputRate(
+        CONFIG_INSTANCE.getFrameGenerationRateMode() == FrameGenerationRateMode::Multiple,
+        CONFIG_INSTANCE.getFrameGenerationTargetFps(),
+        CONFIG_INSTANCE.getFrameGenerationMultiplier(), static_cast<f64>(last_dt_average));
 }
 
 bool System::isRunning() const {

@@ -105,13 +105,34 @@ struct ShaderOverrides {
 
 // The same explicit fields form the hash and the exact collision key. Do not
 // hash struct padding or treat a 32-bit hash as proof of descriptor equality.
-struct ShaderKeyBuilder {
-    std::vector<u32> words;
-    ShaderKeyBuilder() { words.reserve(128); }
+template <bool compact> struct ShaderKeyBuilder {
+    std::vector<u32>& words;
+    explicit ShaderKeyBuilder(std::vector<u32>& words_) : words{words_} {
+        words.clear();
+        if (words.capacity() < 128)
+            words.reserve(128);
+    }
     void add(u32 value) { words.push_back(value); }
     void add(u64 value) { add(u32(value)); add(u32(value >> 32)); }
     template <typename T> void add(const T& value) {
         static_assert(std::is_trivially_copyable_v<T>);
+        if constexpr (compact) {
+            if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {
+                static_assert(sizeof(T) <= sizeof(u64));
+                if constexpr (sizeof(T) <= sizeof(u32))
+                    add(static_cast<u32>(value));
+                else
+                    add(static_cast<u64>(value));
+                return;
+            } else if constexpr (std::is_same_v<T, f32>) {
+                add(std::bit_cast<u32>(value));
+                return;
+            } else if constexpr (std::is_same_v<T, simd::uint4>) {
+                for (u32 i = 0; i < 4; ++i)
+                    add(static_cast<u32>(value[i]));
+                return;
+            }
+        }
         const auto* bytes = reinterpret_cast<const u8*>(&value);
         for (usize i = 0; i < sizeof(T); ++i) add(u32(bytes[i]));
     }
@@ -141,23 +162,27 @@ bool matchesMappedCode(uptr address, const std::vector<u8>& bytes,
     return !tail || tail->ptr == 0;
 }
 
-std::vector<u32> makeShaderKey(const GuestShaderDescriptor& descriptor) {
+template <bool compiled_version = false>
+void buildShaderKey(const GuestShaderDescriptor& descriptor,
+                    std::vector<u32>& words) {
     // Hash enum values as words rather than feeding each byte separately.
     // Keep explicit fields: hashing whole structs would include padding.
-    ShaderKeyBuilder hash;
+    ShaderKeyBuilder<compiled_version> hash(words);
     hash.add(descriptor.gpu_addr);
     hash.add(reinterpret_cast<uptr>(tls_crnt_gmmu));
     hash.add(::hydra::hot::generation());
-    hash.add(descriptor.code_revision);
+    hash.add(compiled_version ? u64{0} : descriptor.code_revision);
     hash.add(static_cast<u32>(descriptor.stage));
     hash.add(descriptor.code_ptr);
     hash.add(descriptor.state.program_offset);
     hash.add(ShaderOverrides::instance().getGeneration(descriptor.gpu_addr));
-    hash.add(descriptor.state.branch_constants.size());
-    for (const auto& [location, value] : descriptor.state.branch_constants) {
-        hash.add(location.first);
-        hash.add(location.second);
-        hash.add(value);
+    hash.add(compiled_version ? usize{0} : descriptor.state.branch_constants.size());
+    if constexpr (!compiled_version) {
+        for (const auto& [location, value] : descriptor.state.branch_constants) {
+            hash.add(location.first);
+            hash.add(location.second);
+            hash.add(value);
+        }
     }
     hash.add(descriptor.state.buffer_texture_formats.size());
     for (const auto& [index, format] :
@@ -260,8 +285,12 @@ std::vector<u32> makeShaderKey(const GuestShaderDescriptor& descriptor) {
         for (const auto swizzle : descriptor.state.color_target_swizzles)
             hash.add(static_cast<u32>(swizzle));
     }
+}
 
-    return std::move(hash.words);
+std::vector<u32> makeShaderKey(const GuestShaderDescriptor& descriptor) {
+    std::vector<u32> words;
+    buildShaderKey(descriptor, words);
+    return words;
 }
 
 
@@ -312,10 +341,26 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         return shader;
     };
     std::scoped_lock lock(lookup_mutex);
-    auto actual = descriptor;
-    actual.code_revision = 0;
-    actual.state.branch_constants.clear();
-    const auto version_key = makeShaderKey(actual);
+    static const bool reuse_lookup =
+        std::getenv("HYDRA_DISABLE_SHADER_LOOKUP_REUSE") == nullptr;
+    // Warm hits need an exact key and current code/constants, but no owned
+    // descriptor copy. Keep the reference path available for pixel/timing A/B.
+    std::optional<GuestShaderDescriptor> actual_storage;
+    const auto normalized = [&]() -> GuestShaderDescriptor& {
+        if (!actual_storage) {
+            actual_storage.emplace(descriptor);
+            actual_storage->code_revision = 0;
+            actual_storage->state.branch_constants.clear();
+        }
+        return *actual_storage;
+    };
+    std::vector<u32> reference_key;
+    if (reuse_lookup) {
+        buildShaderKey<true>(descriptor, lookup_key);
+    } else {
+        reference_key = makeShaderKey(normalized());
+    }
+    const auto& version_key = reuse_lookup ? lookup_key : reference_key;
     auto& versions = compiled_versions[version_key];
     for (const auto& version : versions) {
         const auto& resources = version.shader->getDescriptor().resource_mapping;
@@ -329,8 +374,13 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
                     descriptor.read_const_word(entry.first.first,
                                                entry.first.second) == entry.second;
             });
-        if (constants_match) return inspect(actual, version.shader);
+        if (constants_match) {
+            if (!VisualDiagnostics::instance().selected())
+                return version.shader;
+            return inspect(normalized(), version.shader);
+        }
     }
+    auto& actual = normalized();
     auto& source = sources[{reinterpret_cast<uptr>(tls_crnt_gmmu), descriptor.gpu_addr,
                             descriptor.stage}];
     const auto epoch = instruction_epoch.load();

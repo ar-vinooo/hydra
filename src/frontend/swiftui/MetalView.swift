@@ -15,7 +15,10 @@ class MetalLayerCoordinator: NSObject {
 
     private var layer: CAMetalLayer? = nil
     private var displayLink: CADisplayLink? = nil
+    private var presentationTimer: Timer? = nil
+    private var presentationRate = 0.0
     private var surfaceSet = false
+    private weak var surfaceSystem: HydraSystem? = nil
     private var hudShown: Bool? = nil
 
     init(system: Binding<HydraSystem?>, fps: Binding<FrameRate>) {
@@ -26,11 +29,23 @@ class MetalLayerCoordinator: NSObject {
 
     deinit {
         self.displayLink?.invalidate()
+        self.presentationTimer?.invalidate()
+    }
+
+    func stopPresentation() {
+        self.displayLink?.invalidate()
+        self.displayLink = nil
+        self.presentationTimer?.invalidate()
+        self.presentationTimer = nil
     }
 
     #if os(macOS)
         func setView(_ view: NSView) {
+            guard self.layer !== view.layer else { return }
             self.displayLink?.invalidate()
+            self.presentationTimer?.invalidate()
+            self.presentationTimer = nil
+            self.presentationRate = 0
             self.layer = view.layer as? CAMetalLayer
             self.surfaceSet = false
             self.hudShown = nil
@@ -42,22 +57,62 @@ class MetalLayerCoordinator: NSObject {
         }
     #else
         func setView(_ view: UIView) {
+            guard self.layer !== view.layer else { return }
             self.displayLink?.invalidate()
+            self.presentationTimer?.invalidate()
+            self.presentationTimer = nil
+            self.presentationRate = 0
             self.layer = view.layer as? CAMetalLayer
             self.surfaceSet = false
             self.hudShown = nil
 
             // Display link
             self.displayLink = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
-            // Refresh as fast as the display can (ProMotion), for frame
-            // generation and frame rate limits above 60
+            // Native presentation follows the display. Frame generation uses
+            // its own timer below, independent of this display link.
             self.displayLink?.preferredFrameRateRange = CAFrameRateRange(
                 minimum: 60, maximum: 120, preferred: 120)
             self.displayLink?.add(to: .main, forMode: .commonModes)
         }
     #endif
 
+    // The display link observes setting changes and drives normal presentation.
+    // FG uses a separate clock; its rate is never clamped to a screen's refresh.
+    private func updatePresentationClock() -> Bool {
+        let frameGenerationEnabled =
+            configGetFrameGeneration().pointee != HYDRA_FRAME_GENERATION_OFF.rawValue
+        #if os(macOS)
+            self.layer?.displaySyncEnabled = !frameGenerationEnabled
+        #endif
+        guard frameGenerationEnabled else {
+            self.presentationTimer?.invalidate()
+            self.presentationTimer = nil
+            self.presentationRate = 0
+            return false
+        }
+        let rate = self.system?.getPresentationFrameRate() ?? 120.0
+        if self.presentationTimer == nil || rate != self.presentationRate {
+            self.presentationTimer?.invalidate()
+            self.presentationRate = rate
+            let timer = Timer(timeInterval: max(1.0 / rate, 1e-9), repeats: true) {
+                [weak self] _ in
+                guard let self, self.updatePresentationClock() else { return }
+                self.presentFrame()
+            }
+            timer.tolerance = 0
+            self.presentationTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+        return true
+    }
+
     @objc func handleDisplayLink() {
+        if !self.updatePresentationClock() {
+            self.presentFrame()
+        }
+    }
+
+    private func presentFrame() {
         // Metal performance HUD
         let showHud = configGetMetalHud().pointee
         if showHud != self.hudShown, let layer = self.layer {
@@ -69,12 +124,13 @@ class MetalLayerCoordinator: NSObject {
 
         if let system = system {
             // Set the surface if its not already set
-            if !self.surfaceSet {
+            if !self.surfaceSet || self.surfaceSystem !== system {
                 guard let layer = self.layer else {
                     return
                 }
                 system.surface = Unmanaged.passUnretained(layer).toOpaque()
                 self.surfaceSet = true
+                self.surfaceSystem = system
             }
 
             // Present
@@ -116,6 +172,10 @@ class MetalLayerCoordinator: NSObject {
             return view
         }
 
+        static func dismantleNSView(_ view: NSView, coordinator: MetalLayerCoordinator) {
+            coordinator.stopPresentation()
+        }
+
         func updateNSView(_ view: NSView, context: Context) {
             guard let layer = view.layer as? CAMetalLayer else { return }
             layer.frame = view.bounds
@@ -150,6 +210,10 @@ class MetalLayerCoordinator: NSObject {
             let view = MetalBackedView(frame: .zero)
             context.coordinator.setView(view)
             return view
+        }
+
+        static func dismantleUIView(_ view: UIView, coordinator: MetalLayerCoordinator) {
+            coordinator.stopPresentation()
         }
 
         func updateUIView(_ view: UIView, context: Context) {

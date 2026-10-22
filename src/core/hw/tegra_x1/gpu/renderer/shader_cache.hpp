@@ -117,6 +117,8 @@ class ShaderCache
         ShaderBase* shader;
     };
     std::map<std::vector<u32>, std::vector<CompiledVersion>> compiled_versions;
+    // Reused under lookup_mutex; map entries own their copied keys.
+    std::vector<u32> lookup_key;
     u64 next_code_revision{0};
     std::atomic<u64> instruction_epoch{0};
     std::mutex lookup_mutex;
