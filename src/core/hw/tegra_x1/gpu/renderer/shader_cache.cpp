@@ -362,9 +362,9 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
     }
     const auto& version_key = reuse_lookup ? lookup_key : reference_key;
     auto& versions = compiled_versions[version_key];
-    for (const auto& version : versions) {
-        const auto& resources = version.shader->getDescriptor().resource_mapping;
-        if (!matchesMappedCode(descriptor.gpu_addr, *version.bytes,
+    for (auto version = versions.begin(); version != versions.end(); ++version) {
+        const auto& resources = version->shader->getDescriptor().resource_mapping;
+        if (!matchesMappedCode(descriptor.gpu_addr, *version->bytes,
                                resources.code_read_size))
             continue;
         const auto constants_match = std::all_of(
@@ -375,9 +375,13 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
                                                entry.first.second) == entry.second;
             });
         if (constants_match) {
+            auto* shader = version->shader;
+            // Retain all historical artifacts, but validate the last hit first.
+            if (reuse_lookup && version != versions.begin())
+                std::rotate(versions.begin(), version, std::next(version));
             if (!VisualDiagnostics::instance().selected())
-                return version.shader;
-            return inspect(normalized(), version.shader);
+                return shader;
+            return inspect(normalized(), shader);
         }
     }
     auto& actual = normalized();
@@ -425,7 +429,11 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         actual.cache_key = makeShaderKey(actual);
     }
     auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true, true>::find(actual);
-    if (shader) versions.push_back({actual.code_snapshot, shader});
+    if (shader) {
+        versions.push_back({actual.code_snapshot, shader});
+        if (reuse_lookup)
+            std::rotate(versions.begin(), std::prev(versions.end()), versions.end());
+    }
     return inspect(actual, shader);
 }
 

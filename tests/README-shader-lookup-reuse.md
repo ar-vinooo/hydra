@@ -19,6 +19,12 @@ sampler colors by component. The normal compilation/hash key retains its
 existing encoding. Both resident-key paths include the same specialization
 fields; no instruction or constant validation is skipped.
 
+Resident versions are searched in order of their last successful match. A hit
+moves its entry to the front; a new artifact starts there. Older artifacts remain
+owned and available for code/branch restoration. The first candidate still has
+its mapped bytes and branch constants checked on every use. This avoids a
+growing linear scan through historical versions on repeated warm lookups.
+
 This changes allocation/copy work. It retains exact key equality, comparison of
 the mapped instruction bytes actually decoded by the shader, branch-constant
 checks, address-space identity, hot-module/override revisions, invalidation and
@@ -64,3 +70,21 @@ Routine kernel waits with an infinite timeout are traced only when
 Warnings for actual waits longer than two seconds remain active. File logging
 was already buffered; error/fatal messages still flush immediately. This removes
 routine formatting/debugger-callback work without hiding warnings or errors.
+
+## Measured validation
+
+The local Metal-validation run passed all 184 reference cases in both modes,
+twice per mode, plus the internal state/identity assertions. The baseline warm
+lookup samples were 2.682/2.588 us, versus 0.128/0.131 us with packed reusable
+keys and last-hit-first history: about 95% less lookup time in this historical
+code-version workload. Retained historical artifacts were restored and rendered
+throughout the same tests. This does not imply a 20x gameplay speedup.
+
+The resource-registry, raster-state and render-hash suites also passed. The GPU
+engine suite passed 51 groups and shader-library passed 60 groups with Metal
+validation enabled; debugger logging passed. Two uniform-readback fixtures now
+wait through the production backend-neutral checkpoint API rather than assuming
+the wrapper owns a Metal 3 command buffer when Metal 4 is selected.
+
+Detailed local results: `build/render-final-validation/summary.json` and the
+adjacent per-suite logs. CTR gameplay validation remains user-controlled.

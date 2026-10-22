@@ -31,8 +31,14 @@ set(HYDRA_GPU_GATE_ALLOWED 1)
 if(HYDRA_HOT_RELOAD)
     set(HYDRA_GPU_GATE_ALLOWED 0)
 endif()
-target_compile_definitions(hydra-core PRIVATE
+# Only this translation unit consumes the receipt identity. Target-wide flags
+# would invalidate the core PCH and every object after any covered source edit.
+set(HYDRA_GPU_POLICY_SOURCE
+    "${CMAKE_CURRENT_SOURCE_DIR}/hw/tegra_x1/gpu/optimization_policy.cpp")
+set_property(SOURCE "${HYDRA_GPU_POLICY_SOURCE}" APPEND PROPERTY COMPILE_DEFINITIONS
     HYDRA_GPU_OPTIMIZATION_FINGERPRINT="${HYDRA_GPU_GATE_FINGERPRINT}"
     HYDRA_GPU_OPTIMIZATION_BUILD_ALLOWED=${HYDRA_GPU_GATE_ALLOWED})
+set_source_files_properties("${HYDRA_GPU_POLICY_SOURCE}" PROPERTIES
+    SKIP_PRECOMPILE_HEADERS ON)
 file(WRITE "${CMAKE_BINARY_DIR}/gpu-optimization-fingerprint.txt"
     "${HYDRA_GPU_GATE_FINGERPRINT}\n${HYDRA_GPU_GATE_ALLOWED}\n")
