@@ -16,7 +16,8 @@ class ISurfaceCompositor {
                              const FloatRect2D src_rect,
                              const FloatRect2D dst_rect, bool transparent,
                              f32 opacity = 1.0f) = 0;
-    virtual void present(ICommandBuffer* command_buffer) = 0;
+    // `new_frame` is whether a layer got a new guest frame for this refresh
+    virtual void present(ICommandBuffer* command_buffer, bool new_frame) = 0;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

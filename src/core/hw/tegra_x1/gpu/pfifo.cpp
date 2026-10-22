@@ -551,12 +551,11 @@ void Pfifo::threadFunc() {
                     const auto id = entry_list.correlation_id;
                     const auto epoch = VisualDiagnostics::instance().frameId();
                     static_cast<renderer::metal::CommandBuffer*>(tls_crnt_command_buffer)
-                        ->getCommandBuffer()->addCompletedHandler([id, epoch](MTL::CommandBuffer* completed) {
-                            const auto* error = completed->error();
+                        ->addCompletedHandler([id, epoch](const renderer::metal::GpuCompletion& completion) {
                             VisualDiagnostics::instance().completed(id, epoch,
-                                completed->status() == MTL::CommandBufferStatusCompleted ? "completed" : "failed",
-                                error ? error->localizedDescription()->utf8String() : "",
-                                completed->GPUEndTime() - completed->GPUStartTime());
+                                completion.succeeded ? "completed" : "failed",
+                                completion.error.c_str(),
+                                completion.gpu_end_time - completion.gpu_start_time);
                         });
                 }
 #endif

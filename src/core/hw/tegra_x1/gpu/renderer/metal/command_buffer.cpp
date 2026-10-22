@@ -1,20 +1,109 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+// A Metal 4 command buffer and what the GPU needs until it finished it
+struct Mtl4Submission {
+    std::shared_ptr<Mtl4Context> context;
+    MTL4::CommandBuffer* command_buffer{nullptr};
+    MTL4::CommandAllocator* allocator{nullptr};
+    // Retained and resident until the GPU finished
+    std::vector<MTL::Allocation*> allocations;
+    std::unordered_set<const void*> tracked;
+    MTL::ResidencySet* residency_set{nullptr};
+    // Inline bytes
+    std::vector<MTL::Buffer*> transient_chunks;
+    usize transient_offset{0};
+    std::vector<GpuCompletionHandler> handlers;
+    std::vector<CA::MetalDrawable*> drawables;
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool completed{false};
+    GpuCompletion result{};
+};
+
+namespace {
+
+GpuCompletion toGpuCompletion(MTL::CommandBuffer* command_buffer) {
+    const auto* error = command_buffer->error();
+    return {
+        .succeeded =
+            command_buffer->status() == MTL::CommandBufferStatusCompleted,
+        .gpu_start_time = command_buffer->GPUStartTime(),
+        .gpu_end_time = command_buffer->GPUEndTime(),
+        .error = error ? error->localizedDescription()->utf8String() : "",
+    };
+}
+
+void completeMtl4Submission(Mtl4Submission& submission,
+                            MTL4::CommitFeedback* feedback) {
+    const auto* error = feedback->error();
+    const GpuCompletion result{
+        .succeeded = error == nullptr,
+        .gpu_start_time = feedback->GPUStartTime(),
+        .gpu_end_time = feedback->GPUEndTime(),
+        .error = error ? error->localizedDescription()->utf8String() : "",
+    };
+    {
+        std::scoped_lock lock(submission.mutex);
+        submission.result = result;
+        submission.completed = true;
+    }
+    submission.condition.notify_all();
+
+    for (const auto& handler : submission.handlers)
+        handler(result);
+    submission.handlers.clear();
+
+    // The GPU is done with everything the command buffer used
+    auto* context = submission.context.get();
+    for (auto* allocation : submission.allocations)
+        allocation->release();
+    submission.allocations.clear();
+    submission.tracked.clear();
+    if (submission.residency_set != nullptr)
+        context->recycleResidencySet(submission.residency_set);
+    for (auto* chunk : submission.transient_chunks)
+        context->recycleTransientChunk(chunk);
+    submission.transient_chunks.clear();
+    context->recycleAllocator(submission.allocator);
+    submission.command_buffer->release();
+}
+
+} // namespace
+
 CommandBuffer::CommandBuffer(MTL::CommandQueue* command_queue_,
                              std::shared_ptr<CompletionQueue> completions_)
     : command_queue{command_queue_}, completions{std::move(completions_)} {
-    TMP_AUTORELEASE_POOL_BEGIN();
-    command_buffer = command_queue->commandBuffer()->retain();
-    TMP_AUTORELEASE_POOL_END();
+    render_encoder.owner = this;
+    compute_encoder.owner = this;
+    blit_encoder.owner = this;
+    beginNative();
+}
+
+CommandBuffer::CommandBuffer(std::shared_ptr<Mtl4Context> mtl4_context_,
+                             std::shared_ptr<CompletionQueue> completions_)
+    : mtl4_context{std::move(mtl4_context_)},
+      completions{std::move(completions_)} {
+    render_encoder.owner = this;
+    compute_encoder.owner = this;
+    blit_encoder.owner = this;
+    vertex_table = mtl4_context->acquireArgumentTable();
+    fragment_table = mtl4_context->acquireArgumentTable();
+    compute_table = mtl4_context->acquireArgumentTable();
+    beginNative();
 }
 
 CommandBuffer::~CommandBuffer() {
@@ -25,12 +114,12 @@ CommandBuffer::~CommandBuffer() {
     if (visibility_buffer != nullptr)
         visibility_buffer->release();
     if (!retired_upload_buffers.empty()) {
-        command_buffer->addCompletedHandler(
+        addCompletedHandler(
             [pool = std::move(upload_pool),
-             buffers =
-                 std::move(retired_upload_buffers)](MTL::CommandBuffer* cb) {
+             buffers = std::move(retired_upload_buffers)](
+                const GpuCompletion& completion) {
                 for (auto* buffer : buffers) {
-                    if (cb->status() == MTL::CommandBufferStatusCompleted)
+                    if (completion.succeeded)
                         pool->recycle(buffer);
                     else
                         buffer->release();
@@ -43,8 +132,8 @@ CommandBuffer::~CommandBuffer() {
         PerfStats::instance().render_encoders += render_encoders;
         PerfStats::instance().blit_encoders += blit_encoders;
         PerfStats::instance().command_buffers++;
-        command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
-            const auto dt = cb->GPUEndTime() - cb->GPUStartTime();
+        addCompletedHandler([](const GpuCompletion& completion) {
+            const auto dt = completion.gpu_end_time - completion.gpu_start_time;
             if (dt > 0.0)
                 PerfStats::instance().gpu_ns +=
                     static_cast<u64>(dt * 1'000'000'000.0);
@@ -65,28 +154,24 @@ CommandBuffer::~CommandBuffer() {
                 },
                 {}, true);
         } else {
-            command_buffer->addCompletedHandler(
+            addCompletedHandler(
                 [callbacks = std::move(completion_callbacks)](
-                    MTL::CommandBuffer* cb) {
-                    const bool succeeded =
-                        cb->status() == MTL::CommandBufferStatusCompleted;
+                    const GpuCompletion& completion) {
                     for (const auto& callback : callbacks)
-                        callback(succeeded);
+                        callback(completion.succeeded);
                 });
         }
         completion_callbacks.clear();
     }
     // GPU faults and timeouts are otherwise silent. This runs on a Metal
     // dispatch thread the logger does not know about, so print directly.
-    command_buffer->addCompletedHandler([](MTL::CommandBuffer* cb) {
+    addCompletedHandler([](const GpuCompletion& completion) {
         completed_buffers.fetch_add(1, std::memory_order_acq_rel);
-        if (cb->status() != MTL::CommandBufferStatusError)
+        if (completion.succeeded)
             return;
-        const auto error = cb->error();
-        std::fprintf(stderr, "[Metal] Command buffer failed (code %ld): %s\n",
-                     error ? static_cast<long>(error->code()) : -1L,
-                     error ? error->localizedDescription()->utf8String()
-                           : "unknown error");
+        std::fprintf(stderr, "[Metal] Command buffer failed: %s\n",
+                     completion.error.empty() ? "unknown error"
+                                              : completion.error.c_str());
     });
     submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
     commitSubmission();
@@ -95,8 +180,189 @@ CommandBuffer::~CommandBuffer() {
     // for debugging.
     static const bool gpu_sync = std::getenv("HYDRA_GPU_SYNC") != nullptr;
     if (gpu_sync)
+        waitNative();
+    if (command_buffer != nullptr)
+        command_buffer->release();
+    if (mtl4_context != nullptr) {
+        // Encoders copied the bindings they used
+        mtl4_context->recycleArgumentTable(vertex_table);
+        mtl4_context->recycleArgumentTable(fragment_table);
+        mtl4_context->recycleArgumentTable(compute_table);
+    }
+}
+
+void CommandBuffer::beginNative() {
+    if (mtl4_context == nullptr) {
+        TMP_AUTORELEASE_POOL_BEGIN();
+        command_buffer = command_queue->commandBuffer()->retain();
+        TMP_AUTORELEASE_POOL_END();
+        return;
+    }
+
+    auto submission = std::make_shared<Mtl4Submission>();
+    submission->context = mtl4_context;
+    submission->allocator = mtl4_context->acquireAllocator();
+    submission->command_buffer = mtl4_context->getDevice()->newCommandBuffer();
+    submission->command_buffer->beginCommandBuffer(submission->allocator);
+    mtl4_command_buffer = submission->command_buffer;
+    mtl4_submission = std::move(submission);
+}
+
+void CommandBuffer::commitNative() {
+    if (mtl4_context == nullptr) {
+        command_buffer->commit();
+        return;
+    }
+
+    auto submission = mtl4_submission;
+    if (!submission->allocations.empty()) {
+        submission->residency_set = mtl4_context->acquireResidencySet();
+        if (submission->residency_set != nullptr) {
+            submission->residency_set->addAllocations(
+                submission->allocations.data(),
+                submission->allocations.size());
+            submission->residency_set->commit();
+            submission->command_buffer->useResidencySet(
+                submission->residency_set);
+        }
+    }
+    submission->command_buffer->endCommandBuffer();
+
+    auto* queue = mtl4_context->getQueue();
+    // Rendering to a drawable waits until the display released it
+    for (auto* drawable : submission->drawables)
+        queue->wait(drawable);
+    NS_STACK_SCOPED auto options = MTL4::CommitOptions::alloc()->init();
+    options->addFeedbackHandler([submission](MTL4::CommitFeedback* feedback) {
+        completeMtl4Submission(*submission, feedback);
+    });
+    const MTL4::CommandBuffer* buffers[] = {submission->command_buffer};
+    queue->commit(buffers, 1, options);
+    for (auto* drawable : submission->drawables) {
+        queue->signalDrawable(drawable);
+        drawable->present();
+        drawable->release();
+    }
+    submission->drawables.clear();
+}
+
+GpuCompletion CommandBuffer::waitNative() {
+    if (mtl4_context == nullptr) {
         command_buffer->waitUntilCompleted();
-    command_buffer->release();
+        return toGpuCompletion(command_buffer);
+    }
+
+    auto& submission = *mtl4_submission;
+    std::unique_lock lock(submission.mutex);
+    submission.condition.wait(lock, [&] { return submission.completed; });
+    return submission.result;
+}
+
+MTL::Device* CommandBuffer::getDevice() const {
+    return mtl4_context != nullptr ? mtl4_context->getDevice()
+                                   : command_buffer->device();
+}
+
+void CommandBuffer::addCompletedHandler(GpuCompletionHandler handler) {
+    if (mtl4_context != nullptr) {
+        mtl4_submission->handlers.push_back(std::move(handler));
+        return;
+    }
+    command_buffer->addCompletedHandler(
+        [handler = std::move(handler)](MTL::CommandBuffer* completed) {
+            handler(toGpuCompletion(completed));
+        });
+}
+
+void CommandBuffer::presentDrawable(CA::MetalDrawable* drawable) {
+    has_commands = true;
+    if (mtl4_context != nullptr) {
+        // Presented after the commit
+        mtl4_submission->drawables.push_back(drawable->retain());
+        return;
+    }
+    command_buffer->presentDrawable(drawable);
+}
+
+MTL::Fence* CommandBuffer::beginExternalEncoding() {
+    endEncoding();
+    has_commands = true;
+    if (mtl4_context == nullptr)
+        return nullptr;
+
+    // The external work does not wait for earlier encoders by itself: an
+    // encoder that does wait for them signals the fence it waits for. It has
+    // to do some work for its stages to run after the barrier.
+    auto* fence = mtl4_context->getExternalFence();
+    auto* scratch = mtl4_context->getScratchBuffer();
+    track(scratch);
+    TMP_AUTORELEASE_POOL_BEGIN();
+    auto* encoder = mtl4_command_buffer->computeCommandEncoder();
+    encoder->barrierAfterQueueStages(MTL4_ALL_STAGES, MTL4_COMPUTE_STAGES,
+                                     MTL4::VisibilityOptionDevice);
+    encoder->fillBuffer(scratch, NS::Range(0, 4), 0);
+    encoder->updateFence(fence, MTL4_COMPUTE_STAGES);
+    encoder->endEncoding();
+    TMP_AUTORELEASE_POOL_END();
+    return fence;
+}
+
+void CommandBuffer::track(const MTL::Buffer* buffer) {
+    if (mtl4_context == nullptr || buffer == nullptr)
+        return;
+    auto& submission = *mtl4_submission;
+    if (!submission.tracked.insert(buffer).second)
+        return;
+    auto* allocation = const_cast<MTL::Buffer*>(buffer);
+    allocation->retain();
+    submission.allocations.push_back(allocation);
+}
+
+void CommandBuffer::track(const MTL::Texture* texture) {
+    if (mtl4_context == nullptr || texture == nullptr)
+        return;
+    // Drawables are made resident through their layer
+    if (texture->framebufferOnly())
+        return;
+    auto& submission = *mtl4_submission;
+    if (!submission.tracked.insert(texture).second)
+        return;
+    auto* allocation = const_cast<MTL::Texture*>(texture);
+    allocation->retain();
+    submission.allocations.push_back(allocation);
+    // Views and buffer textures use the memory of what they view
+    track(texture->parentTexture());
+    track(texture->buffer());
+}
+
+MTL::GPUAddress CommandBuffer::allocateTransient(const void* bytes,
+                                                 usize length) {
+    // Constant buffers need this alignment on some GPUs
+    constexpr usize ALIGNMENT = 256;
+    auto& submission = *mtl4_submission;
+    if (length > Mtl4Context::TRANSIENT_CHUNK_SIZE) {
+        auto* buffer = getDevice()->newBuffer(bytes, length,
+                                              MTL::ResourceStorageModeShared);
+        track(buffer);
+        const auto address = buffer->gpuAddress();
+        buffer->release();
+        return address;
+    }
+    if (submission.transient_chunks.empty() ||
+        submission.transient_offset + length >
+            Mtl4Context::TRANSIENT_CHUNK_SIZE) {
+        auto* chunk = mtl4_context->acquireTransientChunk();
+        submission.transient_chunks.push_back(chunk);
+        track(chunk);
+        submission.transient_offset = 0;
+    }
+    auto* chunk = submission.transient_chunks.back();
+    const auto offset = submission.transient_offset;
+    std::memcpy(static_cast<u8*>(chunk->contents()) + offset, bytes, length);
+    submission.transient_offset =
+        (offset + length + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    has_commands = true;
+    return chunk->gpuAddress() + offset;
 }
 
 void CommandBuffer::retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> pool,
@@ -113,14 +379,12 @@ const std::shared_ptr<CompletionToken>& CommandBuffer::shareCompletionToken() {
         // The work depending on the token needs the buffer to be committed,
         // even if nothing else was encoded
         has_commands = true;
-        command_buffer->addCompletedHandler(
-            [token = completion_token,
-             queue = completions](MTL::CommandBuffer* cb) {
-                token->complete(cb->status() ==
-                                MTL::CommandBufferStatusCompleted);
-                if (queue)
-                    queue->notify();
-            });
+        addCompletedHandler([token = completion_token, queue = completions](
+                                const GpuCompletion& completion) {
+            token->complete(completion.succeeded);
+            if (queue)
+                queue->notify();
+        });
     }
     return completion_token;
 }
@@ -217,7 +481,7 @@ bool CommandBuffer::continuesOpenRenderPass(
             continuesRenderPass(encoder_state.render_pass, descriptor));
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
+RenderEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     if (render_pass_descriptor == encoder_state.render_pass)
         return getRenderCommandEncoderUnchecked();
@@ -242,7 +506,7 @@ MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoderHot1(
     return createRenderCommandEncoder(render_pass_descriptor);
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::getDirectRenderCommandEncoder(
+RenderEncoder* CommandBuffer::getDirectRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor,
     MTL::DepthStencilState* depth_stencil_disabled) {
     const bool continues =
@@ -269,7 +533,7 @@ MTL::RenderCommandEncoder* CommandBuffer::getDirectRenderCommandEncoder(
     return encoder;
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
+RenderEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     // What ended the previous pass, when it is not this one
     if (render_pass_gap == 0 && encoder_type != EncoderType::Render)
@@ -277,19 +541,76 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
-    auto* descriptor = render_pass_descriptor;
-    // Sampling GPU timestamps changes the descriptor
-    const bool sample = GpuPassProfiler::get(command_buffer->device()) != nullptr;
-    if (visibility_buffer != nullptr || sample) {
-        descriptor = render_pass_descriptor->copy();
-        if (visibility_buffer != nullptr)
-            descriptor->setVisibilityResultBuffer(visibility_buffer);
+    if (mtl4_context != nullptr) {
+        if (PerfStats::isEnabled())
+            profileRenderPass(render_pass_descriptor);
+        // The same pass with Metal 4 types. The attachment descriptors are
+        // shared by both APIs.
+        NS_STACK_SCOPED auto pass = MTL4::RenderPassDescriptor::alloc()->init();
+        for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
+            auto* attachment = render_pass_descriptor->colorAttachments()->object(i);
+            if (attachment->texture() == nullptr)
+                continue;
+            track(attachment->texture());
+            track(attachment->resolveTexture());
+            pass->colorAttachments()->setObject(attachment, i);
+        }
+        if (auto* depth = render_pass_descriptor->depthAttachment();
+            depth->texture() != nullptr) {
+            track(depth->texture());
+            track(depth->resolveTexture());
+            pass->setDepthAttachment(depth);
+        }
+        if (auto* stencil = render_pass_descriptor->stencilAttachment();
+            stencil->texture() != nullptr) {
+            track(stencil->texture());
+            track(stencil->resolveTexture());
+            pass->setStencilAttachment(stencil);
+        }
+        pass->setRenderTargetArrayLength(
+            render_pass_descriptor->renderTargetArrayLength());
+        if (render_pass_descriptor->renderTargetWidth() != 0) {
+            pass->setRenderTargetWidth(
+                render_pass_descriptor->renderTargetWidth());
+            pass->setRenderTargetHeight(
+                render_pass_descriptor->renderTargetHeight());
+        }
+        pass->setDefaultRasterSampleCount(
+            render_pass_descriptor->defaultRasterSampleCount());
+        if (visibility_buffer != nullptr) {
+            track(visibility_buffer);
+            pass->setVisibilityResultBuffer(visibility_buffer);
+        }
+
+        auto* encoder = mtl4_command_buffer->renderCommandEncoder(pass);
+        // No hazard tracking: wait for everything before, as Metal 3 does for
+        // the resources the pass uses
+        encoder->barrierAfterQueueStages(MTL4_ALL_STAGES, MTL4_RENDER_STAGES,
+                                         MTL4::VisibilityOptionDevice);
+        encoder->setArgumentTable(vertex_table, MTL::RenderStageVertex);
+        encoder->setArgumentTable(fragment_table, MTL::RenderStageFragment);
+        mtl4_encoder = encoder->retain();
+        render_encoder.mtl4 = encoder;
+        render_encoder.vertex_table = vertex_table;
+        render_encoder.fragment_table = fragment_table;
+    } else {
+        auto* descriptor = render_pass_descriptor;
+        // Sampling GPU timestamps changes the descriptor
+        const bool sample =
+            GpuPassProfiler::get(command_buffer->device()) != nullptr;
+        if (visibility_buffer != nullptr || sample) {
+            descriptor = render_pass_descriptor->copy();
+            if (visibility_buffer != nullptr)
+                descriptor->setVisibilityResultBuffer(visibility_buffer);
+        }
+        if (PerfStats::isEnabled())
+            profileRenderPass(descriptor);
+        auto* encoder = command_buffer->renderCommandEncoder(descriptor)->retain();
+        command_encoder = encoder;
+        render_encoder.mtl3 = encoder;
+        if (descriptor != render_pass_descriptor)
+            descriptor->release();
     }
-    if (PerfStats::isEnabled())
-        profileRenderPass(descriptor);
-    command_encoder = command_buffer->renderCommandEncoder(descriptor)->retain();
-    if (descriptor != render_pass_descriptor)
-        descriptor->release();
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Render;
@@ -303,6 +624,9 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoderHot2(
 
 u32 CommandBuffer::reservePassSamples(GpuPassProfiler::Kind kind,
                                       std::string label) {
+    // TODO: Metal 4 samples timestamps through counter heaps
+    if (mtl4_context != nullptr)
+        return invalid<u32>();
     auto* profiler = GpuPassProfiler::get(command_buffer->device());
     if (!profiler)
         return invalid<u32>();
@@ -451,24 +775,37 @@ void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
     attachment->setEndOfFragmentSampleIndex(sample + 1);
 }
 
-MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
+BlitEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     if (encoder_type == EncoderType::Blit)
         return getBlitCommandEncoderUnchecked();
 
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
-    if (const auto sample = reservePassSamples(GpuPassProfiler::Kind::Blit, "blit");
-        sample != invalid<u32>()) {
+    if (mtl4_context != nullptr) {
+        // Metal 4 copies are compute work
+        auto* encoder = mtl4_command_buffer->computeCommandEncoder();
+        encoder->barrierAfterQueueStages(MTL4_ALL_STAGES, MTL4_COMPUTE_STAGES,
+                                         MTL4::VisibilityOptionDevice);
+        mtl4_encoder = encoder->retain();
+        blit_encoder.mtl4 = encoder;
+        blit_encoder.encoded_any = false;
+    } else if (const auto sample =
+                   reservePassSamples(GpuPassProfiler::Kind::Blit, "blit");
+               sample != invalid<u32>()) {
         auto* pass = MTL::BlitPassDescriptor::blitPassDescriptor();
         auto* attachment = pass->sampleBufferAttachments()->object(0);
         attachment->setSampleBuffer(
             GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
         attachment->setStartOfEncoderSampleIndex(sample);
         attachment->setEndOfEncoderSampleIndex(sample + 1);
-        command_encoder = command_buffer->blitCommandEncoder(pass)->retain();
+        auto* encoder = command_buffer->blitCommandEncoder(pass)->retain();
+        command_encoder = encoder;
+        blit_encoder.mtl3 = encoder;
     } else {
-        command_encoder = command_buffer->blitCommandEncoder()->retain();
+        auto* encoder = command_buffer->blitCommandEncoder()->retain();
+        command_encoder = encoder;
+        blit_encoder.mtl3 = encoder;
     }
     TMP_AUTORELEASE_POOL_END();
 
@@ -480,17 +817,26 @@ MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     return getBlitCommandEncoderUnchecked();
 }
 
-MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
+ComputeEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
     if (encoder_type == EncoderType::Compute)
-        return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
+        return &compute_encoder;
 
     endEncoding();
 
     TMP_AUTORELEASE_POOL_BEGIN();
-    // Serial dispatches see the results of previous ones
-    if (const auto sample =
-            reservePassSamples(GpuPassProfiler::Kind::Compute, "compute");
-        sample != invalid<u32>()) {
+    if (mtl4_context != nullptr) {
+        auto* encoder = mtl4_command_buffer->computeCommandEncoder();
+        encoder->barrierAfterQueueStages(MTL4_ALL_STAGES, MTL4_COMPUTE_STAGES,
+                                         MTL4::VisibilityOptionDevice);
+        encoder->setArgumentTable(compute_table);
+        mtl4_encoder = encoder->retain();
+        compute_encoder.mtl4 = encoder;
+        compute_encoder.table = compute_table;
+        compute_encoder.encoded_any = false;
+    } else if (const auto sample =
+                   reservePassSamples(GpuPassProfiler::Kind::Compute, "compute");
+               sample != invalid<u32>()) {
+        // Serial dispatches see the results of previous ones
         auto* pass = MTL::ComputePassDescriptor::computePassDescriptor();
         pass->setDispatchType(MTL::DispatchTypeSerial);
         auto* attachment = pass->sampleBufferAttachments()->object(0);
@@ -498,9 +844,13 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
             GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
         attachment->setStartOfEncoderSampleIndex(sample);
         attachment->setEndOfEncoderSampleIndex(sample + 1);
-        command_encoder = command_buffer->computeCommandEncoder(pass)->retain();
+        auto* encoder = command_buffer->computeCommandEncoder(pass)->retain();
+        command_encoder = encoder;
+        compute_encoder.mtl3 = encoder;
     } else {
-        command_encoder = command_buffer->computeCommandEncoder()->retain();
+        auto* encoder = command_buffer->computeCommandEncoder()->retain();
+        command_encoder = encoder;
+        compute_encoder.mtl3 = encoder;
     }
     TMP_AUTORELEASE_POOL_END();
 
@@ -508,7 +858,7 @@ MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
     render_pass_gap = 2;
     has_commands = true;
 
-    return static_cast<MTL::ComputeCommandEncoder*>(command_encoder);
+    return &compute_encoder;
 }
 
 f64 CommandBuffer::debugCommitAndWaitHot5() {
@@ -535,16 +885,14 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
     const u64 write_epoch = guest_write_epoch.load(std::memory_order_acquire);
     submitted_buffers.fetch_add(1, std::memory_order_acq_rel);
     commitSubmission();
-    command_buffer->waitUntilCompleted();
+    const auto result = waitNative();
     completed_buffers.fetch_add(1, std::memory_order_acq_rel);
     checkpoint_total.fetch_add(1, std::memory_order_acq_rel);
     has_commands = false;
-    last_submission_succeeded =
-        command_buffer->status() == MTL::CommandBufferStatusCompleted;
+    last_submission_succeeded = result.succeeded;
     if (!last_submission_succeeded) {
-        const auto error = command_buffer->error();
         LOG_ERROR(MetalRenderer, "GPU checkpoint failed: {}",
-                  error ? error->localizedDescription()->utf8String() : "unknown error");
+                  result.error.empty() ? "unknown error" : result.error);
     }
     // Everything encoded before the commit finished (queue order), so its
     // writes to guest memory are visible
@@ -568,9 +916,7 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
             buffer->release();
     }
     retired_upload_buffers.clear();
-    const auto ms =
-        (command_buffer->GPUEndTime() - command_buffer->GPUStartTime()) *
-        1000.0;
+    const auto ms = (result.gpu_end_time - result.gpu_start_time) * 1000.0;
     if (profile) {
         const auto now = std::chrono::steady_clock::now();
         static thread_local auto last = start;
@@ -599,10 +945,9 @@ f64 CommandBuffer::debugCommitAndWaitHot5() {
             last = now;
         }
     }
-    command_buffer->release();
-    TMP_AUTORELEASE_POOL_BEGIN();
-    command_buffer = command_queue->commandBuffer()->retain();
-    TMP_AUTORELEASE_POOL_END();
+    if (command_buffer != nullptr)
+        command_buffer->release();
+    beginNative();
     capture::GuestEvents::instance().event(
         "checkpoint", capture::currentGuestEventOrigin(), 0, 0, 0,
         last_submission_succeeded ? 1 : 0);
@@ -613,9 +958,21 @@ void CommandBuffer::endEncodingHot6() {
     if (encoder_type == EncoderType::None)
         return;
 
-    command_encoder->endEncoding();
-    command_encoder->release();
-    command_encoder = nullptr;
+    if (mtl4_encoder != nullptr) {
+        mtl4_encoder->endEncoding();
+        mtl4_encoder->release();
+        mtl4_encoder = nullptr;
+    } else {
+        command_encoder->endEncoding();
+        command_encoder->release();
+        command_encoder = nullptr;
+    }
+    render_encoder.mtl3 = nullptr;
+    render_encoder.mtl4 = nullptr;
+    compute_encoder.mtl3 = nullptr;
+    compute_encoder.mtl4 = nullptr;
+    blit_encoder.mtl3 = nullptr;
+    blit_encoder.mtl4 = nullptr;
     encoder_type = EncoderType::None;
 
     // A new render pass resets visibility storage, so it needs a fresh page.

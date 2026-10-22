@@ -6,6 +6,7 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class CommandBuffer;
+class RenderEncoder;
 class Renderer;
 
 class SurfaceCompositor final : public ISurfaceCompositor {
@@ -17,16 +18,18 @@ class SurfaceCompositor final : public ISurfaceCompositor {
                      const ITextureView* texture, const FloatRect2D src_rect,
                      const FloatRect2D dst_rect, bool transparent,
                      f32 opacity) override;
-    void present(ICommandBuffer* command_buffer) override;
+    void present(ICommandBuffer* command_buffer, bool new_frame) override;
 
   private:
     Renderer& renderer;
     CA::MetalDrawable* drawable;
+    // The drawable's texture, or the frame presenter's canvas
+    MTL::Texture* target;
     MTL::RenderPassDescriptor* render_pass_descriptor;
     // A render pass after the first one keeps what earlier ones drew
     bool render_pass_started{false};
 
-    MTL::RenderCommandEncoder* getEncoder(CommandBuffer* command_buffer);
+    RenderEncoder* getEncoder(CommandBuffer* command_buffer);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -891,7 +891,7 @@ void System::progressFrame(u32 width, u32 height,
         }
     }
 
-    compositor->present(command_buffer);
+    compositor->present(command_buffer, acquired);
 
     delete command_buffer;
     delete compositor;

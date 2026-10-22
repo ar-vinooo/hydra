@@ -410,12 +410,28 @@ func configGetCustomDisplayResolution() -> UnsafeMutablePointer<HydraUint2> {
     hydraConfigGetCustomDisplayResolution()
 }
 
+func configGetMetalApi() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetMetalApi()
+}
+
 func configGetUpscalingFilter() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetUpscalingFilter()
 }
 
 func configGetFrameRateLimit() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetFrameRateLimit()
+}
+
+func configGetFrameGeneration() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGeneration()
+}
+
+func configGetSharpening() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetSharpening()
+}
+
+func configGetMetalHud() -> UnsafeMutablePointer<Bool> {
+    hydraConfigGetMetalHud()
 }
 
 func configGetAudioBackend() -> UnsafeMutablePointer<UInt32> {

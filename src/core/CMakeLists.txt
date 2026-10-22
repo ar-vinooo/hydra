@@ -686,6 +686,12 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/occlusion.hpp
     hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.cpp
     hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp
+    hw/tegra_x1/gpu/renderer/metal/encoder.cpp
+    hw/tegra_x1/gpu/renderer/metal/encoder.hpp
+    hw/tegra_x1/gpu/renderer/metal/frame_presenter.cpp
+    hw/tegra_x1/gpu/renderer/metal/frame_presenter.hpp
+    hw/tegra_x1/gpu/renderer/metal/mtl4_context.cpp
+    hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp
     hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.cpp
     hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.cpp

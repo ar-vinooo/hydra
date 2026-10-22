@@ -29,10 +29,10 @@ std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
                 static_cast<metal::Buffer*>(buffer)->getBuffer();
             native_buffer->retain();
             static_cast<metal::CommandBuffer*>(tls_crnt_command_buffer)
-                ->getCommandBuffer()->addCompletedHandler(
-                    [pool, native_buffer](MTL::CommandBuffer* completed) {
-                        if (completed->status() ==
-                            MTL::CommandBufferStatusCompleted)
+                ->addCompletedHandler(
+                    [pool, native_buffer](
+                        const metal::GpuCompletion& completion) {
+                        if (completion.succeeded)
                             pool->recycle(native_buffer);
                         else
                             native_buffer->release();

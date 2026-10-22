@@ -11,12 +11,24 @@ namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
                                      CA::MetalDrawable* drawable_)
-    : renderer{renderer_}, drawable{drawable_} {
+    : renderer{renderer_}, drawable{drawable_},
+      target{drawable_->texture()} {
+    // Frame generation and sharpening read the composited frame
+    auto& presenter = renderer.getFramePresenter();
+    if (FramePresenter::isEnabled()) {
+        if (auto* canvas = presenter.getCanvas(
+                static_cast<u32>(target->width()),
+                static_cast<u32>(target->height()), target->pixelFormat()))
+            target = canvas;
+    } else {
+        presenter.reset();
+    }
+
     // Render pass
     render_pass_descriptor = MTL::RenderPassDescriptor::alloc()->init();
     auto color_attachment =
         render_pass_descriptor->colorAttachments()->object(0);
-    color_attachment->setTexture(drawable->texture());
+    color_attachment->setTexture(target);
     color_attachment->setLoadAction(MTL::LoadActionClear);
     color_attachment->setClearColor(MTL::ClearColor::Make(0.0, 0.0, 0.0, 1.0));
     color_attachment->setStoreAction(MTL::StoreActionStore);
@@ -25,7 +37,7 @@ SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
 
 SurfaceCompositor::~SurfaceCompositor() { render_pass_descriptor->release(); }
 
-MTL::RenderCommandEncoder*
+RenderEncoder*
 SurfaceCompositor::getEncoder(CommandBuffer* command_buffer) {
     auto* encoder = command_buffer->getRenderCommandEncoder(render_pass_descriptor);
     if (!render_pass_started) {
@@ -61,10 +73,8 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
             const auto output_height = static_cast<u32>(std::lround(
                 static_cast<f32>(descriptor.height) * std::max(scale_y, 1.0f)));
             // MetalFX encodes its own pass
-            command_buffer_impl->endEncoding();
             if (auto* upscaled = renderer.getSpatialUpscaler().upscale(
-                    command_buffer_impl->getCommandBuffer(), source,
-                    output_width, output_height))
+                    command_buffer_impl, source, output_width, output_height))
                 source = upscaled;
         }
     }
@@ -73,7 +83,7 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
 
     // Draw
     encoder->setRenderPipelineState(renderer.getBlitPipelineCache().find(
-        {.pixel_format = drawable->texture()->pixelFormat(),
+        {.pixel_format = target->pixelFormat(),
          .transparent = transparent}));
     encoder->setViewport(
         MTL::Viewport{.originX = static_cast<f64>(dst_rect.origin.x()),
@@ -108,12 +118,16 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
                             static_cast<NS::UInteger>(3));
 }
 
-void SurfaceCompositor::present(ICommandBuffer* command_buffer) {
+void SurfaceCompositor::present(ICommandBuffer* command_buffer,
+                                bool new_frame) {
     auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
 
     getEncoder(command_buffer_impl);
     command_buffer_impl->endEncoding();
-    command_buffer_impl->getCommandBuffer()->presentDrawable(drawable);
+    if (target != drawable->texture())
+        renderer.getFramePresenter().present(
+            command_buffer_impl, drawable->texture(), new_frame);
+    command_buffer_impl->presentDrawable(drawable);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

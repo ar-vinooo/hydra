@@ -66,10 +66,21 @@ typedef enum : uint32_t {
 } HydraResolution;
 
 typedef enum : uint32_t {
+    HYDRA_METAL_API_METAL3,
+    HYDRA_METAL_API_METAL4,
+} HydraMetalApi;
+
+typedef enum : uint32_t {
     HYDRA_UPSCALING_FILTER_BILINEAR,
     HYDRA_UPSCALING_FILTER_NEAREST,
     HYDRA_UPSCALING_FILTER_METALFX,
 } HydraUpscalingFilter;
+
+typedef enum : uint32_t {
+    HYDRA_FRAME_GENERATION_OFF,
+    HYDRA_FRAME_GENERATION_INTERPOLATE,
+    HYDRA_FRAME_GENERATION_METALFX,
+} HydraFrameGeneration;
 
 typedef enum : uint32_t {
     HYDRA_AUDIO_BACKEND_NULL,
@@ -203,8 +214,12 @@ uint32_t* hydraConfigGetGpuRenderer();
 uint32_t* hydraConfigGetShaderBackend();
 uint32_t* hydraConfigGetDisplayResolution();
 HydraUint2* hydraConfigGetCustomDisplayResolution();
+uint32_t* hydraConfigGetMetalApi();
 uint32_t* hydraConfigGetUpscalingFilter();
 uint32_t* hydraConfigGetFrameRateLimit();
+uint32_t* hydraConfigGetFrameGeneration();
+uint32_t* hydraConfigGetSharpening();
+bool* hydraConfigGetMetalHud();
 uint32_t* hydraConfigGetAudioBackend();
 HydraU128* hydraConfigGetUserId();
 HydraString hydraConfigGetDeviceNickname();

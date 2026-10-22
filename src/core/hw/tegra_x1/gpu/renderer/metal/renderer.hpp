@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/frame_presenter.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp"
@@ -9,6 +10,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/occlusion.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
@@ -16,6 +18,7 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class CommandBuffer;
+class RenderEncoder;
 class TextureView;
 class Sampler;
 class RenderPass;
@@ -202,7 +205,7 @@ class Renderer : public IRenderer {
                      const u32 instance_count) override;
 
     // Helpers
-    MTL::RenderCommandEncoder*
+    RenderEncoder*
     getRenderCommandEncoder(CommandBuffer* command_buffer) const;
     void getColorPixelFormats(
         MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const;
@@ -228,6 +231,8 @@ class Renderer : public IRenderer {
   private:
     MTL::Device* device;
     MTL::CommandQueue* command_queue;
+    // Null when encoding with Metal 3
+    std::shared_ptr<Mtl4Context> mtl4_context;
     std::shared_ptr<UploadBufferPool> upload_buffer_pool;
 
     // Buffers wrapping guest memory pages, by first page
@@ -247,6 +252,7 @@ class Renderer : public IRenderer {
     BinaryArchiveCache binary_archive_cache;
     ShaderLibraryCache shader_library_cache;
     SpatialUpscaler spatial_upscaler;
+    FramePresenter frame_presenter;
     DepthStencilStateCache depth_stencil_state_cache;
     BlitPipelineCache blit_pipeline_cache;
     ClearColorPipelineCache clear_color_pipeline_cache;
@@ -289,6 +295,8 @@ class Renderer : public IRenderer {
     GETTER(nearest_sampler, getNearestSampler);
     GETTER(linear_sampler, getLinearSampler);
     SpatialUpscaler& getSpatialUpscaler() { return spatial_upscaler; }
+    FramePresenter& getFramePresenter() { return frame_presenter; }
+    Mtl4Context* getMtl4Context() const { return mtl4_context.get(); }
 
   public:
     // ABI-stable implementations selected by the live module.
@@ -361,7 +369,7 @@ class Renderer : public IRenderer {
     void getColorPixelFormatsHot42(
         MTL::PixelFormat out_pixel_formats[COLOR_TARGET_COUNT]) const;
     MTL::PixelFormat getDepthStencilPixelFormatHot43() const;
-    MTL::RenderCommandEncoder*
+    RenderEncoder*
     getRenderCommandEncoderHot44(CommandBuffer* command_buffer) const;
     void setRenderPipelineStateHot45(CommandBuffer* command_buffer) const;
     void setDepthStencilStateHot46(CommandBuffer* command_buffer);

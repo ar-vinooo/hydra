@@ -36,14 +36,34 @@ using namespace metal;
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+namespace {
+
+Mtl4Context* createMtl4Context(MTL::Device* device) {
+    if (CONFIG_INSTANCE.getMetalApi() != MetalApi::Metal4) {
+        LOG_INFO(MetalRenderer, "Encoding with Metal 3");
+        return nullptr;
+    }
+    auto* context = Mtl4Context::create(device);
+    if (context != nullptr)
+        LOG_INFO(MetalRenderer, "Encoding with Metal 4");
+    else
+        LOG_WARN(MetalRenderer,
+                 "The GPU or OS does not support Metal 4, encoding with Metal 3");
+    return context;
+}
+
+} // namespace
+
 Renderer::Renderer()
     : device{MTL::CreateSystemDefaultDevice()},
       command_queue{device->newCommandQueue()},
+      mtl4_context{std::shared_ptr<Mtl4Context>(createMtl4Context(device))},
       upload_buffer_pool(std::make_shared<UploadBufferPool>(device)),
       completions(std::make_shared<CompletionQueue>()),
       occlusion(std::make_unique<OcclusionCounter>(device, completions)),
       binary_archive_cache(device), shader_library_cache(device),
-      spatial_upscaler(device),
+      spatial_upscaler(device, mtl4_context.get()),
+      frame_presenter(device, mtl4_context.get()),
       depth_stencil_state_cache(device),
       blit_pipeline_cache(device), clear_color_pipeline_cache(device),
       clear_depth_pipeline_cache(device) {
@@ -90,6 +110,8 @@ Renderer::Renderer()
 
     // Nearest
     auto sampler_state_descriptor = MTL::SamplerDescriptor::alloc()->init();
+    // Metal 4 binds samplers through argument tables
+    sampler_state_descriptor->setSupportArgumentBuffers(true);
     nearest_sampler = device->newSamplerState(sampler_state_descriptor);
 
     // Linear
@@ -135,6 +157,8 @@ void Renderer::setSurfaceHot0(void* surface) {
     // (metal-cpp has no wrapper for CALayer.opaque)
     reinterpret_cast<void (*)(void*, SEL, BOOL)>(objc_msgSend)(
         ca_layer, sel_registerName("setOpaque:"), YES);
+    if (mtl4_context)
+        mtl4_context->addLayer(ca_layer);
     // TODO: set pixel format
 }
 
@@ -418,6 +442,8 @@ SamplerBase* Renderer::createSamplerHot10(const SamplerDescriptor& descriptor) {
 }
 
 ICommandBuffer* Renderer::createCommandBufferHot11() {
+    if (mtl4_context)
+        return new CommandBuffer(mtl4_context, completions);
     return new CommandBuffer(command_queue, completions);
 }
 
@@ -722,9 +748,9 @@ void Renderer::debugDumpTextureLevelHot23(ICommandBuffer* command_buffer,
                                  MTL::Size(width, height, 1), buffer,
                                  image_size * slice, bytes_per_row, image_size);
 
-    command_buffer_impl->getCommandBuffer()->addCompletedHandler(
-        [=](MTL::CommandBuffer* completed) {
-            if (completed->status() != MTL::CommandBufferStatusCompleted) {
+    command_buffer_impl->addCompletedHandler(
+        [=](const GpuCompletion& completion) {
+            if (!completion.succeeded) {
                 buffer->release();
                 return;
             }
@@ -1522,7 +1548,7 @@ MTL::PixelFormat Renderer::getDepthStencilPixelFormatHot43() const {
     return toMtlPixelFormat(texture->getDescriptor().format);
 }
 
-MTL::RenderCommandEncoder*
+RenderEncoder*
 Renderer::getRenderCommandEncoderHot44(CommandBuffer* command_buffer) const {
     return command_buffer->getRenderCommandEncoder(
         state.render_pass->getRenderPassDescriptor());

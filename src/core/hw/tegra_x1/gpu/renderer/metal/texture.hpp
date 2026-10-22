@@ -5,6 +5,8 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+class BlitEncoder;
+
 class Texture final : public ITexture {
   public:
     Texture(MTL::Device* device, const TextureDescriptor& descriptor);
@@ -34,7 +36,7 @@ class Texture final : public ITexture {
     MTL::Buffer* buffer_backing = nullptr;
     MTL::ComputePipelineState* byte_copy_pipeline = nullptr;
 
-    void copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
+    void copyDepthStencilFromBuffer(BlitEncoder* encoder,
                                     const u8* src, const MTL::Size dims,
                                     const u32 layer, const u32 level);
 
@@ -51,7 +53,7 @@ class Texture final : public ITexture {
     void copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src,
                       const ztd::Range<u32> dst_levels,
                       const ztd::Range<u32> dst_layers);
-    void copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
+    void copyDepthStencilFromBufferHot3(BlitEncoder* encoder,
                                         const u8* src, const MTL::Size dims,
                                         const u32 layer, const u32 level);
     bool copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,

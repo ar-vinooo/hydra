@@ -1,9 +1,13 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp"
 
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp"
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-conversion"
 #pragma GCC diagnostic ignored "-Wold-style-cast"
 #pragma GCC diagnostic ignored "-Wundef"
+#include <MetalFX/MTL4FXSpatialScaler.hpp>
 #include <MetalFX/MTLFXSpatialScaler.hpp>
 #pragma GCC diagnostic pop
 
@@ -11,22 +15,31 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-SpatialUpscaler::SpatialUpscaler(MTL::Device* device_)
-    : device{device_->retain()},
-      supported{MTLFX::SpatialScalerDescriptor::supportsDevice(device_)} {
+SpatialUpscaler::SpatialUpscaler(MTL::Device* device_,
+                                 Mtl4Context* mtl4_context_)
+    : device{device_->retain()}, mtl4_context{mtl4_context_},
+      supported{MTLFX::SpatialScalerDescriptor::supportsDevice(device_) &&
+                (mtl4_context_ == nullptr ||
+                 (mtl4_context_->getCompiler() != nullptr &&
+                  MTLFX::SpatialScalerDescriptor::supportsMetal4FX(device_)))} {
     if (!supported)
         LOG_INFO(MetalRenderer, "MetalFX spatial upscaling is not supported, "
                                 "frames are scaled bilinearly");
 }
 
 SpatialUpscaler::~SpatialUpscaler() {
-    for (auto& [key, entry] : entries) {
-        if (entry.scaler)
-            entry.scaler->release();
-        if (entry.output)
-            entry.output->release();
-    }
+    for (auto& [key, entry] : entries)
+        releaseEntry(entry);
     device->release();
+}
+
+void SpatialUpscaler::releaseEntry(Entry& entry) {
+    if (entry.mtl3_scaler)
+        entry.mtl3_scaler->release();
+    if (entry.mtl4_scaler)
+        entry.mtl4_scaler->release();
+    if (entry.output)
+        entry.output->release();
 }
 
 SpatialUpscaler::Entry& SpatialUpscaler::getEntry(const Key& key) {
@@ -39,16 +52,13 @@ SpatialUpscaler::Entry& SpatialUpscaler::getEntry(const Key& key) {
         auto oldest = std::min_element(
             entries.begin(), entries.end(),
             [](auto& a, auto& b) { return a.second.used < b.second.used; });
-        if (oldest->second.scaler)
-            oldest->second.scaler->release();
-        if (oldest->second.output)
-            oldest->second.output->release();
+        releaseEntry(oldest->second);
         entries.erase(oldest);
     }
 
     const auto [input_width, input_height, output_width, output_height,
                 format] = key;
-    Entry entry{nullptr, nullptr, ++clock};
+    Entry entry{nullptr, nullptr, nullptr, nullptr, ++clock};
     NS_STACK_SCOPED auto descriptor =
         MTLFX::SpatialScalerDescriptor::alloc()->init();
     descriptor->setInputWidth(input_width);
@@ -60,7 +70,14 @@ SpatialUpscaler::Entry& SpatialUpscaler::getEntry(const Key& key) {
     // Switch games present SDR frames
     descriptor->setColorProcessingMode(
         MTLFX::SpatialScalerColorProcessingModePerceptual);
-    entry.scaler = descriptor->newSpatialScaler(device);
+    if (mtl4_context) {
+        entry.mtl4_scaler = descriptor->newSpatialScaler(
+            device, mtl4_context->getCompiler());
+        entry.scaler = entry.mtl4_scaler;
+    } else {
+        entry.mtl3_scaler = descriptor->newSpatialScaler(device);
+        entry.scaler = entry.mtl3_scaler;
+    }
     if (entry.scaler) {
         NS_STACK_SCOPED auto texture_descriptor =
             MTL::TextureDescriptor::alloc()->init();
@@ -84,9 +101,9 @@ SpatialUpscaler::Entry& SpatialUpscaler::getEntry(const Key& key) {
     return entries.emplace(key, entry).first->second;
 }
 
-MTL::Texture* SpatialUpscaler::upscale(MTL::CommandBuffer* command_buffer,
-                                       MTL::Texture* input, u32 output_width,
-                                       u32 output_height) {
+SpatialUpscaler::Entry* SpatialUpscaler::prepare(MTL::Texture* input,
+                                                 u32 output_width,
+                                                 u32 output_height) {
     if (!supported || input->textureType() != MTL::TextureType2D ||
         output_width == 0 || output_height == 0 ||
         output_width > MAX_OUTPUT_SIZE || output_height > MAX_OUTPUT_SIZE)
@@ -105,8 +122,40 @@ MTL::Texture* SpatialUpscaler::upscale(MTL::CommandBuffer* command_buffer,
     entry.scaler->setOutputTexture(entry.output);
     entry.scaler->setInputContentWidth(input_width);
     entry.scaler->setInputContentHeight(input_height);
-    entry.scaler->encodeToCommandBuffer(command_buffer);
-    return entry.output;
+    return &entry;
+}
+
+MTL::Texture* SpatialUpscaler::upscale(CommandBuffer* command_buffer,
+                                       MTL::Texture* input, u32 output_width,
+                                       u32 output_height) {
+    auto* entry = prepare(input, output_width, output_height);
+    if (entry == nullptr)
+        return nullptr;
+    auto* fence = command_buffer->beginExternalEncoding();
+    if (entry->mtl4_scaler) {
+        // Metal 4 does not track what MetalFX reads and writes
+        command_buffer->track(input);
+        command_buffer->track(entry->output);
+        entry->scaler->setFence(fence);
+        entry->mtl4_scaler->encodeToCommandBuffer(
+            command_buffer->getMtl4CommandBuffer());
+    } else {
+        entry->mtl3_scaler->encodeToCommandBuffer(
+            command_buffer->getCommandBuffer());
+    }
+    return entry->output;
+}
+
+MTL::Texture* SpatialUpscaler::upscale(MTL::CommandBuffer* command_buffer,
+                                       MTL::Texture* input, u32 output_width,
+                                       u32 output_height) {
+    if (mtl4_context)
+        return nullptr;
+    auto* entry = prepare(input, output_width, output_height);
+    if (entry == nullptr)
+        return nullptr;
+    entry->mtl3_scaler->encodeToCommandBuffer(command_buffer);
+    return entry->output;
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

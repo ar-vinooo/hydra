@@ -8,6 +8,7 @@ class MetalLayerCoordinator: NSObject {
     private var layer: CAMetalLayer? = nil
     private var displayLink: CADisplayLink? = nil
     private var surfaceSet = false
+    private var hudShown: Bool? = nil
 
     init(system: Binding<HydraSystem?>, fps: Binding<Int>) {
         self._system = system
@@ -24,6 +25,7 @@ class MetalLayerCoordinator: NSObject {
             self.displayLink?.invalidate()
             self.layer = view.layer as? CAMetalLayer
             self.surfaceSet = false
+            self.hudShown = nil
 
             // Display link
             self.displayLink = view.displayLink(
@@ -35,14 +37,28 @@ class MetalLayerCoordinator: NSObject {
             self.displayLink?.invalidate()
             self.layer = view.layer as? CAMetalLayer
             self.surfaceSet = false
+            self.hudShown = nil
 
             // Display link
             self.displayLink = CADisplayLink(target: self, selector: #selector(handleDisplayLink))
+            // Refresh as fast as the display can (ProMotion), for frame
+            // generation and frame rate limits above 60
+            self.displayLink?.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 60, maximum: 120, preferred: 120)
             self.displayLink?.add(to: .main, forMode: .commonModes)
         }
     #endif
 
     @objc func handleDisplayLink() {
+        // Metal performance HUD
+        let showHud = configGetMetalHud().pointee
+        if showHud != self.hudShown, let layer = self.layer {
+            layer.developerHUDProperties = [
+                "mode": showHud ? "default" : "disabled"
+            ]
+            self.hudShown = showHud
+        }
+
         if let system = system {
             // Set the surface if its not already set
             if !self.surfaceSet {

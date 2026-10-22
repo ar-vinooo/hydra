@@ -228,6 +228,10 @@ HYDRA_EXPORT uint32_t* hydraConfigGetDisplayResolution() {
         &hydra::CONFIG_INSTANCE.getDisplayResolution());
 }
 
+HYDRA_EXPORT uint32_t* hydraConfigGetMetalApi() {
+    return reinterpret_cast<uint32_t*>(&hydra::CONFIG_INSTANCE.getMetalApi());
+}
+
 HYDRA_EXPORT uint32_t* hydraConfigGetUpscalingFilter() {
     return reinterpret_cast<uint32_t*>(
         &hydra::CONFIG_INSTANCE.getUpscalingFilter());
@@ -235,6 +239,19 @@ HYDRA_EXPORT uint32_t* hydraConfigGetUpscalingFilter() {
 
 HYDRA_EXPORT uint32_t* hydraConfigGetFrameRateLimit() {
     return &hydra::CONFIG_INSTANCE.getFrameRateLimit();
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGeneration() {
+    return reinterpret_cast<uint32_t*>(
+        &hydra::CONFIG_INSTANCE.getFrameGeneration());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetSharpening() {
+    return &hydra::CONFIG_INSTANCE.getSharpening();
+}
+
+HYDRA_EXPORT bool* hydraConfigGetMetalHud() {
+    return &hydra::CONFIG_INSTANCE.getMetalHud();
 }
 
 HYDRA_EXPORT HydraUint2* hydraConfigGetCustomDisplayResolution() {

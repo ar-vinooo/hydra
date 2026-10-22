@@ -20,7 +20,7 @@ namespace {
 // Copies a region between textures. Metal blits need equal pixel formats:
 // formats of the same texel size go through a view, single plane depth and
 // color formats through a buffer.
-bool copyRegion(MTL::BlitCommandEncoder* encoder, MTL::Texture* src,
+bool copyRegion(BlitEncoder* encoder, MTL::Texture* src,
                 TextureFormat src_format, u32 src_slice, u32 src_level,
                 MTL::Origin src_origin, MTL::Texture* dst,
                 TextureFormat dst_format, u32 dst_slice, u32 dst_level,
@@ -487,7 +487,7 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
     }
 }
 
-void Texture::copyDepthStencilFromBufferHot3(MTL::BlitCommandEncoder* encoder,
+void Texture::copyDepthStencilFromBufferHot3(BlitEncoder* encoder,
                                          const u8* src, const MTL::Size dims,
                                          const u32 layer, const u32 level) {
     // Metal can only upload depth and stencil of a packed depth stencil

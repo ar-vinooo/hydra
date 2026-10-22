@@ -305,7 +305,7 @@ MTL::PixelFormat Renderer::getDepthStencilPixelFormat() const {
         hot_scope.table().renderer_getDepthStencilPixelFormatHot43)();
 }
 
-MTL::RenderCommandEncoder*
+RenderEncoder*
 Renderer::getRenderCommandEncoder(CommandBuffer* command_buffer) const {
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
@@ -381,7 +381,7 @@ void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
         pool, buffer);
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
+RenderEncoder* CommandBuffer::getRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     ::hydra::hot::Scope hot_scope;
     return (
@@ -390,7 +390,7 @@ MTL::RenderCommandEncoder* CommandBuffer::getRenderCommandEncoder(
         render_pass_descriptor);
 }
 
-MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
+RenderEncoder* CommandBuffer::createRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
     ::hydra::hot::Scope hot_scope;
     return (
@@ -399,14 +399,14 @@ MTL::RenderCommandEncoder* CommandBuffer::createRenderCommandEncoder(
         render_pass_descriptor);
 }
 
-MTL::BlitCommandEncoder* CommandBuffer::getBlitCommandEncoder() {
+BlitEncoder* CommandBuffer::getBlitCommandEncoder() {
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
         hot_scope.table().command_buffer_getBlitCommandEncoderHot3)();
 }
 
-MTL::ComputeCommandEncoder* CommandBuffer::getComputeCommandEncoder() {
+ComputeEncoder* CommandBuffer::getComputeCommandEncoder() {
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
@@ -533,7 +533,7 @@ void Texture::copyFrom(ICommandBuffer* command_buffer, const BufferBase* src,
         command_buffer, src, dst_levels, dst_layers);
 }
 
-void Texture::copyDepthStencilFromBuffer(MTL::BlitCommandEncoder* encoder,
+void Texture::copyDepthStencilFromBuffer(BlitEncoder* encoder,
                                          const u8* src, const MTL::Size dims,
                                          const u32 layer, const u32 level) {
     ::hydra::hot::Scope hot_scope;

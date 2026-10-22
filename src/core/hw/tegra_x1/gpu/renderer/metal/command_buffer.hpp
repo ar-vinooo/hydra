@@ -4,15 +4,31 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/encoder.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp"
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class UploadBufferPool;
+struct Mtl4Submission;
+
+// How the GPU finished a command buffer
+struct GpuCompletion {
+    bool succeeded;
+    // Seconds, in the host's GPU timeline
+    f64 gpu_start_time;
+    f64 gpu_end_time;
+    // Empty if it succeeded
+    std::string error;
+};
+using GpuCompletionHandler = std::function<void(const GpuCompletion&)>;
 
 enum class EncoderType {
     None,
@@ -61,35 +77,64 @@ class CommandBuffer final : public ICommandBuffer {
     // nothing can depend on the buffer.
     explicit CommandBuffer(MTL::CommandQueue* command_queue_,
                            std::shared_ptr<CompletionQueue> completions_ = {});
+    // Encodes with Metal 4
+    explicit CommandBuffer(std::shared_ptr<Mtl4Context> mtl4_context_,
+                           std::shared_ptr<CompletionQueue> completions_ = {});
     ~CommandBuffer() override;
 
-    MTL::RenderCommandEncoder* getRenderCommandEncoderUnchecked() {
+    bool usesMetal4() const { return mtl4_context != nullptr; }
+
+    RenderEncoder* getRenderCommandEncoderUnchecked() {
         ASSERT_DEBUG(encoder_type == EncoderType::Render, MetalRenderer,
                      "Render command encoder not active");
-        return static_cast<MTL::RenderCommandEncoder*>(command_encoder);
+        return &render_encoder;
     }
-    MTL::RenderCommandEncoder*
+    RenderEncoder*
     getRenderCommandEncoder(MTL::RenderPassDescriptor* render_pass_descriptor);
-    MTL::RenderCommandEncoder* createRenderCommandEncoder(
+    RenderEncoder* createRenderCommandEncoder(
         MTL::RenderPassDescriptor* render_pass_descriptor);
     // Encoder for draws that set their state on the encoder directly instead
     // of through the state setters below (e.g. texture blits). When it
     // continues the open pass, the state earlier draws left that such draws
     // do not set is reset to that of a new encoder.
-    MTL::RenderCommandEncoder* getDirectRenderCommandEncoder(
+    RenderEncoder* getDirectRenderCommandEncoder(
         MTL::RenderPassDescriptor* render_pass_descriptor,
         MTL::DepthStencilState* depth_stencil_disabled);
 
-    MTL::BlitCommandEncoder* getBlitCommandEncoderUnchecked() {
+    BlitEncoder* getBlitCommandEncoderUnchecked() {
         ASSERT_DEBUG(encoder_type == EncoderType::Blit, MetalRenderer,
                      "Blit command encoder not active");
-        return static_cast<MTL::BlitCommandEncoder*>(command_encoder);
+        return &blit_encoder;
     }
-    MTL::BlitCommandEncoder* getBlitCommandEncoder();
+    BlitEncoder* getBlitCommandEncoder();
 
-    MTL::ComputeCommandEncoder* getComputeCommandEncoder();
+    ComputeEncoder* getComputeCommandEncoder();
 
     void endEncoding();
+
+    // Runs once the GPU finished the command buffer, on a Metal thread. Only
+    // before the command buffer is committed.
+    void addCompletedHandler(GpuCompletionHandler handler);
+    // Presents the drawable once the commands before it finished
+    void presentDrawable(CA::MetalDrawable* drawable);
+    // Ends encoding for work another framework encodes into the native
+    // command buffer (MetalFX). With Metal 4, returns the fence that work has
+    // to wait for and update; the textures it uses have to be tracked.
+    MTL::Fence* beginExternalEncoding();
+    // Null with Metal 3
+    MTL4::CommandBuffer* getMtl4CommandBuffer() {
+        has_commands = true;
+        return mtl4_command_buffer;
+    }
+    // Metal 4: keeps the resource alive and resident until the GPU finished
+    // this command buffer
+    void track(const MTL::Buffer* buffer);
+    void track(const MTL::Texture* texture);
+    // Metal 4: copies inline bytes to memory the GPU reads until it finished
+    // this command buffer
+    MTL::GPUAddress allocateTransient(const void* bytes, usize length);
+    // Commits the native command buffer
+    void commitNative();
     // Submit, wait and continue with a new command buffer
     f64 debugCommitAndWait();
     // Checkpoints which waited for the host GPU, all threads
@@ -150,10 +195,32 @@ class CommandBuffer final : public ICommandBuffer {
   private:
     void commitSubmission();
     void attachGpuCompletionCallbacks();
+    // Starts a new native command buffer
+    void beginNative();
+    // Waits for the committed native command buffer
+    GpuCompletion waitNative();
+    MTL::Device* getDevice() const;
     MTL::CommandQueue* command_queue{nullptr};
     MTL::CommandBuffer* command_buffer{nullptr};
     MTL::CommandEncoder* command_encoder{nullptr};
     EncoderType encoder_type{EncoderType::None};
+    RenderEncoder render_encoder;
+    ComputeEncoder compute_encoder;
+    BlitEncoder blit_encoder;
+
+    // Metal 4
+    // Shared with the submissions in flight, whose completion uses its pools
+    std::shared_ptr<Mtl4Context> mtl4_context;
+    MTL4::CommandBuffer* mtl4_command_buffer{nullptr};
+    MTL4::CommandEncoder* mtl4_encoder{nullptr};
+    // What the GPU needs until it finished the native command buffer
+    std::shared_ptr<Mtl4Submission> mtl4_submission;
+    // Bindings of the render and compute stages. Encoders snapshot them at
+    // each draw and dispatch.
+    MTL4::ArgumentTable* vertex_table{nullptr};
+    MTL4::ArgumentTable* fragment_table{nullptr};
+    MTL4::ArgumentTable* compute_table{nullptr};
+    void createArgumentTables();
 
     EncoderState encoder_state{};
     MTL::Buffer* visibility_buffer{nullptr};
@@ -206,12 +273,12 @@ class CommandBuffer final : public ICommandBuffer {
     // ABI-stable implementations selected by the live module.
     void retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> pool,
                                 MTL::Buffer* buffer);
-    MTL::RenderCommandEncoder* getRenderCommandEncoderHot1(
+    RenderEncoder* getRenderCommandEncoderHot1(
         MTL::RenderPassDescriptor* render_pass_descriptor);
-    MTL::RenderCommandEncoder* createRenderCommandEncoderHot2(
+    RenderEncoder* createRenderCommandEncoderHot2(
         MTL::RenderPassDescriptor* render_pass_descriptor);
-    MTL::BlitCommandEncoder* getBlitCommandEncoderHot3();
-    MTL::ComputeCommandEncoder* getComputeCommandEncoderHot4();
+    BlitEncoder* getBlitCommandEncoderHot3();
+    ComputeEncoder* getComputeCommandEncoderHot4();
     f64 debugCommitAndWaitHot5();
     void endEncodingHot6();
     void setRenderPipelineStateHot7(MTL::RenderPipelineState* pipeline);

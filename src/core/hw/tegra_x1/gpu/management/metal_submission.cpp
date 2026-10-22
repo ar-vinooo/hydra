@@ -4,14 +4,23 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-void commitManagedSubmission(
-    MTL::CommandBuffer* commands, const std::shared_ptr<CompletionQueue>& completions,
-    std::unordered_map<const void*, std::shared_ptr<void>> resources) {
+namespace {
+
+auto admitSubmission(const std::shared_ptr<CompletionQueue>& completions) {
     // Tests and standalone command buffers share a fallback budget.
     static execution::WorkManager fallback{{64, 0}};
     auto work = (completions ? completions->submissions : fallback).admit();
     ASSERT(work && work->start(), MetalRenderer,
            "Cannot submit to a stopped GPU work manager");
+    return work;
+}
+
+} // namespace
+
+void commitManagedSubmission(
+    MTL::CommandBuffer* commands, const std::shared_ptr<CompletionQueue>& completions,
+    std::unordered_map<const void*, std::shared_ptr<void>> resources) {
+    auto work = admitSubmission(completions);
     commands->addCompletedHandler(
         [work = std::move(work), resources = std::move(resources)](
             MTL::CommandBuffer* completed) mutable {
@@ -21,15 +30,26 @@ void commitManagedSubmission(
     commands->commit();
 }
 
+void commitManagedSubmission(
+    CommandBuffer& commands, const std::shared_ptr<CompletionQueue>& completions,
+    std::unordered_map<const void*, std::shared_ptr<void>> resources) {
+    auto work = admitSubmission(completions);
+    commands.addCompletedHandler(
+        [work = std::move(work), resources = std::move(resources)](
+            const GpuCompletion& completion) mutable {
+            resources.clear();
+            work->finish(completion.succeeded);
+        });
+    commands.commitNative();
+}
+
 void CommandBuffer::attachGpuCompletionCallbacks() {
     if (!gpu_completion_callbacks.empty()) {
-        command_buffer->addCompletedHandler(
+        addCompletedHandler(
             [callbacks = std::move(gpu_completion_callbacks)](
-                MTL::CommandBuffer* completed) {
-                const bool succeeded =
-                    completed->status() == MTL::CommandBufferStatusCompleted;
+                const GpuCompletion& completion) {
                 for (const auto& callback : callbacks)
-                    callback(succeeded);
+                    callback(completion.succeeded);
             });
         gpu_completion_callbacks.clear();
     }
@@ -38,13 +58,11 @@ void CommandBuffer::attachGpuCompletionCallbacks() {
 void CommandBuffer::attachPassProfiling() {
     if (profiled_passes.empty())
         return;
-    auto* profiler = GpuPassProfiler::get(command_buffer->device());
-    command_buffer->addCompletedHandler(
-        [profiler, passes = std::move(profiled_passes)](
-            MTL::CommandBuffer* completed) {
-            profiler->resolve(passes, completed->status() ==
-                                          MTL::CommandBufferStatusCompleted);
-        });
+    auto* profiler = GpuPassProfiler::get(getDevice());
+    addCompletedHandler([profiler, passes = std::move(profiled_passes)](
+                            const GpuCompletion& completion) {
+        profiler->resolve(passes, completion.succeeded);
+    });
     profiled_passes.clear();
 }
 
@@ -58,19 +76,20 @@ void CommandBuffer::commitSubmission() {
         const auto id =
             next_capture_submission.fetch_add(1, std::memory_order_relaxed);
         const auto origin = capture::currentGuestEventOrigin();
-        const auto native = reinterpret_cast<uptr>(command_buffer);
+        const auto native =
+            mtl4_command_buffer != nullptr
+                ? reinterpret_cast<uptr>(mtl4_command_buffer)
+                : reinterpret_cast<uptr>(command_buffer);
         const auto wrapper = reinterpret_cast<uptr>(this);
         events.event("native_submit", origin, native, 0, id, wrapper);
-        command_buffer->addCompletedHandler([id, origin, native, wrapper](
-                                                MTL::CommandBuffer* completed) {
+        addCompletedHandler([id, origin, native,
+                             wrapper](const GpuCompletion& completion) {
             capture::GuestEvents::instance().event(
                 "native_complete", origin, native, 0, id,
-                completed->status() == MTL::CommandBufferStatusCompleted ? 1
-                                                                         : 0,
-                wrapper);
+                completion.succeeded ? 1 : 0, wrapper);
         });
     }
-    commitManagedSubmission(command_buffer, completions, std::move(retained_resources));
+    commitManagedSubmission(*this, completions, std::move(retained_resources));
     retained_resources.clear();
 }
 

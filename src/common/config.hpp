@@ -27,6 +27,12 @@ enum class GpuRenderer : u32 {
     Metal,
 };
 
+// The Metal API the renderer encodes with
+enum class MetalApi : u32 {
+    Metal3,
+    Metal4, // Explicit barriers, residency and bindings (macOS 26, iOS 26)
+};
+
 enum class ShaderBackend : u32 {
     Msl,
     Air,
@@ -54,6 +60,14 @@ enum class UpscalingFilter : u32 {
     Bilinear,
     Nearest,
     MetalFx, // MetalFX spatial upscaling when the window is larger
+};
+
+// Frames generated between two guest frames, shown on display refreshes that
+// have no new guest frame
+enum class FrameGeneration : u32 {
+    Off,
+    Interpolate, // Optical flow interpolation
+    MetalFx,     // As Interpolate, with MetalFX for the frames halfway
 };
 
 enum class AudioBackend : u32 {
@@ -140,6 +154,7 @@ class Config {
         return GpuRenderer::Null;
 #endif
     }
+    static MetalApi getDefaultMetalApi() { return MetalApi::Metal3; }
     static ShaderBackend getDefaultShaderBackend() {
         return ShaderBackend::Msl;
     }
@@ -152,6 +167,12 @@ class Config {
     }
     // 60 as on a Switch; 0 for unlimited
     static u32 getDefaultFrameRateLimit() { return 60; }
+    static FrameGeneration getDefaultFrameGeneration() {
+        return FrameGeneration::Off;
+    }
+    // Contrast adaptive sharpening of presented frames, 0 (off) to 100
+    static u32 getDefaultSharpening() { return 0; }
+    static bool getDefaultMetalHud() { return false; }
     static AudioBackend getDefaultAudioBackend() {
 #ifdef HYDRA_CUBEB_ENABLED
         return AudioBackend::Cubeb;
@@ -204,11 +225,15 @@ class Config {
     std::vector<std::string> input_profiles;
     CpuBackend cpu_backend;
     GpuRenderer gpu_renderer;
+    MetalApi metal_api;
     ShaderBackend shader_backend;
     Resolution display_resolution;
     uint2 custom_display_resolution;
     UpscalingFilter upscaling_filter;
     u32 frame_rate_limit;
+    FrameGeneration frame_generation;
+    u32 sharpening;
+    bool metal_hud;
     AudioBackend audio_backend;
     uuid_t user_id;
     std::string device_nickname;
@@ -236,11 +261,15 @@ class Config {
     REF_GETTER(input_profiles, getInputProfiles);
     REF_GETTER(cpu_backend, getCpuBackend);
     REF_GETTER(gpu_renderer, getGpuRenderer);
+    REF_GETTER(metal_api, getMetalApi);
     REF_GETTER(shader_backend, getShaderBackend);
     REF_GETTER(display_resolution, getDisplayResolution);
     REF_GETTER(custom_display_resolution, getCustomDisplayResolution);
     REF_GETTER(upscaling_filter, getUpscalingFilter);
     REF_GETTER(frame_rate_limit, getFrameRateLimit);
+    REF_GETTER(frame_generation, getFrameGeneration);
+    REF_GETTER(sharpening, getSharpening);
+    REF_GETTER(metal_hud, getMetalHud);
     REF_GETTER(audio_backend, getAudioBackend);
     REF_GETTER(user_id, getUserId);
     REF_GETTER(device_nickname, getDeviceNickname);
@@ -269,6 +298,8 @@ ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, CpuBackend, AppleHypervisor,
                                    "Apple Hypervisor", Dynarmic, "dynarmic")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, GpuRenderer, Null, "Null", Metal,
                                    "Metal")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, MetalApi, Metal3, "Metal 3", Metal4,
+                                   "Metal 4")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, ShaderBackend, Msl, "MSL", Air, "AIR")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "window", _720p,
                                    "720p", _1080p, "1080p", _1440p, "1440p",
@@ -277,6 +308,9 @@ ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "window", _720p,
                                    "console")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, UpscalingFilter, Bilinear,
                                    "Bilinear", Nearest, "Nearest", MetalFx,
+                                   "MetalFX")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, FrameGeneration, Off, "Off",
+                                   Interpolate, "Interpolate", MetalFx,
                                    "MetalFX")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, AudioBackend, Null, "Null", Cubeb,
                                    "Cubeb")

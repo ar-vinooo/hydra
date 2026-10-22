@@ -2,11 +2,15 @@
 
 #include "common/toml_helper.hpp"
 
+#include <algorithm>
+
 TOML11_DEFINE_CONVERSION_ENUM(hydra::InputBackend, AppleGameController,
                               "Apple GameController", Sdl, "SDL")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::CpuBackend, AppleHypervisor,
                               "Apple Hypervisor", Dynarmic, "dynarmic")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::GpuRenderer, Null, "null", Metal, "Metal")
+TOML11_DEFINE_CONVERSION_ENUM(hydra::MetalApi, Metal3, "Metal 3", Metal4,
+                              "Metal 4")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::ShaderBackend, Msl, "MSL", Air, "AIR")
 // The window based resolution used to be stored as "auto", the default. It
 // reported resolutions no Switch has; such configs now get the console's.
@@ -16,6 +20,8 @@ TOML11_DEFINE_CONVERSION_ENUM(hydra::Resolution, Auto, "window", _720p, "720p",
                               "custom", Console, "console")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::UpscalingFilter, Bilinear, "Bilinear",
                               Nearest, "Nearest", MetalFx, "MetalFX")
+TOML11_DEFINE_CONVERSION_ENUM(hydra::FrameGeneration, Off, "Off", Interpolate,
+                              "Interpolate", MetalFx, "MetalFX")
 TOML11_DEFINE_CONVERSION_ENUM(hydra::AudioBackend, Null, "null", Cubeb, "Cubeb")
 TOML11_DEFINE_CONVERSION_ENUM(
     hydra::SystemLanguage, AmericanEnglish, "American English", BritishEnglish,
@@ -139,8 +145,12 @@ void Config::loadDefaults() {
     shader_backend = getDefaultShaderBackend();
     display_resolution = getDefaultDisplayResolution();
     custom_display_resolution = getDefaultCustomDisplayResolution();
+    metal_api = getDefaultMetalApi();
     upscaling_filter = getDefaultUpscalingFilter();
     frame_rate_limit = getDefaultFrameRateLimit();
+    frame_generation = getDefaultFrameGeneration();
+    sharpening = getDefaultSharpening();
+    metal_hud = getDefaultMetalHud();
     audio_backend = getDefaultAudioBackend();
     user_id = getDefaultUserId();
     device_nickname = getDefaultDeviceNickname();
@@ -204,12 +214,16 @@ void Config::serialize() {
     {
         auto& graphics = data.at("Graphics");
         graphics["renderer"] = gpu_renderer;
+        graphics["metal_api"] = metal_api;
         graphics["shader_backend"] = shader_backend;
         graphics["display_resolution"] = display_resolution;
         graphics["custom_display_resolution"] =
             CustomResolution(custom_display_resolution);
         graphics["upscaling_filter"] = upscaling_filter;
         graphics["frame_rate_limit"] = frame_rate_limit;
+        graphics["frame_generation"] = frame_generation;
+        graphics["sharpening"] = sharpening;
+        graphics["metal_hud"] = metal_hud;
     }
 
     {
@@ -305,12 +319,24 @@ void Config::deserialize() {
         custom_display_resolution = toml::find_or<CustomResolution>(
             graphics, "custom_display_resolution",
             getDefaultCustomDisplayResolution());
+        metal_api = toml::find_or<std::optional<MetalApi>>(
+                        graphics, "metal_api", getDefaultMetalApi())
+                        .value_or(getDefaultMetalApi());
         upscaling_filter =
             toml::find_or<std::optional<UpscalingFilter>>(
                 graphics, "upscaling_filter", getDefaultUpscalingFilter())
                 .value_or(getDefaultUpscalingFilter());
         frame_rate_limit = toml::find_or<u32>(graphics, "frame_rate_limit",
                                               getDefaultFrameRateLimit());
+        frame_generation =
+            toml::find_or<std::optional<FrameGeneration>>(
+                graphics, "frame_generation", getDefaultFrameGeneration())
+                .value_or(getDefaultFrameGeneration());
+        sharpening = std::min(
+            toml::find_or<u32>(graphics, "sharpening", getDefaultSharpening()),
+            100u);
+        metal_hud =
+            toml::find_or<bool>(graphics, "metal_hud", getDefaultMetalHud());
     }
     if (data.contains("Audio")) {
         const auto& audio = data.at("Audio");
@@ -376,8 +402,12 @@ void Config::log() {
     LOG_INFO(Other, "Display resolution: {}", display_resolution);
     LOG_INFO(Other, "Custom display resolution: {}x{}",
              custom_display_resolution.x(), custom_display_resolution.y());
+    LOG_INFO(Other, "Metal API: {}", metal_api);
     LOG_INFO(Other, "Upscaling filter: {}", upscaling_filter);
     LOG_INFO(Other, "Frame rate limit: {}", frame_rate_limit);
+    LOG_INFO(Other, "Frame generation: {}", frame_generation);
+    LOG_INFO(Other, "Sharpening: {}", sharpening);
+    LOG_INFO(Other, "Metal HUD: {}", metal_hud);
     LOG_INFO(Other, "Audio backend: {}", audio_backend);
     LOG_INFO(Other, "User ID: {:032x}", user_id);
     LOG_INFO(Other, "Device nickname: {}", device_nickname);
