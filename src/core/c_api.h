@@ -204,6 +204,7 @@ uint32_t* hydraConfigGetShaderBackend();
 uint32_t* hydraConfigGetDisplayResolution();
 HydraUint2* hydraConfigGetCustomDisplayResolution();
 uint32_t* hydraConfigGetUpscalingFilter();
+uint32_t* hydraConfigGetFrameRateLimit();
 uint32_t* hydraConfigGetAudioBackend();
 HydraU128* hydraConfigGetUserId();
 HydraString hydraConfigGetDeviceNickname();

@@ -233,6 +233,10 @@ HYDRA_EXPORT uint32_t* hydraConfigGetUpscalingFilter() {
         &hydra::CONFIG_INSTANCE.getUpscalingFilter());
 }
 
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameRateLimit() {
+    return &hydra::CONFIG_INSTANCE.getFrameRateLimit();
+}
+
 HYDRA_EXPORT HydraUint2* hydraConfigGetCustomDisplayResolution() {
     return reinterpret_cast<HydraUint2*>(
         &hydra::CONFIG_INSTANCE.getCustomDisplayResolution());

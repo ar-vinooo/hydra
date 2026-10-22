@@ -136,6 +136,8 @@ struct Binder {
 
   private:
     kernel::Event* event;
+    // The earliest the next frame is queued under a raised frame rate limit
+    clock_t::time_point next_frame_time{};
 
     struct QueueState {
         std::array<Buffer, MAX_BINDER_BUFFER_COUNT> buffers{};

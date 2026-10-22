@@ -414,6 +414,10 @@ func configGetUpscalingFilter() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetUpscalingFilter()
 }
 
+func configGetFrameRateLimit() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameRateLimit()
+}
+
 func configGetAudioBackend() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetAudioBackend()
 }

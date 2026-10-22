@@ -150,6 +150,8 @@ class Config {
     static UpscalingFilter getDefaultUpscalingFilter() {
         return UpscalingFilter::Bilinear;
     }
+    // 60 as on a Switch; 0 for unlimited
+    static u32 getDefaultFrameRateLimit() { return 60; }
     static AudioBackend getDefaultAudioBackend() {
 #ifdef HYDRA_CUBEB_ENABLED
         return AudioBackend::Cubeb;
@@ -206,6 +208,7 @@ class Config {
     Resolution display_resolution;
     uint2 custom_display_resolution;
     UpscalingFilter upscaling_filter;
+    u32 frame_rate_limit;
     AudioBackend audio_backend;
     uuid_t user_id;
     std::string device_nickname;
@@ -237,6 +240,7 @@ class Config {
     REF_GETTER(display_resolution, getDisplayResolution);
     REF_GETTER(custom_display_resolution, getCustomDisplayResolution);
     REF_GETTER(upscaling_filter, getUpscalingFilter);
+    REF_GETTER(frame_rate_limit, getFrameRateLimit);
     REF_GETTER(audio_backend, getAudioBackend);
     REF_GETTER(user_id, getUserId);
     REF_GETTER(device_nickname, getDeviceNickname);

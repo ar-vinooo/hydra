@@ -34,6 +34,11 @@ void testVSyncSchedule() {
                 static_cast<i64>(u64(sample) * 1'000'000'000ull / host_hz)));
         expect(ticks == 60, "One second contains 60 guest vblanks at any host rate");
     }
+    VSyncSchedule raised(origin, 120);
+    u32 raised_ticks = 0;
+    for (u32 ms = 1; ms <= 1000; ++ms)
+        raised_ticks += raised.advance(origin + std::chrono::milliseconds(ms));
+    expect(raised_ticks == 120, "A raised frame rate limit sets the vblank rate");
     expect(schedule.advance(origin + std::chrono::hours(1)),
            "Clock resumes after host suspension");
     expect(!schedule.advance(origin + std::chrono::hours(1)),

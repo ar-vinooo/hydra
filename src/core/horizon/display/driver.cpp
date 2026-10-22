@@ -1,5 +1,6 @@
 #include "core/horizon/display/driver.hpp"
 
+#include "common/config.hpp"
 #include "core/system.hpp"
 #include "core/horizon/display/vsync_schedule.hpp"
 
@@ -13,9 +14,13 @@ Driver::Driver(System& system_) : system{system_} {
 void Driver::startVSync() {
     if (vsync_thread.joinable())
         return;
-    vsync_thread = std::jthread([this](std::stop_token stop) {
+    // Above 60, the guest display refreshes at the frame rate limit (1000 Hz
+    // for unlimited), for titles that pace themselves on its vsync
+    const u32 limit = CONFIG_INSTANCE.getFrameRateLimit();
+    const u32 rate = limit == 0 ? 1000 : std::max(limit, 60u);
+    vsync_thread = std::jthread([this, rate](std::stop_token stop) {
         using Clock = std::chrono::steady_clock;
-        VSyncSchedule schedule(Clock::now());
+        VSyncSchedule schedule(Clock::now(), rate);
         std::unique_lock lock(vsync_mutex);
         while (!stop.stop_requested()) {
             vsync_cv.wait_until(lock, stop, schedule.nextDeadline(),

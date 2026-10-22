@@ -5,6 +5,7 @@ struct GraphicsSettingsView: View {
     @State private var shaderBackend = HydraShaderBackend(rawValue: configGetShaderBackend().pointee)
     @State private var upscalingFilter = HydraUpscalingFilter(
         rawValue: configGetUpscalingFilter().pointee)
+    @State private var frameRateLimit = configGetFrameRateLimit().pointee
 
     var body: some View {
         Spacer()
@@ -44,6 +45,24 @@ struct GraphicsSettingsView: View {
                 } footer: {
                     Text(
                         "Only changes how the final image is scaled to the window, not the emulation. Games choose their own rendering resolution, as on a Switch: 1080p display when docked, 720p in Handheld mode (System), which renders fewer pixels."
+                    )
+                }
+
+                Section {
+                    Picker("Frame rate limit", selection: self.$frameRateLimit) {
+                        Text("60 (console)").tag(UInt32(60))
+                        Text("90").tag(UInt32(90))
+                        Text("120").tag(UInt32(120))
+                        Text("Unlimited").tag(UInt32(0))
+                    }
+                    .onChange(of: self.frameRateLimit) { _, newValue in
+                        configGetFrameRateLimit().pointee = newValue
+                    }
+                } header: {
+                    Text("Frame rate")
+                } footer: {
+                    Text(
+                        "Above 60, the game's display refreshes faster than a Switch's and the window shows the newest frame, for lower input latency. Games that time themselves by display refreshes run too fast. Applies when a game boots."
                     )
                 }
             }

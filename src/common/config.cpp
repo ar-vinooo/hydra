@@ -140,6 +140,7 @@ void Config::loadDefaults() {
     display_resolution = getDefaultDisplayResolution();
     custom_display_resolution = getDefaultCustomDisplayResolution();
     upscaling_filter = getDefaultUpscalingFilter();
+    frame_rate_limit = getDefaultFrameRateLimit();
     audio_backend = getDefaultAudioBackend();
     user_id = getDefaultUserId();
     device_nickname = getDefaultDeviceNickname();
@@ -208,6 +209,7 @@ void Config::serialize() {
         graphics["custom_display_resolution"] =
             CustomResolution(custom_display_resolution);
         graphics["upscaling_filter"] = upscaling_filter;
+        graphics["frame_rate_limit"] = frame_rate_limit;
     }
 
     {
@@ -307,6 +309,8 @@ void Config::deserialize() {
             toml::find_or<std::optional<UpscalingFilter>>(
                 graphics, "upscaling_filter", getDefaultUpscalingFilter())
                 .value_or(getDefaultUpscalingFilter());
+        frame_rate_limit = toml::find_or<u32>(graphics, "frame_rate_limit",
+                                              getDefaultFrameRateLimit());
     }
     if (data.contains("Audio")) {
         const auto& audio = data.at("Audio");
@@ -373,6 +377,7 @@ void Config::log() {
     LOG_INFO(Other, "Custom display resolution: {}x{}",
              custom_display_resolution.x(), custom_display_resolution.y());
     LOG_INFO(Other, "Upscaling filter: {}", upscaling_filter);
+    LOG_INFO(Other, "Frame rate limit: {}", frame_rate_limit);
     LOG_INFO(Other, "Audio backend: {}", audio_backend);
     LOG_INFO(Other, "User ID: {:032x}", user_id);
     LOG_INFO(Other, "Device nickname: {}", device_nickname);

@@ -1,5 +1,8 @@
 #include "core/horizon/display/binder.hpp"
 
+#include <thread>
+
+#include "common/config.hpp"
 #include "core/system.hpp"
 
 namespace hydra::horizon::display {
@@ -52,6 +55,18 @@ i32 Binder::getAvailableSlot() {
 }
 
 bool Binder::queueBuffer(System& system, i32 slot, const BqBufferInput& input) {
+    // A frame rate limit above the console's 60 spaces the title's frames,
+    // whether it paces itself on vsync or not
+    if (const u32 limit = CONFIG_INSTANCE.getFrameRateLimit(); limit > 60) {
+        const auto period =
+            std::chrono::nanoseconds(static_cast<i64>(1'000'000'000 / limit));
+        const auto now = clock_t::now();
+        if (now < next_frame_time)
+            std::this_thread::sleep_until(next_frame_time);
+        // A late frame does not earn a burst of early ones
+        next_frame_time = std::max(now, next_frame_time) + period;
+    }
+
     const auto gpu_fence = system.getGpu().getPfifo().getSubmittedCount();
     if (!queueBuffer(slot, input, gpu_fence))
         return false;

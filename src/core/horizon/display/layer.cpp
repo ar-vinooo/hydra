@@ -1,5 +1,6 @@
 #include "core/horizon/display/layer.hpp"
 
+#include "common/config.hpp"
 #include "core/horizon/kernel/process.hpp"
 #include "core/horizon/os.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
@@ -20,6 +21,22 @@ bool Layer::acquirePresentTexture(
     i32 slot = binder.consumeBuffer(input, gpu_fence);
     if (slot == -1)
         return false;
+
+    // Above the console's 60, only the newest frame is shown and the older
+    // ones go back to the title at once, so it renders on instead of waiting
+    // for the host display
+    if (CONFIG_INSTANCE.getFrameRateLimit() != 60) {
+        BqBufferInput newer_input;
+        u64 newer_gpu_fence;
+        for (i32 newer_slot;
+             (newer_slot = binder.consumeBuffer(newer_input,
+                                                newer_gpu_fence)) != -1;) {
+            binder.releaseCallback(slot)();
+            slot = newer_slot;
+            input = newer_input;
+            gpu_fence = newer_gpu_fence;
+        }
+    }
 
     // Wait for the GPU to finish rendering the buffer
     system.getGpu().getPfifo().waitForCompletion(gpu_fence);
