@@ -53,6 +53,7 @@ endif ()
 option(HYDRA_LINT_TARGET "Add the hydra-lint target" ${HYDRA_LINT_TARGET_DEFAULT})
 set(HYDRA_LINT_EXTRA_BUILD_DIRS "" CACHE STRING
     "Extra build directories to include in hydra-lint (e.g. a second frontend)")
+option(HYDRA_NO_LOGGING "Compile out info, warning, error and stub logging" OFF)
 option(CUBEB_ENABLED "Enable the cubeb audio backend" ON)
 option(HYDRA_FFMPEG_VIDEO "Build the FFmpeg video decoder backend" OFF)
 option(SDL_ENABLED "Enable building SDL files" ON)
@@ -253,6 +254,10 @@ endif ()
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_definitions(HYDRA_DEBUG)
+endif ()
+
+if (HYDRA_NO_LOGGING)
+    add_compile_definitions(HYDRA_NO_LOGGING)
 endif ()
 
 add_subdirectory(src)

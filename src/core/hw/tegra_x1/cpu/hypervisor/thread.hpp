@@ -97,7 +97,12 @@ class Thread : public IThread {
     std::queue<ThreadMessage> msg_queue;
 
     // State
-    void serializeState();
+    // SVCs don't touch SIMD registers, so their exits can skip reading them.
+    // `state.v` is stale until serializeSimd runs.
+    void serializeState(bool skip_simd = false);
+    void serializeSimd();
+    bool canSkipSimdOnExit();
+    bool simd_stale{false};
     void deserializeState();
 
     void instructionTrap(u32 esr);

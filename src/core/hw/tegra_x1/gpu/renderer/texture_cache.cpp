@@ -523,7 +523,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                     !new_storage.base->copyFrom(command_buffer, old_base, 0, 0,
                                                 0, 0, old_descriptor.level_count,
                                                 old_descriptor.layer_count))
-                    logTextureEvent("copy_unsupported_resize", new_descriptor,
+                    LOG_TEXTURE_EVENT("copy_unsupported_resize", new_descriptor,
                                     fmt::format("old={:#x} {} {}",
                                                 old_descriptor.ptr,
                                                 old_descriptor.type,
@@ -629,7 +629,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
             other_descriptor.getRange(),
             [&](ztd::Range<uptr>) { fresh = true; });
         if (!fresh) {
-            logTextureEvent("copy_skipped_stale_storage", descriptor,
+            LOG_TEXTURE_EVENT("copy_skipped_stale_storage", descriptor,
                             fmt::format("old={:#x} {} {}", other_descriptor.ptr,
                                         other_descriptor.type,
                                         other_descriptor.format));
@@ -639,7 +639,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 command_buffer, other_base, 0, 0, overlapping_storage.level,
                 overlapping_storage.layer, other_descriptor.level_count,
                 other_descriptor.layer_count))
-            logTextureEvent("copy_unsupported_overlap", descriptor,
+            LOG_TEXTURE_EVENT("copy_unsupported_overlap", descriptor,
                             fmt::format("old={:#x} {} {}", other_descriptor.ptr,
                                         other_descriptor.type,
                                         other_descriptor.format));
@@ -663,7 +663,7 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
             std::getenv("HYDRA_RT_ZERO_INIT") != nullptr;
         zero_fill_decode = zero_init && usage == TextureUsage::Write &&
                            mem.info.written_timestamp == TextureCacheTimePoint{};
-        logTextureEvent(
+        LOG_TEXTURE_EVENT(
             "create", descriptor,
             fmt::format("usage={} zero_fill={}", static_cast<u32>(usage),
                         zero_fill_decode));

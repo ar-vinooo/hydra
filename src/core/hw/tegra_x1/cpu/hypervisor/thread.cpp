@@ -256,7 +256,7 @@ void Thread::run() {
         deserializeState();
         HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
         exception = (getReg(HV_REG_PC) >= cpu.getKernelPageTable().getBase());
-        serializeState();
+        serializeState(canSkipSimdOnExit());
 
         // Handle exit
         if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
@@ -275,8 +275,11 @@ void Thread::run() {
                 case ExceptionClass::SvcAarch64:
                     // Don't hold on to a vCPU while blocked if they run low
                     if (live_vcpu_count >= getVcpuReleaseThreshold() &&
-                        mayBlock(esr & 0xffff))
+                        mayBlock(esr & 0xffff)) {
+                        // The registers are recreated from `state`
+                        serializeSimd();
                         releaseVcpu();
+                    }
                     callbacks.svc_handler(this, esr & 0xffff);
                     break;
                 case ExceptionClass::TrappedMsrMrsSystem: {
@@ -453,7 +456,33 @@ void Thread::updateVTimer() {
     hv_vcpu_set_vtimer_mask(vcpu, false);
 }
 
-void Thread::serializeState() {
+bool Thread::canSkipSimdOnExit() {
+    static const bool disable_filter =
+        std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") != nullptr;
+    // Without a baseline or filter every register is written back from `state`
+    if (disable_filter || !exit_register_state || !has_vcpu)
+        return false;
+    if (exit->reason != HV_EXIT_REASON_EXCEPTION ||
+        static_cast<ExceptionClass>((exit->exception.syndrome >> 26) & 0x3f) !=
+            ExceptionClass::HvcAarch64)
+        return false;
+    const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+    return static_cast<ExceptionClass>((esr >> 26) & 0x3f) ==
+           ExceptionClass::SvcAarch64;
+}
+
+void Thread::serializeSimd() {
+    if (!simd_stale)
+        return;
+    for (u8 i = 0; i < 32; i++)
+        state.v[i] = getSimdFpReg(i);
+    if (exit_register_state)
+        for (u8 i = 0; i < 32; i++)
+            exit_register_state->v[i] = state.v[i];
+    simd_stale = false;
+}
+
+void Thread::serializeState(bool skip_simd) {
     for (u8 i = 0; i < 29; i++)
         state.r[i] = getReg(hv_reg_t(HV_REG_X0 + i));
     state.fp = getReg(HV_REG_FP);
@@ -464,8 +493,13 @@ void Thread::serializeState() {
     else
         state.pc = getReg(HV_REG_PC);
     state.pstate = static_cast<u32>(getReg(HV_REG_CPSR));
-    for (u8 i = 0; i < 32; i++)
-        state.v[i] = getSimdFpReg(i);
+    if (!skip_simd) {
+        for (u8 i = 0; i < 32; i++)
+            state.v[i] = getSimdFpReg(i);
+        simd_stale = false;
+    } else {
+        simd_stale = true;
+    }
     state.fpcr = static_cast<u32>(getReg(HV_REG_FPCR));
     state.fpsr = static_cast<u32>(getReg(HV_REG_FPSR));
     exit_register_state = state;

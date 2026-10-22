@@ -3,7 +3,25 @@
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/kernel/process.hpp"
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 namespace hydra::horizon::kernel {
+
+namespace {
+
+// Horizon priorities run from 0 (highest) to 63. Never drop below
+// user-initiated: guest threads must not end up on efficiency cores.
+void applyHostQos([[maybe_unused]] i32 priority) {
+#ifdef __APPLE__
+    const auto qos = priority <= 28 ? QOS_CLASS_USER_INTERACTIVE
+                                    : QOS_CLASS_USER_INITIATED;
+    pthread_set_qos_class_self_np(qos, 0);
+#endif
+}
+
+} // namespace
 
 IThread::~IThread() noexcept { stopAndJoin(); }
 
@@ -24,6 +42,7 @@ void IThread::start() {
         process->registerThread(this);
     thread = std::jthread([&] {
         tls_current_thread = this;
+        applyHostQos(priority);
 
         GET_CURRENT_PROCESS_DEBUGGER().registerThisThread(getDebugName());
 
