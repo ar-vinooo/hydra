@@ -70,8 +70,12 @@ struct ShaderRecord {
     renderer::ShaderDescriptor descriptor;
 };
 
+// Vertex, fragment and compute: the capture format predates geometry shaders,
+// whose pipelines are not captured
+constexpr usize CAPTURED_SHADER_TYPE_COUNT = 3;
+
 struct PipelineRecord {
-    i32 shaders[static_cast<usize>(renderer::ShaderType::Count)];
+    i32 shaders[CAPTURED_SHADER_TYPE_COUNT];
     std::vector<u8> vertex_state;
     std::vector<u8> color_targets;
     u32 depth_stencil_format;

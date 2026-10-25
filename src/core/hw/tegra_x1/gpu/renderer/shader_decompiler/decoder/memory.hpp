@@ -19,7 +19,8 @@ union InstLda {
     BitField64<u32, 20, 11> src_offset;
     BitField64<bool, 31, 1> p;
     BitField64<bool, 32, 1> o;
-    BitField64<reg_t, 39, 8> todo; // TODO
+    // Geometry shaders: the input vertex
+    BitField64<reg_t, 39, 8> vertex;
     BitField64<LsSize, 47, 2> size;
 };
 
@@ -32,7 +33,9 @@ union InstSta {
     BitField64<bool, 19, 1> pred_inv;
     BitField64<u32, 20, 11> dst_offset;
     BitField64<bool, 31, 1> p;
-    BitField64<reg_t, 39, 8> todo; // TODO
+    // The output vertex handle of geometry shaders (outputs are those of the
+    // vertex being built, see OUT)
+    BitField64<reg_t, 39, 8> vertex;
     BitField64<LsSize, 47, 2> size;
 };
 

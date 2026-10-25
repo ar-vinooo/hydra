@@ -734,7 +734,7 @@ i32 Recorder::pipeline(ICommandBuffer*, PipelineBase* object) {
         return it->second;
     const auto& d = object->getDescriptor();
     PipelineRecord record{};
-    for (usize i = 0; i < static_cast<usize>(ShaderType::Count); i++)
+    for (usize i = 0; i < CAPTURED_SHADER_TYPE_COUNT; i++)
         record.shaders[i] = shader(d.shaders[i]);
     record.vertex_state = raw(d.vertex_state);
     std::vector<u8> targets;
@@ -823,6 +823,10 @@ bool Recorder::recordDraw(ICommandBuffer* command_buffer,
     }
     if (!command.pipeline || !command.render_pass)
         return fail("Draw without a pipeline or render pass");
+    if (command.pipeline->getDescriptor().geometry_passthrough != nullptr)
+        return fail("Draws with a geometry shader are not captured");
+    if (command.pipeline->getDescriptor().tessellation_factors != nullptr)
+        return fail("Tessellated draws are not captured");
     // Earlier work may still be writing the buffers it reads
     if (!renderer.synchronize(command_buffer))
         return fail("Earlier GPU work failed before draw capture");
@@ -1139,7 +1143,7 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
             shaders.emplace_back(renderer.createShader(s.descriptor));
         for (const auto& p : file.pipelines) {
             PipelineDescriptor d{};
-            for (usize i = 0; i < static_cast<usize>(ShaderType::Count); i++)
+            for (usize i = 0; i < CAPTURED_SHADER_TYPE_COUNT; i++)
                 d.shaders[i] =
                     p.shaders[i] < 0 ? nullptr : at(shaders, p.shaders[i]).get();
             d.vertex_state = fromRaw<VertexState>(p.vertex_state);

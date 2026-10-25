@@ -22,6 +22,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/render_pass_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/sampler_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_view.hpp"
@@ -1658,7 +1660,10 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
                                         u32 fragment_input_mask,
                                         u32 layer_output_addr) {
     const auto& program = regs.shader_programs[static_cast<usize>(stage)];
-    if (!program.config.enable) {
+    if (!program.config.enable ||
+        (stage == ShaderStage::Geometry && !geometry_active) ||
+        ((stage == ShaderStage::TessCtrl || stage == ShaderStage::TessEval) &&
+         !tessellation_active)) {
         active_shaders[static_cast<u32>(toRendererShaderType(stage))] = nullptr;
         return nullptr;
     }
@@ -1694,15 +1699,49 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     constexpr u32 REG_POINT_SPRITE_SELECT = 0x581;
     constexpr u32 REG_ATTRIBUTE_POINT_SIZE = 0x644;
     descriptor.state.program_offset = regs.shader_programs[static_cast<u32>(stage)].offset;
+    // Geometry shader emulation (geometry.hpp)
+    if (stage == ShaderStage::Geometry) {
+        descriptor.state.geometry_input_primitive = regs.begin.primitive_type;
+        descriptor.state.geometry_input_vertices =
+            renderer::geometry::getInputVertexCount(regs.begin.primitive_type);
+    }
+    if (stage == ShaderStage::VertexB)
+        descriptor.state.geometry_capture = geometry_active || tessellation_active;
+    // Tessellation emulation (tessellation.hpp)
+    constexpr u32 REG_TESSELLATION_PARAMETERS = 0x320 / 4;
+    constexpr u32 REG_PATCH = 0xdcc / 4;
+    if (stage == ShaderStage::TessCtrl)
+        descriptor.state.tessellation_patch_size = regs_raw[REG_PATCH] & 0xffu;
+    if (stage == ShaderStage::TessEval) {
+        descriptor.state.tessellation_control_points =
+            tessellation_control_points;
+        descriptor.state.tessellation_domain = static_cast<u32>(
+            renderer::tessellation::getDomain(
+                regs_raw[REG_TESSELLATION_PARAMETERS]));
+    }
+    // The stage whose outputs the fragment shader reads
+    const auto last_vertex_stage =
+        tessellation_active ? ShaderStage::TessEval : ShaderStage::VertexB;
     descriptor.state.y_negate =
         any(regs.window_origin_flags & WindowOriginFlags::LowerLeft);
     // Without the viewport transform the vertex shader outputs window
     // coordinates, converted to clip space in the shader
-    if (stage == ShaderStage::VertexB && !viewportTransformEnabled()) {
+    if (stage == last_vertex_stage && !viewportTransformEnabled()) {
         descriptor.state.window_space_width = regs.screen_scissor.horizontal.width;
         descriptor.state.window_space_height = regs.screen_scissor.vertical.height;
     }
     if (stage == ShaderStage::VertexB) {
+        // VertexA runs first, the vertex shader continues it (see
+        // shader_decomp::decompile)
+        const auto& vertex_a =
+            regs.shader_programs[static_cast<usize>(ShaderStage::VertexA)];
+        if (vertex_a.config.enable) {
+            descriptor.vertex_a_gpu_addr =
+                static_cast<u64>(regs.shader_program_region) + vertex_a.offset;
+            descriptor.state.vertex_a_program_offset = vertex_a.offset;
+        }
+    }
+    if (stage == last_vertex_stage) {
         descriptor.state.fragment_input_mask = fragment_input_mask;
         descriptor.state.layer_output_addr = layer_output_addr;
         descriptor.state.depth_zero_to_one =
@@ -1930,6 +1969,122 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     return active_shader;
 }
 
+bool ThreeD::useTessellation() const {
+    // DEBUG: HYDRA_NO_TESSELLATION draws patches without tessellating
+    static const bool disabled = std::getenv("HYDRA_NO_TESSELLATION") != nullptr;
+    constexpr u32 REG_TESSELLATION_PARAMETERS = 0x320 / 4;
+    if (disabled || regs.begin.primitive_type != PrimitiveType::Patches ||
+        !regs.shader_programs[static_cast<usize>(ShaderStage::TessEval)]
+             .config.enable)
+        return false;
+    const u32 parameters = regs_raw[REG_TESSELLATION_PARAMETERS];
+    if (!renderer::tessellation::isSupported(parameters)) {
+        ONCE(LOG_WARN(Engines,
+                      "Tessellation domain {} with output {}: Metal tessellates "
+                      "triangles and quads into triangles only",
+                      static_cast<u32>(renderer::tessellation::getDomain(parameters)),
+                      static_cast<u32>(
+                          renderer::tessellation::getOutputPrimitives(parameters))));
+        return false;
+    }
+    return true;
+}
+
+renderer::ShaderBase* ThreeD::getTessellationCopy(u32 patch_size) {
+    auto& shader = tessellation_copies[patch_size];
+    if (!shader) {
+        renderer::ShaderDescriptor descriptor{};
+        descriptor.type = renderer::ShaderType::TessControl;
+        descriptor.backend = ShaderBackend::Msl;
+        const auto code =
+            renderer::shader_decomp::generateTessellationCopy(patch_size);
+        descriptor.code.assign(code.begin(), code.end());
+        descriptor.resource_mapping.tess_output_vertices = patch_size;
+        shader.reset(gpu.getRenderer().createShader(descriptor));
+    }
+    return shader.get();
+}
+
+renderer::ShaderBase*
+ThreeD::getTessellationFactors(u32 domain, bool from_patches,
+                               const std::array<f32, 6>& levels) {
+    std::array<u32, 6> level_bits{};
+    for (u32 i = 0; i < levels.size(); i++)
+        level_bits[i] = from_patches ? 0 : std::bit_cast<u32>(levels[i]);
+    auto& shader = tessellation_factor_shaders[{domain, from_patches, level_bits}];
+    if (!shader) {
+        renderer::ShaderDescriptor descriptor{};
+        descriptor.type = renderer::ShaderType::Vertex;
+        descriptor.backend = ShaderBackend::Msl;
+        const auto code = renderer::shader_decomp::generateTessellationFactors(
+            domain, from_patches, levels);
+        descriptor.code.assign(code.begin(), code.end());
+        shader.reset(gpu.getRenderer().createShader(descriptor));
+    }
+    return shader.get();
+}
+
+bool ThreeD::useGeometryShader() const {
+    // DEBUG: HYDRA_NO_GEOMETRY_SHADER draws without geometry shaders (a
+    // geometry shader that only forwards the layer still selects it)
+    static const bool disabled =
+        std::getenv("HYDRA_NO_GEOMETRY_SHADER") != nullptr;
+    const auto& program =
+        regs.shader_programs[static_cast<usize>(ShaderStage::Geometry)];
+    if (disabled || !program.config.enable)
+        return false;
+    if (renderer::geometry::getInputVertexCount(regs.begin.primitive_type) ==
+        0) {
+        ONCE(LOG_WARN(Engines, "Geometry shader with {} input, drawn without it",
+                      regs.begin.primitive_type));
+        return false;
+    }
+    return true;
+}
+
+renderer::ShaderBase*
+ThreeD::getGeometryPassthrough(const renderer::ShaderBase& geometry_shader,
+                               u32 fragment_input_mask) {
+    // Register offsets from NVIDIA's clb197.h
+    constexpr u32 REG_POINT_SIZE = 0x546;
+    constexpr u32 REG_ATTRIBUTE_POINT_SIZE = 0x644;
+    const auto& mapping = geometry_shader.getDescriptor().resource_mapping;
+    renderer::shader_decomp::GeometryPassthroughState state{};
+    state.output_mask = fragment_input_mask;
+    state.layer = mapping.writes_layer;
+    state.viewport_index = mapping.writes_layer;
+    state.point_list = mapping.geometry_output ==
+                       static_cast<u32>(renderer::geometry::Output::Points);
+    if (state.point_list) {
+        state.program_point_size = (regs_raw[REG_ATTRIBUTE_POINT_SIZE] & 0x1u) != 0;
+        state.point_size = std::bit_cast<f32>(regs_raw[REG_POINT_SIZE]);
+    }
+    if (!viewportTransformEnabled()) {
+        state.window_space_width = regs.screen_scissor.horizontal.width;
+        state.window_space_height = regs.screen_scissor.vertical.height;
+    }
+    state.y_negate = any(regs.window_origin_flags & WindowOriginFlags::LowerLeft);
+    state.depth_zero_to_one = regs.viewport_z_clip == ViewportZClip::ZeroToOne;
+
+    const auto key = std::make_tuple(
+        state.output_mask, state.layer, state.point_list,
+        state.program_point_size, std::bit_cast<u32>(state.point_size),
+        state.window_space_width, state.window_space_height, state.y_negate,
+        state.depth_zero_to_one);
+    auto& shader = geometry_passthroughs[key];
+    if (!shader) {
+        renderer::ShaderDescriptor descriptor{};
+        descriptor.type = renderer::ShaderType::Vertex;
+        descriptor.backend = ShaderBackend::Msl;
+        const auto code =
+            renderer::shader_decomp::generateGeometryPassthrough(state);
+        descriptor.code.assign(code.begin(), code.end());
+        descriptor.writes_layer = state.layer;
+        shader.reset(gpu.getRenderer().createShader(descriptor));
+    }
+    return shader.get();
+}
+
 u32 ThreeD::getGeometryLayerSource() {
     // TODO: support geometry shaders. Until then, handle the common case of a
     // geometry shader that only forwards a vertex output as the layer by
@@ -1961,11 +2116,12 @@ u32 ThreeD::getGeometryLayerSource() {
 renderer::PipelineBase* ThreeD::getPipeline() {
     renderer::PipelineDescriptor descriptor{};
 
-    // DEBUG: report enabled stages that are not supported
-    for (const auto stage : {ShaderStage::VertexA, ShaderStage::TessCtrl,
-                             ShaderStage::TessEval}) {
+    // Tessellation is emulated for patches (tessellation.hpp)
+    tessellation_active = useTessellation();
+    // DEBUG: report enabled stages that are not used
+    for (const auto stage : {ShaderStage::TessCtrl, ShaderStage::TessEval}) {
         const auto& program = regs.shader_programs[static_cast<usize>(stage)];
-        if (!program.config.enable)
+        if (!program.config.enable || tessellation_active)
             continue;
         static std::set<std::pair<u32, u64>> reported;
         const auto addr = static_cast<u64>(regs.shader_program_region) +
@@ -1984,19 +2140,65 @@ renderer::PipelineBase* ThreeD::getPipeline() {
     }
 
     // Shaders
-    // TODO: add all shaders
     // The fragment shader comes first, since the vertex shader has to write
     // all of its inputs
     const auto fragment_shader = getShader(ShaderStage::Fragment);
     descriptor.shaders[static_cast<u32>(renderer::ShaderType::Fragment)] =
         fragment_shader;
+    const u32 fragment_inputs =
+        fragment_shader != nullptr
+            ? fragment_shader->getDescriptor().resource_mapping.stage_input_mask
+            : 0;
+    // Tessellation: the control shader (or the copy function) writes control
+    // points, the evaluation shader is the last vertex stage
+    if (tessellation_active) {
+        constexpr u32 REG_TESSELLATION_PARAMETERS = 0x320 / 4;
+        constexpr u32 REG_TESSELLATION_LEVELS = 0x324 / 4;
+        constexpr u32 REG_PATCH = 0xdcc / 4;
+        const u32 parameters = regs_raw[REG_TESSELLATION_PARAMETERS];
+        const u32 patch_size = std::max(regs_raw[REG_PATCH] & 0xffu, 1u);
+        auto* control_shader = getShader(ShaderStage::TessCtrl);
+        if (control_shader == nullptr)
+            control_shader = getTessellationCopy(patch_size);
+        tessellation_control_points =
+            control_shader->getDescriptor().resource_mapping.tess_output_vertices;
+        std::array<f32, 6> levels{};
+        for (u32 i = 0; i < levels.size(); i++)
+            levels[i] = std::bit_cast<f32>(regs_raw[REG_TESSELLATION_LEVELS + i]);
+        descriptor.shaders[static_cast<u32>(renderer::ShaderType::TessControl)] =
+            control_shader;
+        descriptor.shaders[static_cast<u32>(
+            renderer::ShaderType::TessEvaluation)] =
+            getShader(ShaderStage::TessEval, fragment_inputs);
+        descriptor.tessellation_factors = getTessellationFactors(
+            static_cast<u32>(renderer::tessellation::getDomain(parameters)),
+            getShaderUnchecked(ShaderStage::TessCtrl) != nullptr, levels);
+        descriptor.tessellation_parameters = parameters;
+        descriptor.tessellation_patch_size = patch_size;
+    } else {
+        getShader(ShaderStage::TessCtrl);
+        getShader(ShaderStage::TessEval);
+    }
+    // A geometry shader is emulated (geometry.hpp): the vertex shader captures
+    // its outputs and a passthrough draws what the geometry shader emits
+    geometry_active = !tessellation_active && useGeometryShader();
+    if (tessellation_active &&
+        regs.shader_programs[static_cast<usize>(ShaderStage::Geometry)]
+            .config.enable)
+        ONCE(LOG_WARN(Engines, "Geometry shader after tessellation, drawn "
+                               "without it"));
+    auto* geometry_shader = getShader(ShaderStage::Geometry);
+    geometry_active = geometry_shader != nullptr;
+    descriptor.shaders[static_cast<u32>(renderer::ShaderType::Geometry)] =
+        geometry_shader;
     descriptor.shaders[static_cast<u32>(renderer::ShaderType::Vertex)] =
-        getShader(ShaderStage::VertexB,
-                  fragment_shader != nullptr
-                      ? fragment_shader->getDescriptor()
-                            .resource_mapping.stage_input_mask
-                      : 0,
-                  getGeometryLayerSource());
+        getShader(ShaderStage::VertexB, fragment_inputs,
+                  geometry_active || tessellation_active
+                      ? 0
+                      : getGeometryLayerSource());
+    if (geometry_active)
+        descriptor.geometry_passthrough =
+            getGeometryPassthrough(*geometry_shader, fragment_inputs);
 
     if (auto& visual = VisualDiagnostics::instance(); visual.active()) {
         renderer::ShaderType stages[] = {renderer::ShaderType::Vertex,
@@ -3817,6 +4019,21 @@ bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
                          command.stages[0], command.storage_writes);
     configureShaderStage(ShaderStage::Fragment, tex_header_pool, tex_sampler_pool,
                          command.stages[1], command.storage_writes);
+    command.stages[2] = {};
+    command.stages[3] = {};
+    command.stages[4] = {};
+    if (geometry_active)
+        configureShaderStage(ShaderStage::Geometry, tex_header_pool,
+                             tex_sampler_pool, command.stages[2],
+                             command.storage_writes);
+    if (tessellation_active) {
+        configureShaderStage(ShaderStage::TessCtrl, tex_header_pool,
+                             tex_sampler_pool, command.stages[3],
+                             command.storage_writes);
+        configureShaderStage(ShaderStage::TessEval, tex_header_pool,
+                             tex_sampler_pool, command.stages[4],
+                             command.storage_writes);
+    }
     texture_memo_epoch = texture_cache.getEpoch();
     texture_memo_render_pass = render_pass;
     texture_memo_gmmu = tls_crnt_gmmu;

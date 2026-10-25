@@ -215,6 +215,32 @@ void RenderEncoder::setVisibilityResultMode(MTL::VisibilityResultMode mode,
         mtl3->setVisibilityResultMode(mode, offset);
 }
 
+void RenderEncoder::vertexBufferBarrier() {
+    if (mtl4)
+        mtl4->barrierAfterEncoderStages(MTL::StageVertex, MTL::StageVertex,
+                                        MTL4::VisibilityOptionDevice);
+    else
+        mtl3->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                            MTL::RenderStageVertex);
+}
+
+void RenderEncoder::setTessellationFactorBuffer(const MTL::Buffer* buffer,
+                                                NS::UInteger offset,
+                                                NS::UInteger instance_stride) {
+    if (mtl3)
+        mtl3->setTessellationFactorBuffer(buffer, offset, instance_stride);
+}
+
+void RenderEncoder::drawPatches(NS::UInteger control_points,
+                                NS::UInteger patch_start,
+                                NS::UInteger patch_count,
+                                NS::UInteger instance_count,
+                                NS::UInteger base_instance) {
+    if (mtl3)
+        mtl3->drawPatches(control_points, patch_start, patch_count, nullptr, 0,
+                          instance_count, base_instance);
+}
+
 void RenderEncoder::drawPrimitives(MTL::PrimitiveType type,
                                    NS::UInteger vertex_start,
                                    NS::UInteger vertex_count) {

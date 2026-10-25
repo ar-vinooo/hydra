@@ -242,9 +242,12 @@ void MemoryAnalyzer::analyze(const ir::Module& modul,
 }
 
 void MemoryAnalyzer::handleAMemLoad(const AMem amem) {
+    // Per patch attributes are not stage inputs
+    if (amem.patch)
+        return;
     // TODO: support indexing with src
     // Not an assertion: release builds must not translate this silently wrong
-    if (amem.reg != RZ)
+    if (amem.reg != RZ && !geometry)
         SHADER_UNSUPPORTED_ONCE("Indexed attribute load (src: {})", amem.reg);
     pushSv(input_svs, stage_inputs, amem.imm);
 }
@@ -261,8 +264,11 @@ void MemoryAnalyzer::handleCMemLoad(const CMem cmem) {
 }
 
 void MemoryAnalyzer::handleAMemStore(const AMem amem) {
+    // Per patch attributes are not stage outputs
+    if (amem.patch)
+        return;
     // TODO: support indexing with src
-    if (amem.reg != RZ)
+    if (amem.reg != RZ && !geometry)
         SHADER_UNSUPPORTED_ONCE("Indexed attribute store (src: {})", amem.reg);
     const auto access = pushSv(output_svs, stage_outputs, amem.imm);
     if (access.sv.semantic == SvSemantic::ClipDistance)

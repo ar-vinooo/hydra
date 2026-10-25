@@ -36,12 +36,20 @@ struct AMem {
     reg_t reg;
     u64 imm;
     bool is_input;
+    // Geometry and tessellation shader inputs: the register holding the
+    // input vertex (control point)
+    reg_t vertex{RZ};
+    // Tessellation shaders: a per patch attribute (ALD/AST.P)
+    bool patch{false};
 
-    AMem(reg_t reg_, u64 imm_, bool is_input_)
-        : reg{reg_}, imm{imm_}, is_input{is_input_} {}
+    AMem(reg_t reg_, u64 imm_, bool is_input_, reg_t vertex_ = RZ,
+         bool patch_ = false)
+        : reg{reg_}, imm{imm_}, is_input{is_input_}, vertex{vertex_},
+          patch{patch_} {}
 
     bool operator==(const AMem& other) const {
-        return reg == other.reg && imm == other.imm;
+        return reg == other.reg && imm == other.imm && vertex == other.vertex &&
+               patch == other.patch;
     }
 };
 
@@ -213,6 +221,31 @@ struct DecompilerContext {
     // its color registers (header OMAP sample mask)
     u32 fragment_sample_mask_register{invalid<u32>()};
     u32 fragment_output_mask{0xffffffffu};
+    // A geometry shader, compiled as a vertex function (see geometry.hpp)
+    bool geometry{false};
+    struct {
+        u32 input_vertices{0};
+        engines::PrimitiveType input_primitive{engines::PrimitiveType::Points};
+        // geometry::Output
+        u32 output{0};
+        u32 max_output_vertices{0};
+        u32 invocations{1};
+    } geo;
+    // A vertex shader that writes its outputs to the capture buffer
+    bool geometry_capture{false};
+    // Tessellation shaders (see tessellation.hpp): the control shader runs
+    // as a vertex function per output control point, the evaluation shader
+    // as Metal's post-tessellation vertex function
+    bool tess_control{false};
+    bool tess_eval{false};
+    struct {
+        // Control points per input patch (SET_PATCH)
+        u32 input_vertices{0};
+        // Control points the control shader outputs
+        u32 output_vertices{0};
+        // SET_TESSELLATION_PARAMETERS domain: 1 triangle, 2 quad
+        u32 domain{0};
+    } tess;
     union {
         struct {
             PixelImap pixel_imaps[PIXEL_IMAP_COUNT];

@@ -4,6 +4,7 @@
 #include "core/hw/tegra_x1/gpu/macro/driver_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -240,6 +241,12 @@ inline renderer::ShaderType toRendererShaderType(ShaderStage stage) {
         return renderer::ShaderType::Fragment;
     case ShaderStage::Compute:
         return renderer::ShaderType::Compute;
+    case ShaderStage::Geometry:
+        return renderer::ShaderType::Geometry;
+    case ShaderStage::TessCtrl:
+        return renderer::ShaderType::TessControl;
+    case ShaderStage::TessEval:
+        return renderer::ShaderType::TessEvaluation;
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Engines, "Shader stage {}", stage));
         return renderer::ShaderType::Count;
@@ -812,6 +819,28 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
                                     u32 fragment_input_mask = 0,
                                     u32 layer_output_addr = 0);
     u32 getGeometryLayerSource();
+    // Geometry shader emulation (see renderer/geometry.hpp)
+    bool useGeometryShader() const;
+    renderer::ShaderBase*
+    getGeometryPassthrough(const renderer::ShaderBase& geometry_shader,
+                           u32 fragment_input_mask);
+    // The current pipeline has an emulated geometry shader
+    bool geometry_active{false};
+    // Tessellation emulation (see renderer/tessellation.hpp)
+    bool useTessellation() const;
+    renderer::ShaderBase* getTessellationCopy(u32 patch_size);
+    renderer::ShaderBase* getTessellationFactors(u32 domain, bool from_patches,
+                                                 const std::array<f32, 6>& levels);
+    bool tessellation_active{false};
+    // Control points the control shader of the current pipeline outputs
+    u32 tessellation_control_points{0};
+    std::map<u32, std::unique_ptr<renderer::ShaderBase>> tessellation_copies;
+    std::map<std::tuple<u32, bool, std::array<u32, 6>>,
+             std::unique_ptr<renderer::ShaderBase>>
+        tessellation_factor_shaders;
+    std::map<std::tuple<u32, bool, bool, bool, u32, u32, u32, bool, bool>,
+             std::unique_ptr<renderer::ShaderBase>>
+        geometry_passthroughs;
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
     bool isVertexArrayInstanced(u32 vertex_array_index) const;

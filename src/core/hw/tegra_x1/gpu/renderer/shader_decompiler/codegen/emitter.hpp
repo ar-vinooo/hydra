@@ -208,6 +208,8 @@ class Emitter {
                                       const ir::Value& compare,
                                       const ir::Value& value) = 0;
     virtual void emitBarrier() = 0;
+    virtual void emitEmitVertex() = 0;
+    virtual void emitEndPrimitive() = 0;
     virtual void emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,
                                 const std::array<ir::Value, 4>& values,

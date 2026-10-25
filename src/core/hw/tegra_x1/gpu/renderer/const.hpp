@@ -502,6 +502,10 @@ enum class ShaderType {
     Vertex,
     Fragment,
     Compute,
+    // Emulated with vertex functions (see geometry.hpp, tessellation.hpp)
+    Geometry,
+    TessControl,
+    TessEvaluation,
 
     Count,
 };
@@ -623,6 +627,17 @@ struct ResourceMapping {
     std::map<u32, MTL::TextureType> image_types;
     // The vertex shader exports the render target layer or viewport index
     bool writes_layer{false};
+    // A vertex shader capturing its outputs for a geometry shader (see
+    // geometry.hpp): its record buffer and parameter slots
+    u32 capture_buffer_index{invalid<u32>()};
+    u32 capture_params_index{invalid<u32>()};
+    // A geometry shader: its header's output topology (geometry::Output, 0
+    // otherwise), output vertex limit and invocations per primitive
+    u32 geometry_output{0};
+    u32 geometry_max_output_vertices{0};
+    u32 geometry_invocations{1};
+    // A tessellation control shader: the control points it outputs per patch
+    u32 tess_output_vertices{0};
     // Guest features the decompile skipped; the shader may compute wrong values
     std::vector<std::string> unsupported;
 
@@ -683,6 +698,14 @@ struct StencilState {
 
 struct PipelineDescriptor {
     ShaderBase* shaders[static_cast<usize>(ShaderType::Count)];
+    // With a geometry shader: the vertex function drawing what it emits (the
+    // vertex shader captures its outputs, see geometry.hpp)
+    ShaderBase* geometry_passthrough{nullptr};
+    // Tessellation (see tessellation.hpp): the function writing the factors,
+    // SET_TESSELLATION_PARAMETERS and the control points per input patch
+    ShaderBase* tessellation_factors{nullptr};
+    u32 tessellation_parameters{0};
+    u32 tessellation_patch_size{0};
     VertexState vertex_state;
     ColorTargetState color_target_states[COLOR_TARGET_COUNT];
     TextureFormat depth_stencil_format{TextureFormat::Invalid};

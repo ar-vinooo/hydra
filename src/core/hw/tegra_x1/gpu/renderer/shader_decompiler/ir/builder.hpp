@@ -557,6 +557,9 @@ class Builder {
                               {addr, value});
     }
     void opBarrier() { addInstructionWithDst(Opcode::Barrier); }
+    // Geometry shader output (OUT)
+    void opEmitVertex() { addInstructionWithDst(Opcode::EmitVertex); }
+    void opEndPrimitive() { addInstructionWithDst(Opcode::EndPrimitive); }
     // Raw sizes of images accessed as raw words (SULD.D, SUST.D); formatted
     // accesses convert the texel to or from channel values
     // Store of 4 raw register values, formatted or as raw words of the given

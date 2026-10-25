@@ -22,6 +22,7 @@ class DrawQueue;
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class CommandBuffer;
+class Shader;
 class RenderEncoder;
 class TextureView;
 class Sampler;
@@ -302,6 +303,34 @@ class Renderer : public IRenderer {
     // Helpers
     bool canDraw() const;
     void bindDrawState(CommandBuffer* command_buffer);
+    // Binds the resources `shader` declares from the bindings of `state_type`
+    // to the `host_type` stage (a geometry shader runs as a vertex function)
+    void bindStageResources(CommandBuffer* command_buffer, const Shader* shader,
+                            ShaderType state_type, ShaderType host_type);
+    // The vertex ids a draw uses, which index the vertex shader's captured
+    // records from the lowest (geometry.hpp). False if they cannot be read.
+    struct VertexRange {
+        u32 min_vertex;
+        u32 slots;
+        MTL::Buffer* index_buffer;
+        u64 index_offset;
+    };
+    std::optional<VertexRange> getDrawVertexRange(bool indexed, u32 start,
+                                                  u32 count, u32 base_vertex);
+    // Records the vertex shader's outputs for the draw (geometry.hpp)
+    void encodeVertexCapture(CommandBuffer* command_buffer,
+                             const VertexRange& range, MTL::Buffer* records,
+                             MTL::Buffer* params, bool indexed, u32 start,
+                             u32 count, u32 base_vertex, u32 base_instance);
+    // A draw with a geometry shader (see geometry.hpp)
+    void drawGeometry(CommandBuffer* command_buffer,
+                      engines::PrimitiveType primitive_type, u32 start,
+                      u32 count, bool indexed, u32 base_vertex,
+                      u32 base_instance, u32 instance_count);
+    // A draw of patches with tessellation (see tessellation.hpp)
+    void drawTessellation(CommandBuffer* command_buffer, u32 start, u32 count,
+                          bool indexed, u32 base_vertex, u32 base_instance,
+                          u32 instance_count);
 
   public:
     GETTER(device, getDevice);

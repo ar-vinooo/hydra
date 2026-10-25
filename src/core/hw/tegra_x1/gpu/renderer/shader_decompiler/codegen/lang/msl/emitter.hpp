@@ -102,6 +102,17 @@ class MslEmitter final : public LangEmitter {
                               const ir::Value& compare,
                               const ir::Value& value) override;
     void emitBarrier() override;
+    void emitEmitVertex() override;
+    void emitEndPrimitive() override;
+    void emitGeometryPrologue();
+    std::string getGeometryInputStr(const AMem amem, ir::Type type) override;
+    void emitGeometryEpilogue() override;
+    void emitGeometryCapture() override;
+    void emitTessControlPrologue();
+    void emitTessEvalPrologue();
+    std::string getPatchStr(const AMem amem, ir::Type type) override;
+    std::string getEvaluationInputStr(const AMem amem, ir::Type type) override;
+    void emitTessControlEpilogue() override;
     void emitImageStore(u32 index, TextureType type, const ir::Value& coords,
                         const std::array<ir::Value, 4>& values,
                         u32 raw_size) override;

@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/helper.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen::lang {
@@ -104,6 +105,18 @@ void LangEmitter::emitMainFunctionPrologue() {
 
     switch (context.type) {
     case ShaderType::Vertex:
+        if (context.geometry || context.tess_control) {
+            // Outputs a vertex does not write: zero, and a position w of 1
+            writeStatement("for (uint i = {}u; i < {}u; i++) state.a_out[i]._u32 = 0u",
+                           geometry::RECORD_BASE / 4, geometry::RECORD_END / 4);
+            writeStatement("{} = 0x3f800000u",
+                           getAttrMemoryStr({RZ, SV_POSITION_BASE + 12u, false}));
+            break;
+        }
+        // The captured record holds every output word: start from zero
+        if (context.geometry_capture)
+            writeStatement("for (uint i = {}u; i < {}u; i++) state.a_out[i]._u32 = 0u",
+                           geometry::RECORD_BASE / 4, geometry::RECORD_END / 4);
         // Guest shaders may only write XY (for fullscreen/offscreen passes).
         // Supply the default homogeneous position before executing the shader;
         // otherwise its unwritten Z/W components contain thread-stack garbage.
@@ -121,6 +134,9 @@ void LangEmitter::emitMainFunctionPrologue() {
                          false}),
                     c == 3 ? "0x3f800000u" : "0u");
         }
+        // The evaluation shader reads control points, not vertex attributes
+        if (context.tess_eval)
+            break;
         for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
             const auto vertex_attrib_state = state.vertex_attrib_states[i];
 
@@ -211,14 +227,12 @@ void LangEmitter::emitFunction(const ir::Function& func) {
     for (const auto& [_, block] : func.getBlocks())
         emitBlock(func, block);
 
-    // Function
-    // TODO: function name
-    std::string name = "main";
-    if (name == "main") {
-        emitMainPrototype();
-    } else
-        LOG_FATAL(ShaderDecompiler,
-                  "Custom functions not implemented (name: {})", name);
+    // Other functions are programs main runs first, in the same state
+    if (func.getName() != "main") {
+        prior_functions.push_back(&func);
+        return;
+    }
+    emitMainPrototype();
 
     // Structurize
     /*
@@ -237,32 +251,28 @@ void LangEmitter::emitFunction(const ir::Function& func) {
                    ? static_cast<u32>(std::strtoul(env, nullptr, 0))
                    : 65536u;
     }();
-    writeStatement("auto next = Block_{}::{}", func.getName(), label_t(0x0));
     writeStatement("uint block_guard = 0");
-    enterScope("while (next != Block_{}::None && block_guard++ < {}u)",
-               func.getName(), guard_limit);
-    enterScope("switch (next)");
-    for (const auto& [label, block] : func.getBlocks()) {
-        indent--;
-        write("case Block_{}::{}:", func.getName(), label);
-        indent++;
-        writeStatement("next = func_{}(state)", label);
-        writeStatement("break");
-    }
-    indent--;
-    write("default:");
-    indent++;
-    // A return to nowhere (or from a garbage stack) ends the shader
-    writeStatement("next = Block_{}::None", func.getName());
-    writeStatement("break");
-    exitScopeEmpty();
-    exitScopeEmpty();
-    writeNewline();
+    // VertexA runs to its exit, then VertexB continues with its registers
+    for (const auto* prior : prior_functions)
+        emitDispatchLoop(*prior, guard_limit);
+    emitDispatchLoop(func, guard_limit);
 
     // Exit
     // Outputs
     switch (context.type) {
     case ShaderType::Vertex:
+        if (context.geometry) {
+            emitGeometryEpilogue();
+            break;
+        }
+        if (context.geometry_capture) {
+            emitGeometryCapture();
+            break;
+        }
+        if (context.tess_control) {
+            emitTessControlEpilogue();
+            break;
+        }
         // TODO: don't hardcode the bit cast type
 #define ADD_OUTPUT(sv_semantic, index, base, c)                                \
     {                                                                          \
@@ -392,9 +402,42 @@ void LangEmitter::EmitNode(const ir::Function& func,
 }
 */
 
+void LangEmitter::emitDispatchLoop(const ir::Function& func, u32 guard_limit) {
+    enterScopeEmpty();
+    writeStatement("auto next = Block_{}::{}", func.getName(), label_t(0x0));
+    writeStatement("block_guard = 0");
+    enterScope("while (next != Block_{}::None && block_guard++ < {}u)",
+               func.getName(), guard_limit);
+    enterScope("switch (next)");
+    for (const auto& [label, block] : func.getBlocks()) {
+        indent--;
+        write("case Block_{}::{}:", func.getName(), label);
+        indent++;
+        writeStatement("next = {}(state)", getBlockFunctionName(func, label));
+        writeStatement("break");
+    }
+    indent--;
+    write("default:");
+    indent++;
+    // A return to nowhere (or from a garbage stack) ends the program
+    writeStatement("next = Block_{}::None", func.getName());
+    writeStatement("break");
+    exitScopeEmpty();
+    exitScopeEmpty();
+    exitScopeEmpty();
+    writeNewline();
+}
+
+std::string LangEmitter::getBlockFunctionName(const ir::Function& func,
+                                              label_t label) {
+    if (func.getName() == "main")
+        return fmt::format("func_{}", label);
+    return fmt::format("func_{}_{}", func.getName(), label);
+}
+
 void LangEmitter::emitBlock(const ir::Function& func, const ir::Block& block) {
-    enterScope("Block_{} func_{}(thread State& state)", func.getName(),
-               block.getLabel());
+    enterScope("Block_{} {}(thread State& state)", func.getName(),
+               getBlockFunctionName(func, block.getLabel()));
 
     // Block enum alias
     writeStatement("using Block = Block_{}", func.getName());

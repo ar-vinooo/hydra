@@ -16,6 +16,13 @@ u32 PipelineCache::hashHot1(const PipelineDescriptor& descriptor) {
     // TODO: use the shader hash instead of the pointer?
     hash.add(descriptor.shaders[0]);
     hash.add(descriptor.shaders[1]);
+    hash.add(descriptor.shaders[static_cast<u32>(ShaderType::Geometry)]);
+    hash.add(descriptor.geometry_passthrough);
+    hash.add(descriptor.shaders[static_cast<u32>(ShaderType::TessControl)]);
+    hash.add(descriptor.shaders[static_cast<u32>(ShaderType::TessEvaluation)]);
+    hash.add(descriptor.tessellation_factors);
+    hash.add(descriptor.tessellation_parameters);
+    hash.add(descriptor.tessellation_patch_size);
 
     // Vertex state
 
@@ -66,7 +73,19 @@ u32 PipelineCache::hashHot1(const PipelineDescriptor& descriptor) {
 // The fields of the hash
 bool PipelineCache::equals(const PipelineDescriptor& a,
                            const PipelineDescriptor& b) {
-    if (a.shaders[0] != b.shaders[0] || a.shaders[1] != b.shaders[1])
+    constexpr auto GEOMETRY = static_cast<u32>(ShaderType::Geometry);
+    if (a.shaders[0] != b.shaders[0] || a.shaders[1] != b.shaders[1] ||
+        a.shaders[GEOMETRY] != b.shaders[GEOMETRY] ||
+        a.geometry_passthrough != b.geometry_passthrough)
+        return false;
+    constexpr auto TESS_CONTROL = static_cast<u32>(ShaderType::TessControl);
+    constexpr auto TESS_EVALUATION =
+        static_cast<u32>(ShaderType::TessEvaluation);
+    if (a.shaders[TESS_CONTROL] != b.shaders[TESS_CONTROL] ||
+        a.shaders[TESS_EVALUATION] != b.shaders[TESS_EVALUATION] ||
+        a.tessellation_factors != b.tessellation_factors ||
+        a.tessellation_parameters != b.tessellation_parameters ||
+        a.tessellation_patch_size != b.tessellation_patch_size)
         return false;
 
     for (usize i = 0; i < std::size(a.vertex_state.vertex_attrib_states);

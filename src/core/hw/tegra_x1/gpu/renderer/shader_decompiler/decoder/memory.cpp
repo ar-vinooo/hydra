@@ -9,7 +9,7 @@ namespace {
 // TODO: p, todo
 void emitLoadAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
                        bool is_input, LsSize size, reg_t dst, reg_t src,
-                       u32 src_offset) {
+                       u32 src_offset, reg_t vertex, bool patch) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     u32 count;
@@ -34,7 +34,7 @@ void emitLoadAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
     values.reserve(count);
     for (u32 i = 0; i < count; i++) {
         values.push_back(context.builder.opCopy(ir::Value::createAttrMemory(
-            AMem(src, src_offset + i * sizeof(u32), is_input))));
+            AMem(src, src_offset + i * sizeof(u32), is_input, vertex, patch))));
     }
 
     for (u32 i = 0; i < count; i++) {
@@ -46,9 +46,9 @@ void emitLoadAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: p, todo
 void emitStoreAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
-                        LsSize size, reg_t dst, u32 dst_offset, reg_t src) {
+                        LsSize size, reg_t dst, u32 dst_offset, reg_t src,
+                        bool patch) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     u32 count;
@@ -72,7 +72,7 @@ void emitStoreAttribute(DecoderContext& context, pred_t pred, bool pred_inv,
     for (u32 i = 0; i < count; i++) {
         context.builder.opCopy(
             ir::Value::createAttrMemory(
-                AMem(dst, dst_offset + i * sizeof(u32), false)),
+                AMem(dst, dst_offset + i * sizeof(u32), false, RZ, patch)),
             ir::Value::createRegister(offsetRegister(src, i)));
     }
 
@@ -376,12 +376,12 @@ void emitInterpolateAttribute(DecoderContext& context, pred_t pred,
 
 void emitLda(DecoderContext& context, InstLda inst) {
     emitLoadAttribute(context, inst.pred, inst.pred_inv, !inst.o, inst.size,
-                      inst.dst, inst.src, inst.src_offset);
+                      inst.dst, inst.src, inst.src_offset, inst.vertex, inst.p);
 }
 
 void emitSta(DecoderContext& context, InstSta inst) {
     emitStoreAttribute(context, inst.pred, inst.pred_inv, inst.size, inst.dst,
-                       inst.dst_offset, inst.src);
+                       inst.dst_offset, inst.src, inst.p);
 }
 
 void emitLdc(DecoderContext& context, InstLdc inst) {

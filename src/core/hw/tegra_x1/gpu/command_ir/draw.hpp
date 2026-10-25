@@ -28,6 +28,16 @@ struct BufferBinding {
 
 using TextureBinding = renderer::TextureBinding;
 
+// Bindings of a draw: vertex, fragment, geometry and tessellation stages
+constexpr usize DRAW_STAGE_COUNT = 5;
+inline renderer::ShaderType getDrawStageShaderType(usize index) {
+    constexpr renderer::ShaderType TYPES[DRAW_STAGE_COUNT] = {
+        renderer::ShaderType::Vertex, renderer::ShaderType::Fragment,
+        renderer::ShaderType::Geometry, renderer::ShaderType::TessControl,
+        renderer::ShaderType::TessEvaluation};
+    return TYPES[index];
+}
+
 struct StageBindings {
     bool active{false};
     // Producer snapshots inherited slots when descriptor pools are absent.
@@ -47,7 +57,7 @@ struct DrawCommand {
     renderer::DrawState state{};
     bool occlusion_enabled{false};
     std::array<renderer::BufferView, VERTEX_ARRAY_COUNT> vertices{};
-    std::array<StageBindings, renderer::GRAPHICS_SHADER_TYPE_COUNT> stages{};
+    std::array<StageBindings, DRAW_STAGE_COUNT> stages{};
     std::vector<ztd::Range<uptr>> storage_writes;
     std::vector<ResourceReference> resource_refs;
     std::vector<std::shared_ptr<void>> resource_owners;

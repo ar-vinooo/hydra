@@ -175,6 +175,15 @@ void buildShaderKey(const GuestShaderDescriptor& descriptor,
     hash.add(static_cast<u32>(descriptor.stage));
     hash.add(descriptor.code_ptr);
     hash.add(descriptor.state.program_offset);
+    hash.add(descriptor.vertex_a_gpu_addr);
+    hash.add(descriptor.state.vertex_a_program_offset);
+    hash.add(compiled_version ? u64{0} : descriptor.vertex_a_code_revision);
+    hash.add(descriptor.state.geometry_input_vertices);
+    hash.add(descriptor.state.geometry_input_primitive);
+    hash.add(descriptor.state.geometry_capture);
+    hash.add(descriptor.state.tessellation_patch_size);
+    hash.add(descriptor.state.tessellation_control_points);
+    hash.add(descriptor.state.tessellation_domain);
     hash.add(ShaderOverrides::instance().getGeneration(descriptor.gpu_addr));
     hash.add(compiled_version ? usize{0} : descriptor.state.branch_constants.size());
     if constexpr (!compiled_version) {
@@ -374,6 +383,11 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         if (!matchesMappedCode(descriptor.gpu_addr, *version->bytes,
                                resources.code_read_size))
             continue;
+        if (descriptor.vertex_a_gpu_addr != 0 &&
+            (!version->vertex_a_bytes ||
+             !matchesMappedCode(descriptor.vertex_a_gpu_addr,
+                                *version->vertex_a_bytes)))
+            continue;
         const auto constants_match = std::all_of(
             resources.branch_constants.begin(), resources.branch_constants.end(),
             [&](const auto& entry) {
@@ -392,30 +406,48 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         }
     }
     auto& actual = normalized();
-    auto& source = sources[{reinterpret_cast<uptr>(tls_crnt_gmmu), descriptor.gpu_addr,
-                            descriptor.stage}];
     const auto epoch = instruction_epoch.load();
-    if (!source.bytes || source.validated_epoch != epoch ||
-        !matchesMappedCode(descriptor.gpu_addr, *source.bytes)) {
-        auto bytes = tls_crnt_gmmu->readMappedBytes(descriptor.gpu_addr, 0x10000);
-        const usize minimum = descriptor.stage == engines::ShaderStage::Compute ? 8 : 88;
-        if (bytes.size() < minimum) return nullptr;
-        // A -> B -> A code uploads should reuse A's immutable artifact rather
-        // than accumulating duplicate shader/pipeline objects every frame.
-        const auto known = std::find_if(source.history.begin(), source.history.end(),
-            [&](const auto& version) { return *version.first == bytes; });
-        if (known != source.history.end()) {
-            source.bytes = known->first;
-            source.revision = known->second;
-        } else {
-            source.bytes = std::make_shared<const std::vector<u8>>(std::move(bytes));
-            source.revision = ++next_code_revision;
-            source.history.emplace_back(source.bytes, source.revision);
+    // The current owned code of a program
+    const auto snapshot = [&](uptr gpu_addr,
+                              engines::ShaderStage stage) -> SourceVersion* {
+        auto& source =
+            sources[{reinterpret_cast<uptr>(tls_crnt_gmmu), gpu_addr, stage}];
+        if (!source.bytes || source.validated_epoch != epoch ||
+            !matchesMappedCode(gpu_addr, *source.bytes)) {
+            auto bytes = tls_crnt_gmmu->readMappedBytes(gpu_addr, 0x10000);
+            const usize minimum =
+                stage == engines::ShaderStage::Compute ? 8 : 88;
+            if (bytes.size() < minimum) return nullptr;
+            // A -> B -> A code uploads should reuse A's immutable artifact
+            // rather than accumulating duplicate shader/pipeline objects
+            // every frame.
+            const auto known = std::find_if(
+                source.history.begin(), source.history.end(),
+                [&](const auto& version) { return *version.first == bytes; });
+            if (known != source.history.end()) {
+                source.bytes = known->first;
+                source.revision = known->second;
+            } else {
+                source.bytes =
+                    std::make_shared<const std::vector<u8>>(std::move(bytes));
+                source.revision = ++next_code_revision;
+                source.history.emplace_back(source.bytes, source.revision);
+            }
+            source.validated_epoch = epoch;
         }
-        source.validated_epoch = epoch;
+        return &source;
+    };
+    const auto* source = snapshot(descriptor.gpu_addr, descriptor.stage);
+    if (source == nullptr) return nullptr;
+    actual.code_snapshot = source->bytes;
+    actual.code_revision = source->revision;
+    if (descriptor.vertex_a_gpu_addr != 0) {
+        const auto* vertex_a = snapshot(descriptor.vertex_a_gpu_addr,
+                                        engines::ShaderStage::VertexA);
+        if (vertex_a == nullptr) return nullptr;
+        actual.state.vertex_a_code = vertex_a->bytes;
+        actual.vertex_a_code_revision = vertex_a->revision;
     }
-    actual.code_snapshot = source.bytes;
-    actual.code_revision = source.revision;
     actual.state.branch_constants.clear();
     actual.cache_key = makeShaderKey(actual);
     if (const auto it = branch_dependencies.find(actual.cache_key);
@@ -437,7 +469,8 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
     }
     auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true, true>::find(actual);
     if (shader) {
-        versions.push_back({actual.code_snapshot, shader});
+        versions.push_back(
+            {actual.code_snapshot, shader, actual.state.vertex_a_code});
         if (reuse_lookup)
             std::rotate(versions.begin(), std::prev(versions.end()), versions.end());
     }
@@ -542,9 +575,12 @@ u32 ShaderCache::hashHot2(const GuestShaderDescriptor& descriptor) {
 
 bool ShaderCache::equals(const GuestShaderDescriptor& a,
                          const GuestShaderDescriptor& b) {
+    const auto same_code = [](const auto& x, const auto& y) {
+        return x == y || (x && y && *x == *y);
+    };
     return a.cache_key == b.cache_key &&
-           (a.code_snapshot == b.code_snapshot ||
-            (a.code_snapshot && b.code_snapshot && *a.code_snapshot == *b.code_snapshot));
+           same_code(a.code_snapshot, b.code_snapshot) &&
+           same_code(a.state.vertex_a_code, b.state.vertex_a_code);
 }
 
 void ShaderCache::destroyElement(ShaderBase* shader) { delete shader; }

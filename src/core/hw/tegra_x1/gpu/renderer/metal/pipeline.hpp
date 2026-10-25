@@ -14,10 +14,33 @@ class Pipeline final : public PipelineBase {
     ~Pipeline() override;
 
     // Getters
+    // With a geometry shader, the passthrough draw (see geometry.hpp)
     MTL::RenderPipelineState* getPipeline() const { return pipeline; }
+    // The vertex shader writing its output records, rasterization off
+    MTL::RenderPipelineState* getCapturePipeline() const {
+        return capture_pipeline;
+    }
+    // The geometry shader as a vertex function, rasterization off
+    MTL::RenderPipelineState* getGeometryPipeline() const {
+        return geometry_pipeline;
+    }
+    bool hasGeometry() const { return geometry_pipeline != nullptr; }
+    // Tessellation (tessellation.hpp): the control shader and the factor
+    // function, rasterization off; getPipeline() tessellates
+    MTL::RenderPipelineState* getTessControlPipeline() const {
+        return tess_control_pipeline;
+    }
+    MTL::RenderPipelineState* getTessFactorPipeline() const {
+        return tess_factor_pipeline;
+    }
+    bool hasTessellation() const { return tess_factor_pipeline != nullptr; }
 
   private:
     MTL::RenderPipelineState* pipeline{nullptr};
+    MTL::RenderPipelineState* capture_pipeline{nullptr};
+    MTL::RenderPipelineState* geometry_pipeline{nullptr};
+    MTL::RenderPipelineState* tess_control_pipeline{nullptr};
+    MTL::RenderPipelineState* tess_factor_pipeline{nullptr};
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

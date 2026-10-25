@@ -27,6 +27,30 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
+namespace {
+
+// OUT: emits the vertex built so far and/or ends the strip. The result
+// register (the next vertex handle) is not written: attribute stores and OUT
+// address the vertex being built regardless of handles.
+void emitOut(ir::Builder& b, u64 inst, bool rasterized_stream) {
+    const auto conditional =
+        handlePredCond(b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+                       extractBits(inst, 19, 1) != 0);
+    const auto type = extractBits(inst, 39, 2);
+    if (rasterized_stream) {
+        if (type == 0)
+            SHADER_UNSUPPORTED("OUT type 0");
+        if ((type & 0x1) != 0)
+            b.opEmitVertex();
+        if ((type & 0x2) != 0)
+            b.opEndPrimitive();
+    }
+    if (conditional)
+        b.opEndIf();
+}
+
+} // namespace
+
 void Decoder::decode() {
     crnt_block = &blocks[0x0];
     while (crnt_block != nullptr) {
@@ -184,11 +208,19 @@ void Decoder::parseNextInstruction() {
 
 #define EMIT(op) do { visual.decoded(pc, inst, #op); emit##op(context, std::bit_cast<Inst##op>(inst)); } while (false)
 
+    // OUT (envytools gm107.c): bits 39-40 emit (1), cut (2) or both (3) for
+    // the vertex stream in bits 20+. Only stream 0 is rasterized.
     INST0(0xfbe0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("out");
+        if (static_cast<reg_t>(extractBits(inst, 20, 8)) != RZ)
+            SHADER_UNSUPPORTED("OUT with a register stream");
+        emitOut(context.builder, inst, true);
     }
     INST(0xf6e0000000000000, 0xfef8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("out");
+        emitOut(context.builder, inst, (extractBits(inst, 20, 20) & 0x3) == 0);
+    }
+    INST(0xebe0000000000000, 0xfff8000000000000) {
+        SHADER_UNSUPPORTED("OUT with a constant buffer stream");
+        emitOut(context.builder, inst, true);
     }
     INST(0xf0f8000000000000, 0xfff8000000000000) { // sync
                 const auto pred = static_cast<pred_t>(extractBits(inst, 16, 3));
@@ -271,7 +303,22 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xefd8000000000000, 0xfff8000000000000) { EMIT(Lda); }
     INST(0xefd0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("isberd");
+        // ISBERD: the plain form gives the vertex index for ALD as is
+        // (yuzu, Ryujinx); skew, o, the patch/prim/attr modes and sizes are
+        // not known
+        if (extractBits(inst, 31, 4) != 0 || extractBits(inst, 47, 2) != 0)
+            SHADER_UNSUPPORTED("ISBERD mode {:#x}", extractBits(inst, 31, 18));
+        auto& b = context.builder;
+        const auto conditional = handlePredCond(
+            b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+            extractBits(inst, 19, 1) != 0);
+        const auto dst = static_cast<reg_t>(extractBits(inst, 0, 8));
+        if (dst != RZ)
+            b.opCopy(ir::Value::createRegister(dst),
+                     ir::Value::createRegister(
+                         static_cast<reg_t>(extractBits(inst, 8, 8))));
+        if (conditional)
+            b.opEndIf();
     }
     INST(0xefa0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("al2p");

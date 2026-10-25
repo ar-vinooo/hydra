@@ -42,6 +42,22 @@ class LangEmitter : public Emitter {
     void emitFunction(const ir::Function& func) override;
     // void EmitNode(const ir::Function& func, const analyzer::CfgNode* node);
     void emitBlock(const ir::Function& func, const ir::Block& block);
+    // Geometry shader emulation (see geometry.hpp)
+    virtual std::string getGeometryInputStr(const AMem amem, ir::Type type) = 0;
+    virtual void emitGeometryEpilogue() = 0;
+    virtual void emitGeometryCapture() = 0;
+    // Tessellation emulation (see tessellation.hpp)
+    virtual std::string getPatchStr(const AMem amem, ir::Type type) = 0;
+    // Empty for inputs that are not control point attributes
+    virtual std::string getEvaluationInputStr(const AMem amem,
+                                              ir::Type type) = 0;
+    virtual void emitTessControlEpilogue() = 0;
+    // Runs a function's blocks from its entry until it exits
+    void emitDispatchLoop(const ir::Function& func, u32 guard_limit);
+    static std::string getBlockFunctionName(const ir::Function& func,
+                                            label_t label);
+    // Functions emitted before main that main runs first (VertexA)
+    std::vector<const ir::Function*> prior_functions;
 
     // Data
     void emitCopy(const ir::Value& dst, const ir::Value& src) override;
@@ -301,6 +317,15 @@ class LangEmitter : public Emitter {
 
     std::string getAttrMemoryStr(const AMem amem,
                                  ir::Type type = ir::ScalarType::U32) {
+        if (amem.patch && (context.tess_control || context.tess_eval))
+            return getPatchStr(amem, type);
+        if ((context.geometry || context.tess_control) && amem.is_input)
+            return getGeometryInputStr(amem, type);
+        if (context.tess_eval && amem.is_input) {
+            const auto str = getEvaluationInputStr(amem, type);
+            if (!str.empty())
+                return str;
+        }
         // TODO: what about unaligned access?
         return fmt::format("state.a_{}[({} + 0x{:08x}) >> 2].{}",
                            (amem.is_input ? "in" : "out"),

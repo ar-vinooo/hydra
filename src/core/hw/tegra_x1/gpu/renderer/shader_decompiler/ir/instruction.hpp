@@ -109,6 +109,10 @@ enum class Opcode {
     ImageLoad,
     ImageAtomic,
 
+    // Geometry
+    EmitVertex,
+    EndPrimitive,
+
     // Warp
     Vote,
     Ballot,
@@ -172,7 +176,8 @@ ENABLE_ENUM_FORMATTING(
     AtomicSharedCas, "atomic_shared_cas", LoadStorage, "load_storage",
     StoreStorage, "store_storage", AtomicStorage, "atomic_storage",
     AtomicStorageCas, "atomic_storage_cas", LoadLocal, "load_local", StoreLocal, "store_local", Barrier, "barrier", ImageStore, "image_store", ImageLoad, "image_load",
-    ImageAtomic, "image_atomic", Vote, "vote", Ballot, "ballot", Shuffle,
+    ImageAtomic, "image_atomic", EmitVertex, "emit_vertex", EndPrimitive,
+    "end_primitive", Vote, "vote", Ballot, "ballot", Shuffle,
     "shuffle", Intrinsic, "intrinsic")
 
 template <>

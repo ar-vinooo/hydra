@@ -6,8 +6,14 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen {
 
 void Emitter::emit(const ir::Module& modul) {
     start();
+    // Programs that run before main in the same thread (VertexA) first: main
+    // runs them
     for (const auto& [name, func] : modul.getFunctions())
-        emitFunction(func);
+        if (name != "main")
+            emitFunction(func);
+    for (const auto& [name, func] : modul.getFunctions())
+        if (name == "main")
+            emitFunction(func);
     finish();
 }
 
@@ -290,6 +296,12 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         break;
     case ir::Opcode::Barrier:
         emitBarrier();
+        break;
+    case ir::Opcode::EmitVertex:
+        emitEmitVertex();
+        break;
+    case ir::Opcode::EndPrimitive:
+        emitEndPrimitive();
         break;
     case ir::Opcode::ImageStore:
         emitImageStore(inst.getOperand(0).getRawValue<u32>(),

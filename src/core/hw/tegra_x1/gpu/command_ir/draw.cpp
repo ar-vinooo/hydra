@@ -134,9 +134,14 @@ bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command) {
     };
     visitDirectResources(command, track);
     command.direct_resource_count = command.resource_refs.size();
-    if (command.pipeline)
+    if (command.pipeline) {
         for (auto* shader : command.pipeline->getDescriptor().shaders)
             track(shader, ResourceKind::Shader);
+        track(command.pipeline->getDescriptor().geometry_passthrough,
+              ResourceKind::Shader);
+        track(command.pipeline->getDescriptor().tessellation_factors,
+              ResourceKind::Shader);
+    }
     const auto track_view = [&](renderer::ITextureView* view) {
         track(view, ResourceKind::TextureView);
         if (view)
@@ -238,11 +243,11 @@ bool executeDraw(renderer::IRenderer& renderer,
     renderer::applyDrawState(renderer, command.state);
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++)
         renderer.bindVertexBuffer(command.vertices[i], i);
-    for (u32 i = 0; i < renderer::GRAPHICS_SHADER_TYPE_COUNT; i++) {
+    for (u32 i = 0; i < DRAW_STAGE_COUNT; i++) {
         const auto& stage = command.stages[i];
         if (!stage.active)
             continue;
-        const auto type = static_cast<renderer::ShaderType>(i);
+        const auto type = getDrawStageShaderType(i);
         renderer.unbindUniformBuffers(type);
         for (const auto& binding : stage.uniforms)
             renderer.bindUniformBuffer(binding.buffer, type, binding.index);

@@ -29,8 +29,12 @@ class MemoryAnalyzer {
     // size, which no instruction of the shader tells
     void analyze(const ir::Module& modul,
                  const std::map<u32, TextureType>& type_hints = {});
+    // Geometry and tessellation shaders index their input vertices and the
+    // outputs of the vertex they build (see geometry.hpp)
+    void setGeometry(bool value) { geometry = value; }
 
   private:
+    bool geometry{false};
     std::unordered_set<SvSemantic> input_svs;
     std::unordered_set<SvSemantic> output_svs;
     std::unordered_set<u8> stage_inputs;
