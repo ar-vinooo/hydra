@@ -42,6 +42,7 @@ BufferBase* Renderer::allocateTextureUploadBuffer(u64 size) {
 
 void Renderer::retireTextureUploadBuffer(ICommandBuffer* command_buffer,
                                          BufferBase* buffer) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_retireTextureUploadBufferHot6)(
@@ -65,6 +66,7 @@ void Renderer::blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
                            u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
                            MTL::Size dst_size, u32 dst_level, u32 dst_layer,
                            u32 level_count, u32 layer_count, const BlitOptions& options) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_blitTextureHot9)(
         command_buffer, src, src_origin, src_size, src_level, src_layer, dst,
@@ -92,6 +94,7 @@ Renderer::createRenderPass(const RenderPassDescriptor& descriptor) {
 }
 
 void Renderer::bindRenderPass(const RenderPassBase* render_pass) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_bindRenderPassHot13)(render_pass);
@@ -99,6 +102,7 @@ void Renderer::bindRenderPass(const RenderPassBase* render_pass) {
 
 void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
                           u32 layer, u8 mask, const simd::uint4 color) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_clearColorHot14)(
         command_buffer, render_target_id, layer, mask, color);
@@ -106,6 +110,7 @@ void Renderer::clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
 
 void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
                           const float value) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_clearDepthHot15)(
         command_buffer, layer, value);
@@ -113,6 +118,7 @@ void Renderer::clearDepth(ICommandBuffer* command_buffer, u32 layer,
 
 void Renderer::clearStencil(ICommandBuffer* command_buffer, u32 layer,
                             const u32 value) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_clearStencilHot16)(
         command_buffer, layer, value);
@@ -131,12 +137,14 @@ PipelineBase* Renderer::createPipeline(const PipelineDescriptor& descriptor) {
 }
 
 void Renderer::bindPipeline(const PipelineBase* pipeline) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_bindPipelineHot19)(pipeline);
 }
 
 void Renderer::setDepthTestEnabled(bool enabled) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setDepthTestEnabledHot20)(
@@ -144,6 +152,7 @@ void Renderer::setDepthTestEnabled(bool enabled) {
 }
 
 void Renderer::setDepthWriteEnabled(bool enabled) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setDepthWriteEnabledHot21)(
@@ -152,6 +161,7 @@ void Renderer::setDepthWriteEnabled(bool enabled) {
 
 void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
                                 ITextureView* view, const std::string& path) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_debugDumpTextureHot22)(
         command_buffer, view, path);
@@ -160,6 +170,7 @@ void Renderer::debugDumpTexture(ICommandBuffer* command_buffer,
 void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
                                      ITextureView* view, u32 level,
                                      const std::string& path) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_debugDumpTextureLevelHot23)(
@@ -167,6 +178,7 @@ void Renderer::debugDumpTextureLevel(ICommandBuffer* command_buffer,
 }
 
 void Renderer::setStencilState(const StencilState& stencil) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setStencilStateHot24)(stencil);
@@ -180,42 +192,49 @@ bool Renderer::hasStencilAttachment() const {
 
 void Renderer::setCullState(bool enabled, engines::CullFaceMode mode,
                             engines::Winding front_face) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_setCullStateHot26)(
         enabled, mode, front_face);
 }
 
 void Renderer::setDepthBias(f32 constant, f32 slope, f32 clamp) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_setDepthBiasHot27)(
         constant, slope, clamp);
 }
 
 void Renderer::setBlendConstant(const simd::float4 color) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setBlendConstantHot28)(color);
 }
 
 void Renderer::setDepthCompareOp(engines::CompareOp op) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setDepthCompareOpHot29)(op);
 }
 
 void Renderer::setViewport(u32 index, const MTL::Viewport& viewport) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_setViewportHot30)(
         index, viewport);
 }
 
 void Renderer::setScissor(u32 index, const MTL::ScissorRect& scissor) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_setScissorHot31)(index, scissor);
 }
 
 void Renderer::bindVertexBuffer(const BufferView& buffer, u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_bindVertexBufferHot32)(
         buffer, index);
@@ -223,6 +242,7 @@ void Renderer::bindVertexBuffer(const BufferView& buffer, u32 index) {
 
 void Renderer::bindIndexBuffer(const BufferView& index_buffer,
                                engines::IndexType index_type) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_bindIndexBufferHot33)(
         index_buffer, index_type);
@@ -230,6 +250,7 @@ void Renderer::bindIndexBuffer(const BufferView& index_buffer,
 
 void Renderer::bindUniformBuffer(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_bindUniformBufferHot34)(
         buffer, shader_type, index);
@@ -237,12 +258,14 @@ void Renderer::bindUniformBuffer(const BufferView& buffer,
 
 void Renderer::bindTexture(ITextureView* texture, SamplerBase* sampler,
                            ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_bindTextureHot35)(
         texture, sampler, shader_type, index);
 }
 
 void Renderer::unbindUniformBuffers(ShaderType shader_type) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_unbindUniformBuffersHot36)(
@@ -250,6 +273,7 @@ void Renderer::unbindUniformBuffers(ShaderType shader_type) {
 }
 
 void Renderer::unbindTextures(ShaderType shader_type) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_unbindTexturesHot37)(shader_type);
@@ -259,6 +283,7 @@ void Renderer::draw(ICommandBuffer* command_buffer,
                     const engines::PrimitiveType primitive_type,
                     const u32 start, const u32 count, const u32 base_instance,
                     const u32 instance_count) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_drawHot38)(
         command_buffer, primitive_type, start, count, base_instance,
@@ -270,6 +295,7 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
                            const u32 start, const u32 count,
                            const u32 base_vertex, const u32 base_instance,
                            const u32 instance_count) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_drawIndexedHot39)(
         command_buffer, primitive_type, start, count, base_vertex,
@@ -277,6 +303,7 @@ void Renderer::drawIndexed(ICommandBuffer* command_buffer,
 }
 
 f64 Renderer::debugSyncCommandBuffer(ICommandBuffer* command_buffer) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().renderer_debugSyncCommandBufferHot40)(
@@ -285,6 +312,7 @@ f64 Renderer::debugSyncCommandBuffer(ICommandBuffer* command_buffer) {
 
 bool Renderer::dispatchCompute(ICommandBuffer* command_buffer,
                                const ComputeDispatch& dispatch) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_dispatchComputeHot41)(
         command_buffer, dispatch);
@@ -348,11 +376,13 @@ void Renderer::setTexture(CommandBuffer* command_buffer, ShaderType shader_type,
 }
 
 void Renderer::beginCapture() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_beginCaptureHot50)();
 }
 
 void Renderer::endCapture() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().renderer_endCaptureHot51)();
 }
@@ -375,6 +405,7 @@ void Renderer::bindDrawState(CommandBuffer* command_buffer) {
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
                                        MTL::Buffer* buffer) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_retireUploadBufferHot0)(
@@ -383,6 +414,7 @@ void CommandBuffer::retireUploadBuffer(std::shared_ptr<UploadBufferPool> pool,
 
 RenderEncoder* CommandBuffer::getRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
@@ -392,6 +424,7 @@ RenderEncoder* CommandBuffer::getRenderCommandEncoder(
 
 RenderEncoder* CommandBuffer::createRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
@@ -400,6 +433,7 @@ RenderEncoder* CommandBuffer::createRenderCommandEncoder(
 }
 
 BlitEncoder* CommandBuffer::getBlitCommandEncoder() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
@@ -407,6 +441,7 @@ BlitEncoder* CommandBuffer::getBlitCommandEncoder() {
 }
 
 ComputeEncoder* CommandBuffer::getComputeCommandEncoder() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return (
         (*this).*
@@ -414,17 +449,20 @@ ComputeEncoder* CommandBuffer::getComputeCommandEncoder() {
 }
 
 f64 CommandBuffer::debugCommitAndWait() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_debugCommitAndWaitHot5)();
 }
 
 void CommandBuffer::endEncoding() {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().command_buffer_endEncodingHot6)();
 }
 
 void CommandBuffer::setRenderPipelineState(MTL::RenderPipelineState* pipeline) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setRenderPipelineStateHot7)(
@@ -433,6 +471,7 @@ void CommandBuffer::setRenderPipelineState(MTL::RenderPipelineState* pipeline) {
 
 void CommandBuffer::setDepthStencilState(
     MTL::DepthStencilState* depth_stencil_state) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setDepthStencilStateHot8)(
@@ -440,12 +479,14 @@ void CommandBuffer::setDepthStencilState(
 }
 
 void CommandBuffer::setCullMode(MTL::CullMode cull_mode) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setCullModeHot9)(cull_mode);
 }
 
 void CommandBuffer::setFrontFaceWinding(MTL::Winding front_face_winding) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setFrontFaceWindingHot10)(
@@ -453,12 +494,14 @@ void CommandBuffer::setFrontFaceWinding(MTL::Winding front_face_winding) {
 }
 
 void CommandBuffer::setDepthBias(float constant, float slope, float clamp) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().command_buffer_setDepthBiasHot11)(
         constant, slope, clamp);
 }
 
 void CommandBuffer::setBlendColor(float r, float g, float b, float a) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setBlendColorHot12)(r, g, b,
@@ -466,6 +509,7 @@ void CommandBuffer::setBlendColor(float r, float g, float b, float a) {
 }
 
 void CommandBuffer::setStencilReferences(u32 front, u32 back) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setStencilReferencesHot13)(
@@ -473,12 +517,14 @@ void CommandBuffer::setStencilReferences(u32 front, u32 back) {
 }
 
 void CommandBuffer::setViewports(std::span<const MTL::Viewport> values) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setViewportsHot14)(values);
 }
 
 void CommandBuffer::setScissors(std::span<const MTL::ScissorRect> values) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*
             hot_scope.table().command_buffer_setScissorsHot15)(values);
@@ -486,6 +532,7 @@ void CommandBuffer::setScissors(std::span<const MTL::ScissorRect> values) {
 
 void CommandBuffer::setBuffer(MTL::Buffer* buffer, u64 offset,
                               ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().command_buffer_setBufferHot16)(
         buffer, offset, shader_type, index);
@@ -493,6 +540,7 @@ void CommandBuffer::setBuffer(MTL::Buffer* buffer, u64 offset,
 
 void CommandBuffer::setTexture(MTL::Texture* texture, ShaderType shader_type,
                                u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().command_buffer_setTextureHot17)(
         texture, shader_type, index);
@@ -500,6 +548,7 @@ void CommandBuffer::setTexture(MTL::Texture* texture, ShaderType shader_type,
 
 void CommandBuffer::setSampler(MTL::SamplerState* sampler,
                                ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     ::hydra::hot::Scope hot_scope;
     return ((*this).*hot_scope.table().command_buffer_setSamplerHot18)(
         sampler, shader_type, index);

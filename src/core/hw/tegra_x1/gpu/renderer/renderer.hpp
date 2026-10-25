@@ -85,6 +85,8 @@ enum class MemoryInvalidationScope {
 };
 ZTD_ENABLE_ENUM_BITWISE_OPERATORS(MemoryInvalidationScope)
 
+class DrawQueue;
+
 class IRenderer {
   public:
     IRenderer()
@@ -216,6 +218,8 @@ class IRenderer {
     }
 
     virtual u64 getAllocatedResourceBytes() const { return 0; }
+    // Encodes draws on another thread, if the backend has one
+    virtual DrawQueue* getDrawQueue() { return nullptr; }
     // DEBUG: logs the GPU time per pass since the last call (HYDRA_PERF_STATS)
     virtual void logPassProfile([[maybe_unused]] f64 frames) {}
 

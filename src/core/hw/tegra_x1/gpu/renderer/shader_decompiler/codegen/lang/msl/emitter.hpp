@@ -52,6 +52,8 @@ class MslEmitter final : public LangEmitter {
                            const ir::Value& offsets, u8 component) override;
     void emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
                             const ir::Value& mask) override;
+    void emitQuadShuffle(const ir::Value& dst, const ir::Value& src,
+                         const ir::Value& index) override;
     void emitSwizzleAdd(const ir::Value& dst, const ir::Value& src_a,
                         const ir::Value& src_b, u32 swizzle) override;
     void emitTextureGather(const ir::Value& dst, u32 const_buffer_index,

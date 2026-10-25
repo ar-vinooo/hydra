@@ -11,6 +11,9 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
+// See draw_queue.hpp
+void syncDrawQueue();
+
 // Writes a report once the GPU produced it: with the counter, or with nothing
 // if the work failed (a failed report must not look like a result)
 using ReportPublisher = std::function<void(std::optional<u64> value)>;
@@ -45,6 +48,7 @@ class ICommandBuffer {
     }
 
     void retainResource(const std::shared_ptr<void>& owner) {
+        syncDrawQueue();
         if (owner)
             retained_resources.try_emplace(owner.get(), owner);
     }

@@ -465,8 +465,11 @@ void Copy::executeCopy(const LaunchDMAData data) {
             capture::recordGuestCommand(
                 "dma_access", capture::currentGuestEventOrigin(), accesses);
         }
-        // DEBUG: summary of the copies per 2 s (to correlate with readbacks)
-        {
+        // Opt-in summary to correlate DMA copies with texture readbacks.
+        // Formatting keys and growing a map on every copy is diagnostic work.
+        static const bool trace_dma =
+            std::getenv("HYDRA_TRACE_DMA") != nullptr;
+        if (trace_dma) {
             static std::map<std::string, u32> seen;
             static auto last = std::chrono::steady_clock::now();
             seen[fmt::format("src={:#x}+{:#x} L{} -> dst={:#x}+{:#x} L{} line={} x{} multi={} remap={}",

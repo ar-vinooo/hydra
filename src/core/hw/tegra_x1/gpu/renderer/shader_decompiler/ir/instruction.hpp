@@ -85,6 +85,7 @@ enum class Opcode {
 
     // Quad (fragment shaders)
     QuadShuffleXor,
+    QuadShuffle,
     SwizzleAdd,
 
     // Bit counting
@@ -165,7 +166,7 @@ ENABLE_ENUM_FORMATTING(
     VectorInsert, "vec_insert", VectorConstruct, "vec_construct", TextureSample,
     "tex_sample", TextureGather, "tex_gather", TextureQueryDimension,
     "tex_query_dim", TextureQueryLod, "tex_query_lod", Exit, "exit", Discard, "discard", QuadShuffleXor,
-    "quad_shuffle_xor", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
+    "quad_shuffle_xor", QuadShuffle, "quad_shuffle", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
     "find_msb", ReadSystemRegister, "read_sysreg", LoadShared, "load_shared",
     StoreShared, "store_shared", AtomicShared, "atomic_shared",
     AtomicSharedCas, "atomic_shared_cas", LoadStorage, "load_storage",

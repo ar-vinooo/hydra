@@ -81,8 +81,29 @@ bool validateDrawResources(renderer::IRenderer& renderer,
 bool validateDrawContents(renderer::IRenderer& renderer,
                           const DrawCommand& command);
 
+enum class DrawExecution {
+    // Executed later than sealed: the resources are validated again
+    Validate,
+    // Sealed right before, with nothing in between that could retire its
+    // resources
+    Sealed,
+    // Sealed and its guest writes issued at sealing (DrawQueue), which
+    // syncs everything that could change its resources
+    Deferred,
+};
+
 bool executeDraw(renderer::IRenderer& renderer,
                  renderer::ICommandBuffer* command_buffer,
-                 const DrawCommand& command);
+                 const DrawCommand& command,
+                 DrawExecution execution = DrawExecution::Validate);
+// Whether executeDraw can encode a sealed command (not counting resource
+// validation)
+bool canExecuteDraw(const DrawCommand& command,
+                    const renderer::ICommandBuffer* command_buffer);
+// Records the guest memory the draw writes, in decode order. executeDraw does
+// it unless the draw is deferred.
+void issueDrawWrites(renderer::IRenderer& renderer,
+                     renderer::ICommandBuffer* command_buffer,
+                     const DrawCommand& command);
 
 } // namespace hydra::hw::tegra_x1::gpu::command_ir

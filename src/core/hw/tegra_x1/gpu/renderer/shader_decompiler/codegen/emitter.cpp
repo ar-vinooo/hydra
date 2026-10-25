@@ -45,6 +45,9 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         emitQuadShuffleXor(inst.getDst(), inst.getOperand(0),
                            inst.getOperand(1));
         break;
+    case ir::Opcode::QuadShuffle:
+        emitQuadShuffle(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
+        break;
     case ir::Opcode::SwizzleAdd:
         emitSwizzleAdd(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
                        inst.getOperand(2).getRawValue<u32>());

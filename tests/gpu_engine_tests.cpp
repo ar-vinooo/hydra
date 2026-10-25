@@ -15,6 +15,7 @@
 #include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
@@ -1279,6 +1280,73 @@ void testDrawContentVersions() {
            "A checkpoint completes draw writes before the logical buffer is destroyed");
     std::cout << "PASS: draw content versions track guest writes separately "
                  "from resource identity\n";
+}
+
+// Draws encoded on the draw queue's thread land in order, also past the
+// queue's bound, and code reading the results on the GPU thread sees every
+// draw queued before it
+void testDrawQueueOrder() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    const auto shader = [&](ShaderType type, const std::string& code) {
+        ShaderDescriptor descriptor{};
+        descriptor.type = type;
+        descriptor.backend = ShaderBackend::Msl;
+        descriptor.code.assign(code.begin(), code.end());
+        return std::unique_ptr<ShaderBase>(rig.renderer.createShader(descriptor));
+    };
+    const auto solid = [&](const char* color) {
+        return shader(ShaderType::Fragment,
+                      std::string("#include <metal_stdlib>\nusing namespace metal;\n"
+                                  "fragment float4 main_() { return float4(") +
+                          color + "); }\n");
+    };
+    auto red = solid("1, 0, 0, 1");
+    auto green = solid("0, 1, 0, 1");
+    const auto pipeline = [&](ShaderBase* fragment) {
+        auto descriptor = rig.pipeline->getDescriptor();
+        descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment;
+        return std::unique_ptr<PipelineBase>(rig.renderer.createPipeline(descriptor));
+    };
+    auto red_pipeline = pipeline(red.get());
+    auto green_pipeline = pipeline(green.get());
+    auto* color = rig.pass->getDescriptor().color_targets[0].texture->getBase();
+    const auto pixel = [&] {
+        rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+        std::vector<std::vector<u8>> contents;
+        expect(rig.renderer.readTextureContents(color, contents) &&
+                   !contents.empty() && contents[0].size() >= 4,
+               "Read the color target back");
+        return std::array<u8, 4>{contents[0][0], contents[0][1], contents[0][2],
+                                 contents[0][3]};
+    };
+    constexpr std::array<u8, 4> RED{255, 0, 0, 255};
+    constexpr std::array<u8, 4> GREEN{0, 255, 0, 255};
+    auto* queue = rig.renderer.getDrawQueue();
+    const u64 encoded_before = queue ? queue->getEncodedCount() : 0;
+    constexpr u32 DRAWS = 2001;
+    constexpr u32 CHECKED = 777;
+    for (u32 i = 0; i < DRAWS; i++) {
+        command_ir::DrawCommand command;
+        command.pipeline = (i % 2 == 0 ? red_pipeline : green_pipeline).get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        engines::ThreeDTestAccess::execute(rig.engine, command);
+        if (i == CHECKED)
+            expect(pixel() == GREEN,
+                   "A readback on the GPU thread sees the draw queued before it");
+    }
+    expect(pixel() == RED, "The last queued draw wins");
+    if (queue)
+        expect(queue->getEncodedCount() - encoded_before == DRAWS,
+               "Every draw went through the draw queue");
+    rig.renderer.bindPipeline(rig.pipeline.get());
+    std::cout << "PASS: queued draws encode in order past the queue bound and "
+                 "sync before readback (" << (queue ? "queue" : "sync encode")
+              << ")\n";
 }
 
 void testClearAndCopyCommands() {
@@ -4823,6 +4891,7 @@ int main(int argc, char** argv) {
         testDrawCommands();
         testDrawResourceValidation();
         testDrawContentVersions();
+        testDrawQueueOrder();
         testClearAndCopyCommands();
         testComputeCommandsAndCapture();
         testCaptureAndReplay();

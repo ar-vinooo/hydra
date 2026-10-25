@@ -49,6 +49,7 @@ class ILoader {
     bool hasExeFs() const { return exefs_dir != nullptr; }
     void extractExeFs(std::string_view path) const;
     bool hasRomFs() const { return romfs_entry != nullptr; }
+    filesystem::IEntry* getRomFs() const { return romfs_entry; }
     void extractRomFs(std::string_view path) const;
 
   protected:

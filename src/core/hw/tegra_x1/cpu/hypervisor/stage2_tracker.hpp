@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <unordered_map>
@@ -57,6 +58,7 @@ class Stage2Tracker {
     std::mutex mutex;
     std::unordered_map<paddr_t, PageState> pages;
     std::vector<paddr_t> written_pages;
+    std::atomic<bool> has_written_pages{false};
     Callbacks callbacks;
     u64 fault_count{0};
     u64 flush_count{0};

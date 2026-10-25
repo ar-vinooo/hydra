@@ -25,8 +25,12 @@ class SamplerCache
 
     static void destroyElement(SamplerBase* sampler);
 
+    // The draw encoding thread looks samplers up too (see DrawQueue)
+    std::mutex& getMutex() { return mutex; }
+
   private:
     IRenderer& renderer;
+    std::mutex mutex;
 
   public:
     // ABI-stable implementations selected by the live module.

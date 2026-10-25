@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "core/horizon/services/const.hpp"
 #include "core/horizon/services/timesrv/const.hpp"
 
@@ -60,13 +62,24 @@ class ITimeZoneService : public IService {
                           i32* out_count,
                           OutBuffer<BufferAttr::HipcPointer> out_buffer);
 
-    // Impl
-    result_t toCalendarTimeImpl(i64 posix_time, const TimeZoneRule& rule,
-                                CalendarTime& out_time,
-                                CalendarAdditionalInfo& out_additional_info);
-    // TODO: support more than 1 time?
-    result_t toPosixTimeImpl(const CalendarTime& calendar_time,
-                             const TimeZoneRule& rule, i64& out_time);
+  public:
+    // Conversions, without service state
+    static result_t
+    toCalendarTimeImpl(i64 posix_time, const TimeZoneRule& rule,
+                       CalendarTime& out_time,
+                       CalendarAdditionalInfo& out_additional_info);
+    // The POSIX times showing `calendar_time` locally: none or one, or two
+    // when clocks are set back (in ascending order). A time skipped by a
+    // forward change is taken with the offset before it, like mktime.
+    static result_t toPosixTimeImpl(const CalendarTime& calendar_time,
+                                    const TimeZoneRule& rule,
+                                    std::array<i64, 2>& out_times,
+                                    u32& out_count);
+
+  private:
+    static void writePosixTimes(const std::array<i64, 2>& times, u32 count,
+                                OutBuffer<BufferAttr::HipcPointer>& out_buffer,
+                                i32* out_count);
 };
 
 } // namespace hydra::horizon::services::timesrv

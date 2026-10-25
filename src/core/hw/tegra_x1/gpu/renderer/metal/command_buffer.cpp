@@ -209,6 +209,7 @@ void CommandBuffer::beginNative() {
 }
 
 void CommandBuffer::commitNative() {
+    syncDrawQueue();
     if (mtl4_context == nullptr) {
         command_buffer->commit();
         return;
@@ -264,6 +265,7 @@ MTL::Device* CommandBuffer::getDevice() const {
 }
 
 void CommandBuffer::addCompletedHandler(GpuCompletionHandler handler) {
+    syncDrawQueue();
     if (mtl4_context != nullptr) {
         mtl4_submission->handlers.push_back(std::move(handler));
         return;
@@ -275,6 +277,7 @@ void CommandBuffer::addCompletedHandler(GpuCompletionHandler handler) {
 }
 
 void CommandBuffer::presentDrawable(CA::MetalDrawable* drawable) {
+    syncDrawQueue();
     has_commands = true;
     if (mtl4_context != nullptr) {
         // Presented after the commit
@@ -285,6 +288,7 @@ void CommandBuffer::presentDrawable(CA::MetalDrawable* drawable) {
 }
 
 MTL::Fence* CommandBuffer::beginExternalEncoding() {
+    syncDrawQueue();
     endEncoding();
     has_commands = true;
     if (mtl4_context == nullptr)
@@ -308,6 +312,7 @@ MTL::Fence* CommandBuffer::beginExternalEncoding() {
 }
 
 void CommandBuffer::track(const MTL::Buffer* buffer) {
+    syncDrawQueue();
     if (mtl4_context == nullptr || buffer == nullptr)
         return;
     auto& submission = *mtl4_submission;
@@ -319,6 +324,7 @@ void CommandBuffer::track(const MTL::Buffer* buffer) {
 }
 
 void CommandBuffer::track(const MTL::Texture* texture) {
+    syncDrawQueue();
     if (mtl4_context == nullptr || texture == nullptr)
         return;
     // Drawables are made resident through their layer
@@ -337,6 +343,7 @@ void CommandBuffer::track(const MTL::Texture* texture) {
 
 MTL::GPUAddress CommandBuffer::allocateTransient(const void* bytes,
                                                  usize length) {
+    syncDrawQueue();
     // Constant buffers need this alignment on some GPUs
     constexpr usize ALIGNMENT = 256;
     auto& submission = *mtl4_submission;
@@ -374,6 +381,7 @@ void CommandBuffer::retireUploadBufferHot0(std::shared_ptr<UploadBufferPool> poo
 }
 
 const std::shared_ptr<CompletionToken>& CommandBuffer::shareCompletionToken() {
+    syncDrawQueue();
     if (!completion_token) {
         completion_token = std::make_shared<CompletionToken>();
         // The work depending on the token needs the buffer to be committed,
@@ -390,10 +398,12 @@ const std::shared_ptr<CompletionToken>& CommandBuffer::shareCompletionToken() {
 }
 
 CompletionToken* CommandBuffer::getCompletionToken() {
+    syncDrawQueue();
     return shareCompletionToken().get();
 }
 
 void CommandBuffer::setVisibilityResultBuffer(MTL::Buffer* buffer) {
+    syncDrawQueue();
     if (buffer == visibility_buffer)
         return;
     if (encoder_type == EncoderType::Render)
@@ -509,6 +519,7 @@ RenderEncoder* CommandBuffer::getRenderCommandEncoderHot1(
 RenderEncoder* CommandBuffer::getDirectRenderCommandEncoder(
     MTL::RenderPassDescriptor* render_pass_descriptor,
     MTL::DepthStencilState* depth_stencil_disabled) {
+    syncDrawQueue();
     const bool continues =
         render_pass_descriptor != encoder_state.render_pass &&
         continuesOpenRenderPass(render_pass_descriptor);

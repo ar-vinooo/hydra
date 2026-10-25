@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -119,6 +120,14 @@ class ShaderCache
     std::map<std::vector<u32>, std::vector<CompiledVersion>> compiled_versions;
     // Reused under lookup_mutex; map entries own their copied keys.
     std::vector<u32> lookup_key;
+    // The versions of the last key looked up per stage: consecutive draws
+    // mostly use the same shaders. Entries of compiled_versions are never
+    // erased, so the pointer stays valid.
+    struct LookupMemo {
+        std::vector<u32> key;
+        std::vector<CompiledVersion>* versions{nullptr};
+    };
+    std::array<LookupMemo, 8> lookup_memos;
     u64 next_code_revision{0};
     std::atomic<u64> instruction_epoch{0};
     std::mutex lookup_mutex;

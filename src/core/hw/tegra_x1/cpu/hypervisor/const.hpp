@@ -14,7 +14,11 @@ constexpr paddr_t KERNEL_PAGE_TABLE_REGION_BASE = 0x100000000;
 constexpr paddr_t USER_PAGE_TABLE_REGION_BASE =
     KERNEL_PAGE_TABLE_REGION_BASE + PAGE_TABLE_RESERVED_SIZE;
 
+// Returns from the exception handler to the guest: as it is, after
+// invalidating this core's TLB, or after invalidating the TLBs of every core
 constexpr uptr EXCEPTION_TRAMPOLINE_OFFSET = 0x800;
+constexpr uptr EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET = 0x840;
+constexpr uptr EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET = 0x880;
 
 #define HV_ASSERT_SUCCESS(ret)                                                 \
     {                                                                          \

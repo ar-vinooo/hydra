@@ -112,6 +112,11 @@ bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command) {
     command.resource_refs.clear();
     auto previous_owners = std::move(command.resource_owners);
     command.resource_owners.clear();
+    // A draw references a few dozen resources: allocate once instead of
+    // growing the vectors through every power of two
+    constexpr usize TYPICAL_RESOURCE_COUNT = 64;
+    command.resource_refs.reserve(TYPICAL_RESOURCE_COUNT);
+    command.resource_owners.reserve(TYPICAL_RESOURCE_COUNT);
     auto& registry = renderer.getResourceRegistry();
     if (!mappingMatches(registry, command))
         return false;
@@ -148,12 +153,10 @@ bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command) {
             for (const auto& binding : stage.textures)
                 if (binding.texture)
                     track(binding.texture->getBase(), ResourceKind::Texture);
+    // The handles were just taken from the live objects and the mappings
+    // checked above, so there is nothing to validate again here
     command.resources_sealed = true;
     buildDrawContents(renderer, command);
-    if (!validateDrawResources(renderer, command)) {
-        command.resources_sealed = false;
-        return false;
-    }
     return true;
 }
 
@@ -190,9 +193,25 @@ bool validateDrawContents(renderer::IRenderer& renderer,
            command.contents.readsCurrent(renderer.getContentVersions());
 }
 
+bool canExecuteDraw(const DrawCommand& command,
+                    const renderer::ICommandBuffer* command_buffer) {
+    const bool indexed = command.index_type != engines::IndexType::None;
+    return command.resources_sealed && command.pipeline &&
+           command.render_pass && command_buffer &&
+           (!indexed || command.indices.isValid());
+}
+
+void issueDrawWrites(renderer::IRenderer& renderer,
+                     renderer::ICommandBuffer* command_buffer,
+                     const DrawCommand& command) {
+    renderer.recordGpuWrites(command_buffer, command.contents.writes,
+                             {command.origin.channel, command.origin.sequence,
+                              command.origin.source_address});
+}
+
 bool executeDraw(renderer::IRenderer& renderer,
                  renderer::ICommandBuffer* command_buffer,
-                 const DrawCommand& command) {
+                 const DrawCommand& command, DrawExecution execution) {
     if (command.count == 0 || command.instance_count == 0)
         return true;
     ScopedPerfTimer timer(PerfStats::instance().draw_command_ns,
@@ -201,7 +220,9 @@ bool executeDraw(renderer::IRenderer& renderer,
     const bool indexed = command.index_type != engines::IndexType::None;
     if (!command.pipeline || !command.render_pass || !command_buffer ||
         (indexed && !command.indices.isValid()) ||
-        !validateDrawResources(renderer, command))
+        !(execution == DrawExecution::Validate
+              ? validateDrawResources(renderer, command)
+              : command.resources_sealed))
         return false;
     capture::recordGuestCommand("draw",
                                 {command.origin.channel,
@@ -244,9 +265,8 @@ bool executeDraw(renderer::IRenderer& renderer,
                       command.count, command.base_instance,
                       command.instance_count);
     }
-    renderer.recordGpuWrites(command_buffer, command.contents.writes,
-                             {command.origin.channel, command.origin.sequence,
-                              command.origin.source_address});
+    if (execution != DrawExecution::Deferred)
+        issueDrawWrites(renderer, command_buffer, command);
     if (!command.storage_writes.empty()) {
         auto& cache = renderer.getTextureCache();
         std::scoped_lock lock(cache.getMutex());

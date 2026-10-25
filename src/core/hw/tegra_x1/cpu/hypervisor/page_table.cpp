@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/cpu/hypervisor/page_table.hpp"
 
+#include <atomic>
+
 #include "common/type_aliases.hpp"
 #include "core/debugger/debugger_manager.hpp"
 
@@ -40,6 +42,16 @@ PageTableLevel& PageTableLevel::getNext(PageAllocator& allocator, u32 index) {
     return *next;
 }
 
+namespace {
+std::atomic<u64> tlb_generation{1};
+} // namespace
+
+u64 getTlbGeneration() { return tlb_generation.load(std::memory_order_acquire); }
+
+void notePageTableChange() {
+    tlb_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
 PageTable::PageTable(paddr_t base_pa)
     : allocator(base_pa, 1024), top_level(0, allocator.getNextPage(), 0x0) {}
 
@@ -55,6 +67,8 @@ void PageTable::map(vaddr_t va, ztd::Range<uptr> range,
     ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
 
     mapLevel(top_level, va, range.getBegin(), range.getSize(), state, ap_flags);
+    // A mapping may replace one TLBs hold
+    notePageTableChange();
 }
 
 void PageTable::unmap(ztd::Range<vaddr_t> range) {
@@ -67,6 +81,7 @@ void PageTable::unmap(ztd::Range<vaddr_t> range) {
         state = {.type = horizon::kernel::MemoryType::Free};
         flags = PageFlags::None;
     });
+    notePageTableChange();
 }
 
 // TODO: use IterateRange
@@ -119,6 +134,7 @@ void PageTable::setMemoryPermission(ztd::Range<vaddr_t> range,
             }
             state.perm = perm;
         });
+    notePageTableChange();
 }
 
 void PageTable::setMemoryAttribute(ztd::Range<vaddr_t> range,
@@ -150,6 +166,7 @@ void PageTable::setWriteTrackingEnabled(ztd::Range<vaddr_t> range,
                     else
                         flags &= ~PageFlags::WriteTrackingEnabled;
                 });
+    notePageTableChange();
 }
 
 bool PageTable::trySuspendWriteTracking(ztd::Range<vaddr_t> range) {
@@ -180,6 +197,9 @@ void PageTable::resumeWriteTracking(ztd::Range<vaddr_t> range) {
                         entry |= static_cast<u64>(ApFlags::UserReadKernelRead);
                     }
                 });
+    // Writes must fault again, also on cores still holding the writable
+    // translation
+    notePageTableChange();
 }
 
 paddr_t PageTable::unmapAddr(vaddr_t va) const {

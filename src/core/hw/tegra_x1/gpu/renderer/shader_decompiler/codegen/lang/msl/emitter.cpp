@@ -774,6 +774,22 @@ void MslEmitter::emitHeader() {
         write("    if ((mask & 2u) != 0u) host_mask |= y_mask;");
         write("    return quad_shuffle_xor(v, host_mask);");
         write("}}");
+        // Value of guest quad lane `index`. Every quad shuffle uses a mask
+        // that is the same for all lanes; each lane then picks the neighbour
+        // in the direction of the requested lane.
+        write("inline uint hydra_quad_shuffle(uint v, uint index, float px, "
+              "float py) {{");
+        write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
+        write("    const ushort y_mask = x_mask ^ ushort(3);");
+        write("    const uint by_x = quad_shuffle_xor(v, x_mask);");
+        write("    const uint by_y = quad_shuffle_xor(v, y_mask);");
+        write("    const uint by_xy = quad_shuffle_xor(v, ushort(3));");
+        write("    const uint x_bit = px > quad_shuffle_xor(px, x_mask) ? 1u : 0u;");
+        write("    const uint y_bit = py > quad_shuffle_xor(py, y_mask) ? 1u : 0u;");
+        write("    const uint mask = (x_bit | (y_bit << 1)) ^ (index & 3u);");
+        write("    return mask == 0u ? v : mask == 1u ? by_x : mask == 2u ? "
+              "by_y : by_xy;");
+        write("}}");
         write("inline float hydra_swizzle_add(float a, float b, uint swizzle, "
               "float px, float py) {{");
         write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
@@ -800,6 +816,22 @@ void MslEmitter::emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
     storeValue(dst, "hydra_quad_shuffle_xor({}, {}, {})", getValueStr(src),
                getValueStr(mask),
                getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32));
+}
+
+void MslEmitter::emitQuadShuffle(const ir::Value& dst, const ir::Value& src,
+                                 const ir::Value& index) {
+    if (context.type != ShaderType::Fragment) {
+        // TODO: implement for other stages
+        storeValue(dst, "{}", getValueStr(src));
+        return;
+    }
+
+    storeValue(dst, "hydra_quad_shuffle({}, {}, {}, {})", getValueStr(src),
+               getValueStr(index),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x4, true},
                                 ir::ScalarType::F32));
 }
 

@@ -74,13 +74,13 @@ class Kernel {
                           i32 priority, i32 processor_id, IThread*& out_thread);
     result_t startThread(IThread* thread);
     void exitThread(IThread* crnt_thread);
-    void sleepThread(i64 nano);
+    void sleepThread(IThread* crnt_thread, i64 nano);
     result_t getThreadPriority(IThread* thread, i32& out_priority);
     result_t setThreadPriority(IThread* thread, i32 priority);
     result_t getThreadCoreMask(IThread* thread, i32& out_core_mask0,
                                u64& out_core_mask1);
     result_t setThreadCoreMask(IThread* thread, i32 core_mask0, u64 core_mask1);
-    void getCurrentProcessorNumber(u32& out_number);
+    void getCurrentProcessorNumber(IThread* crnt_thread, u32& out_number);
     result_t signalEvent(Event* event);
     result_t clearEvent(Event* event);
     result_t mapSharedMemory(Process* crnt_process, SharedMemory* shmem,
@@ -110,6 +110,7 @@ class Kernel {
                                 hipc::ClientSession*& out_client_session);
     result_t sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
                              hipc::ClientSession* client_session);
+    result_t getProcessId(AutoObject* obj, u64& out_process_id);
     result_t getThreadId(IThread* thread, u64& out_thread_id);
     result_t break_(BreakReason reason, uptr buffer_ptr, u64 buffer_size);
     result_t outputDebugString(const std::string_view str, u64 len);
@@ -119,8 +120,9 @@ class Kernel {
     result_t unmapPhysicalMemory(Process* crnt_process, vaddr_t addr,
                                  u64 size);
     result_t checkPhysicalMemoryRange(vaddr_t addr, u64 size);
-    result_t setThreadActivity(IThread* thread, ThreadActivity activity);
-    result_t getThreadContext3(IThread* thread,
+    result_t setThreadActivity(IThread* crnt_thread, IThread* thread,
+                               ThreadActivity activity);
+    result_t getThreadContext3(IThread* crnt_thread, IThread* thread,
                                ThreadContext& out_thread_context);
     result_t waitForAddress(IThread* crnt_thread, uptr addr,
                             ArbitrationType arbitration_type, u32 value,

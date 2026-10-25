@@ -992,6 +992,100 @@ void testQuadDerivatives(MTL::Device* device) {
     std::cout << "PASS: fragment quad derivatives and FSWZADD add/move modes\n";
 }
 
+// Maxwell SHFL.IDX with a quad segment (Jump Force: c = 0x1c03) reads one
+// lane of each 2x2 quad. Lanes are x | (y << 1), found by position on the host.
+void testQuadIndexedShuffle(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (u32 index = 0; index < 4; ++index) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        GuestShaderState guest{};
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
+        ir::Module module;
+        ir::Builder builder(module);
+        for (u32 axis = 0; axis < 2; ++axis) {
+            const auto position = ir::Value::createAttrMemory(
+                {RZ, SV_POSITION_BASE + axis * 4, true}, ir::ScalarType::F32);
+            const auto shuffled = builder.opBitCast(
+                builder.opQuadShuffle(
+                    builder.opBitCast(position, ir::ScalarType::U32),
+                    ir::Value::createConstantU(index)),
+                ir::ScalarType::F32);
+            builder.opCopy(ir::Value::createRegister(static_cast<u8>(axis),
+                                                     ir::ScalarType::F32),
+                           shuffled);
+        }
+        for (u32 component = 2; component < 4; ++component)
+            builder.opCopy(ir::Value::createRegister(static_cast<u8>(component),
+                                                     ir::ScalarType::F32),
+                           ir::Value::createConstantF(0));
+        builder.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter emitter(context, memory, guest,
+                                               generated, mapping);
+        emitter.emit(module);
+        std::string source(generated.begin(), generated.end());
+        source += "\nvertex float4 quad_vertex(uint id [[vertex_id]]) { return "
+                  "float4(id==1?3.0:-1.0,id==2?3.0:-1.0,0,1); }\n";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << '\n';
+        check(library != nullptr, "Quad indexed shuffle shader compiles");
+        NS_STACK_SCOPED auto vertex =
+            library->newFunction(toNsString("quad_vertex"));
+        NS_STACK_SCOPED auto fragment =
+            library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vertex);
+        pd->setFragmentFunction(fragment);
+        pd->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA32Float);
+        NS_STACK_SCOPED auto pipeline =
+            device->newRenderPipelineState(pd, &error);
+        check(pipeline != nullptr, "Quad indexed shuffle pipeline compiles");
+        auto* td = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, 4, 4, false);
+        td->setStorageMode(MTL::StorageModeShared);
+        td->setUsage(MTL::TextureUsageRenderTarget);
+        NS_STACK_SCOPED auto texture = device->newTexture(td);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* color = pass->colorAttachments()->object(0);
+        color->setTexture(texture);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setStoreAction(MTL::StoreActionStore);
+        NS_STACK_SCOPED auto queue = device->newCommandQueue();
+        auto* commands = queue->commandBuffer();
+        auto* encoder = commands->renderCommandEncoder(pass);
+        encoder->setRenderPipelineState(pipeline);
+        encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                                NS::UInteger(3));
+        encoder->endEncoding();
+        commands->commit();
+        commands->waitUntilCompleted();
+        check(commands->status() == MTL::CommandBufferStatusCompleted,
+              "Quad indexed shuffle draw completes");
+        std::array<float, 64> pixels{};
+        texture->getBytes(pixels.data(), 64, MTL::Region::Make2D(0, 0, 4, 4),
+                          0);
+        for (u32 y = 0; y < 4; ++y) {
+            for (u32 x = 0; x < 4; ++x) {
+                const auto* pixel = &pixels[(y * 4 + x) * 4];
+                const float expected_x = float((x & ~1u) + (index & 1u)) + 0.5f;
+                const float expected_y = float((y & ~1u) + (index >> 1)) + 0.5f;
+                check(pixel[0] == expected_x && pixel[1] == expected_y,
+                      "Every quad lane reads the indexed lane of its quad");
+            }
+        }
+    }
+    std::cout << "PASS: fragment SHFL.IDX within quads reads lanes x | (y << 1)\n";
+}
+
 // Fragment depth follows packed color exports and a reserved sample-mask slot.
 // Read the native depth attachment back, rather than only checking emitted
 // text.
@@ -2444,6 +2538,7 @@ int main() {
         testVertexPositionDefaults(device);
         testFragmentDepth(device);
         testQuadDerivatives(device);
+        testQuadIndexedShuffle(device);
         testTextureLodSelection();
         testTextureBorderEmulation();
         testTextureOffsetAndGather(device);

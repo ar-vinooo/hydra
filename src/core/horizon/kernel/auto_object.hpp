@@ -4,6 +4,8 @@
 
 namespace hydra::horizon::kernel {
 
+class SynchronizationObject;
+
 enum class AutoObjectTypeId {
     ClientPort,
     ClientSession,
@@ -46,11 +48,34 @@ class AutoObject {
         return false;
     }
 
+    // Base classes without a type ID match every type derived from them
     template <typename T>
     bool isOfType() const
         requires std::is_base_of_v<AutoObject, T>
     {
-        return type_id == T::TYPE_ID;
+        if constexpr (std::is_same_v<T, AutoObject>) {
+            return true;
+        } else if constexpr (std::is_same_v<T, SynchronizationObject>) {
+            switch (type_id) {
+            case AutoObjectTypeId::ClientPort:
+            case AutoObjectTypeId::ServerPort:
+            case AutoObjectTypeId::ServerSession:
+            case AutoObjectTypeId::Event:
+            case AutoObjectTypeId::Process:
+            case AutoObjectTypeId::Thread:
+                return true;
+            default:
+                return false;
+            }
+        } else {
+            return type_id == T::TYPE_ID;
+        }
+    }
+
+    // nullptr unless the object is a T (there is no RTTI)
+    template <typename T>
+    T* as() {
+        return isOfType<T>() ? static_cast<T*>(this) : nullptr;
     }
 
     std::string_view getDebugName() const { return debug_name; }

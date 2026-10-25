@@ -85,6 +85,7 @@ class CommandBuffer final : public ICommandBuffer {
     bool usesMetal4() const { return mtl4_context != nullptr; }
 
     RenderEncoder* getRenderCommandEncoderUnchecked() {
+        syncDrawQueue();
         ASSERT_DEBUG(encoder_type == EncoderType::Render, MetalRenderer,
                      "Render command encoder not active");
         return &render_encoder;
@@ -102,6 +103,7 @@ class CommandBuffer final : public ICommandBuffer {
         MTL::DepthStencilState* depth_stencil_disabled);
 
     BlitEncoder* getBlitCommandEncoderUnchecked() {
+        syncDrawQueue();
         ASSERT_DEBUG(encoder_type == EncoderType::Blit, MetalRenderer,
                      "Blit command encoder not active");
         return &blit_encoder;
@@ -123,6 +125,7 @@ class CommandBuffer final : public ICommandBuffer {
     MTL::Fence* beginExternalEncoding();
     // Null with Metal 3
     MTL4::CommandBuffer* getMtl4CommandBuffer() {
+        syncDrawQueue();
         has_commands = true;
         return mtl4_command_buffer;
     }
@@ -265,6 +268,7 @@ class CommandBuffer final : public ICommandBuffer {
   public:
     // Handlers and drawables attached through this are part of the work
     MTL::CommandBuffer* getCommandBuffer() {
+        syncDrawQueue();
         has_commands = true;
         return command_buffer;
     }

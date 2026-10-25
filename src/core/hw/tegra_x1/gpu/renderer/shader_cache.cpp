@@ -361,7 +361,14 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         reference_key = makeShaderKey(normalized());
     }
     const auto& version_key = reuse_lookup ? lookup_key : reference_key;
-    auto& versions = compiled_versions[version_key];
+    auto* memo = reuse_lookup ? &lookup_memos[static_cast<u32>(descriptor.stage) %
+                                               lookup_memos.size()]
+                              : nullptr;
+    if (memo && (memo->versions == nullptr || memo->key != version_key)) {
+        memo->versions = &compiled_versions[version_key];
+        memo->key = version_key;
+    }
+    auto& versions = memo ? *memo->versions : compiled_versions[version_key];
     for (auto version = versions.begin(); version != versions.end(); ++version) {
         const auto& resources = version->shader->getDescriptor().resource_mapping;
         if (!matchesMappedCode(descriptor.gpu_addr, *version->bytes,

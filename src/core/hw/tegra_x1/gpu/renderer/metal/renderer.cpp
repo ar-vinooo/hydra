@@ -1,4 +1,5 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/compute_limits.hpp"
 #include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
@@ -124,9 +125,15 @@ Renderer::Renderer()
     info = {
         .supports_quads_primitive = false,
     };
+
+    if (DrawQueue::isEnabled())
+        draw_queue = std::make_unique<DrawQueue>(*this);
 }
 
 Renderer::~Renderer() {
+    // Encodes what is left, before the objects the draws use go away
+    draw_queue.reset();
+
     for (auto& [function, pipeline] : compute_pipelines) {
         if (pipeline != nullptr)
             pipeline->release();
@@ -490,7 +497,7 @@ void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target
                                       .color_targets[render_target_id]
                                       .texture);
 
-    // HACK
+    // Nothing is bound to clear at this index
     if (texture == nullptr) {
         ONCE(LOG_WARN(MetalRenderer, "Invalid color target at index {}",
                       render_target_id));
@@ -523,7 +530,7 @@ void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
     auto texture = static_cast<TextureView*>(
         state.render_pass->getDescriptor().depth_stencil_target.texture);
 
-    // HACK
+    // No depth target is bound to clear
     if (texture == nullptr) {
         ONCE(LOG_WARN(MetalRenderer, "Invalid depth target"));
         return;
@@ -1081,7 +1088,8 @@ void Renderer::bindIndexBufferHot33(const BufferView& index_buffer,
 
 void Renderer::bindUniformBufferHot34(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1123,6 +1131,7 @@ BufferView Renderer::getGuestMemoryBuffer(ztd::Range<uptr> range) {
 
 void Renderer::bindStorageBuffer(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     if (shader_type == ShaderType::Count)
         return;
     state.storage_buffers[static_cast<u32>(shader_type)][index] = buffer;
@@ -1130,7 +1139,8 @@ void Renderer::bindStorageBuffer(const BufferView& buffer,
 
 void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
                            ShaderType shader_type, u32 index) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1141,6 +1151,7 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
             MTL::SamplerMinMagFilterNearest;
         descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;
+        std::scoped_lock lock(getSamplerCache().getMutex());
         sampler = getSamplerCache().find(descriptor);
     }
     state.textures[static_cast<u32>(shader_type)][index] = {
@@ -1152,6 +1163,7 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
 
 std::vector<TextureBinding>
 Renderer::getTextureBindings(ShaderType shader_type) const {
+    syncDrawQueue();
     std::vector<TextureBinding> result;
     if (shader_type == ShaderType::Count)
         return result;
@@ -1166,7 +1178,8 @@ Renderer::getTextureBindings(ShaderType shader_type) const {
 }
 
 void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1174,13 +1187,15 @@ void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
 }
 
 void Renderer::unbindStorageBuffers(ShaderType shader_type) {
+    syncDrawQueue();
     if (shader_type == ShaderType::Count)
         return;
     state.storage_buffers[static_cast<u32>(shader_type)] = {};
 }
 
 void Renderer::unbindTexturesHot37(ShaderType shader_type) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1188,12 +1203,14 @@ void Renderer::unbindTexturesHot37(ShaderType shader_type) {
 }
 
 bool Renderer::synchronize(ICommandBuffer* command_buffer) {
+    syncDrawQueue();
     auto* commands = static_cast<CommandBuffer*>(command_buffer);
     commands->debugCommitAndWait();
     return commands->lastSubmissionSucceeded();
 }
 
 bool Renderer::synchronizeGuestWrites(ICommandBuffer* command_buffer) {
+    syncDrawQueue();
     if (!CommandBuffer::hasUnsynchronizedGuestWrites())
         return true;
     return synchronize(command_buffer);
@@ -1202,6 +1219,7 @@ bool Renderer::synchronizeGuestWrites(ICommandBuffer* command_buffer) {
 void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
                                     ReportPublisher publish,
                                     std::vector<ztd::Range<uptr>> writes) {
+    syncDrawQueue();
     if (PerfStats::isEnabled())
         PerfStats::instance().reports_queued++;
     const auto trace = capture::GuestEvents::instance().beginReport(
@@ -1222,6 +1240,7 @@ void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
 void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
                                std::function<void(bool succeeded)> write,
                                std::vector<ztd::Range<uptr>> writes) {
+    syncDrawQueue();
     auto* impl = static_cast<CommandBuffer*>(command_buffer);
     const auto trace = capture::GuestEvents::instance().beginReport(
         capture::currentGuestEventOrigin());
@@ -1240,6 +1259,7 @@ void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
 
 void Renderer::flushReports(ICommandBuffer* command_buffer,
                             ztd::Range<uptr> range) {
+    syncDrawQueue();
     if (!completions->hasPendingWrites())
         return;
     const auto sequence = completions->lastWriteTo(range);
@@ -1264,6 +1284,7 @@ void Renderer::flushReports(ICommandBuffer* command_buffer,
 }
 
 void Renderer::drainReports() {
+    syncDrawQueue();
     if (!completions->hasPendingOrdered())
         return;
     // A marker behind everything queued so far

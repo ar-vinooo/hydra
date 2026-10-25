@@ -1,4 +1,5 @@
 #include "core/horizon/kernel/process.hpp"
+#include "core/horizon/services/ns/const.hpp"
 
 #include <random>
 #include <sys/mman.h>
@@ -30,6 +31,11 @@ Process::Process(System& system_, std::string_view debug_name)
     std::mt19937_64 gen(rd());
     for (auto& random_e : random_entropy)
         random_e = gen();
+}
+
+void Process::setApplicationControlProperty(
+    std::unique_ptr<services::ns::ApplicationControlProperty> property) {
+    control_property = std::move(property);
 }
 
 Process::~Process() {

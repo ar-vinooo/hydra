@@ -123,6 +123,13 @@ void IMmu::applyPendingInvalidations() {
     std::vector<ztd::Range<uptr>> ranges;
     {
         std::scoped_lock lock(write_tracking_mutex);
+        // Rearm the written pages before taking their invalidations: a write
+        // after this faults again and is queued for the next entry. Rearming
+        // on every draw instead made each CPU write fault again between
+        // draws, although its invalidation is only applied here anyway.
+        for (const auto& range : tracked_pages)
+            resumeWriteTracking(range);
+        tracked_pages.clear();
         ranges.swap(pending_invalidations);
         has_pending_invalidations.store(false, std::memory_order_relaxed);
     }
@@ -132,13 +139,8 @@ void IMmu::applyPendingInvalidations() {
 }
 
 void IMmu::flushTrackedPages() {
-    // Pending invalidations are applied by PFIFO before each entry: this is
-    // called with the cache mutexes held, so invalidating here would deadlock.
-    // Ranges stay queued, so a write after the resume is not lost
-    std::scoped_lock lock(write_tracking_mutex);
-    for (const auto& range : tracked_pages)
-        resumeWriteTracking(range);
-    tracked_pages.clear();
+    // Write tracking through trackWrite is rearmed when its invalidations are
+    // applied, see applyPendingInvalidations
 }
 
 } // namespace hydra::hw::tegra_x1::cpu

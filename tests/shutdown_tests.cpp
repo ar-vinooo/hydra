@@ -2685,6 +2685,7 @@ void testSemaphoreShutdown(System& system, kernel::Process* process) {
 int runSharedMemoryCases(System& system, const char* input_path, const char* output_path);
 void testSharedMemoryCleanup(System& system);
 void testStageAMemory(System& system);
+void testTlbMaintenance(System& system);
 int runDeviceSharedCases(System& system, const char* input_path, const char* output_path);
 
 int main(int argc, char** argv) {
@@ -2695,6 +2696,11 @@ int main(int argc, char** argv) {
             auto* process = system.getOs().getKernel().getProcessManager().createProcess("DLC service test");
             testInstalledDlc(system, process);
             testAddOnContentEvent(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-tlb-maintenance") {
+            System system(ui);
+            testTlbMaintenance(system);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--check-stage-a-memory") {

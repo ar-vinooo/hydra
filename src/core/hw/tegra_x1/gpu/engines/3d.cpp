@@ -6,6 +6,7 @@
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/engines/storage_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 #include "core/hot/table.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
@@ -640,12 +641,36 @@ void ThreeD::drawVertexArray(const u32 index, u32 count) {
 }
 
 void ThreeD::executeDrawCommand(command_ir::DrawCommand& command) {
-    if (command_ir::sealDrawResources(gpu.getRenderer(), command)) {
-        if (auto& live = capture::LiveCapture::instance(); live.active())
-            live.draw(gpu.getRenderer(), tls_crnt_command_buffer, command);
+    auto& renderer = gpu.getRenderer();
+    if (command_ir::sealDrawResources(renderer, command)) {
+        // A live capture runs host code between sealing and execution, so
+        // the resources are validated again then
+        auto& live = capture::LiveCapture::instance();
+        const bool capturing = live.active();
+        if (capturing)
+            live.draw(renderer, tls_crnt_command_buffer, command);
         labelCaptureDraw(command.count);
-        if (command_ir::executeDraw(gpu.getRenderer(), tls_crnt_command_buffer, command)) {
-            if (auto& live = capture::LiveCapture::instance(); live.active())
+        // Encode on the draw queue's thread. Diagnostics observe each draw
+        // right after it is encoded, and a draw writing storage synchronizes
+        // textures after it, so those stay on this thread.
+        if (auto queue = renderer.getDrawQueue();
+            queue && !capturing && command.storage_writes.empty() &&
+            !renderer.isCapturing() && !FrameTracer::instance().isActive() &&
+            !VisualDiagnostics::instance().active() &&
+            !capture::GuestEvents::instance().enabled() && !isProfilingDraws() &&
+            command_ir::canExecuteDraw(command, tls_crnt_command_buffer)) {
+            if (command.count == 0 || command.instance_count == 0)
+                return;
+            command_ir::issueDrawWrites(renderer, tls_crnt_command_buffer,
+                                        command);
+            queue->push(tls_crnt_command_buffer, std::move(command));
+            return;
+        }
+        if (command_ir::executeDraw(renderer, tls_crnt_command_buffer, command,
+                                    capturing
+                                        ? command_ir::DrawExecution::Validate
+                                        : command_ir::DrawExecution::Sealed)) {
+            if (live.active())
                 live.commandExecuted(tls_crnt_command_buffer);
             profileDraw(command.count);
             captureVisualDraw(true);
@@ -675,10 +700,14 @@ void ThreeD::labelCaptureDraw(u32 count) {
         count, static_cast<u64>(regs.color_targets[0].addr)));
 }
 
+bool ThreeD::isProfilingDraws() {
+    static const bool enabled = std::getenv("HYDRA_PROFILE_DRAWS") != nullptr;
+    return enabled;
+}
+
 // DEBUG: GPU time per shader pair, enabled with HYDRA_PROFILE_DRAWS
 void ThreeD::profileDraw(u32 count) {
-    static const bool enabled = std::getenv("HYDRA_PROFILE_DRAWS") != nullptr;
-    if (!enabled)
+    if (!isProfilingDraws())
         return;
     const auto ms =
         gpu.getRenderer().debugSyncCommandBuffer(tls_crnt_command_buffer);
@@ -1093,8 +1122,10 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
     const u32 counter_type = extractBits(data, 23, 5);
     const bool short_query = extractBits(data, 28, 1) != 0;
 
-    // DEBUG: log the kinds of queries used
-    {
+    // DEBUG: log the kinds of queries used (HYDRA_LOG_QUERIES). The lock and
+    // set lookup would otherwise run for every report on the GPU thread.
+    static const bool log_queries = std::getenv("HYDRA_LOG_QUERIES") != nullptr;
+    if (log_queries) {
         static std::mutex debug_mutex;
         static std::set<u32> seen;
         std::scoped_lock lock(debug_mutex);
@@ -2081,6 +2112,11 @@ renderer::BufferView ThreeD::getVertexBuffer(u32 vertex_array_index) const {
     }
 
     auto ptr = tls_crnt_gmmu->unmapAddr(vertex_array.addr);
+    if (ptr == 0x0) {
+        ONCE(LOG_WARN(Engines, "Vertex array {} at unmapped address {:#x}",
+                      vertex_array_index, static_cast<u64>(vertex_array.addr)));
+        return {};
+    }
     auto size =
         static_cast<u64>(regs.vertex_array_limits[vertex_array_index]) + 1 -
         static_cast<u64>(vertex_array.addr);
@@ -2532,9 +2568,10 @@ ThreeD::getSampler(const TextureSamplerControl& tsc,
         memo.view_lods == packed_lods)
         return memo.sampler;
 
-    memo = {key, packed_lods,
-            gpu.getRenderer().getSamplerCache().find(
-                decodeSampler(tsc, texture_format, view_lods))};
+    auto& sampler_cache = gpu.getRenderer().getSamplerCache();
+    const auto descriptor = decodeSampler(tsc, texture_format, view_lods);
+    std::scoped_lock lock(sampler_cache.getMutex());
+    memo = {key, packed_lods, sampler_cache.find(descriptor)};
     return memo.sampler;
 }
 
@@ -3694,11 +3731,17 @@ bool ThreeD::prepareDraw(command_ir::DrawCommand& command) {
     ScopedPerfTimer bindings_timer(PerfStats::instance().draw_resources_ns,
                                    PerfStats::isEnabled());
     ScopedGpuWork bindings_work(GpuWork::Lookup);
+    // The hardware only fetches the streams that enabled, non-constant
+    // attributes read (the pipeline's vertex descriptor uses the same ones).
+    // Others may hold any address (Super Meat Boy leaves 4096 in some).
+    u32 fetched_arrays = 0;
+    for (const auto& attrib : regs.vertex_attrib_states)
+        if (attrib.type != VertexAttribType::None && !attrib.is_fixed &&
+            attrib.buffer_id < VERTEX_ARRAY_COUNT)
+            fetched_arrays |= 1u << attrib.buffer_id;
     for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++) {
-        const auto& vertex_array = regs.vertex_arrays[i];
-        // HACK: Super Meat Boy contains invalid vertex arrays with address 4096
-        if (!vertex_array.config.enable ||
-            (vertex_array.addr.hi == 0 && vertex_array.addr.lo == 4096)) {
+        if (!regs.vertex_arrays[i].config.enable ||
+            (fetched_arrays & (1u << i)) == 0) {
             command.vertices[i] = {};
             continue;
         }

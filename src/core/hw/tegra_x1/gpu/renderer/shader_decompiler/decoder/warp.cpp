@@ -13,10 +13,32 @@ void emitShuffle(DecoderContext& context, pred_t pred, bool pred_inv,
 
     ir::Value res = src_a_v;
     auto pred_res = ir::Value::createConstantB(true);
+    // Segment mask (c[12:8]) 0x1c groups lanes in 2x2 quads
+    constexpr u32 QUAD_SEGMENT_MASK = 0x1c;
+    const bool quad_segment =
+        src_c.getKind() == ir::ValueKind::Constant &&
+        ((src_c.getConstant() >> 8) & 0x1f) == QUAD_SEGMENT_MASK;
     if (mode == ShuffleMode::Bfly &&
         context.decomp_context.type == ShaderType::Fragment) {
         // Butterfly shuffles within a quad are used to compute derivatives
         res = context.builder.opQuadShuffleXor(src_a_v, src_b);
+    } else if (mode == ShuffleMode::Idx && quad_segment &&
+               context.decomp_context.type == ShaderType::Fragment) {
+        // Indexed shuffle within each quad. Fragment lanes are only known by
+        // their quad position, so the lane math below is done per quad: the
+        // source lane is (b & ~segment) | quad base, in range if it does not
+        // pass the quad base | (clamp & 3)
+        auto& builder = context.builder;
+        const u32 clamp = src_c.getConstant() & 0x3;
+        const auto in_range = builder.opCompareLessOrEqual(
+            builder.opBitwiseAnd(src_b,
+                                 ir::Value::createConstantU(~QUAD_SEGMENT_MASK)),
+            ir::Value::createConstantU(clamp));
+        const auto shuffled = builder.opQuadShuffle(
+            src_a_v,
+            builder.opBitwiseAnd(src_b, ir::Value::createConstantU(0x3)));
+        res = builder.opSelect(in_range, shuffled, src_a_v);
+        pred_res = in_range;
     } else if (context.decomp_context.type == ShaderType::Compute) {
         // Host SIMD groups have 32 lanes, like warps
         auto& builder = context.builder;

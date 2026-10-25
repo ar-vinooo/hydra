@@ -81,6 +81,8 @@ add_library(hydra-core
     horizon/filesystem/content_archive.cpp
     horizon/filesystem/content_archive.hpp
     horizon/filesystem/bktr.cpp
+    horizon/filesystem/compressed_storage.cpp
+    horizon/filesystem/compressed_storage.hpp
     horizon/filesystem/bktr.hpp
     horizon/filesystem/nca_file.cpp
     horizon/filesystem/nca_file.hpp
@@ -653,6 +655,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/texture_cache.hpp
     hw/tegra_x1/gpu/renderer/sampler_base.hpp
     hw/tegra_x1/gpu/renderer/sampler_cache.cpp
+    hw/tegra_x1/gpu/renderer/draw_queue.cpp
+    hw/tegra_x1/gpu/renderer/draw_queue.hpp
     hw/tegra_x1/gpu/renderer/sampler_cache.hpp
     hw/tegra_x1/gpu/renderer/render_pass_base.hpp
     hw/tegra_x1/gpu/renderer/render_pass_cache.cpp

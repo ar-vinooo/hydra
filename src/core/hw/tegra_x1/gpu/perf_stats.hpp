@@ -72,6 +72,26 @@ constexpr bool isGpuWorkAsyncCapable(GpuWork work) {
     return work >= GpuWork::Encode && work < GpuWork::Wait;
 }
 
+// Why a guest thread left hv_vcpu_run
+enum class CpuExit : u8 {
+    Svc,
+    SystemRegister, // Trapped MSR/MRS, mostly CNTPCT_EL0 reads
+    DataAbort,      // Stage 1 write tracking or a guest fault
+    Stage2,         // Stage 2 memory tracking
+    VTimer,
+    Other,
+    Count,
+};
+
+constexpr usize CPU_EXIT_COUNT = static_cast<usize>(CpuExit::Count);
+
+constexpr const char* getCpuExitName(CpuExit exit) {
+    constexpr const char* names[CPU_EXIT_COUNT] = {
+        "svc", "sysreg", "data abort", "stage 2", "vtimer", "other",
+    };
+    return names[static_cast<usize>(exit)];
+}
+
 // DEBUG: frame timing statistics, logged when HYDRA_PERF_STATS is set
 struct PerfStats {
     std::atomic<u64> pfifo_busy_ns{0};
@@ -149,6 +169,12 @@ struct PerfStats {
     std::atomic<u64> msaa_draws{0};
     std::atomic<u64> alpha_to_coverage_draws{0};
     std::atomic<u64> alpha_to_one_draws{0};
+    // Guest CPU: time inside hv_vcpu_run summed over all guest threads, VM
+    // exits by kind (see CpuExit) and wall time spent in each SVC
+    std::atomic<u64> guest_run_ns{0};
+    std::array<std::atomic<u64>, CPU_EXIT_COUNT> cpu_exits{};
+    std::array<std::atomic<u64>, 0x80> svc_count{};
+    std::array<std::atomic<u64>, 0x80> svc_ns{};
 
     static PerfStats& instance() {
         static PerfStats stats;

@@ -660,8 +660,11 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                       getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
         }
     }
-    // DEBUG: which textures are read back each frame (synchronous waits)
-    {
+    // Descriptor formatting and aggregation are diagnostics, not part of
+    // readback/coherence. Keep them off the normal CPU render path.
+    static const bool trace_readbacks =
+        std::getenv("HYDRA_TRACE_TEXTURE_READBACK") != nullptr;
+    if (trace_readbacks) {
         static std::map<std::string, u32> seen;
         static auto last = std::chrono::steady_clock::now();
         seen[fmt::format("ptr={:#x} {} {}x{} lin={} lv={} ly={} range={:#x}+{:#x}", descriptor.ptr, descriptor.format,

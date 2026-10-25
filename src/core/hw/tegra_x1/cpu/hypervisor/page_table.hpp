@@ -5,6 +5,13 @@
 
 namespace hydra::hw::tegra_x1::cpu::hypervisor {
 
+// Changes of guest translations that TLBs may still hold the old version of
+// (unmapping, remapping, restricting permissions). A vCPU invalidates the
+// TLBs of every core before running the guest again once this changed.
+// Defined in the host so live modules share it.
+u64 getTlbGeneration();
+void notePageTableChange();
+
 class PageAllocator;
 
 constexpr usize BLOCK_SHIFT_DIFF = 9;

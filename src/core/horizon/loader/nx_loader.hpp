@@ -2,6 +2,7 @@
 
 #include "core/horizon/filesystem/directory.hpp"
 #include "core/horizon/loader/loader.hpp"
+#include "core/horizon/loader/npdm.hpp"
 
 namespace hydra {
 class System;
@@ -27,6 +28,7 @@ class NxLoader : public ILoader {
 
     u8 main_thread_priority;
     u8 main_thread_core_number;
+    std::optional<NpdmThreadInfo> thread_info;
     u32 main_thread_stack_size;
     u32 system_resource_size;
 

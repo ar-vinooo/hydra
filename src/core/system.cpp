@@ -176,6 +176,10 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
     main_process =
         os.getKernel().getProcessManager().createProcess("Guest process");
     loader->loadProcess(*this, main_process);
+    // Services read the version and save data sizes from it
+    main_process->setApplicationControlProperty(
+        std::unique_ptr<horizon::services::ns::ApplicationControlProperty>(
+            loader->loadNacp()));
 
     // Check for firmware applets
     horizon::services::am::internal::LibraryAppletController controller(
@@ -702,6 +706,41 @@ void System::progressFrame(u32 width, u32 height,
                          per_frame(waits),
                          static_cast<f64>(wait_ns) / 1e6 / std::max(frames, 1.0),
                          reasons, per_frame(stats.checkpoint_skips.exchange(0)));
+                // Guest CPU: how long the guest threads executed, why they
+                // left the vCPU and which SVCs took the most wall time
+                std::string exits;
+                u64 exit_total = 0;
+                for (usize i = 0; i < hw::tegra_x1::gpu::CPU_EXIT_COUNT; i++) {
+                    const auto count = stats.cpu_exits[i].exchange(0);
+                    exit_total += count;
+                    exits += fmt::format(
+                        " | {} {:.0f}",
+                        hw::tegra_x1::gpu::getCpuExitName(
+                            static_cast<hw::tegra_x1::gpu::CpuExit>(i)),
+                        per_frame(count));
+                }
+                std::array<std::pair<u64, u32>, 0x80> svcs;
+                for (u32 i = 0; i < svcs.size(); i++)
+                    svcs[i] = {stats.svc_ns[i].exchange(0), i};
+                std::sort(svcs.begin(), svcs.end(), std::greater<>());
+                std::string top_svcs;
+                for (usize i = 0; i < 8 && svcs[i].first != 0; i++) {
+                    const auto id = svcs[i].second;
+                    top_svcs += fmt::format(
+                        " | {:#x} {:.0f}x {:.2f} ms", id,
+                        per_frame(stats.svc_count[id].load()),
+                        static_cast<f64>(svcs[i].first) / 1e6 /
+                            std::max(frames, 1.0));
+                }
+                for (auto& count : stats.svc_count)
+                    count = 0;
+                LOG_INFO(Other,
+                         "GUEST CPU: run {:.2f} ms/frame (all threads), "
+                         "{:.0f} exits/frame{}",
+                         static_cast<f64>(stats.guest_run_ns.exchange(0)) /
+                             1e6 / std::max(frames, 1.0),
+                         per_frame(exit_total), exits);
+                LOG_INFO(Other, "GUEST SVC wall time per frame:{}", top_svcs);
                 LOG_INFO(Other,
                          "REPORTS: {:.1f} queued/frame, {} forced a wait",
                          per_frame(stats.reports_queued.exchange(0)),

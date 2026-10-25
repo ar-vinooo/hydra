@@ -53,6 +53,12 @@ class IThread {
     virtual void removeBreakpoint(vaddr_t addr) = 0;
     virtual void singleStep() = 0;
 
+    // Makes `state` complete, for another thread to read while this one is
+    // suspended. Must be called from the thread itself.
+    virtual void completeState() {}
+    // TPIDR_EL0, the user read/write thread pointer. Same caveat.
+    virtual u64 getTpidr() = 0;
+
     // Getters
     IMemory* getTlsMemory() const { return tls_mem; }
 

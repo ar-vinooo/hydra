@@ -52,6 +52,11 @@ class Builder {
         return addInstruction(Opcode::QuadShuffleXor, ScalarType::U32,
                               {src, mask});
     }
+    // Value of the pixel at quad lane `index` (x | (y << 1)) of the 2x2 quad
+    Value opQuadShuffle(const Value& src, const Value& index) {
+        return addInstruction(Opcode::QuadShuffle, ScalarType::U32,
+                              {src, index});
+    }
     // a * LUT_A[mode] + b * LUT_B[mode], mode = swizzle >> (quad lane * 2)
     Value opSwizzleAdd(const Value& src_a, const Value& src_b, u32 swizzle) {
         return addInstruction(Opcode::SwizzleAdd, ScalarType::F32,

@@ -159,11 +159,9 @@ Thread::Thread(WallClock& wall_clock, Cpu& cpu_, IMmu* mmu,
 
     createVcpu();
 
-    // TODO: find out what this does
+    // PSTATE until the first run writes `state`: EL0t (M = 0) with D, A, I
+    // and F masked (0x3c0)
     setReg(HV_REG_CPSR, 0x3c0);
-
-    // HACK: set LR to loader return address
-    // SetReg(HV_REG_LR, 0xffff0000);
 }
 
 Thread::~Thread() { releaseVcpu(false); }
@@ -232,6 +230,8 @@ void Thread::createVcpu() {
 void Thread::releaseVcpu(bool save_state) {
     if (!has_vcpu)
         return;
+    // A new vCPU may run on a core with older translations
+    tlb_generation_seen = 0;
 
     // Only the owning thread may access the registers
     if (save_state) {
@@ -254,7 +254,12 @@ void Thread::run() {
 
         // Run
         deserializeState();
+        const bool perf = gpu::PerfStats::isEnabled();
+        const auto run_start = perf ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
+        if (perf)
+            countExit(run_start);
         exception = (getReg(HV_REG_PC) >= cpu.getKernelPageTable().getBase());
         serializeState(canSkipSimdOnExit());
 
@@ -280,7 +285,19 @@ void Thread::run() {
                         serializeSimd();
                         releaseVcpu();
                     }
-                    callbacks.svc_handler(this, esr & 0xffff);
+                    if (perf) {
+                        const auto svc_id = (esr & 0xffff) & 0x7f;
+                        const auto svc_start = std::chrono::steady_clock::now();
+                        callbacks.svc_handler(this, esr & 0xffff);
+                        auto& stats = gpu::PerfStats::instance();
+                        stats.svc_count[svc_id]++;
+                        stats.svc_ns[svc_id] += static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - svc_start)
+                                .count());
+                    } else {
+                        callbacks.svc_handler(this, esr & 0xffff);
+                    }
                     break;
                 case ExceptionClass::TrappedMsrMrsSystem: {
                     instructionTrap(esr);
@@ -289,11 +306,22 @@ void Thread::run() {
                     break;
                 }
                 case ExceptionClass::DataAbortLowerEl: {
-                    // TODO: use the correct size
+                    // The access size, when the syndrome holds it (ISV,
+                    // SAS); pair and vector accesses do not report one
+                    const bool size_valid = (esr & (1u << 24)) != 0;
+                    const u64 access_size =
+                        size_valid ? (1ull << ((esr >> 22) & 0x3)) : 16;
                     if (far < ADDRESS_SPACE_SIZE &&
-                        MMU.trackWrite(ztd::Range<vaddr_t>::fromSize(far, 8)))
+                        MMU.trackWrite(
+                            ztd::Range<vaddr_t>::fromSize(far, access_size))) {
+                        // The page is writable now, this core may still
+                        // hold it read-only
+                        local_tlb_flush = true;
                         break;
+                    }
 
+                    // A real fault: the debugger may show every register
+                    serializeSimd();
                     bool far_valid = (esr & 0x00000400) == 0;
                     ASSERT_DEBUG(far_valid, Hypervisor, "FAR not valid");
 
@@ -329,10 +357,8 @@ void Thread::run() {
                     break;
                 }
 
-                // Set the PC to trampoline
-                // TODO: most of the time we can skip msr, find out when
-                constexpr u64 trampoline =
-                    KERNEL_REGION_BASE + EXCEPTION_TRAMPOLINE_OFFSET;
+                // Return through the trampoline, invalidating TLBs as needed
+                const auto trampoline = selectTrampoline();
                 if (has_vcpu)
                     setReg(HV_REG_PC, trampoline);
                 else
@@ -445,6 +471,55 @@ void Thread::run() {
     }
 }
 
+void Thread::countExit(std::chrono::steady_clock::time_point run_start) {
+    auto& stats = gpu::PerfStats::instance();
+    stats.guest_run_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - run_start)
+            .count());
+    auto kind = gpu::CpuExit::Other;
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+        kind = gpu::CpuExit::VTimer;
+    } else if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
+        const auto hv_ec = static_cast<ExceptionClass>(
+            (exit->exception.syndrome >> 26) & 0x3f);
+        if (hv_ec == ExceptionClass::DataAbortLowerEl) {
+            kind = gpu::CpuExit::Stage2;
+        } else if (hv_ec == ExceptionClass::HvcAarch64) {
+            const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+            switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+            case ExceptionClass::SvcAarch64:
+                kind = gpu::CpuExit::Svc;
+                break;
+            case ExceptionClass::TrappedMsrMrsSystem:
+                kind = gpu::CpuExit::SystemRegister;
+                break;
+            case ExceptionClass::DataAbortLowerEl:
+                kind = gpu::CpuExit::DataAbort;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    stats.cpu_exits[static_cast<usize>(kind)]++;
+}
+
+u64 Thread::selectTrampoline() {
+    const auto generation = getTlbGeneration();
+    uptr offset = EXCEPTION_TRAMPOLINE_OFFSET;
+    if (generation != tlb_generation_seen) {
+        // Read before invalidating: a change after this is seen next time
+        tlb_generation_seen = generation;
+        local_tlb_flush = false;
+        offset = EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET;
+    } else if (local_tlb_flush) {
+        local_tlb_flush = false;
+        offset = EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET;
+    }
+    return KERNEL_REGION_BASE + offset;
+}
+
 void Thread::setupVTimer() {
     setSysReg(HV_SYS_REG_CNTV_CTL_EL0, 1);
     setSysReg(HV_SYS_REG_CNTV_CVAL_EL0,
@@ -462,13 +537,30 @@ bool Thread::canSkipSimdOnExit() {
     // Without a baseline or filter every register is written back from `state`
     if (disable_filter || !exit_register_state || !has_vcpu)
         return false;
-    if (exit->reason != HV_EXIT_REASON_EXCEPTION ||
-        static_cast<ExceptionClass>((exit->exception.syndrome >> 26) & 0x3f) !=
-            ExceptionClass::HvcAarch64)
+    // The vCPU keeps the live SIMD registers; only exits whose handler may
+    // read them (debugging) need them in `state`
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED)
+        return true;
+    if (exit->reason != HV_EXIT_REASON_EXCEPTION)
         return false;
+    switch (static_cast<ExceptionClass>((exit->exception.syndrome >> 26) &
+                                        0x3f)) {
+    case ExceptionClass::DataAbortLowerEl: // Stage 2 memory tracking
+        return true;
+    case ExceptionClass::HvcAarch64:
+        break;
+    default:
+        return false;
+    }
     const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
-    return static_cast<ExceptionClass>((esr >> 26) & 0x3f) ==
-           ExceptionClass::SvcAarch64;
+    switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+    case ExceptionClass::SvcAarch64:
+    case ExceptionClass::TrappedMsrMrsSystem: // CNTPCT_EL0/CNTFRQ_EL0 reads
+    case ExceptionClass::DataAbortLowerEl:    // Stage 1 write tracking
+        return true;
+    default:
+        return false;
+    }
 }
 
 void Thread::serializeSimd() {
@@ -558,7 +650,11 @@ void Thread::instructionTrap(u32 esr) {
 }
 
 void Thread::processMessages() {
+    // Checked on every VM exit; debugger messages are rare
+    if (!has_messages.load(std::memory_order_acquire))
+        return;
     std::scoped_lock lock(msg_mutex);
+    has_messages.store(false, std::memory_order_relaxed);
     while (!msg_queue.empty()) {
         auto message = msg_queue.front();
         msg_queue.pop();

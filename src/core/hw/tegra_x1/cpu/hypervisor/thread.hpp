@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+
 #include "core/hw/tegra_x1/cpu/hypervisor/const.hpp"
 #include "core/hw/tegra_x1/cpu/thread.hpp"
 
@@ -65,6 +68,11 @@ class Thread : public IThread {
         sendMessage({.type = ThreadMessageType::SingleStep});
     }
 
+    void completeState() override { serializeSimd(); }
+    u64 getTpidr() override {
+        return has_vcpu ? getSysReg(HV_SYS_REG_TPIDR_EL0) : saved_tpidr;
+    }
+
   private:
     Cpu& cpu;
     vaddr_t tls_mem_base;
@@ -95,9 +103,11 @@ class Thread : public IThread {
     // Messages
     std::mutex msg_mutex;
     std::queue<ThreadMessage> msg_queue;
+    std::atomic<bool> has_messages{false};
 
     // State
-    // SVCs don't touch SIMD registers, so their exits can skip reading them.
+    // SVCs, timer reads, memory tracking faults and timer interrupts don't
+    // touch SIMD registers, so their exits can skip reading them.
     // `state.v` is stale until serializeSimd runs.
     void serializeState(bool skip_simd = false);
     void serializeSimd();
@@ -106,6 +116,13 @@ class Thread : public IThread {
     void deserializeState();
 
     void instructionTrap(u32 esr);
+
+    // TLB maintenance on returning to the guest, see selectTrampoline
+    u64 tlb_generation_seen{0};
+    bool local_tlb_flush{false};
+    u64 selectTrampoline();
+    // HYDRA_PERF_STATS: guest run time and VM exits by kind
+    void countExit(std::chrono::steady_clock::time_point run_start);
 
     // Helpers
     u64 getReg(hv_reg_t reg) const {
@@ -151,6 +168,7 @@ class Thread : public IThread {
     void sendMessage(const ThreadMessage& message) {
         std::scoped_lock lock(msg_mutex);
         msg_queue.push(message);
+        has_messages.store(true, std::memory_order_release);
     }
 
     void processMessages();

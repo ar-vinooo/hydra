@@ -246,10 +246,9 @@ bool Mmu::trackWrite(ztd::Range<vaddr_t> range) {
 }
 
 void Mmu::flushTrackedPages() {
-    if (useStage1Tracking()) {
-        IMmu::flushTrackedPages();
+    // Stage 1 pages are rearmed with their invalidations, once per entry
+    if (useStage1Tracking())
         return;
-    }
     Stage2Tracker::instance().rearmWriteTracking();
 }
 

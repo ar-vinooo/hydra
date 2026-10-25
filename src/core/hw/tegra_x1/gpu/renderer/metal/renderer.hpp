@@ -15,6 +15,10 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 
+namespace hydra::hw::tegra_x1::gpu::renderer {
+class DrawQueue;
+}
+
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class CommandBuffer;
@@ -104,6 +108,7 @@ class Renderer : public IRenderer {
 
     // Clear
     void setClearState(const ClearState& clear_state) override {
+        syncDrawQueue();
         state.clear = clear_state;
     }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
@@ -115,6 +120,7 @@ class Renderer : public IRenderer {
 
     // Shader
     u64 getAllocatedResourceBytes() const override { return device->currentAllocatedSize(); }
+    DrawQueue* getDrawQueue() override { return draw_queue.get(); }
     void setTitleId(u64 title_id) override;
     void logPassProfile(f64 frames) override;
     ShaderBase* createShader(const ShaderDescriptor& descriptor) override;
@@ -133,6 +139,7 @@ class Renderer : public IRenderer {
     void setCullState(bool enabled, engines::CullFaceMode mode,
                       engines::Winding front_face) override;
     void setDepthClamp(bool enabled) override {
+        syncDrawQueue();
         state.depth_clip_mode =
             enabled ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip;
     }
@@ -176,9 +183,13 @@ class Renderer : public IRenderer {
     bool synchronize(ICommandBuffer* command_buffer) override;
     bool synchronizeGuestWrites(ICommandBuffer* command_buffer) override;
     void setOcclusionCounterEnabled(bool enabled) override {
+        syncDrawQueue();
         occlusion->setEnabled(enabled);
     }
-    void resetOcclusionCounter() override { occlusion->reset(); }
+    void resetOcclusionCounter() override {
+        syncDrawQueue();
+        occlusion->reset();
+    }
     void queueOcclusionReport(ICommandBuffer* command_buffer,
                               ReportPublisher publish,
                               std::vector<ztd::Range<uptr>> writes) override;
@@ -247,6 +258,9 @@ class Renderer : public IRenderer {
     std::shared_ptr<CompletionQueue> completions;
     std::unique_ptr<OcclusionCounter> occlusion;
     std::optional<u64> prepareOcclusionQuery(CommandBuffer* command_buffer);
+
+    // Encodes draws on a second thread, see DrawQueue
+    std::unique_ptr<DrawQueue> draw_queue;
 
     // Caches
     BinaryArchiveCache binary_archive_cache;

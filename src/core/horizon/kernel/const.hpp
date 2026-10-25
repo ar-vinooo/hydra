@@ -443,9 +443,10 @@ constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_CORE2 = 2;
 constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_CORE3 = 3;
 constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_ALL = 0xFFFFFFFF;
 
+// svcSetThreadActivity
 enum class ThreadActivity {
-    None = 0,
-    Runnable = 1,
+    Runnable = 0,
+    Paused = 1,
 };
 
 union CpuRegister {
@@ -659,8 +660,8 @@ ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::SystemInfoType,
                        UsedPhysicalMemorySize, "used physical memory size",
                        InitialProcessIdRange, "initial process id range")
 
-ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ThreadActivity, None, "none",
-                       Runnable, "runnable")
+ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ThreadActivity, Runnable,
+                       "runnable", Paused, "paused")
 
 ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ArbitrationType, WaitIfLessThan,
                        "wait if less than", DecrementAndWaitIfLessThan,

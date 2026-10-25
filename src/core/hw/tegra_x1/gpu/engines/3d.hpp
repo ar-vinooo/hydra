@@ -792,6 +792,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     // DEBUG: frame tracer
     void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
     bool isHighlightedDraw() const;
+    static bool isProfilingDraws();
     void profileDraw(u32 count);
     void labelCaptureDraw(u32 count);
     u32 capture_draw_index{0};

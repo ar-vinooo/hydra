@@ -2,6 +2,7 @@
 
 #include "core/horizon/kernel/process.hpp"
 #include "core/horizon/services/am/storage.hpp"
+#include "core/horizon/services/ns/const.hpp"
 
 namespace hydra::horizon::services::am {
 
@@ -51,13 +52,17 @@ result_t IApplicationFunctions::setTerminateResult(result_t result) {
     return RESULT_SUCCESS;
 }
 
-result_t IApplicationFunctions::getDisplayVersion(DisplayVersion* out_version) {
-    LOG_FUNC_STUBBED(Services);
-
-    // HACK
-    *out_version = {
-        .name = "1.0.0",
-    };
+result_t IApplicationFunctions::getDisplayVersion(RequestContext* ctx,
+                                                  DisplayVersion* out_version) {
+    // From control.nacp; without one (homebrew), the first version
+    *out_version = {.name = "1.0.0"};
+    if (const auto nacp = ctx->process->getApplicationControlProperty()) {
+        static_assert(sizeof(out_version->name) ==
+                      sizeof(nacp->display_version));
+        std::memcpy(out_version->name, nacp->display_version,
+                    sizeof(out_version->name));
+        out_version->name[sizeof(out_version->name) - 1] = '\0';
+    }
     return RESULT_SUCCESS;
 }
 
@@ -75,13 +80,19 @@ result_t IApplicationFunctions::extendSaveData(u128 user_id, i64 size,
     return RESULT_SUCCESS;
 }
 
-result_t IApplicationFunctions::getSaveDataSize(i64* out_size,
+result_t IApplicationFunctions::getSaveDataSize(RequestContext* ctx,
+                                                i64* out_size,
                                                 i64* out_journal_size) {
-    LOG_FUNC_STUBBED(Services);
-
-    // HACK
+    // The sizes the application declares for its account save data. The
+    // save data type and user (ignored) select between account and device
+    // data, which games ask for their account data.
     *out_size = 0;
     *out_journal_size = 0;
+    if (const auto nacp = ctx->process->getApplicationControlProperty()) {
+        *out_size = static_cast<i64>(nacp->user_account_save_data_size);
+        *out_journal_size =
+            static_cast<i64>(nacp->user_account_save_data_journal_size);
+    }
     return RESULT_SUCCESS;
 }
 

@@ -36,6 +36,14 @@ struct CodeSet {
     ztd::Range<u64> data;
 };
 
+} // namespace hydra::horizon::kernel
+
+namespace hydra::horizon::services::ns {
+struct ApplicationControlProperty;
+}
+
+namespace hydra::horizon::kernel {
+
 class Process : public SynchronizationObject {
   public:
     static constexpr AutoObjectTypeId TYPE_ID = AutoObjectTypeId::Process;
@@ -125,11 +133,16 @@ class Process : public SynchronizationObject {
             return nullptr;
         }
 
-        // HACK
-        return handle_pool.get(handle)
-            .transform(
-                [](AutoObject* obj) -> auto { return static_cast<T*>(obj); })
-            .value_or(nullptr);
+        // A handle of another type is invalid, as on Horizon, instead of
+        // being reinterpreted as T
+        auto obj = handle_pool.get(handle).value_or(nullptr);
+        if (obj == nullptr)
+            return nullptr;
+        auto typed = obj->template as<T>();
+        if (typed == nullptr) [[unlikely]]
+            LOG_WARN(Kernel, "Handle 0x{:x} is a {}, not the expected type",
+                     handle.getRaw(), obj->getTypeId());
+        return typed;
     }
 
     Handle addHandleNoRetain(AutoObject* obj) {
@@ -237,8 +250,22 @@ class Process : public SynchronizationObject {
 
     vaddr_t tls_mem_base{TLS_REGION.getBegin()};
 
+    // Horizon gives IDs up to 0x50 to the initial kernel processes; the
+    // first application gets 0x51
+    static inline std::atomic<u64> next_process_id{0x51};
+    const u64 process_id{next_process_id.fetch_add(1, std::memory_order_relaxed)};
+
+    std::unique_ptr<services::ns::ApplicationControlProperty> control_property;
+
     // Thread
     GuestThread* main_thread{nullptr};
+    // From the ThreadInfo kernel capability and the NPDM: the cores and
+    // priorities this process may use, and the ideal core of its threads.
+    // Defaults allow everything, for processes without capabilities.
+    u64 core_mask{0xf};
+    i32 highest_thread_priority{0};
+    i32 lowest_thread_priority{63};
+    i32 ideal_core{0};
     std::mutex thread_mutex;
     std::vector<IThread*> threads;
     bool stopping{false};
@@ -263,6 +290,33 @@ class Process : public SynchronizationObject {
                       setSystemResourceSize);
     CONST_REF_GETTER(random_entropy, getRandomEntropy);
     GETTER(main_thread, getMainThread);
+    u64 getProcessId() const { return process_id; }
+    GETTER_AND_SETTER(core_mask, getCoreMask, setCoreMask);
+    // The application's control.nacp, if it has one
+    const services::ns::ApplicationControlProperty*
+    getApplicationControlProperty() const {
+        return control_property.get();
+    }
+    void setApplicationControlProperty(
+        std::unique_ptr<services::ns::ApplicationControlProperty> property);
+    GETTER_AND_SETTER(ideal_core, getIdealCore, setIdealCore);
+    GETTER(highest_thread_priority, getHighestThreadPriority);
+    GETTER(lowest_thread_priority, getLowestThreadPriority);
+    void setThreadPriorityRange(i32 highest, i32 lowest) {
+        highest_thread_priority = highest;
+        lowest_thread_priority = lowest;
+    }
+    // The priorities a thread of this process may be given
+    u64 getPriorityMask() const {
+        u64 mask = 0;
+        for (i32 p = highest_thread_priority; p <= lowest_thread_priority; p++)
+            mask |= 1ull << p;
+        return mask;
+    }
+    bool isValidThreadPriority(i32 priority) const {
+        return priority >= highest_thread_priority &&
+               priority <= lowest_thread_priority;
+    }
 };
 
 } // namespace hydra::horizon::kernel

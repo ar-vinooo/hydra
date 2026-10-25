@@ -54,6 +54,8 @@ class ResourceRegistry {
 
   private:
     std::shared_ptr<RegistryState> state;
+
+    bool belongsTo(const ResourceRecord& record) const;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::resource
