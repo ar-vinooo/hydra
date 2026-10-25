@@ -277,6 +277,7 @@ void buildShaderKey(const GuestShaderDescriptor& descriptor,
     hash.add(descriptor.state.window_space_height);
     if (descriptor.stage == engines::ShaderStage::Fragment) {
         hash.add(descriptor.state.point_coord_origin_bottom);
+        hash.add(descriptor.state.early_fragment_tests);
         hash.add(descriptor.state.alpha_test_func);
         hash.add(std::bit_cast<u32>(descriptor.state.alpha_test_ref));
         hash.add(descriptor.state.dual_source_blending);

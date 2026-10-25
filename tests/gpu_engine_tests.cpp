@@ -89,6 +89,15 @@ struct ThreeDTestAccess {
     static void raw(ThreeD& engine, u32 reg, u32 value) {
         engine.regs_raw[reg] = value;
     }
+    static renderer::DrawState drawState(ThreeD& engine) {
+        return engine.prepareDrawState();
+    }
+    static MTL::ScissorRect scissor(ThreeD& engine, u32 index) {
+        return engine.getScissor(index);
+    }
+    static MTL::ScissorRect clearRect(ThreeD& engine) {
+        return engine.getClearRect();
+    }
     static void fixedAttributes(ThreeD& engine) {
         for (auto& attribute : engine.regs.vertex_attrib_states)
             attribute.is_fixed = true;
@@ -3785,6 +3794,71 @@ void testEnginePipelineStages() {
                  "pipelines from guest programs\n";
 }
 
+// SET_FRONT_POLYGON_MODE LINE draws triangle edges only (Metal fill mode)
+void testPolygonLines() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    expect(!engines::ThreeDTestAccess::drawState(engine).polygon_lines,
+           "Polygons fill at power on");
+    engine.method(0xdac / 4, 0x1b01);
+    expect(engines::ThreeDTestAccess::drawState(engine).polygon_lines,
+           "FRONT_POLYGON_MODE LINE selects line fill");
+    engine.method(0xdac / 4, 0x1b02);
+
+    // A full screen triangle drawn as lines leaves the inside empty
+    auto* commands = static_cast<metal::CommandBuffer*>(rig.commands.get());
+    renderer.setClearState({.rect = rig.full});
+    renderer.clearColor(commands, 0, 0, 0xf, simd::uint4{});
+    renderer.setDepthTestEnabled(false);
+    renderer.setPolygonLines(true);
+    renderer.draw(commands, engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+    renderer.setPolygonLines(false);
+    expect(renderer.synchronize(commands), "The line draw completes");
+    auto* color = static_cast<metal::TextureView*>(
+        rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+    const auto pixels = readTexture(renderer.getDevice(), color, 4);
+    // The rig's triangle is (-1,-1) (3,-1) (-1,3): pixel (1,1) is inside,
+    // away from every edge
+    const u8* inside = &pixels[(1 * 4 + 1) * 4];
+    expect(inside[0] == 0 && inside[3] == 0,
+           "Line fill leaves the inside of the triangle untouched");
+    std::cout << "PASS: polygon mode LINE draws triangle edges\n";
+}
+
+// SET_SURFACE_CLIP (0xff4/0xff8) clips draws and clears with the scissor
+void testSurfaceClip() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    const auto same = [](MTL::ScissorRect a, MTL::ScissorRect b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width &&
+               a.height == b.height;
+    };
+    // Unset (zero size): no clip
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(0, 0, 0xffff, 0xffff)),
+           "Without a surface clip the disabled scissor covers everything");
+    engine.method(0x3fd, 0u | (64u << 16)); // x 0, width 64
+    engine.method(0x3fe, 0u | (32u << 16)); // y 0, height 32
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(0, 0, 64, 32)),
+           "The surface clip bounds draws without a scissor");
+    expect(same(engines::ThreeDTestAccess::clearRect(engine),
+                MTL::ScissorRect(0, 0, 64, 32)),
+           "The surface clip bounds clears");
+    // Scissor 0: enable, x 48..96, y 8..16
+    engine.method(0x380, 1);
+    engine.method(0x381, 48u | (96u << 16));
+    engine.method(0x382, 8u | (16u << 16));
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(48, 8, 16, 8)),
+           "Draws use the intersection of the scissor and the surface clip");
+    std::cout << "PASS: surface clip bounds draws and clears\n";
+}
+
 // SET_SAMPLER_BINDING (0x48d) and SET_SINGLE_CT_WRITE_CONTROL (0x3e4)
 void testSamplerBindingAndCommonWriteMask() {
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
@@ -3857,6 +3931,21 @@ void testConditionalRendering() {
     engine.method(0x651, 1);
     expect(engine.shouldExecute(), "ALWAYS override wins over FALSE mode");
     engine.method(0x651, 0);
+    // SET_GLOBAL_RENDER_ENABLE_C (0x138): on at power on, both conditions
+    // have to pass
+    engine.method(0x556, 1);
+    expect(engine.shouldExecute(), "The global render enable is on at power on");
+    engine.method(0x4e, 0);
+    expect(!engine.shouldExecute(), "Global FALSE disables execution");
+    engine.method(0x4c, static_cast<u32>(ADDRESS >> 32));
+    engine.method(0x4d, static_cast<u32>(ADDRESS));
+    engine.method(0x4e, 2);
+    expect(engine.shouldExecute(), "Global conditional mode reads its report");
+    compare[0] = compare[1] = 0;
+    expect(!engine.shouldExecute(), "Global conditional mode rejects a zero value");
+    compare[0] = 5;
+    compare[1] = 1;
+    engine.method(0x4e, 1);
     engine.method(0x556, 3);
     gmmu.unmap(ADDRESS + 12);
     expect(!engine.shouldExecute(), "Incomplete comparison data safely disables execution");
@@ -4059,6 +4148,25 @@ void checkPrimitiveRestart(engines::IndexType input_type) {
         expect(primitive == P::TriangleStrip && count == source.size() &&
                    read(native_restart) == std::vector<u32>({1, 2, maximum, 3, 4}),
                "Fixed U16/U32 restart uses the native Metal strip path");
+    // Geometry shaders and tessellation read the indices themselves: no
+    // restart index may reach them
+    descriptor.expand_restart = true;
+    expect(!decode().isValid() && count == 0,
+           "Expanded restart decodes the strips, dropping those too short "
+           "around the cut");
+    source = {1, 2, 3, static_cast<T>(~T{0}), 4, 5, 6};
+    descriptor.mem_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T));
+    descriptor.count = static_cast<u32>(source.size());
+    if (sizeof(T) > 1)
+        expect(read(decode()) == std::vector<u32>({1, 2, 3, 4, 5, 6}) &&
+                   primitive == P::Triangles,
+               "Expanded restart gives the triangles of each strip as a list");
+    descriptor.expand_restart = false;
+    source = {1, 2, static_cast<T>(~T{0}), 3, 4};
+    descriptor.mem_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T));
+    descriptor.count = static_cast<u32>(source.size());
     descriptor.restart_index = 0xffffffff;
     if (sizeof(T) < sizeof(u32))
         expect(read(decode()).size() == 9,
@@ -4113,7 +4221,18 @@ void testInlineIndices() {
     expect(PerfStats::instance().draws.load() == before + 2 &&
                engine.getRegs().vertex_array_start == 7,
            "DRAW_AUTO submits byte count divided by stride from vertex zero");
-    std::cout << "PASS: inline indices, restart registers and DRAW_AUTO fallback\n";
+    // DRAW_ZERO_INDEX (0x304): one draw of count vertices
+    engine.method(0xc1, 5);
+    expect(PerfStats::instance().draws.load() == before + 3,
+           "DRAW_ZERO_INDEX submits one draw");
+    // DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE topology is 4 bits (31:28)
+    const auto primitive_before = engine.getRegs().begin.primitive_type;
+    engine.method(0x485, 3u | (4u << 16) | (8u << 28));
+    expect(PerfStats::instance().draws.load() == before + 4 &&
+               engine.getRegs().begin.primitive_type == primitive_before,
+           "Compact array draws decode QUAD_STRIP and restore the topology");
+    std::cout << "PASS: inline indices, restart registers, DRAW_AUTO fallback "
+                 "and DRAW_ZERO_INDEX\n";
 }
 
 void testClippedBlitRegions() {
@@ -5826,6 +5945,8 @@ int main(int argc, char** argv) {
         testReportSemaphoreReductionAndAcquire();
         testConditionalRendering();
         testSamplerBindingAndCommonWriteMask();
+        testSurfaceClip();
+        testPolygonLines();
         testGeometryDrawCommand();
         testTessellationDrawCommand();
         testEnginePipelineStages();

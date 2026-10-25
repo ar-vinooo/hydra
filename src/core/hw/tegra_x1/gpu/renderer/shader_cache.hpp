@@ -73,6 +73,9 @@ struct GuestShaderState {
     u32 window_space_height{0};
     // Point sprite coordinates have their origin at the bottom
     bool point_coord_origin_bottom{false};
+    // Depth and stencil tests run before the fragment shader (and its
+    // discards), SET_API_MANDATED_EARLY_Z
+    bool early_fragment_tests{false};
     // Fixed function alpha test of render target 0 (Invalid when disabled)
     engines::CompareOp alpha_test_func{engines::CompareOp::Invalid};
     f32 alpha_test_ref{0.0f};

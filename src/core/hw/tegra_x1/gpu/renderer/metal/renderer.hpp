@@ -53,6 +53,7 @@ struct State {
     MTL::CullMode cull_mode{MTL::CullModeNone};
     MTL::Winding front_face_winding{MTL::WindingClockwise};
     MTL::DepthClipMode depth_clip_mode{MTL::DepthClipModeClip};
+    MTL::TriangleFillMode triangle_fill_mode{MTL::TriangleFillModeFill};
     MTL::Viewport viewports[VIEWPORT_COUNT];
     MTL::ScissorRect scissors[VIEWPORT_COUNT];
     BufferView index_buffer;
@@ -143,6 +144,11 @@ class Renderer : public IRenderer {
         syncDrawQueue();
         state.depth_clip_mode =
             enabled ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip;
+    }
+    void setPolygonLines(bool enabled) override {
+        syncDrawQueue();
+        state.triangle_fill_mode =
+            enabled ? MTL::TriangleFillModeLines : MTL::TriangleFillModeFill;
     }
     void debugDumpTexture(ICommandBuffer* command_buffer, ITextureView* view,
                           const std::string& path) override;

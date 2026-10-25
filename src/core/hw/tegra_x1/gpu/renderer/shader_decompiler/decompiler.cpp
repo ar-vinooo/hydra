@@ -332,6 +332,14 @@ std::string generateGeometryPassthrough(const GeometryPassthroughState& state) {
     for (u32 i = 0; i < 32; i++)
         if ((state.output_mask & (1u << i)) != 0)
             code += fmt::format("    float4 user{0} [[user(locn{0})]];\n", i);
+    const u32 clip_distances =
+        state.clip_distance_mask == 0
+            ? 0
+            : 32 - static_cast<u32>(std::countl_zero(state.clip_distance_mask &
+                                                     0xffu));
+    if (clip_distances != 0)
+        code += fmt::format("    float clip_distance [[clip_distance]] [{}];\n",
+                            clip_distances);
     code += "};\n";
     code += fmt::format(
         "vertex StageOut main_(uint vid [[vertex_id]], const device uint* "
@@ -386,6 +394,14 @@ std::string generateGeometryPassthrough(const GeometryPassthroughState& state) {
             "as_type<float>(r[{}]), as_type<float>(r[{}]), "
             "as_type<float>(r[{}]));\n",
             i, base, base + 1, base + 2, base + 3);
+    }
+    // Distances the guest enabled clip, as the vertex epilogue
+    for (u32 i = 0; i < clip_distances; i++) {
+        if ((state.clip_distance_mask & (1u << i)) != 0)
+            code += fmt::format("    __out.clip_distance[{}] = as_type<float>(r[{}]);\n",
+                                i, word(SV_CLIP_DISTANCE_BASE + i * 4));
+        else
+            code += fmt::format("    __out.clip_distance[{}] = 0.0;\n", i);
     }
     code += "    return __out;\n}\n";
     return code;

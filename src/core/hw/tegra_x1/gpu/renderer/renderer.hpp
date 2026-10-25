@@ -342,6 +342,8 @@ class IRenderer {
                               engines::Winding front_face) = 0;
     // Depth outside the clip range is clamped instead of clipped
     virtual void setDepthClamp(bool enabled) = 0;
+    // Triangles are drawn as their edges (polygon mode LINE)
+    virtual void setPolygonLines(bool enabled) = 0;
 
     // DEBUG: save the current contents of a texture to a PNG file
     virtual void

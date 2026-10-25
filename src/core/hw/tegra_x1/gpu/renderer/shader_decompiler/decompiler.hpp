@@ -43,6 +43,8 @@ struct GeometryPassthroughState {
     u32 window_space_height{0};
     bool y_negate{false};
     bool depth_zero_to_one{false};
+    // Clip distances the guest enabled (bit per distance)
+    u32 clip_distance_mask{0};
 };
 std::string generateGeometryPassthrough(const GeometryPassthroughState& state);
 

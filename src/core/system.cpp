@@ -899,7 +899,8 @@ void System::progressFrame(u32 width, u32 height,
     }
 
     // Render pass
-    os.getDisplayDriver().present(command_buffer, compositor, width, height);
+    if (!compositor->reusesPresentedFrame(acquired))
+        os.getDisplayDriver().present(command_buffer, compositor, width, height);
 
     if (loading) {
         if (acquired) {

@@ -17,7 +17,7 @@ bool usesNativeRestart(const IndexDescriptor& descriptor) {
     const bool strip =
         descriptor.primitive_type == engines::PrimitiveType::LineStrip ||
         descriptor.primitive_type == engines::PrimitiveType::TriangleStrip;
-    return strip && descriptor.restart_enabled &&
+    return strip && descriptor.restart_enabled && !descriptor.expand_restart &&
            ((descriptor.type == engines::IndexType::UInt16 &&
              descriptor.restart_index == 0xffff) ||
             (descriptor.type == engines::IndexType::UInt32 &&
@@ -163,6 +163,7 @@ bool isSameDescriptor(const IndexDescriptor& a, const IndexDescriptor& b) {
     if (a.type != b.type || a.primitive_type != b.primitive_type ||
         a.count != b.count || a.restart_enabled != b.restart_enabled ||
         (a.restart_enabled && a.restart_index != b.restart_index) ||
+        a.expand_restart != b.expand_restart ||
         a.mem_range.has_value() != b.mem_range.has_value())
         return false;
     return !a.mem_range ||
@@ -272,6 +273,7 @@ u32 IndexCache::hashHot1(const IndexDescriptor& descriptor) {
     hash.add(descriptor.restart_enabled);
     if (descriptor.restart_enabled)
         hash.add(descriptor.restart_index);
+    hash.add(descriptor.expand_restart);
     return hash.toHashCode();
 }
 

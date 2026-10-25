@@ -640,6 +640,24 @@ void MslEmitter::emitHeader() {
                 default: return position;
                 }
             }
+            // Triangle i of n in a strip with adjacency (OpenGL 4.6 table
+            // 10.1), geometry shader input k
+            inline uint hydra_strip_adjacency(uint i, uint n, uint k) {
+                const uint only[6] = {0, 1, 2, 5, 4, 3};
+                if (n == 1) return only[k];
+                if (i == 0) {
+                    const uint first[6] = {0, 1, 2, 6, 4, 3};
+                    return first[k];
+                }
+                const bool odd = (i & 1u) != 0u;
+                const bool last = i == n - 1u;
+                const uint v1 = odd ? 2u * i + 2u : 2u * i;
+                const uint v2 = odd ? 2u * i : 2u * i + 2u;
+                const uint a23 = odd ? 2u * i + 3u : (last ? 2u * i + 5u : 2u * i + 6u);
+                const uint a31 = odd ? (last ? 2u * i + 5u : 2u * i + 6u) : 2u * i + 3u;
+                const uint vertices[6] = {v1, 2u * i - 2u, v2, a23, 2u * i + 4u, a31};
+                return vertices[k];
+            }
         )");
     if (context.geometry_capture)
         write("struct HydraCaptureParams {{ uint min_vertex; }};");
@@ -1185,6 +1203,10 @@ void MslEmitter::emitMainPrototype() {
         writeRaw("vertex ");
         break;
     case ShaderType::Fragment:
+        // Metal cannot test early when the shader writes the depth
+        if (state.early_fragment_tests &&
+            context.fragment_depth_register == invalid<u32>())
+            writeRaw("[[early_fragment_tests]] ");
         writeRaw("fragment ");
         break;
     case ShaderType::Compute:
@@ -2412,6 +2434,13 @@ void MslEmitter::emitGeometryPrologue() {
     case engines::PrimitiveType::TrianglesAdjacency:
         for (u32 k = 0; k < 6; k++)
             positions.push_back(fmt::format("{} * 6u + {}u", i, k));
+        break;
+    case engines::PrimitiveType::TriangleStripAdjacency:
+        // OpenGL 4.6 table 10.1, inputs ordered vertex 1, adjacent 1/2,
+        // vertex 2, adjacent 2/3, vertex 3, adjacent 3/1
+        for (u32 k = 0; k < 6; k++)
+            positions.push_back(fmt::format(
+                "hydra_strip_adjacency({}, __gs.primitive_count, {}u)", i, k));
         break;
     default:
         SHADER_UNSUPPORTED("Geometry shader input primitive {}",

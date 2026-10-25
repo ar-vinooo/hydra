@@ -14,6 +14,9 @@ struct IndexDescriptor {
     std::optional<ztd::Range<uptr>> mem_range{std::nullopt};
     bool restart_enabled{false};
     u32 restart_index{0};
+    // Geometry shaders and tessellation assemble their input from the
+    // indices themselves: strips are decoded instead of restarting natively
+    bool expand_restart{false};
 };
 
 class IndexCache {

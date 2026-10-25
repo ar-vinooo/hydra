@@ -1100,6 +1100,9 @@ void testGeometryShader(MTL::Device* device) {
                      ir::Value::createConstantF(1.0f));
             for (u32 c = 0; c < 4; c++)
                 b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false), color[c]);
+            // Clip distance 0: the left quad (+1) is kept, the right (-1) clipped
+            b.opCopy(attr(SV_CLIP_DISTANCE_BASE, false),
+                     b.opMultiply(center, ir::Value::createConstantF(-2.0f)));
             b.opEmitVertex();
         }
         b.opEndPrimitive();
@@ -1115,6 +1118,7 @@ void testGeometryShader(MTL::Device* device) {
     GeometryPassthroughState passthrough_state{};
     passthrough_state.output_mask = 1;
     passthrough_state.depth_zero_to_one = true;
+    passthrough_state.clip_distance_mask = 1;
     std::string passthrough = generateGeometryPassthrough(passthrough_state);
     passthrough += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
                    "fragment float4 check_geometry(CheckIn in [[stage_in]]) "
@@ -1225,11 +1229,211 @@ void testGeometryShader(MTL::Device* device) {
             const u8* p = &pixels[(y * 8 + x) * 4];
             const bool left = x < 4;
             check(left ? (p[0] == 191 && p[1] == 64 && p[2] == 128)
-                       : (p[0] == 64 && p[1] == 128 && p[2] == 255),
-                  "Each point becomes a half screen quad with its color");
+                       : (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0),
+                  "Each point becomes a half screen quad with its color, the "
+                  "right one clipped by its clip distance");
         }
     }
-    std::cout << "PASS: geometry shader emulation expands points into quads\n";
+    std::cout << "PASS: geometry shader emulation expands points into quads "
+                 "and passes clip distances\n";
+}
+
+// Geometry shader inputs of a triangle strip with adjacency follow OpenGL
+// 4.6 table 10.1: each input vertex is drawn as a point at (input, primitive)
+// colored with its vertex id
+void testGeometryStripAdjacency(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    namespace engines = hydra::hw::tegra_x1::gpu::engines;
+    const auto attr = [](u32 address, bool input, reg_t vertex = RZ) {
+        return ir::Value::createAttrMemory({RZ, address, input, vertex},
+                                           ir::ScalarType::F32);
+    };
+    // Vertex shader: user 0 x = vertex id / 255
+    GuestShaderState vertex_state{};
+    for (auto& attribute : vertex_state.vertex_attrib_states)
+        attribute.is_fixed = true;
+    vertex_state.geometry_capture = true;
+    std::vector<u8> vertex_code;
+    ResourceMapping vertex_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto id = b.opCast(
+            ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true}),
+            ir::ScalarType::F32);
+        b.opCopy(attr(SV_USER_IN_OUT_BASE, false),
+                 b.opMultiply(id, ir::Value::createConstantF(1.0f / 255.0f)));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter(context, memory, vertex_state,
+                                       vertex_code, vertex_mapping)
+            .emit(module);
+    }
+    // Geometry shader: points at pixel (k, primitive) of a 6x2 target
+    std::vector<u8> geometry_code;
+    ResourceMapping geometry_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry = true;
+        context.geo.input_vertices = 6;
+        context.geo.input_primitive = engines::PrimitiveType::TriangleStripAdjacency;
+        context.geo.output = static_cast<u32>(geometry::Output::Points);
+        context.geo.max_output_vertices = 6;
+        context.geo.invocations = 1;
+        GuestShaderState state{};
+        state.geometry_input_vertices = 6;
+        ir::Module module;
+        ir::Builder b(module);
+        // y of the primitive's row: 1 - (primitive + 0.5) (NDC, 2 rows)
+        const auto primitive = b.opCast(
+            ir::Value::createAttrMemory({RZ, SV_PRIMITIVE_ID_BASE, true}),
+            ir::ScalarType::F32);
+        const auto y = b.opAdd(ir::Value::createConstantF(0.5f), b.opNeg(primitive));
+        for (u32 k = 0; k < 6; k++) {
+            b.opCopy(ir::Value::createRegister(8), ir::Value::createConstantU(k));
+            b.opCopy(attr(SV_POSITION_BASE, false),
+                     ir::Value::createConstantF((static_cast<f32>(k) + 0.5f) / 3.0f - 1.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 4, false), y);
+            b.opCopy(attr(SV_POSITION_BASE + 8, false), ir::Value::createConstantF(0.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 12, false), ir::Value::createConstantF(1.0f));
+            b.opCopy(attr(SV_USER_IN_OUT_BASE, false),
+                     b.opCopy(attr(SV_USER_IN_OUT_BASE, true, 8)));
+            b.opEmitVertex();
+        }
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.setGeometry(true);
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter(context, memory, state, geometry_code,
+                                       geometry_mapping)
+            .emit(module);
+    }
+    GeometryPassthroughState passthrough_state{};
+    passthrough_state.output_mask = 1;
+    passthrough_state.depth_zero_to_one = true;
+    passthrough_state.point_list = true;
+    std::string passthrough = generateGeometryPassthrough(passthrough_state);
+    passthrough += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
+                   "fragment float4 check_adjacency(CheckIn in [[stage_in]]) "
+                   "{ return float4(in.color.x, 0, 0, 1); }\n";
+    const auto compile = [&](const std::string& source) {
+        NS::Error* error = nullptr;
+        auto* library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << "\n"
+                      << source << std::endl;
+        check(library != nullptr, "Strip adjacency shaders compile");
+        return library;
+    };
+    NS_STACK_SCOPED auto vertex_library =
+        compile(std::string(vertex_code.begin(), vertex_code.end()));
+    NS_STACK_SCOPED auto geometry_library =
+        compile(std::string(geometry_code.begin(), geometry_code.end()));
+    NS_STACK_SCOPED auto passthrough_library = compile(passthrough);
+    const auto make_pipeline = [&](MTL::Library* library, const char* fragment) {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto vertex_function =
+            library->newFunction(toNsString("main_"));
+        descriptor->setVertexFunction(vertex_function);
+        if (fragment != nullptr) {
+            NS_STACK_SCOPED auto fragment_function =
+                library->newFunction(toNsString(fragment));
+            descriptor->setFragmentFunction(fragment_function);
+        } else {
+            descriptor->setRasterizationEnabled(false);
+        }
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        check(pipeline != nullptr, "Strip adjacency pipeline compiles");
+        return pipeline;
+    };
+    NS_STACK_SCOPED auto capture_pipeline = make_pipeline(vertex_library, nullptr);
+    NS_STACK_SCOPED auto geometry_pipeline = make_pipeline(geometry_library, nullptr);
+    NS_STACK_SCOPED auto draw_pipeline =
+        make_pipeline(passthrough_library, "check_adjacency");
+
+    // 8 vertices: 2 triangles
+    constexpr u32 VERTICES = 8;
+    const u32 primitives = geometry::getPrimitiveCount(
+        engines::PrimitiveType::TriangleStripAdjacency, VERTICES);
+    check(primitives == 2, "A strip of 8 vertices with adjacency has 2 triangles");
+    const u32 max_indices = geometry::getMaxOutputIndices(geometry::Output::Points, 6);
+    NS_STACK_SCOPED auto records = device->newBuffer(
+        VERTICES * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto output = device->newBuffer(
+        primitives * 7 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto indices = device->newBuffer(
+        primitives * max_indices * sizeof(u32), MTL::ResourceStorageModePrivate);
+    const geometry::CaptureParams capture_params{0};
+    const geometry::Params params{primitives,
+                                  static_cast<u32>(engines::IndexType::None), 0, 0,
+                                  0, VERTICES};
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 6, 2, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    encoder->setRenderPipelineState(capture_pipeline);
+    encoder->setVertexBuffer(records, 0, vertex_mapping.capture_buffer_index);
+    encoder->setVertexBytes(&capture_params, sizeof(capture_params),
+                            vertex_mapping.capture_params_index);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(VERTICES));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(geometry_pipeline);
+    encoder->setVertexBuffer(records, 0, geometry::INPUT_BUFFER);
+    encoder->setVertexBuffer(records, 0, geometry::INDEX_DATA_BUFFER);
+    encoder->setVertexBuffer(output, 0, geometry::OUTPUT_BUFFER);
+    encoder->setVertexBuffer(indices, 0, geometry::OUTPUT_INDEX_BUFFER);
+    encoder->setVertexBytes(&params, sizeof(params), geometry::PARAMS_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(primitives));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(draw_pipeline);
+    encoder->drawIndexedPrimitives(MTL::PrimitiveTypePoint,
+                                   NS::UInteger(primitives * max_indices),
+                                   MTL::IndexTypeUInt32, indices, 0);
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    std::array<u8, 6 * 2 * 4> pixels{};
+    texture->getBytes(pixels.data(), 6 * 4, MTL::Region::Make2D(0, 0, 6, 2), 0);
+    // OpenGL 4.6 table 10.1: first (0, 1, 2, 6, 4, 3), last odd
+    // (2i+2, 2i-2, 2i, 2i+3, 2i+4, 2i+5) = (4, 0, 2, 5, 6, 7)
+    const u32 expected[2][6] = {{0, 1, 2, 6, 4, 3}, {4, 0, 2, 5, 6, 7}};
+    for (u32 primitive = 0; primitive < 2; primitive++) {
+        for (u32 k = 0; k < 6; k++) {
+            const u8* p = &pixels[(primitive * 6 + k) * 4];
+            if (p[0] != expected[primitive][k] || p[3] != 255)
+                std::cerr << "primitive " << primitive << " input " << k
+                          << ": vertex " << int(p[0]) << " (alpha " << int(p[3])
+                          << ")" << std::endl;
+            check(p[0] == expected[primitive][k] && p[3] == 255,
+                  "Strip adjacency inputs follow the OpenGL table");
+        }
+    }
+    std::cout << "PASS: geometry shader inputs of triangle strips with "
+                 "adjacency\n";
 }
 
 // A real geometry shader binary through the decoder: header (output
@@ -1708,6 +1912,48 @@ void testTessellation(MTL::Device* device) {
               "The tessellated patch covers the target with its control "
               "points' color");
     std::cout << "PASS: tessellation emulation draws the evaluated patch\n";
+}
+
+// SET_API_MANDATED_EARLY_Z: the fragment function tests early, unless it
+// writes the depth (Metal cannot combine the two)
+void testEarlyFragmentTests(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (const bool writes_depth : {false, true}) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        context.fragment_output_mask = 0xf;
+        if (writes_depth)
+            context.fragment_depth_register = 4;
+        GuestShaderState state{};
+        state.early_fragment_tests = true;
+        state.color_target_data_types[0] = MTL::DataTypeFloat;
+        ir::Module module;
+        ir::Builder b(module);
+        for (u32 c = 0; c < 5; c++)
+            b.opCopy(ir::Value::createRegister(static_cast<reg_t>(c),
+                                               ir::ScalarType::F32),
+                     ir::Value::createConstantF(0.5f));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> code;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+            .emit(module);
+        const std::string source(code.begin(), code.end());
+        const bool early = source.find("[[early_fragment_tests]]") != std::string::npos;
+        check(early == !writes_depth,
+              writes_depth ? "A depth writing fragment shader does not test early"
+                           : "The fragment shader tests early");
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << std::endl;
+        check(library != nullptr, "The early tested fragment shader compiles");
+    }
+    std::cout << "PASS: mandated early fragment tests\n";
 }
 
 // Maxwell's SHFL.BFLY + FSWZADD patterns implement positive X/Y derivatives.
@@ -3455,7 +3701,9 @@ int main() {
         testVertexA(device);
         testGeometryShader(device);
         testGeometryShaderBinary(device);
+        testGeometryStripAdjacency(device);
         testTessellation(device);
+        testEarlyFragmentTests(device);
         testFragmentDepth(device);
         testQuadDerivatives(device);
         testQuadIndexedShuffle(device);

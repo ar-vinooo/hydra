@@ -1358,6 +1358,8 @@ void Renderer::drawHot38(ICommandBuffer* command_buffer,
     // Draw
     encoder->drawPrimitives(toMtlPrimitiveType(primitive_type), start, count,
                             instance_count, base_instance);
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        encoder->setTriangleFillMode(MTL::TriangleFillModeFill);
     if (visibility_offset)
         encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
@@ -1418,6 +1420,8 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
                                    toMtlIndexType(state.index_type),
                                    index_buffer_mtl, index_buffer_offset,
                                    instance_count, base_vertex, base_instance);
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        encoder->setTriangleFillMode(MTL::TriangleFillModeFill);
     if (visibility_offset)
         encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
@@ -1674,6 +1678,9 @@ void Renderer::drawTessellation(CommandBuffer* command_buffer, u32 start,
             encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled,
                                              0);
     }
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            MTL::TriangleFillModeFill);
     for (auto* buffer : {records, control, patch_data, factors, params})
         retireTextureUploadBuffer(command_buffer, buffer);
 }
@@ -1797,6 +1804,9 @@ void Renderer::drawGeometry(CommandBuffer* command_buffer,
             encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled,
                                              0);
     }
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            MTL::TriangleFillModeFill);
     for (auto* buffer : {records, emitted, indices, params})
         retireTextureUploadBuffer(command_buffer, buffer);
 }
@@ -2162,6 +2172,10 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
     command_buffer->setFrontFaceWinding(state.front_face_winding);
     command_buffer->getRenderCommandEncoderUnchecked()->setDepthClipMode(
         state.depth_clip_mode);
+    // Reset after the draw (see endPolygonLines): internal draws fill
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            state.triangle_fill_mode);
 
     // Stencil reference
     command_buffer->setStencilReferences(state.stencil.front.ref & 0xff,

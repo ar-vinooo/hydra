@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <vector>
@@ -47,6 +48,19 @@ class FramePresenter {
     // the presenter cannot handle this size (the compositor then draws to the
     // drawable)
     MTL::Texture* getCanvas(u32 width, u32 height, MTL::PixelFormat format);
+    // Scale from the canvas to the game's rendering (below 1 when the
+    // compositor upscales), per layer drawn. Motion is searched at the game's
+    // size, as MetalFX takes motion and depth at the input size and color at
+    // the output size. Applies from the next canvas.
+    void setInputScale(f32 scale_x, f32 scale_y) {
+        next_input_scale_x = std::max(next_input_scale_x, scale_x);
+        next_input_scale_y = std::max(next_input_scale_y, scale_y);
+    }
+    // Whether refreshes without a new guest frame show frames the presenter
+    // holds (generated or repeated), without reading the canvas
+    bool holdsFrames() const;
+    u32 getInputWidth() const { return input_width; }
+    u32 getInputHeight() const { return input_height; }
     // Encodes the frame for this display refresh into the drawable, which has
     // the size of the canvas. `new_frame` is whether the canvas holds a new
     // guest frame.
@@ -62,13 +76,14 @@ class FramePresenter {
   private:
     // Smallest canvas dimension to generate frames for
     static constexpr u32 MIN_SIZE = 64;
-    // Luma level the final motion field is at (luma is half size, so 1/8)
+    // Luma level the final motion field is at (luma has the input size, so
+    // 1/4)
     static constexpr u32 FINEST_FLOW_LEVEL = 2;
     static constexpr u32 FLOW_LEVEL_COUNT = 5;
 
     struct Slot {
         MTL::Texture* color{nullptr};
-        // Half size, with mipmaps for the coarse to fine motion search
+        // Input size, with mipmaps for the coarse to fine motion search
         MTL::Texture* luma{nullptr};
     };
 
@@ -100,6 +115,14 @@ class FramePresenter {
     u32 width{0};
     u32 height{0};
     MTL::PixelFormat format{MTL::PixelFormatInvalid};
+    // Size of the motion search and MetalFX's motion and depth
+    u32 input_width{0};
+    u32 input_height{0};
+    f32 input_scale_x{1.0f};
+    f32 input_scale_y{1.0f};
+    // Largest scale of the layers drawn since the last canvas, 0 if none
+    f32 next_input_scale_x{0.0f};
+    f32 next_input_scale_y{0.0f};
     std::array<Slot, 3> slots{};
     std::array<Flow, 2> flows{};
     u32 flow_level_count{0};
@@ -143,7 +166,8 @@ class FramePresenter {
     bool repeated_generated{false};
 
     bool createPipelines();
-    bool resize(u32 width, u32 height, MTL::PixelFormat format);
+    bool resize(u32 width, u32 height, MTL::PixelFormat format,
+                u32 input_width, u32 input_height);
     void releaseResources();
     MTL::Texture* newTexture(u32 texture_width, u32 texture_height,
                              MTL::PixelFormat texture_format,

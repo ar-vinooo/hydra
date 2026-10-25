@@ -705,11 +705,15 @@ TextureFormat toTextureFormat(DepthSurfaceFormat depth_surface_format) {
         DEPTH_SURFACE_FORMAT_CASE(Z24X8Unorm, Z24Unorm_X8Uint)
         DEPTH_SURFACE_FORMAT_CASE(Z24S8Unorm, Z24Unorm_S8Uint)
         DEPTH_SURFACE_FORMAT_CASE(S8Uint, S8Uint)
-        DEPTH_SURFACE_FORMAT_CASE(Z24C8Unorm, Invalid)
+        // V8Z24 (0x18) has X8Z24's layout, with coverage in the X8 byte
+        DEPTH_SURFACE_FORMAT_CASE(Z24C8Unorm, Z24Unorm_X8Uint)
         DEPTH_SURFACE_FORMAT_CASE(Z32S8X24Float, Z32Float_X24S8Uint)
+        // X8Z24_X16V8S8 (0x1d): 24-bit depth in a 64-bit pixel, no host format
         DEPTH_SURFACE_FORMAT_CASE(Z24X8S8C8X16Unorm, Invalid)
-        DEPTH_SURFACE_FORMAT_CASE(Z32X8C8X16Float, Invalid)
-        DEPTH_SURFACE_FORMAT_CASE(Z32S8C8X16Float, Invalid)
+        // ZF32_X16V8X8 and ZF32_X16V8S8 (0x1e, 0x1f) have ZF32_X24S8's
+        // layout, with coverage in its X bytes
+        DEPTH_SURFACE_FORMAT_CASE(Z32X8C8X16Float, Z32Float_X24S8Uint)
+        DEPTH_SURFACE_FORMAT_CASE(Z32S8C8X16Float, Z32Float_X24S8Uint)
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Depth surface format {:#x}",
                                  static_cast<u32>(depth_surface_format)));

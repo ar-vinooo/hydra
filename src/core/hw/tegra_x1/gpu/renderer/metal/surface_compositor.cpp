@@ -39,6 +39,13 @@ SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
 
 SurfaceCompositor::~SurfaceCompositor() { render_pass_descriptor->release(); }
 
+bool SurfaceCompositor::reusesPresentedFrame(bool new_frame) const {
+    // Frame generation shows the frames it holds until a new one arrives, the
+    // canvas is only read for new frames
+    return !new_frame && target != drawable->texture() &&
+           renderer.getFramePresenter().holdsFrames();
+}
+
 RenderEncoder*
 SurfaceCompositor::getEncoder(CommandBuffer* command_buffer) {
     auto* encoder = command_buffer->getRenderCommandEncoder(render_pass_descriptor);
@@ -62,6 +69,12 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
     const auto filter = CONFIG_INSTANCE.getUpscalingFilter();
     ScopedPerfTimer encode_timer(PerfStats::instance().present_encode_ns,
                                  PerfStats::isEnabled());
+    // Frame generation searches motion at the size the game rendered at
+    if (target != drawable->texture() && dst_rect.size.x() > 0.0f &&
+        dst_rect.size.y() > 0.0f)
+        renderer.getFramePresenter().setInputScale(
+            std::abs(src_rect.size.x()) / dst_rect.size.x(),
+            std::abs(src_rect.size.y()) / dst_rect.size.y());
     if (PerfStats::isEnabled()) {
         auto& stats = PerfStats::instance();
         stats.present_input_width = static_cast<u32>(std::abs(src_rect.size.x()));
@@ -147,8 +160,12 @@ void SurfaceCompositor::present(ICommandBuffer* command_buffer,
         });
     }
 
-    getEncoder(command_buffer_impl);
-    command_buffer_impl->endEncoding();
+    // The canvas is cleared even when no layer drew, unless the presenter
+    // does not read it
+    if (!reusesPresentedFrame(new_frame)) {
+        getEncoder(command_buffer_impl);
+        command_buffer_impl->endEncoding();
+    }
     // 0: a game frame shown for the first time, 1: generated, 2: repeated
     int kind = new_frame ? 0 : 2;
     if (target != drawable->texture()) {

@@ -101,6 +101,7 @@ class Renderer : public IRenderer {
                       [[maybe_unused]] engines::CullFaceMode mode,
                       [[maybe_unused]] engines::Winding front_face) override {}
     void setDepthClamp([[maybe_unused]] bool enabled) override {}
+    void setPolygonLines([[maybe_unused]] bool enabled) override {}
 
     // Viewport and scissor
     void setViewport(u32 index, const MTL::Viewport& viewport) override;

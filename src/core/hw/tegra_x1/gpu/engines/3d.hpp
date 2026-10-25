@@ -756,6 +756,16 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     void drawVertexElementsImpl(u32 count,
                                std::optional<ztd::Range<uptr>> inline_range);
     void drawAuto(const u32 index, const u32 byte_count);
+    void drawZeroIndex(const u32 index, const u32 count);
+    // DRAW_ZERO_INDEX's indices
+    std::shared_ptr<renderer::BufferBase> zero_indices;
+    // SET_CT_SELECT's target count, at most the 8 targets
+    u32 getColorTargetCount() const {
+        return std::min<u32>(regs.color_target_control.count,
+                             COLOR_TARGET_COUNT);
+    }
+    // A render enable condition (SET_RENDER_ENABLE_A, or the global one)
+    bool evaluateRenderEnable(u32 base_reg) const;
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
     // Draws with their topology, first vertex or index and count in the
@@ -814,6 +824,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
 
     MTL::Viewport getViewport(u32 index);
     MTL::ScissorRect getScissor(u32 index);
+    // The scissor alone, without the surface clip
+    MTL::ScissorRect getScissorRect(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
     renderer::ShaderBase* getShader(ShaderStage stage,
                                     u32 fragment_input_mask = 0,
@@ -838,7 +850,7 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     std::map<std::tuple<u32, bool, std::array<u32, 6>>,
              std::unique_ptr<renderer::ShaderBase>>
         tessellation_factor_shaders;
-    std::map<std::tuple<u32, bool, bool, bool, u32, u32, u32, bool, bool>,
+    std::map<std::tuple<u32, bool, bool, bool, u32, u32, u32, bool, bool, u32>,
              std::unique_ptr<renderer::ShaderBase>>
         geometry_passthroughs;
     renderer::PipelineBase* getPipeline();

@@ -179,7 +179,7 @@ kernel void fg_interpolate(texture2d<float> prev [[texture(0)]],
     out.write(float4(color, 1.0), gid);
 }
 
-// Full size motion for MetalFX, in normalized coordinates
+// Input size motion for MetalFX, in normalized coordinates
 kernel void fg_motion(texture2d<float> backward [[texture(0)]],
                       texture2d<float, access::write> motion [[texture(1)]],
                       constant float& sign [[buffer(0)]],
@@ -286,6 +286,11 @@ FramePresenter::~FramePresenter() {
     device->release();
 }
 
+bool FramePresenter::holdsFrames() const {
+    return CONFIG_INSTANCE.getFrameGeneration() != FrameGeneration::Off &&
+           resources_valid && history != 0;
+}
+
 bool FramePresenter::isEnabled() {
     return CONFIG_INSTANCE.getFrameGeneration() != FrameGeneration::Off ||
            CONFIG_INSTANCE.getSharpening() != 0;
@@ -376,13 +381,17 @@ void FramePresenter::releaseResources() {
 }
 
 bool FramePresenter::resize(u32 width_, u32 height_,
-                            MTL::PixelFormat format_) {
-    if (width_ == width && height_ == height && format_ == format)
+                            MTL::PixelFormat format_, u32 input_width_,
+                            u32 input_height_) {
+    if (width_ == width && height_ == height && format_ == format &&
+        input_width_ == input_width && input_height_ == input_height)
         return resources_valid;
     releaseResources();
     width = width_;
     height = height_;
     format = format_;
+    input_width = input_width_;
+    input_height = input_height_;
 
     // MetalFX first, the frames it reads need its usages
     MTL::TextureUsage color_usage =
@@ -395,8 +404,8 @@ bool FramePresenter::resize(u32 width_, u32 height_,
     if (metalfx_supported) {
         NS_STACK_SCOPED auto descriptor =
             MTLFX::FrameInterpolatorDescriptor::alloc()->init();
-        descriptor->setInputWidth(width);
-        descriptor->setInputHeight(height);
+        descriptor->setInputWidth(input_width);
+        descriptor->setInputHeight(input_height);
         descriptor->setOutputWidth(width);
         descriptor->setOutputHeight(height);
         descriptor->setColorTextureFormat(format);
@@ -414,9 +423,9 @@ bool FramePresenter::resize(u32 width_, u32 height_,
         if (metalfx) {
             color_usage |= metalfx->colorTextureUsage();
             metalfx_motion = newTexture(
-                width, height, MTL::PixelFormatRG16Float,
+                input_width, input_height, MTL::PixelFormatRG16Float,
                 metalfx->motionTextureUsage() | MTL::TextureUsageShaderWrite);
-            metalfx_depth = newTexture(width, height,
+            metalfx_depth = newTexture(input_width, input_height,
                                        MTL::PixelFormatDepth32Float,
                                        metalfx->depthTextureUsage() |
                                            MTL::TextureUsageRenderTarget);
@@ -431,8 +440,8 @@ bool FramePresenter::resize(u32 width_, u32 height_,
         }
     }
 
-    const u32 luma_width = std::max(width / 2, 1u);
-    const u32 luma_height = std::max(height / 2, 1u);
+    const u32 luma_width = input_width;
+    const u32 luma_height = input_height;
     const u32 luma_mips = mipCount(luma_width, luma_height);
     for (auto& slot : slots) {
         slot.color = newTexture(width, height, format, color_usage);
@@ -472,9 +481,9 @@ bool FramePresenter::resize(u32 width_, u32 height_,
                                MTL::TextureUsageShaderWrite);
 
     LOG_INFO(MetalRenderer,
-             "Frame presenter {}x{}: {} motion levels, MetalFX frame "
-             "interpolation {}",
-             width, height, flow_level_count,
+             "Frame presenter {}x{} from {}x{}: {} motion levels, MetalFX "
+             "frame interpolation {}",
+             width, height, input_width, input_height, flow_level_count,
              metalfx ? "available" : "unavailable");
     resources_valid = slots[0].color != nullptr && generated != nullptr &&
                       flow_level_count != 0;
@@ -486,7 +495,21 @@ MTL::Texture* FramePresenter::getCanvas(u32 canvas_width, u32 canvas_height,
     if (!pipelines_valid || canvas_width < MIN_SIZE ||
         canvas_height < MIN_SIZE)
         return nullptr;
-    if (!resize(canvas_width, canvas_height, canvas_format))
+    // Refreshes that draw no layer keep the input size
+    if (next_input_scale_x > 0.0f && next_input_scale_y > 0.0f) {
+        input_scale_x = std::min(next_input_scale_x, 1.0f);
+        input_scale_y = std::min(next_input_scale_y, 1.0f);
+    }
+    next_input_scale_x = 0.0f;
+    next_input_scale_y = 0.0f;
+    const auto scaled = [](u32 size, f32 scale) {
+        const auto value = static_cast<u32>(
+            std::lround(static_cast<f32>(size) * scale));
+        return value < MIN_SIZE ? size : value;
+    };
+    if (!resize(canvas_width, canvas_height, canvas_format,
+                scaled(canvas_width, input_scale_x),
+                scaled(canvas_height, input_scale_y)))
         return nullptr;
     return slots[canvas_slot].color;
 }
@@ -645,7 +668,7 @@ void FramePresenter::encodeFlow(CommandBuffer* command_buffer,
         encoder->setTexture(flows[1].filtered, 0);
         encoder->setTexture(metalfx_motion, 1);
         encoder->setBytes(&sign, sizeof(sign), 0);
-        dispatch2D(encoder, width, height);
+        dispatch2D(encoder, input_width, input_height);
     }
 }
 
@@ -683,8 +706,10 @@ bool FramePresenter::encodeMetalFx(CommandBuffer* command_buffer) {
     metalfx->setPrevColorTexture(slots[previous_slot].color);
     metalfx->setDepthTexture(metalfx_depth);
     metalfx->setMotionTexture(metalfx_motion);
-    metalfx->setMotionVectorScaleX(static_cast<f32>(width));
-    metalfx->setMotionVectorScaleY(static_cast<f32>(height));
+    // Motion is in pixels of the motion texture (the input size), verified
+    // with a half size input on M1
+    metalfx->setMotionVectorScaleX(static_cast<f32>(input_width));
+    metalfx->setMotionVectorScaleY(static_cast<f32>(input_height));
     metalfx->setDeltaTime(frame_delta_time);
     metalfx->setNearPlane(0.1f);
     metalfx->setFarPlane(1000.0f);

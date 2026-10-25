@@ -297,7 +297,7 @@ DEFINE_METHOD_TABLE(ThreeD, INLINE_ENGINE_TABLE, 0x87, 1,
                     loadMmeInstructionRam, u32, 0x47, 1,
                     loadMmeStartAddressRamPointer, u32, 0x48, 1,
                     loadMmeStartAddressRam, u32, 0x35e, 1, drawVertexArray, u32,
-                    0x48f, 1, drawAuto, u32,
+                    0x48f, 1, drawAuto, u32, 0xc1, 1, drawZeroIndex, u32,
                     0x54c, 1, resetCounter, u32, 0x586, 1, beginDraw, u32,
                     0x585, 1, endDraw, u32, 0x57a, 1, inlineIndex32, u32,
                     0x57c, 1, inlineIndex16, u32, 0x4c1, 1, inlineIndex8, u32,
@@ -358,9 +358,11 @@ void ThreeD::incrementSyncPoint(u32 index, u32 arg) {
 ThreeD::ThreeD(Gpu& gpu_) : gpu{gpu_}, macro_driver{createMacroDriver(*this)} {
     // Initialize default state
 
-    // Rasterization and rendering are on at power on
+    // Rasterization and rendering are on at power on (the local and the
+    // global render enable)
     regs_raw[0xdf] = 1;
     regs_raw[0x556] = 1;
+    regs_raw[0x138 / 4] = 1;
 
     const auto reset_blend = [](auto& blend) {
         blend.rgb_op = blend.alpha_op = 1;
@@ -392,6 +394,21 @@ ThreeD::ThreeD(Gpu& gpu_) : gpu{gpu_}, macro_driver{createMacroDriver(*this)} {
     // TODO: correct?
     for (auto& color_write_mask : regs.color_write_masks)
         color_write_mask = ColorWriteMask::All;
+
+    // Stencil: keep, always pass, all bits (as Eden); offsets from clb197.h
+    for (const u32 op : {0x1384u, 0x1388u, 0x138cu, 0x1598u, 0x159cu, 0x15a0u})
+        regs_raw[op / 4] = 0x1e00; // OGL_KEEP
+    for (const u32 func : {0x1390u, 0x15a4u})
+        regs_raw[func / 4] = 0x207; // OGL_ALWAYS
+    for (const u32 mask : {0x1398u, 0x139cu, 0xf58u, 0xf5cu})
+        regs_raw[mask / 4] = 0xff;
+    // Both faces fill
+    regs_raw[0xdac / 4] = 0x1b02;
+    regs_raw[0xdb0 / 4] = 0x1b02;
+    // Point size and line widths of 1
+    regs_raw[0x1518 / 4] = std::bit_cast<u32>(1.0f);
+    regs_raw[0x13b0 / 4] = std::bit_cast<u32>(1.0f);
+    regs_raw[0x13b4 / 4] = std::bit_cast<u32>(1.0f);
 
     // HACK
     regs.shader_programs[static_cast<u32>(ShaderStage::VertexB)].config.enable =
@@ -431,8 +448,7 @@ void ThreeD::loadMmeStartAddressRam(const u32 index, const u32 data) {
 static bool viewportTransformEnabled() { return true; }
 
 bool ThreeD::shouldExecute() const {
-    // SET_RENDER_ENABLE_C (mode) and the render enable override
-    constexpr u32 REG_RENDER_ENABLE_MODE = 0x556;
+    // SET_RENDER_ENABLE_OVERRIDE (0x1944) overrides the conditions
     constexpr u32 REG_RENDER_ENABLE_OVERRIDE = 0x651;
     switch (regs_raw[REG_RENDER_ENABLE_OVERRIDE] & 0x3) {
     case 1:
@@ -442,7 +458,13 @@ bool ThreeD::shouldExecute() const {
     default:
         break;
     }
-    const auto mode = regs_raw[REG_RENDER_ENABLE_MODE] & 0x7;
+    // SET_RENDER_ENABLE_A-C (0x1550) and SET_GLOBAL_RENDER_ENABLE_A-C
+    // (0x130): both have to allow rendering
+    return evaluateRenderEnable(0x1550 / 4) && evaluateRenderEnable(0x130 / 4);
+}
+
+bool ThreeD::evaluateRenderEnable(u32 base_reg) const {
+    const auto mode = regs_raw[base_reg + 2] & 0x7;
     if (mode == 0)
         return false;
     if (mode == 1)
@@ -454,8 +476,8 @@ bool ThreeD::shouldExecute() const {
 
     // The comparison data comes from reports, which reach guest memory when
     // the GPU finished them
-    const u64 address = (static_cast<u64>(regs_raw[0x554] & 0xff) << 32) |
-                        regs_raw[0x555];
+    const u64 address = (static_cast<u64>(regs_raw[base_reg] & 0xff) << 32) |
+                        regs_raw[base_reg + 1];
     std::array<u32, 6> compare{};
     auto* data = reinterpret_cast<u8*>(compare.data());
     usize offset = 0;
@@ -502,8 +524,9 @@ void ThreeD::drawVertexArrayCompact(const u32 index, const u32 arg) {
     const auto start = regs.vertex_array_start;
     const auto primitive_type = regs.begin.primitive_type;
     regs.vertex_array_start = extractBits(arg, 0, 16);
+    // TOPOLOGY is bits 31:28 (clb197.h 0x1214), up to PATCH (0xe)
     regs.begin.primitive_type =
-        static_cast<PrimitiveType>(extractBits(arg, 28, 3));
+        static_cast<PrimitiveType>(extractBits(arg, 28, 4));
     drawVertexArray(0, extractBits(arg, 16, 12));
     regs.vertex_array_start = start;
     regs.begin.primitive_type = primitive_type;
@@ -544,6 +567,50 @@ void ThreeD::drawAuto(const u32, const u32 byte_count) {
     regs.vertex_array_start = 0;
     drawVertexArray(0, byte_count / stride);
     regs.vertex_array_start = start;
+}
+
+void ThreeD::drawZeroIndex(const u32, const u32 count) {
+    // DRAW_ZERO_INDEX (clb197.h 0x304): count vertices, all of them index 0
+    if (count == 0)
+        return;
+    const u64 size = static_cast<u64>(count) * sizeof(u32);
+    if (!zero_indices || zero_indices->getSize() < size) {
+        zero_indices = std::shared_ptr<renderer::BufferBase>(
+            gpu.getRenderer().allocateTemporaryBuffer(size));
+        std::memset(reinterpret_cast<void*>(zero_indices->getPtr()), 0, size);
+    }
+    // The vertices are all the same: lists stand in for the topologies Metal
+    // does not draw (every primitive is degenerate either way)
+    auto primitive_type = regs.begin.primitive_type;
+    switch (primitive_type) {
+    case PrimitiveType::Quads:
+    case PrimitiveType::QuadStrip:
+    case PrimitiveType::Polygon:
+    case PrimitiveType::TriangleFan:
+        primitive_type = PrimitiveType::Triangles;
+        break;
+    case PrimitiveType::LineLoop:
+        primitive_type = PrimitiveType::LineStrip;
+        break;
+    default:
+        break;
+    }
+    command_ir::DrawCommand command;
+    {
+        std::scoped_lock buffer_cache_lock(
+            gpu.getRenderer().getBufferCache().getMutex());
+        resource::MappingCaptureScope mappings(tls_crnt_gmmu,
+                                               command.mapping_dependencies);
+        if (!prepareDraw(command))
+            return;
+    }
+    command.primitive = primitive_type;
+    command.count = count;
+    command.base_instance = instance_index;
+    command.indices = renderer::BufferView(zero_indices, 0, size);
+    command.index_type = IndexType::UInt32;
+    command.base_vertex = regs.vertex_array_start;
+    executeDrawCommand(command);
 }
 
 void ThreeD::beginDraw(const u32 index, const u32 arg) {
@@ -819,7 +886,8 @@ void ThreeD::drawVertexElementsImpl(
              .count = count,
              .mem_range = range,
              .restart_enabled = (regs.primitive_restart_enabled & 1) != 0,
-             .restart_index = regs.primitive_restart_index},
+             .restart_index = regs.primitive_restart_index,
+             .expand_restart = useGeometryShader() || useTessellation()},
             index_type, primitive_type, count);
     }
     if (count == 0)
@@ -1419,14 +1487,19 @@ renderer::ITextureView* ThreeD::getDepthStencilTargetTexture() const {
     if (format == renderer::TextureFormat::Invalid)
         return nullptr;
 
-    const auto type = regs.depth_target_array_mode.layers > 1
-                          ? MTL::TextureType2DArray
-                          : MTL::TextureType2D;
+    // SET_ZT_SIZE_C: THIRD_DIMENSION is the array size unless CONTROL says
+    // ARRAY_SIZE_IS_ONE (clb197.h 0x1230)
+    constexpr u32 REG_ZT_SIZE_C = 0x1230 / 4;
+    const u32 depth_layers = ((regs_raw[REG_ZT_SIZE_C] >> 16) & 0x1) != 0
+                                 ? 1u
+                                 : std::max<u32>(regs.depth_target_array_mode.layers, 1);
+    const auto type =
+        depth_layers > 1 ? MTL::TextureType2DArray : MTL::TextureType2D;
 
     const renderer::TextureDescriptor descriptor(
         tls_crnt_gmmu->unmapAddr(gpu_addr), type, format, false, 0,
         regs.depth_target_width, regs.depth_target_height, 1, 1,
-        regs.depth_target_array_mode.layers,
+        depth_layers,
         regs.depth_target_tile_mode.width_gobs_log2,
         regs.depth_target_tile_mode.height_gobs_log2,
         regs.depth_target_tile_mode.depth_gobs_log2,
@@ -1460,7 +1533,7 @@ renderer::RenderPassBase* ThreeD::getRenderPass() const {
     renderer::RenderPassDescriptor descriptor{};
 
     // Color targets
-    for (u32 i = 0; i < regs.color_target_control.count; i++) {
+    for (u32 i = 0; i < getColorTargetCount(); i++) {
         descriptor.color_targets[i] = {
             .texture =
                 getColorTargetTexture(regs.color_target_control.getMap(i)),
@@ -1595,11 +1668,41 @@ MTL::ScissorRect ThreeD::getClearRect() const {
                   static_cast<u16>(viewport.vertical.y) +
                       static_cast<u16>(viewport.vertical.height));
     }
+    // The surface clip (when set)
+    if (regs.screen_scissor.horizontal.width != 0 &&
+        regs.screen_scissor.vertical.height != 0)
+        intersect(regs.screen_scissor.horizontal.x, regs.screen_scissor.vertical.y,
+                  u32(regs.screen_scissor.horizontal.x) +
+                      regs.screen_scissor.horizontal.width,
+                  u32(regs.screen_scissor.vertical.y) +
+                      regs.screen_scissor.vertical.height);
     return MTL::ScissorRect(min_x, min_y, max_x > min_x ? max_x - min_x : 0,
                             max_y > min_y ? max_y - min_y : 0);
 }
 
 MTL::ScissorRect ThreeD::getScissor(u32 index) {
+    // SET_SURFACE_CLIP (clb197.h 0xff4) clips rendering too: memory rows,
+    // flipped like the scissor with a lower left origin
+    const auto clip = [&](MTL::ScissorRect rect) {
+        const u32 width = regs.screen_scissor.horizontal.width;
+        const u32 height = regs.screen_scissor.vertical.height;
+        if (width == 0 || height == 0)
+            return rect;
+        const u32 x0 = regs.screen_scissor.horizontal.x;
+        u32 y0 = regs.screen_scissor.vertical.y;
+        if (any(regs.window_origin_flags & engines::WindowOriginFlags::LowerLeft))
+            y0 = 0;
+        const u64 min_x = std::max<u64>(rect.x, x0);
+        const u64 min_y = std::max<u64>(rect.y, y0);
+        const u64 max_x = std::min<u64>(u64(rect.x) + rect.width, u64(x0) + width);
+        const u64 max_y = std::min<u64>(u64(rect.y) + rect.height, u64(y0) + height);
+        return MTL::ScissorRect(min_x, min_y, max_x > min_x ? max_x - min_x : 0,
+                                max_y > min_y ? max_y - min_y : 0);
+    };
+    return clip(getScissorRect(index));
+}
+
+MTL::ScissorRect ThreeD::getScissorRect(u32 index) {
     const auto& scissor = regs.scissors[index];
     if (scissor.enabled != 0u) {
         u32 min_y = scissor.vertical.min;
@@ -1758,6 +1861,8 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
         }
     }
     if (stage == ShaderStage::Fragment) {
+        // SET_API_MANDATED_EARLY_Z (clb197.h 0x210)
+        descriptor.state.early_fragment_tests = (regs_raw[0x210 / 4] & 0x1u) != 0;
         descriptor.state.point_coord_origin_bottom =
             ((regs_raw[REG_POINT_SPRITE_SELECT] >> 2) & 0x1u) == 0;
         // SET_ALPHA_TEST, SET_ALPHA_REF, SET_ALPHA_FUNC
@@ -1836,7 +1941,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     }
 
     // Color target formats
-    for (u32 i = 0; i < regs.color_target_control.count; i++) {
+    for (u32 i = 0; i < getColorTargetCount(); i++) {
         const auto& render_target =
             regs.color_targets[regs.color_target_control.getMap(i)];
         const auto addr = static_cast<u64>(render_target.addr);
@@ -1851,7 +1956,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
 
     // Dual-source blending: only render target 0 is bound, the shader exports
     // the second blend input as output 1 (like Eden)
-    if (stage == ShaderStage::Fragment && regs.color_target_control.count != 0 &&
+    if (stage == ShaderStage::Fragment && getColorTargetCount() != 0 &&
         regs.color_blend_enabled[0] != 0u) {
         const auto is_src1 = [](u32 factor) {
             const auto mapped = getBlendFactor(factor);
@@ -2065,12 +2170,14 @@ ThreeD::getGeometryPassthrough(const renderer::ShaderBase& geometry_shader,
     }
     state.y_negate = any(regs.window_origin_flags & WindowOriginFlags::LowerLeft);
     state.depth_zero_to_one = regs.viewport_z_clip == ViewportZClip::ZeroToOne;
+    constexpr u32 REG_USER_CLIP_ENABLE = 0x544;
+    state.clip_distance_mask = regs_raw[REG_USER_CLIP_ENABLE] & 0xffu;
 
     const auto key = std::make_tuple(
         state.output_mask, state.layer, state.point_list,
         state.program_point_size, std::bit_cast<u32>(state.point_size),
         state.window_space_width, state.window_space_height, state.y_negate,
-        state.depth_zero_to_one);
+        state.depth_zero_to_one, state.clip_distance_mask);
     auto& shader = geometry_passthroughs[key];
     if (!shader) {
         renderer::ShaderDescriptor descriptor{};
@@ -2285,7 +2392,7 @@ renderer::PipelineBase* ThreeD::getPipeline() {
         auto& color_target = descriptor.color_target_states[i];
         // Must match the render pass attachments (see getRenderPass)
         color_target.format = renderer::TextureFormat::Invalid;
-        if (i < regs.color_target_control.count) {
+        if (i < getColorTargetCount()) {
             const auto& render_target =
                 regs.color_targets[regs.color_target_control.getMap(i)];
             if (static_cast<u64>(render_target.addr) != 0x0)
@@ -3043,8 +3150,8 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
 
     // Render targets
     str += fmt::format("    RT count={}",
-                       static_cast<u32>(regs.color_target_control.count));
-    for (u32 i = 0; i < regs.color_target_control.count; i++) {
+                       static_cast<u32>(getColorTargetCount()));
+    for (u32 i = 0; i < getColorTargetCount(); i++) {
         const auto& rt = regs.color_targets[regs.color_target_control.getMap(i)];
         str += fmt::format(" | [{}->{}] addr={:#x} fmt={} {}x{} mask={:#x} "
                            "3d={} layers={} base_layer={} instance={}",
@@ -3130,7 +3237,7 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                        regs.independent_blend_enabled != 0u,
                        regs.blend_constant.x(), regs.blend_constant.y(),
                        regs.blend_constant.z(), regs.blend_constant.w());
-    for (u32 i = 0; i < regs.color_target_control.count; i++) {
+    for (u32 i = 0; i < getColorTargetCount(); i++) {
         if (regs.color_blend_enabled[i] == 0u) {
             str += fmt::format(" | [{}] off", i);
             continue;
@@ -3305,7 +3412,7 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                                        : env_dump_gbuffer_every;
     static std::atomic<u32> gbuffer_draws{0};
     const bool dump_gbuffer =
-        dump_gbuffer_every != 0 && regs.color_target_control.count >= 4 &&
+        dump_gbuffer_every != 0 && getColorTargetCount() >= 4 &&
         gbuffer_draws.fetch_add(1) % dump_gbuffer_every == 0;
     // HYDRA_TRACE_DUMP_POST=<N>: dump the target of every Nth draw that writes
     // exactly one full-size color target (post processing and the final pass)
@@ -3318,11 +3425,11 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                                     : env_dump_post_every;
     static std::atomic<u32> post_draws{0};
     const bool dump_post =
-        dump_post_every != 0 && regs.color_target_control.count == 1 &&
+        dump_post_every != 0 && getColorTargetCount() == 1 &&
         post_draws.fetch_add(1) % dump_post_every == 0;
     if (dump_gbuffer || dump_post ||
         (dump_rt_every != 0 && draw_index_for_dump % dump_rt_every == 0)) {
-        for (u32 i = 0; i < regs.color_target_control.count; i++) {
+        for (u32 i = 0; i < getColorTargetCount(); i++) {
             const auto rt_index = regs.color_target_control.getMap(i);
             const auto& rt = regs.color_targets[rt_index];
             if (static_cast<u64>(rt.addr) == 0x0 || rt.height < 400)
@@ -3555,7 +3662,7 @@ void ThreeD::selectVisualResources() {
     auto& visual = VisualDiagnostics::instance();
     if (!visual.active() || !visual.options().resource)
         return;
-    for (u32 i = 0; i < std::min<u32>(static_cast<u32>(regs.color_target_control.count), COLOR_TARGET_COUNT); ++i)
+    for (u32 i = 0; i < std::min<u32>(static_cast<u32>(getColorTargetCount()), COLOR_TARGET_COUNT); ++i)
         visual.selectResource(static_cast<u64>(regs.color_targets[regs.color_target_control.getMap(i)].addr));
     if (regs.depth_target_enabled)
         visual.selectResource(static_cast<u64>(regs.depth_target_addr));
@@ -3632,7 +3739,7 @@ void ThreeD::captureVisualDraw(bool after) {
             {"scissor", fmt::format("{},{} {}x{}", scissor.x, scissor.y,
                 scissor.width, scissor.height)}});
     }
-    for (u32 i = 0; i < std::min<u32>(static_cast<u32>(regs.color_target_control.count), COLOR_TARGET_COUNT); ++i) {
+    for (u32 i = 0; i < std::min<u32>(static_cast<u32>(getColorTargetCount()), COLOR_TARGET_COUNT); ++i) {
         const auto index = regs.color_target_control.getMap(i);
         const auto& rt = regs.color_targets[index];
         if (!after)
@@ -3857,6 +3964,23 @@ renderer::DrawState ThreeD::prepareDrawState() {
         extractBits(regs_raw[REG_VIEWPORT_CLIP_CONTROL], 11, 3);
     state.depth_clamp = geometry_clip != 1 && geometry_clip != 3 &&
                         geometry_clip != 5;
+
+    // SET_FRONT_POLYGON_MODE / SET_BACK_POLYGON_MODE (0xdac, 0xdb0): Metal
+    // has one fill mode for both faces and no point mode
+    constexpr u32 REG_FRONT_POLYGON_MODE = 0xdac / 4;
+    constexpr u32 REG_BACK_POLYGON_MODE = 0xdb0 / 4;
+    constexpr u32 POLYGON_MODE_POINT = 0x1b00;
+    constexpr u32 POLYGON_MODE_LINE = 0x1b01;
+    const u32 front_mode = regs_raw[REG_FRONT_POLYGON_MODE];
+    const u32 back_mode = regs_raw[REG_BACK_POLYGON_MODE];
+    state.polygon_lines = front_mode == POLYGON_MODE_LINE;
+    if (front_mode == POLYGON_MODE_POINT || back_mode == POLYGON_MODE_POINT)
+        ONCE(LOG_NOT_IMPLEMENTED(Engines, "Polygon mode POINT"));
+    if (front_mode != back_mode && front_mode != 0 && back_mode != 0 &&
+        !(state.cull_enabled && state.cull_mode == CullFaceMode::Back))
+        ONCE(LOG_WARN(Engines, "Polygon modes differ per face ({:#x}, {:#x}), "
+                               "the front face's is used",
+                      front_mode, back_mode));
 
     for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
         state.viewports[i] = getViewport(i);

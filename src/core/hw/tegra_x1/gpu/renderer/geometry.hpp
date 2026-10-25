@@ -17,9 +17,10 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::geometry {
 
 // Output attribute words of a vertex: from 0x60 (layer, viewport index,
-// point size) through the position to the end of the generic attributes
+// point size) through the position, the generic attributes and the fixed
+// function colors and texture coordinates to the end of the clip distances
 constexpr u32 RECORD_BASE = 0x60;
-constexpr u32 RECORD_END = 0x280;
+constexpr u32 RECORD_END = 0x2e0;
 constexpr u32 RECORD_WORDS = (RECORD_END - RECORD_BASE) / 4;
 constexpr u32 RECORD_SIZE = RECORD_WORDS * 4;
 
