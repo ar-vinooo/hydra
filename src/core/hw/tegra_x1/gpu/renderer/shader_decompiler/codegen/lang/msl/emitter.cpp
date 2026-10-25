@@ -44,6 +44,10 @@ MTL::TextureType toRendererTextureType(TextureType type) {
         return MTL::TextureTypeCubeArray;
     case TextureType::Buffer:
         return MTL::TextureTypeTextureBuffer;
+    case TextureType::_2DMS:
+        return MTL::TextureType2DMultisample;
+    case TextureType::_2DMSArray:
+        return MTL::TextureType2DMultisampleArray;
     default:
         return MTL::TextureType2D;
     }
@@ -71,6 +75,10 @@ std::string textureTypeToStr(TextureType type, bool is_depth) {
         return prefix + "cube_array";
     case TextureType::Buffer:
         return prefix + "_buffer";
+    case TextureType::_2DMS:
+        return prefix + "2d_ms";
+    case TextureType::_2DMSArray:
+        return prefix + "2d_ms_array";
     }
 }
 
@@ -971,6 +979,8 @@ void MslEmitter::emitDeclarations() {
         }
         if (context.fragment_depth_register != invalid<u32>())
             write("float depth [[depth(any)]];");
+        if (context.fragment_sample_mask_register != invalid<u32>())
+            write("uint sample_mask [[sample_mask]];");
         break;
     default:
         break;
@@ -997,6 +1007,12 @@ void MslEmitter::emitStateBindings() {
     } else if (memory_analyzer.usesLaneId()) {
         // Vertex functions have no SIMD-group lane, they read lane 0
         writeStatement("uint lane");
+    }
+    if (context.type == ShaderType::Fragment) {
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            writeStatement("uint coverage_mask");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            writeStatement("uint sample_index");
     }
 
     // Storage buffers
@@ -1092,6 +1108,11 @@ void MslEmitter::emitMainPrototype() {
         const auto& inputs = memory_analyzer.getInputSVs();
         if (memory_analyzer.usesLaneId())
             ADD_ARG("uint __lane [[thread_index_in_simdgroup]]");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            ADD_ARG("uint __coverage_mask [[sample_mask]]");
+        // Reading the sample index makes the shader run once per sample
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            ADD_ARG("uint __sample_index [[sample_id]]");
         if (inputs.contains(SvSemantic::FrontFacing))
             ADD_ARG("bool __front_facing [[front_facing]]");
         if (inputs.contains(SvSemantic::PointCoord))
@@ -1185,8 +1206,13 @@ void MslEmitter::emitMainPrototype() {
         writeStatement("state.lane = {}", context.type == ShaderType::Fragment
                                               ? "__lane"
                                               : "0u");
-    if (context.type == ShaderType::Fragment)
+    if (context.type == ShaderType::Fragment) {
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            writeStatement("state.coverage_mask = __coverage_mask");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            writeStatement("state.sample_index = __sample_index");
         emitFragmentSystemValueInputs();
+    }
 }
 
 void MslEmitter::emitFragmentSystemValueInputs() {
@@ -1330,6 +1356,13 @@ void MslEmitter::emitExitReturn() {
         writeStatement("__out.depth = {}",
                        getRegisterStr(static_cast<u8>(context.fragment_depth_register),
                                       ir::ScalarType::F32));
+    }
+    // The covered samples are those of the rasterizer and the shader's mask
+    if (context.type == ShaderType::Fragment &&
+        context.fragment_sample_mask_register != invalid<u32>()) {
+        writeStatement("__out.sample_mask = {}",
+                       getRegisterStr(static_cast<u8>(context.fragment_sample_mask_register),
+                                      ir::ScalarType::U32));
     }
 
     // DEBUG: highlight
@@ -1703,6 +1736,8 @@ void MslEmitter::emitTextureSample(
         switch (type) {
         case TextureType::_2D:
         case TextureType::_2DArray:
+        case TextureType::_2DMS:
+        case TextureType::_2DMSArray:
             coord_count = 2;
             break;
         case TextureType::_3D:
@@ -2006,6 +2041,12 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
         break;
     case 0x38: // Equal lane mask
         value = "(1u << state.lane)";
+        break;
+    case SR_PIXEL_COVERAGE_MASK:
+        value = context.type == ShaderType::Fragment ? "state.coverage_mask" : "0u";
+        break;
+    case SR_PIXEL_SAMPLE_INDEX:
+        value = context.type == ShaderType::Fragment ? "state.sample_index" : "0u";
         break;
     case 0x39: // Less
         value = "((1u << state.lane) - 1u)";

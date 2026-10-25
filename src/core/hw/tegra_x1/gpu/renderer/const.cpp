@@ -911,6 +911,87 @@ u32 TextureDescriptor::getGroupHash() const {
     return key;
 }
 
+MsaaLayout getMsaaLayout(u32 mode) {
+    switch (mode) {
+    case 0x1: // 2X1
+        return {2, 1, 0};
+    case 0x5: // 2X1_D3D
+        return {2, 1, 0, false, true};
+    case 0x2: // 2X2
+        return {4, 1, 1};
+    case 0x8: // 2X2_VC_4
+    case 0x9: // 2X2_VC_12
+        return {4, 1, 1, true};
+    case 0x3: // 4X2
+        return {8, 2, 1};
+    case 0x4: // 4X2_D3D
+        return {8, 2, 1, false, true};
+    case 0xa: // 4X2_VC_8
+    case 0xb: // 4X2_VC_24
+        return {8, 2, 1, true};
+    case 0x6: // 4X4
+        return {16, 2, 2};
+    default: // 1X1
+        return {};
+    }
+}
+
+MsaaLayout getMsaaLayoutForSamples(u32 samples) {
+    switch (samples) {
+    case 2:
+        return {2, 1, 0};
+    case 4:
+        return {4, 1, 1};
+    case 8:
+        return {8, 2, 1};
+    case 16:
+        return {16, 2, 2};
+    default:
+        return {};
+    }
+}
+
+std::pair<u32, u32> getMsaaSampleTexel(u32 samples, u32 index) {
+    switch (samples) {
+    case 2: // (0,0), (1,0)
+        return {index & 1, 0};
+    case 4: // (0,0), (1,0), (0,1), (1,1)
+        return {index & 1, (index >> 1) & 1};
+    case 8: // 2x2 blocks of 4: (0,0), (1,0), (0,1), (1,1), (2,0), (3,0), ...
+        return {(index & 1) | ((index >> 2 & 1) << 1), (index >> 1) & 1};
+    case 16: // Four 2x2 blocks of the 8 sample pattern
+        return {(index & 1) | ((index >> 2 & 1) << 1),
+                ((index >> 1) & 1) | ((index >> 3 & 1) << 1)};
+    default:
+        return {0, 0};
+    }
+}
+
+std::pair<u32, u32> getMsaaSamplePosition(const MsaaLayout& layout, u32 index) {
+    // nouveau nvc0_get_sample_locations, in 1/16 pixel
+    static constexpr u8 MS2[2][2] = {{0x4, 0x4}, {0xc, 0xc}};
+    static constexpr u8 MS4[4][2] = {{0x6, 0x2}, {0xe, 0x6}, {0x2, 0xa}, {0xa, 0xe}};
+    static constexpr u8 MS8[8][2] = {{0x1, 0x7}, {0x5, 0x3}, {0x3, 0xd}, {0x7, 0xb},
+                                     {0x9, 0x5}, {0xf, 0x1}, {0xb, 0xf}, {0xd, 0x9}};
+    // The Direct3D standard patterns (offsets from the center, +8)
+    static constexpr u8 D3D2[2][2] = {{0xc, 0xc}, {0x4, 0x4}};
+    static constexpr u8 D3D8[8][2] = {{0x9, 0x5}, {0x7, 0xb}, {0xd, 0x9}, {0x5, 0x3},
+                                      {0x3, 0xd}, {0x1, 0x7}, {0xb, 0xf}, {0xf, 0x1}};
+    const auto pick = [&](const u8 (*table)[2]) {
+        return std::pair<u32, u32>{table[index][0], table[index][1]};
+    };
+    switch (layout.samples) {
+    case 2:
+        return pick(layout.d3d_positions ? D3D2 : MS2);
+    case 4:
+        return pick(MS4);
+    case 8:
+        return pick(layout.d3d_positions ? D3D8 : MS8);
+    default:
+        return {8, 8};
+    }
+}
+
 u32 TextureDescriptor::getStorageHash() const {
     ztd::hash::XxHash32 hash;
     hash.add(ptr);
@@ -928,6 +1009,7 @@ u32 TextureDescriptor::getStorageHash() const {
     hash.add(level_count);
     hash.add(layer_count);
     hash.add(layer_size);
+    hash.add(sample_count);
 
     return hash.toHashCode();
 }

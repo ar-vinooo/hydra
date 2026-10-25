@@ -9,7 +9,7 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-Pipeline::Pipeline(MTL::Device* /*device*/,
+Pipeline::Pipeline(MTL::Device* device,
                    const PipelineDescriptor& descriptor,
                    BinaryArchiveCache& binary_archive_cache)
     : PipelineBase(descriptor) {
@@ -50,6 +50,12 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     // Depth-only passes can intentionally disable the fragment stage.
     if (fragment_shader != nullptr)
         pipeline_descriptor->setFragmentFunction(fragment_shader->getFunction());
+    // With one sample, alpha-to-coverage keeps or drops the whole pixel
+    pipeline_descriptor->setAlphaToCoverageEnabled(descriptor.alpha_to_coverage);
+    pipeline_descriptor->setAlphaToOneEnabled(descriptor.alpha_to_one);
+    // As many samples as the render targets have on the host
+    pipeline_descriptor->setRasterSampleCount(
+        getHostSampleCount(device, descriptor.sample_count));
 
     // Vertex state
 

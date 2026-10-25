@@ -55,6 +55,7 @@ ClearDepthPipelineCache::createHot0(
     // Pipeline
     setDepthStencilPixelFormat(pipeline_descriptor,
                                descriptor.depth_stencil_pixel_format);
+    pipeline_descriptor->setRasterSampleCount(descriptor.sample_count);
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
         auto attachment = pipeline_descriptor->colorAttachments()->object(i);
         attachment->setPixelFormat(descriptor.color_pixel_formats[i]);
@@ -78,6 +79,7 @@ u32 ClearDepthPipelineCache::hashHot1(
     hash.add(descriptor.depth_stencil_pixel_format);
     for (const auto pixel_format : descriptor.color_pixel_formats)
         hash.add(pixel_format);
+    hash.add(descriptor.sample_count);
     return hash.toHashCode();
 }
 
@@ -87,7 +89,8 @@ bool ClearDepthPipelineCache::equals(const ClearDepthPipelineDescriptor& a,
     return a.depth_stencil_pixel_format == b.depth_stencil_pixel_format &&
            std::equal(std::begin(a.color_pixel_formats),
                       std::end(a.color_pixel_formats),
-                      std::begin(b.color_pixel_formats));
+                      std::begin(b.color_pixel_formats)) &&
+           a.sample_count == b.sample_count;
 }
 
 void ClearDepthPipelineCache::destroyElement(

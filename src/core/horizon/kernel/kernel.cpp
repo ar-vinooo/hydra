@@ -46,7 +46,8 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         break;
     case 0x2:
         state.r[0] = setMemoryPermission(
-            state.r[0], state.r[1], static_cast<MemoryPermission>(state.r[2]));
+            crnt_process, state.r[0], state.r[1],
+            static_cast<MemoryPermission>(state.r[2]));
         break;
     case 0x3:
         state.r[0] =
@@ -165,6 +166,7 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[0] = createTransferMemory(
             state.r[1], state.r[2], static_cast<MemoryPermission>(state.r[3]),
             tmem);
+        tmem->chargeTo(crnt_process->getResourceLimit());
         state.r[1] = crnt_process->addHandleNoRetain(tmem).getRaw();
         break;
     }
@@ -286,6 +288,30 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                             crnt_process->getHandle<hipc::ClientSession>(
                                 static_cast<u32>(state.r[0])));
         break;
+    case 0x22: { // SendSyncRequestWithUserBuffer
+        const vaddr_t buffer = state.r[0];
+        const u64 buffer_size = state.r[1];
+        state.r[0] = checkUserBuffer(buffer, buffer_size);
+        if (state.r[0] == RESULT_SUCCESS)
+            state.r[0] =
+                sendSyncRequest(crnt_process, crnt_thread,
+                                crnt_process->getHandle<hipc::ClientSession>(
+                                    static_cast<u32>(state.r[2])),
+                                buffer, buffer_size);
+        break;
+    }
+    case 0x23: { // SendAsyncRequestWithUserBuffer
+        Event* event = nullptr;
+        state.r[0] = sendAsyncRequestWithUserBuffer(
+            crnt_process,
+            crnt_process->getHandle<hipc::ClientSession>(
+                static_cast<u32>(state.r[3])),
+            state.r[1], state.r[2], event);
+        state.r[1] = event != nullptr
+                         ? crnt_process->addHandleNoRetain(event).getRaw()
+                         : 0;
+        break;
+    }
     case 0x24:
         state.r[0] = getProcessId(
             crnt_process->getHandle<AutoObject>(static_cast<u32>(state.r[1])),
@@ -317,6 +343,22 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                 crnt_process->getMmu()->unmapAddr(state.r[0])),
             state.r[1]);
         break;
+    case 0x28: // ReturnFromException
+        if (!crnt_process->leaveUserException(crnt_thread, *guest_thread)) {
+            // Not handling an exception
+            state.r[0] = MAKE_RESULT(Svc, Error::InvalidState);
+            break;
+        }
+        if (static_cast<result_t>(state.r[0]) != RESULT_SUCCESS) {
+            // The handler gave up: Horizon ends the process
+            LOG_ERROR(Kernel,
+                      "Unhandled user exception (handler result {:#x}) at PC "
+                      "{:#x}",
+                      static_cast<u32>(state.r[0]), state.pc);
+            DEBUGGER_MANAGER_INSTANCE.getDebugger(crnt_process)
+                .breakOnThisThread("Unhandled user exception");
+        }
+        break;
     case 0x2a: // FlushEntireDataCache
     case 0x2b: // FlushDataCache
         // CPU writes reach the GPU through write tracking, not through
@@ -335,6 +377,18 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             state.r[3], tmp_u64);
         state.r[1] = tmp_u64;
         break;
+    case 0x30: // GetResourceLimitLimitValue
+    case 0x31: // GetResourceLimitCurrentValue
+    case 0x37: { // GetResourceLimitPeakValue
+        i64 value = 0;
+        state.r[0] = getResourceLimitValue(
+            crnt_process->getHandle<ResourceLimit>(
+                static_cast<u32>(state.r[1])),
+            static_cast<LimitableResource>(state.r[2]), static_cast<u32>(id),
+            value);
+        state.r[1] = std::bit_cast<u64>(value);
+        break;
+    }
     case 0x2c:
         state.r[0] = mapPhysicalMemory(crnt_process, state.r[0], state.r[1]);
         break;
@@ -409,10 +463,44 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[1] = tmp_u32;
         break;
     }
+    case 0x44: { // ReplyAndReceiveWithUserBuffer
+        const vaddr_t buffer = state.r[1];
+        const u64 buffer_size = state.r[2];
+        state.r[0] = checkUserBuffer(buffer, buffer_size);
+        if (state.r[0] != RESULT_SUCCESS)
+            break;
+        const auto handles = reinterpret_cast<Handle*>(
+            crnt_process->getMmu()->unmapAddr(state.r[3]));
+        const auto num_handles = std::bit_cast<i64>(state.r[4]);
+        SynchronizationObject* sync_objs[num_handles];
+        for (auto i = 0; i < num_handles; i++)
+            sync_objs[i] =
+                crnt_process->getHandle<SynchronizationObject>(handles[i]);
+
+        state.r[0] = replyAndReceive(
+            crnt_thread, std::span(sync_objs, static_cast<usize>(num_handles)),
+            crnt_process->getHandle<hipc::ServerSession>(
+                static_cast<u32>(state.r[5])),
+            std::bit_cast<i64>(state.r[6]), tmp_u32,
+            crnt_process->getMmu()->unmapAddr(buffer), buffer_size);
+        state.r[1] = tmp_u32;
+        break;
+    }
+    case 0x45: { // CreateEvent
+        Event* event = nullptr;
+        state.r[0] = createEvent(crnt_process, event);
+        // The writable and readable ends are the same event
+        state.r[1] = crnt_process->addHandleNoRetain(event).getRaw();
+        state.r[2] = crnt_process->addHandle(event).getRaw();
+        break;
+    }
     case 0x4b: {
         CodeMemory* code_mem = nullptr;
-        state.r[0] = createCodeMemory(state.r[1], state.r[2], code_mem);
-        state.r[1] = crnt_process->addHandleNoRetain(code_mem).getRaw();
+        state.r[0] =
+            createCodeMemory(crnt_process, state.r[1], state.r[2], code_mem);
+        state.r[1] = code_mem != nullptr
+                         ? crnt_process->addHandleNoRetain(code_mem).getRaw()
+                         : 0;
         break;
     }
     case 0x4c:
@@ -482,17 +570,46 @@ result_t Kernel::setHeapSize(Process* crnt_process, u64 size, uptr& out_base) {
     return RESULT_SUCCESS;
 }
 
-result_t Kernel::setMemoryPermission(uptr addr, u64 size,
-                                     MemoryPermission perm) {
+result_t Kernel::checkMemoryRange(vaddr_t addr, u64 size) {
+    constexpr u64 PAGE_SIZE = 0x1000;
+    if (addr % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+    if (size == 0 || size % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    if (addr + size <= addr)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::setMemoryPermission(Process* crnt_process, vaddr_t addr,
+                                     u64 size, MemoryPermission perm) {
     LOG_DEBUG(
         Kernel,
         "SetMemoryPermission called (addr: 0x{:08x}, size: 0x{:08x}, perm: "
         "{})",
         addr, size, perm);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Kernel, "addr: 0x{:08x}, size: 0x{:08x}, perm: {}", addr, size, perm);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (perm != MemoryPermission::None && perm != MemoryPermission::Read &&
+        perm != MemoryPermission::ReadWrite)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+
+    // Only memory that may be reprotected (heap, code data, ...), with no
+    // attributes set
+    constexpr u32 FLAG_CAN_REPROTECT = ZTD_BIT(8);
+    auto* mmu = crnt_process->getMmu();
+    for (vaddr_t va = addr; va < addr + size;) {
+        const auto region = mmu->queryRegion(va);
+        if ((static_cast<u32>(region.state.type) & FLAG_CAN_REPROTECT) == 0 ||
+            region.state.attr != MemoryAttribute::None || region.size == 0)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        va = region.va + region.size;
+    }
+
+    mmu->protect(ztd::Range<vaddr_t>::fromSize(addr, size), perm);
 
     return RESULT_SUCCESS;
 }
@@ -1059,7 +1176,8 @@ result_t Kernel::connectToNamedPort(const std::string_view name,
 }
 
 result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
-                                 hipc::ClientSession* client_session) {
+                                 hipc::ClientSession* client_session,
+                                 vaddr_t buffer, u64 buffer_size) {
     if (client_session == nullptr) {
         LOG_WARN(Kernel, "SendSyncRequest called (INVALID_HANDLE)");
         return MAKE_RESULT(Svc, Error::InvalidHandle);
@@ -1072,8 +1190,13 @@ result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
     crnt_thread->pause();
 
     // Send request
-    client_session->getParent()->getServerSide()->enqueueRequest(
-        crnt_process, crnt_thread, crnt_thread->getTlsPtr());
+    if (buffer != 0x0)
+        client_session->getParent()->getServerSide()->enqueueRequest(
+            crnt_process, crnt_thread,
+            crnt_process->getMmu()->unmapAddr(buffer), buffer_size);
+    else
+        client_session->getParent()->getServerSide()->enqueueRequest(
+            crnt_process, crnt_thread, crnt_thread->getTlsPtr());
 
     // Wait for response
     ASSERT_DEBUG(crnt_thread->processMessages(), Kernel,
@@ -1089,6 +1212,77 @@ result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
     }
 
     return res;
+}
+
+result_t Kernel::checkUserBuffer(vaddr_t buffer, u64 buffer_size) {
+    // Whole pages, as Horizon locks them for the request
+    constexpr u64 PAGE_SIZE = 0x1000;
+    if (buffer % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+    if (buffer_size == 0 || buffer_size % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    if (buffer + buffer_size <= buffer)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::sendAsyncRequestWithUserBuffer(
+    Process* crnt_process, hipc::ClientSession* client_session, vaddr_t buffer,
+    u64 buffer_size, Event*& out_event) {
+    LOG_DEBUG(Kernel,
+              "SendAsyncRequestWithUserBuffer called (buffer: {:#x}, size: "
+              "{:#x})",
+              buffer, buffer_size);
+
+    if (const auto res = checkUserBuffer(buffer, buffer_size);
+        res != RESULT_SUCCESS)
+        return res;
+    if (client_session == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+
+    // The reply signals the event; the client waits on it
+    out_event = new Event();
+    out_event->chargeTo(crnt_process->getResourceLimit());
+    client_session->getParent()->getServerSide()->enqueueRequest(
+        crnt_process, nullptr, crnt_process->getMmu()->unmapAddr(buffer),
+        buffer_size, out_event);
+
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::createEvent(Process* crnt_process, Event*& out_event) {
+    LOG_DEBUG(Kernel, "CreateEvent called");
+
+    out_event = new Event();
+    out_event->chargeTo(crnt_process->getResourceLimit());
+
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::getResourceLimitValue(ResourceLimit* resource_limit,
+                                       LimitableResource which, u32 kind,
+                                       i64& out_value) {
+    LOG_DEBUG(Kernel, "GetResourceLimitValue called (SVC {:#x}, which: {})",
+              kind, static_cast<u32>(which));
+
+    if (which >= LimitableResource::Count)
+        return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+    if (resource_limit == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+
+    switch (kind) {
+    case 0x30:
+        out_value = resource_limit->getLimitValue(which);
+        break;
+    case 0x31:
+        out_value = resource_limit->getCurrentValue(which);
+        break;
+    default:
+        out_value = resource_limit->getPeakValue(which);
+        break;
+    }
+
+    return RESULT_SUCCESS;
 }
 
 result_t Kernel::getProcessId(AutoObject* obj, u64& out_process_id) {
@@ -1191,8 +1385,7 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
         out_info = HEAP_REGION.getSize();
         return RESULT_SUCCESS;
     case InfoType::TotalMemorySize:
-        // TODO: what should this be?
-        out_info = 3ull * 1024ull * 1024ull * 1024ull;
+        out_info = APPLICATION_MEMORY_SIZE;
         return RESULT_SUCCESS;
     case InfoType::UsedMemorySize:
         out_info =
@@ -1233,14 +1426,21 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
     case InfoType::ProgramId:
         out_info = crnt_process->getTitleId();
         return RESULT_SUCCESS;
+    case InfoType::ResourceLimit:
+        // Only the current process's, with no handle
+        if (obj != nullptr)
+            return MAKE_RESULT(Svc, Error::InvalidHandle);
+        if (info_sub_type != 0)
+            return MAKE_RESULT(Svc, Error::InvalidCombination);
+        out_info =
+            crnt_process->addHandle(crnt_process->getResourceLimit()).getRaw();
+        return RESULT_SUCCESS;
     case InfoType::UserExceptionContextAddress:
-        LOG_NOT_IMPLEMENTED(Kernel, "UserExceptionContextAddress");
-        // HACK
-        out_info = 0;
+        out_info = crnt_process->getProcessLocalRegion();
         return RESULT_SUCCESS;
     case InfoType::TotalNonSystemMemorySize:
-        out_info = 3ull * 1024ull * 1024ull * 1024ull -
-                   crnt_process->getSystemResourceSize();
+        out_info =
+            APPLICATION_MEMORY_SIZE - crnt_process->getSystemResourceSize();
         return RESULT_SUCCESS;
     case InfoType::UsedNonSystemMemorySize:
         out_info = crnt_process->getUsedUserMemorySize();
@@ -1517,13 +1717,18 @@ result_t Kernel::acceptSession(hipc::ServerPort* server_port,
 result_t Kernel::replyAndReceive(IThread* crnt_thread,
                                  std::span<SynchronizationObject*> sync_objs,
                                  hipc::ServerSession* reply_target_session,
-                                 i64 timeout, u32& out_signalled_index) {
+                                 i64 timeout, u32& out_signalled_index,
+                                 uptr buffer, u64 buffer_size) {
+    if (buffer == 0x0) {
+        buffer = crnt_thread->getTlsPtr();
+        buffer_size = hipc::MSG_BUFFER_MAX_SIZE;
+    }
     LOG_DEBUG(Kernel, "ReplyAndReceive called (count: {}, timeout: {})",
               sync_objs.size(), timeout);
 
     if (reply_target_session != nullptr) {
         // Reply
-        reply_target_session->reply(crnt_thread->getTlsPtr());
+        reply_target_session->reply(buffer, buffer_size);
     }
 
     // Wait
@@ -1537,7 +1742,7 @@ result_t Kernel::replyAndReceive(IThread* crnt_thread,
         auto server_session = static_cast<hipc::ServerSession*>(sync_obj);
         if (server_session->isClientOpen()) {
             // Receive
-            server_session->receive(crnt_thread);
+            server_session->receive(buffer, buffer_size);
             return RESULT_SUCCESS;
         } else {
             return MAKE_RESULT(Svc, 123); // SessionClosed
@@ -1547,12 +1752,27 @@ result_t Kernel::replyAndReceive(IThread* crnt_thread,
     }
 }
 
-result_t Kernel::createCodeMemory(vaddr_t addr, u64 size,
-                                  CodeMemory*& out_code_memory) {
+result_t Kernel::createCodeMemory(Process* crnt_process, vaddr_t addr,
+                                  u64 size, CodeMemory*& out_code_memory) {
     LOG_DEBUG(Kernel, "CreateCodeMemory called (addr: 0x{:08x}, size: {})",
               addr, size);
 
-    out_code_memory = new CodeMemory(addr, size);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    // Only memory that may back code memory (heap), with no attributes set
+    constexpr u32 FLAG_CAN_CODE_MEMORY = ZTD_BIT(25);
+    auto* mmu = crnt_process->getMmu();
+    for (vaddr_t va = addr; va < addr + size;) {
+        const auto region = mmu->queryRegion(va);
+        if ((static_cast<u32>(region.state.type) & FLAG_CAN_CODE_MEMORY) == 0 ||
+            region.state.attr != MemoryAttribute::None || region.size == 0)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        va = region.va + region.size;
+    }
+
+    out_code_memory = new CodeMemory(crnt_process, addr, size);
 
     return RESULT_SUCCESS;
 }
@@ -1560,16 +1780,74 @@ result_t Kernel::createCodeMemory(vaddr_t addr, u64 size,
 result_t Kernel::controlCodeMemory(CodeMemory* code_memory,
                                    CodeMemoryOperation op, vaddr_t addr,
                                    u64 size, MemoryPermission perm) {
+    if (code_memory == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel,
               "ControlCodeMemory called (code memory: {}, op: {}, addr: "
               "0x{:08x}, size: {}, perm: {})",
               code_memory->getDebugName(), op, addr, size, perm);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Kernel,
-        "code memory: {}, op: {}, addr: 0x{:08x}, size: 0x{:08x}, perm: {}",
-        code_memory->getDebugName(), op, addr, size, perm);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+    // The whole code memory is mapped at once
+    if (size != code_memory->getSize())
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+
+    // Atmosphere allows these on the caller's own code memory, for JIT
+    auto* mmu = code_memory->getOwner()->getMmu();
+    const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
+    const auto source =
+        ztd::Range<vaddr_t>::fromSize(code_memory->getAddress(), size);
+    const auto is_free = [&] {
+        for (vaddr_t va = addr; va < addr + size;) {
+            const auto region = mmu->queryRegion(va);
+            if (region.state.type != MemoryType::Free || region.size == 0)
+                return false;
+            va = region.va + region.size;
+        }
+        return true;
+    };
+    switch (op) {
+    case CodeMemoryOperation::MapOwner: // Map, writable
+        if (perm != MemoryPermission::ReadWrite)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getMappedAddress() != 0x0 || !is_free())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        mmu->map(addr, source);
+        mmu->protect(range, MemoryPermission::ReadWrite);
+        code_memory->setMappedAddress(addr);
+        break;
+    case CodeMemoryOperation::MapSlave: // MapToOwner, readable or executable
+        if (perm != MemoryPermission::Read &&
+            perm != MemoryPermission::ReadExecute)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getOwnerMappedAddress() != 0x0 || !is_free())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        mmu->map(addr, source);
+        mmu->protect(range, perm);
+        code_memory->setOwnerMappedAddress(addr);
+        break;
+    case CodeMemoryOperation::UnmapOwner:
+        if (perm != MemoryPermission::None)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getMappedAddress() != addr)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+        mmu->unmap(range);
+        code_memory->setMappedAddress(0x0);
+        break;
+    case CodeMemoryOperation::UnmapSlave:
+        if (perm != MemoryPermission::None)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getOwnerMappedAddress() != addr)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+        mmu->unmap(range);
+        code_memory->setOwnerMappedAddress(0x0);
+        break;
+    default:
+        return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+    }
 
     return RESULT_SUCCESS;
 }

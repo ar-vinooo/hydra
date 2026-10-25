@@ -245,6 +245,8 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
         const auto main_thread_handle = process->setMainThread(main_thread);
 
         main_thread->setEntryPoint(base + text_offset);
+        // User exceptions enter the process here too
+        process->setEntryPoint(base + text_offset);
         main_thread->setArg(0, 0x0);
         main_thread->setArg(1, main_thread_handle.getRaw());
     }

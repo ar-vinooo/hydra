@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/horizon/kernel/resource_limit.hpp"
 #include "core/horizon/kernel/applet_resource.hpp"
 #include "core/horizon/kernel/event.hpp"
 #include "core/horizon/kernel/hipc/service_manager.hpp"
@@ -59,7 +60,10 @@ class Kernel {
 
     // SVCs
     result_t setHeapSize(Process* crnt_process, u64 size, uptr& out_base);
-    result_t setMemoryPermission(uptr addr, u64 size, MemoryPermission perm);
+    result_t setMemoryPermission(Process* crnt_process, vaddr_t addr, u64 size,
+                                 MemoryPermission perm);
+    // Page aligned, non-empty and not wrapping around
+    result_t checkMemoryRange(vaddr_t addr, u64 size);
     result_t setMemoryAttribute(Process* crnt_process, vaddr_t addr, u64 size,
                                 MemoryAttribute mask, MemoryAttribute value);
     result_t mapMemory(Process* crnt_process, uptr dst_addr, uptr src_addr,
@@ -108,8 +112,19 @@ class Kernel {
     void getSystemTick(u64& out_tick);
     result_t connectToNamedPort(const std::string_view name,
                                 hipc::ClientSession*& out_client_session);
+    // The message is in the thread's TLS unless a user buffer is given
     result_t sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
-                             hipc::ClientSession* client_session);
+                             hipc::ClientSession* client_session,
+                             vaddr_t buffer = 0x0, u64 buffer_size = 0);
+    result_t sendAsyncRequestWithUserBuffer(Process* crnt_process,
+                                            hipc::ClientSession* client_session,
+                                            vaddr_t buffer, u64 buffer_size,
+                                            Event*& out_event);
+    result_t checkUserBuffer(vaddr_t buffer, u64 buffer_size);
+    result_t createEvent(Process* crnt_process, Event*& out_event);
+    result_t getResourceLimitValue(ResourceLimit* resource_limit,
+                                   LimitableResource which, u32 kind,
+                                   i64& out_value);
     result_t getProcessId(AutoObject* obj, u64& out_process_id);
     result_t getThreadId(IThread* thread, u64& out_thread_id);
     result_t break_(BreakReason reason, uptr buffer_ptr, u64 buffer_size);
@@ -139,8 +154,9 @@ class Kernel {
     result_t replyAndReceive(IThread* crnt_thread,
                              std::span<SynchronizationObject*> sync_objs,
                              hipc::ServerSession* reply_target_session,
-                             i64 timeout, u32& out_signalled_index);
-    result_t createCodeMemory(vaddr_t addr, u64 size,
+                             i64 timeout, u32& out_signalled_index,
+                             uptr buffer = 0x0, u64 buffer_size = 0);
+    result_t createCodeMemory(Process* crnt_process, vaddr_t addr, u64 size,
                               CodeMemory*& out_code_memory);
     result_t controlCodeMemory(CodeMemory* code_memory, CodeMemoryOperation op,
                                vaddr_t addr, u64 size, MemoryPermission perm);

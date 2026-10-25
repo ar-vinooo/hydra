@@ -31,6 +31,10 @@ class Texture final : public ITexture {
                   const u32 dst_level, const u32 dst_layer, const MTL::Size size,
                   const u32 layer_count) override;
 
+    // A single sample texture holding this multisampled texture as the guest
+    // stores it (pixels as blocks of samples), see MsaaConverter
+    std::shared_ptr<Texture> createScaledTexture() const;
+
   private:
     MTL::Texture* texture;
     MTL::Buffer* buffer_backing = nullptr;

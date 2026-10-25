@@ -243,8 +243,31 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xf0a8000000000000, 0xfff8000000000000) { emitBar(context, inst); }
     INST(0xeff0000000000000, 0xfff8000000000000) { EMIT(Sta); }
-    INST(0xefe8000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("pixld");
+    INST(0xefe8000000000000, 0xfff8000000000000) { // pixld
+        // Values of the pixel: its coverage mask or the sample index
+        const auto mode = static_cast<u32>(extractBits(inst, 31, 3));
+        u32 sr = invalid<u32>();
+        if (mode == 1)
+            sr = SR_PIXEL_COVERAGE_MASK;
+        else if (mode == 5)
+            sr = SR_PIXEL_SAMPLE_INDEX;
+        if (sr == invalid<u32>()) {
+            COMMENT_NOT_IMPLEMENTED("pixld mode {}", mode);
+        } else {
+            auto& b = context.builder;
+            const auto conditional = handlePredCond(
+                b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+                extractBits(inst, 19, 1) != 0);
+            b.opCopy(ir::Value::createRegister(
+                         static_cast<reg_t>(extractBits(inst, 0, 8)),
+                         ir::ScalarType::U32),
+                     b.opReadSystemRegister(sr));
+            // What the predicate output holds is not documented
+            if (static_cast<pred_t>(extractBits(inst, 45, 3)) != PT)
+                SHADER_UNSUPPORTED("PIXLD predicate output");
+            if (conditional)
+                b.opEndIf();
+        }
     }
     INST(0xefd8000000000000, 0xfff8000000000000) { EMIT(Lda); }
     INST(0xefd0000000000000, 0xfff8000000000000) {
@@ -259,10 +282,13 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xef90000000000000, 0xfff8000000000000) { EMIT(Ldc); }
     INST(0xef80000000000000, 0xffe0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("cctll");
+        // Cache control of local memory: memory is coherent on Metal
+        COMMENT("cctll");
     }
     INST(0xef60000000000000, 0xffe0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("cctl");
+        // Cache control (invalidate, write back): memory is coherent on
+        // Metal, ordering comes from MEMBAR
+        COMMENT("cctl");
     }
     INST(0xef58000000000000, 0xfff8000000000000) { emitSts(context, inst); }
     INST(0xef50000000000000, 0xfff8000000000000) { emitStl(context, inst); }
@@ -287,7 +313,8 @@ void Decoder::parseNextInstruction() {
     }
     INST(0xebf8000000000000, 0xfff8000000000000) { EMIT(Red); }
     INST(0xebf0000000000000, 0xfff9000000000000) {
-        COMMENT_NOT_IMPLEMENTED("cctlt");
+        // Texture cache control: texture memory is coherent on Metal
+        COMMENT("cctlt");
     }
     INST(0xebe0000000000000, 0xfff8000000000000) {
         COMMENT_NOT_IMPLEMENTED("out");
@@ -310,10 +337,13 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("ide");
     }
     INST(0xe380000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("ram");
+        // Restores the warp's active mask. Control flow is structured per
+        // thread here (SSY/SYNC, PBK/BRK), there is no mask to restore.
+        COMMENT("ram");
     }
     INST(0xe370000000000000, 0xfff0000000000000) {
-        COMMENT_NOT_IMPLEMENTED("sam");
+        // Saves the warp's active mask, see RAM
+        COMMENT("sam");
     }
     INST(0xe360000000000000, 0xfff0000000000000) {
         COMMENT_NOT_IMPLEMENTED("rtt");
@@ -769,7 +799,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("imadsp");
     }
     INST(0x5a00000000000000, 0xff80000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imad");
+        emitImad(context, inst, ImadForm::Register);
     }
     INST(0x5980000000000000, 0xff80000000000000) { EMIT(FfmaR); }
     INST(0x5900000000000000, 0xff80000000000000) { emitDset(context, inst, DoubleSource::Register); }
@@ -784,6 +814,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("vabsdiff");
     }
     INST(0x53f8000000000000, 0xfff8000000000000) {
+        // SM 6.x only, not part of the Switch's Maxwell (SM 5.3)
         COMMENT_NOT_IMPLEMENTED("idp");
     }
     INST(0x53f0000000000000, 0xfff8000000000000) {
@@ -808,7 +839,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("imadsp");
     }
     INST(0x5200000000000000, 0xff80000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imad");
+        emitImad(context, inst, ImadForm::RegisterConstBuffer);
     }
     INST(0x5180000000000000, 0xff80000000000000) { EMIT(FfmaRC); }
     INST(0x5100000000000000, 0xff80000000000000) { EMIT(XmadRC); }
@@ -835,7 +866,9 @@ void Decoder::parseNextInstruction() {
         emitVsetp(context, inst);
     }
     INST(0x50e0000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("vote");
+        // VOTE.VTG: a vote across the vertex thread group that writes no
+        // register or predicate
+        COMMENT("vote.vtg");
     }
     INST(0x50d8000000000000, 0xfff8000000000000) { emitVote(context, inst); }
     INST(0x50d0000000000000, 0xfff8000000000000) {
@@ -846,9 +879,7 @@ void Decoder::parseNextInstruction() {
     INST(0x50a0000000000000, 0xfff8000000000000) {
         emitCsetp(context, inst);
     }
-    INST(0x5098000000000000, 0xfff8000000000000) {
-        COMMENT_NOT_IMPLEMENTED("cset");
-    }
+    INST(0x5098000000000000, 0xfff8000000000000) { emitCset(context, inst); }
     INST(0x5090000000000000, 0xfff8000000000000) { EMIT(Psetp); }
     INST(0x5088000000000000, 0xfff8000000000000) { EMIT(Pset); }
     INST(0x5080000000000000, 0xfff8000000000000) { EMIT(Mufu); }
@@ -907,7 +938,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("imadsp");
     }
     INST(0x4a00000000000000, 0xff80000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imad");
+        emitImad(context, inst, ImadForm::ConstBuffer);
     }
     INST(0x4980000000000000, 0xff80000000000000) { EMIT(FfmaC); }
     INST(0x4900000000000000, 0xff80000000000000) { emitDset(context, inst, DoubleSource::Constant); }
@@ -977,7 +1008,7 @@ void Decoder::parseNextInstruction() {
         COMMENT_NOT_IMPLEMENTED("imadsp");
     }
     INST(0x3400000000000000, 0xfe80000000000000) {
-        COMMENT_NOT_IMPLEMENTED("imad");
+        emitImad(context, inst, ImadForm::Immediate);
     }
     INST(0x3280000000000000, 0xfe80000000000000) { EMIT(FfmaI); }
     INST(0x3200000000000000, 0xfe80000000000000) { emitDset(context, inst, DoubleSource::Immediate); }
@@ -1000,6 +1031,8 @@ void Decoder::parseNextInstruction() {
     INST(0x1800000000000000, 0xfc00000000000000) { EMIT(LeaHiC); }
     INST(0x1400000000000000, 0xfc00000000000000) { EMIT(Iscadd32I); }
     INST(0x1000000000000000, 0xfc00000000000000) {
+        // The operand layout is not known reliably (envytools marks it as
+        // uncertain): report it instead of guessing
         COMMENT_NOT_IMPLEMENTED("imad32i");
     }
     INST(0x0c00000000000000, 0xfc00000000000000) { EMIT(Ffma32I); }

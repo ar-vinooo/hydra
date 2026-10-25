@@ -21,11 +21,15 @@ class ICommandBuffer;
 // the queue state.
 void syncDrawQueue();
 
+// HYDRA_PERF_STATS: where the GPU thread waited for the draw queue since the
+// last call, per frame
+std::string takeDrawQueueReport(f64 frames);
+
 // Encodes sealed draws on a second thread, in order, so the GPU thread can
 // decode and prepare the next draws meanwhile. A sealed draw is logically
 // encoded at sealing: its resources are leased and its writes issued then,
 // and everything that could observe the difference syncs first (see
-// syncDrawQueue). HYDRA_SYNC_ENCODE=1 encodes on the GPU thread instead.
+// syncDrawQueue). Enabled with HYDRA_ASYNC_ENCODE=1.
 class DrawQueue {
   public:
     explicit DrawQueue(IRenderer& renderer_);

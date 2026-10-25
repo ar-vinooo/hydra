@@ -21,6 +21,9 @@ constexpr ztd::Range<vaddr_t> ALIAS_REGION =
     ztd::Range<vaddr_t>(0x200000000, 0x1200000000);
 
 constexpr u64 HEAP_MEM_ALIGNMENT = 0x200000;
+// The memory an application may use (TotalMemorySize). Horizon gives
+// applications 3285 MiB; less leaves more of the host's memory free.
+constexpr u64 APPLICATION_MEMORY_SIZE = 3ull * 1024ull * 1024ull * 1024ull;
 
 constexpr i64 INFINITE_TIMEOUT = -1;
 

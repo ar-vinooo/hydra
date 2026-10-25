@@ -240,4 +240,13 @@ union InstImnmxBase {
 
 DEFINE_INST_SRC2_VARIANTS(Imnmx);
 
+// Where IMAD takes its b and c operands from
+enum class ImadForm {
+    Register,            // b = R20, c = R39
+    RegisterConstBuffer, // b = R39, c = c[slot][offset]
+    ConstBuffer,         // b = c[slot][offset], c = R39
+    Immediate,           // b = imm20, c = R39
+};
+void emitImad(DecoderContext& context, instruction_t inst, ImadForm form);
+
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

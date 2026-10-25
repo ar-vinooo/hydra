@@ -8,6 +8,7 @@ struct ClearDepthPipelineDescriptor {
     MTL::PixelFormat depth_stencil_pixel_format;
     // Formats of all render pass color attachments (not written to)
     MTL::PixelFormat color_pixel_formats[COLOR_TARGET_COUNT];
+    u32 sample_count{1};
 };
 
 class ClearDepthPipelineCache

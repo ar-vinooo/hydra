@@ -10,6 +10,7 @@ struct ClearColorPipelineDescriptor {
     u32 render_target_id;
     u8 mask;
     MTL::PixelFormat depth_stencil_pixel_format;
+    u32 sample_count{1};
 };
 
 class ClearColorPipelineCache

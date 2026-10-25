@@ -1086,6 +1086,112 @@ void testQuadIndexedShuffle(MTL::Device* device) {
     std::cout << "PASS: fragment SHFL.IDX within quads reads lanes x | (y << 1)\n";
 }
 
+// PIXLD.MY_INDEX and PIXLD.COVMASK read the sample index and coverage, and
+// the header's sample mask output (the register after the colors) limits the
+// samples written. Rendered to a 4x target and every sample read back.
+void testFragmentSamples(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (const bool read_coverage : {false, true}) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        if (!read_coverage)
+            context.fragment_sample_mask_register = 4;
+        GuestShaderState guest{};
+        guest.color_target_data_types[0] = MTL::DataTypeUInt;
+        ir::Module module;
+        ir::Builder builder(module);
+        const auto value =
+            read_coverage
+                ? builder.opReadSystemRegister(SR_PIXEL_COVERAGE_MASK)
+                : builder.opAdd(builder.opReadSystemRegister(SR_PIXEL_SAMPLE_INDEX),
+                                ir::Value::createConstantU(1));
+        builder.opCopy(ir::Value::createRegister(0, ir::ScalarType::U32), value);
+        for (u8 component = 1; component < 4; ++component)
+            builder.opCopy(ir::Value::createRegister(component, ir::ScalarType::U32),
+                           ir::Value::createConstantU(0));
+        builder.opCopy(ir::Value::createRegister(4, ir::ScalarType::U32),
+                       ir::Value::createConstantU(0b0101));
+        builder.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter emitter(context, memory, guest, generated,
+                                               mapping);
+        emitter.emit(module);
+        std::string source(generated.begin(), generated.end());
+        source += R"(
+vertex float4 quad_vertex(uint id [[vertex_id]]) {
+    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0, 0, 1);
+}
+kernel void read_samples(texture2d_ms<uint> target [[texture(0)]],
+                         device uint* out [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    for (uint s = 0; s < 4; s++)
+        out[(p.y * 2 + p.x) * 4 + s] = target.read(p, s).r;
+}
+)";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << '\n';
+        check(library != nullptr, "Fragment sample shader compiles");
+        NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("quad_vertex"));
+        NS_STACK_SCOPED auto fragment = library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto reader = library->newFunction(toNsString("read_samples"));
+        NS_STACK_SCOPED auto pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vertex);
+        pd->setFragmentFunction(fragment);
+        pd->setRasterSampleCount(4);
+        pd->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatR32Uint);
+        NS_STACK_SCOPED auto pipeline = device->newRenderPipelineState(pd, &error);
+        check(pipeline != nullptr, "Fragment sample pipeline compiles");
+        NS_STACK_SCOPED auto read_pipeline = device->newComputePipelineState(reader, &error);
+        NS_STACK_SCOPED auto td = MTL::TextureDescriptor::alloc()->init();
+        td->setTextureType(MTL::TextureType2DMultisample);
+        td->setPixelFormat(MTL::PixelFormatR32Uint);
+        td->setWidth(2);
+        td->setHeight(2);
+        td->setSampleCount(4);
+        td->setStorageMode(MTL::StorageModePrivate);
+        td->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        NS_STACK_SCOPED auto texture = device->newTexture(td);
+        NS_STACK_SCOPED auto out = device->newBuffer(16 * 4, MTL::ResourceStorageModeShared);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* color = pass->colorAttachments()->object(0);
+        color->setTexture(texture);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+        color->setStoreAction(MTL::StoreActionStore);
+        NS_STACK_SCOPED auto queue = device->newCommandQueue();
+        auto* commands = queue->commandBuffer();
+        auto* encoder = commands->renderCommandEncoder(pass);
+        encoder->setRenderPipelineState(pipeline);
+        encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+        encoder->endEncoding();
+        auto* compute = commands->computeCommandEncoder();
+        compute->setComputePipelineState(read_pipeline);
+        compute->setTexture(texture, 0);
+        compute->setBuffer(out, 0, 0);
+        compute->dispatchThreads(MTL::Size(2, 2, 1), MTL::Size(2, 2, 1));
+        compute->endEncoding();
+        commands->commit();
+        commands->waitUntilCompleted();
+        check(commands->status() == MTL::CommandBufferStatusCompleted,
+              "Fragment sample draw completes");
+        const auto* samples = static_cast<const u32*>(out->contents());
+        for (u32 i = 0; i < 16; i++) {
+            const u32 sample = i % 4;
+            if (read_coverage)
+                check(samples[i] == 0xf, "PIXLD.COVMASK reads the covered samples");
+            else
+                check(samples[i] == ((sample & 1) == 0 ? sample + 1 : 0u),
+                      "PIXLD.MY_INDEX is the sample, the mask output drops samples");
+        }
+    }
+    std::cout << "PASS: fragment sample index, coverage mask and sample mask output\n";
+}
+
 // Fragment depth follows packed color exports and a reserved sample-mask slot.
 // Read the native depth attachment back, rather than only checking emitted
 // text.
@@ -2539,6 +2645,7 @@ int main() {
         testFragmentDepth(device);
         testQuadDerivatives(device);
         testQuadIndexedShuffle(device);
+        testFragmentSamples(device);
         testTextureLodSelection();
         testTextureBorderEmulation();
         testTextureOffsetAndGather(device);

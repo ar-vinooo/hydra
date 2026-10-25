@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "core/hot/route_headers.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
 
@@ -37,15 +39,32 @@ const char* getAbi();
 // The functions of the latest loaded module, or the built-in ones
 const Table& getTable();
 
+namespace detail {
+// Set once a module replaced the built-in functions. Until then there is only
+// one image, and scopes need no pinning.
+extern std::atomic<bool> pinning;
+extern std::atomic<const Table*> latest_table;
+const Table& initialTable();
+} // namespace detail
+
 // A draw/dispatch (and every nested hot call) stays on one immutable image.
 // Old images remain loaded for in-flight CPU calls and Metal callbacks.
-// The thread-local is reached once per scope: on macOS every access is a
-// _tlv_get_addr call, and hot functions run for every draw. With
-// HYDRA_HOT_RELOAD=0 there is only one image, so scopes skip the thread-local
-// entirely (slot is null).
+// Pinning uses a thread-local: on macOS every access is a _tlv_get_addr
+// call, and scopes run for every register write. While no module was loaded
+// (always, unless one is being developed) a scope is one atomic load.
 class Scope {
   public:
-    Scope();
+    Scope() {
+        if (!detail::pinning.load(std::memory_order_acquire)) [[likely]] {
+            slot = nullptr;
+            previous = nullptr;
+            const auto* table =
+                detail::latest_table.load(std::memory_order_acquire);
+            current = table != nullptr ? table : &detail::initialTable();
+            return;
+        }
+        pin();
+    }
     ~Scope() {
         if (slot != nullptr)
             *slot = previous;
@@ -59,6 +78,8 @@ class Scope {
     const Table** slot;
     const Table* previous;
     const Table* current;
+
+    void pin();
 };
 u64 generation();
 

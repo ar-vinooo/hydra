@@ -128,10 +128,10 @@ void PageTable::setMemoryPermission(ztd::Range<vaddr_t> range,
         range, [perm, ap_flags]([[maybe_unused]] ztd::Range<vaddr_t> range,
                                 u64& entry, horizon::kernel::MemoryState& state,
                                 [[maybe_unused]] PageFlags flags) {
-            if (!any(flags & PageFlags::WriteTrackingEnabled)) {
-                entry &= ~AP_FLAGS_MASK;
-                entry |= static_cast<u64>(ap_flags);
-            }
+            entry &= ~AP_FLAGS_MASK;
+            entry |= static_cast<u64>(any(flags & PageFlags::WriteTrackingEnabled)
+                                          ? toTrackedApFlags(perm)
+                                          : ap_flags);
             state.perm = perm;
         });
     notePageTableChange();
@@ -152,13 +152,13 @@ void PageTable::setWriteTrackingEnabled(ztd::Range<vaddr_t> range,
                                         bool enable) {
     modifyRange(range,
                 [enable]([[maybe_unused]] ztd::Range<vaddr_t> range, u64& entry,
-                         [[maybe_unused]] horizon::kernel::MemoryState& state,
+                         horizon::kernel::MemoryState& state,
                          PageFlags& flags) {
-                    // AP flags
+                    // AP flags, keeping the page's own permission
                     entry &= ~AP_FLAGS_MASK;
-                    entry |= static_cast<u64>(
-                        enable ? ApFlags::UserReadKernelRead
-                               : ApFlags::UserReadWriteKernelReadWrite);
+                    entry |= static_cast<u64>(enable
+                                                  ? toTrackedApFlags(state.perm)
+                                                  : toApFlags(state.perm));
 
                     // Page flags
                     if (enable)
@@ -173,13 +173,14 @@ bool PageTable::trySuspendWriteTracking(ztd::Range<vaddr_t> range) {
     bool res = false;
     modifyRange(
         range, [&res]([[maybe_unused]] ztd::Range<vaddr_t> range, u64& entry,
-                      [[maybe_unused]] horizon::kernel::MemoryState& state,
+                      horizon::kernel::MemoryState& state,
                       [[maybe_unused]] PageFlags& flags) {
-            bool enabled = any(flags & PageFlags::WriteTrackingEnabled);
+            // A write to a page without write permission is a real fault
+            bool enabled = any(flags & PageFlags::WriteTrackingEnabled) &&
+                           any(state.perm & horizon::kernel::MemoryPermission::Write);
             if (enabled) {
                 entry &= ~AP_FLAGS_MASK;
-                entry |=
-                    static_cast<u64>(ApFlags::UserReadWriteKernelReadWrite);
+                entry |= static_cast<u64>(toApFlags(state.perm));
                 res = true;
             }
         });
@@ -190,11 +191,11 @@ bool PageTable::trySuspendWriteTracking(ztd::Range<vaddr_t> range) {
 void PageTable::resumeWriteTracking(ztd::Range<vaddr_t> range) {
     modifyRange(range,
                 []([[maybe_unused]] ztd::Range<vaddr_t> range, u64& entry,
-                   [[maybe_unused]] horizon::kernel::MemoryState& state,
-                   PageFlags& flags) {
+                   horizon::kernel::MemoryState& state, PageFlags& flags) {
                     if (any(flags & PageFlags::WriteTrackingEnabled)) {
                         entry &= ~AP_FLAGS_MASK;
-                        entry |= static_cast<u64>(ApFlags::UserReadKernelRead);
+                        entry |=
+                            static_cast<u64>(toTrackedApFlags(state.perm));
                     }
                 });
     // Writes must fault again, also on cores still holding the writable

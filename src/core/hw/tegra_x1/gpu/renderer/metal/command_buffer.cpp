@@ -210,6 +210,7 @@ void CommandBuffer::beginNative() {
 
 void CommandBuffer::commitNative() {
     syncDrawQueue();
+    attachPendingHandlers();
     if (mtl4_context == nullptr) {
         command_buffer->commit();
         return;
@@ -265,15 +266,28 @@ MTL::Device* CommandBuffer::getDevice() const {
 }
 
 void CommandBuffer::addCompletedHandler(GpuCompletionHandler handler) {
-    syncDrawQueue();
-    if (mtl4_context != nullptr) {
-        mtl4_submission->handlers.push_back(std::move(handler));
-        return;
+    // Any thread, also while the draw queue encodes: the handlers are
+    // attached to the native command buffer, in order, when it is committed
+    std::scoped_lock lock(pending_handlers_mutex);
+    pending_handlers.push_back(std::move(handler));
+}
+
+void CommandBuffer::attachPendingHandlers() {
+    std::vector<GpuCompletionHandler> handlers;
+    {
+        std::scoped_lock lock(pending_handlers_mutex);
+        handlers.swap(pending_handlers);
     }
-    command_buffer->addCompletedHandler(
-        [handler = std::move(handler)](MTL::CommandBuffer* completed) {
-            handler(toGpuCompletion(completed));
-        });
+    for (auto& handler : handlers) {
+        if (mtl4_context != nullptr) {
+            mtl4_submission->handlers.push_back(std::move(handler));
+            continue;
+        }
+        command_buffer->addCompletedHandler(
+            [handler = std::move(handler)](MTL::CommandBuffer* completed) {
+                handler(toGpuCompletion(completed));
+            });
+    }
 }
 
 void CommandBuffer::presentDrawable(CA::MetalDrawable* drawable) {
@@ -550,6 +564,9 @@ RenderEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     if (render_pass_gap == 0 && encoder_type != EncoderType::Render)
         render_pass_gap = 5;
     endEncoding();
+    if (visibility_buffer == nullptr && visibility_source)
+        if (auto* buffer = visibility_source(*this))
+            visibility_buffer = buffer->retain();
 
     TMP_AUTORELEASE_POOL_BEGIN();
     if (mtl4_context != nullptr) {

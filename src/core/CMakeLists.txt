@@ -722,6 +722,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.cpp
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/msaa_converter.cpp
+    hw/tegra_x1/gpu/renderer/metal/msaa_converter.hpp
     hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.cpp
     hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp

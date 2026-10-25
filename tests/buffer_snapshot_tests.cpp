@@ -133,8 +133,8 @@ fragment float4 f(constant float4& color [[buffer(0)]]) { return color; }
         // merged away is no longer counted
         check(cache.getCachedBytes() == (snapshots ? 2 * 4096 : 48),
               "Only live merged resources count in cache budget");
-        check(renderer.createCpuBufferSnapshot(
-                  ztd::Range<uptr>::fromSize(ptr, 65537)) == nullptr,
+        check(renderer.createCpuBufferSnapshot(ztd::Range<uptr>::fromSize(
+                  ptr, BUFFER_SNAPSHOT_MAX_SIZE + 1)) == nullptr,
               "Large buffers retain the private buffer path");
         commands.reset();
         std::cout << "PASS: GPU snapshot pixel lifetime, render encoder count, "

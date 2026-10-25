@@ -126,6 +126,10 @@ void decompileHot(
         for (u32 i = 0; i < COLOR_TARGET_COUNT; ++i)
             if (((header.ps.omap_target >> (i * 4)) & 0xf) != 0)
                 color_registers += 4;
+        // The sample mask follows the colors, depth the sample mask's
+        // register (whether it is written or not)
+        if (header.ps.omap_sample_mask)
+            context.fragment_sample_mask_register = color_registers;
         if (header.ps.omap_depth)
             context.fragment_depth_register = color_registers + 1;
         for (u32 i = 0; i < PIXEL_IMAP_COUNT; i++) {

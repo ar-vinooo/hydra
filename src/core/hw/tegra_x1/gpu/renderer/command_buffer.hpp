@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <optional>
 #include <vector>
@@ -47,10 +48,12 @@ class ICommandBuffer {
         gpu_completion_callbacks.push_back(std::move(callback));
     }
 
+    // Any thread, also while the draw queue encodes
     void retainResource(const std::shared_ptr<void>& owner) {
-        syncDrawQueue();
-        if (owner)
-            retained_resources.try_emplace(owner.get(), owner);
+        if (!owner)
+            return;
+        std::scoped_lock lock(retained_mutex);
+        retained_resources.try_emplace(owner.get(), owner);
     }
 
     // Statistics only: what the next wait for the host GPU is for
@@ -71,6 +74,7 @@ class ICommandBuffer {
     }
     std::vector<std::function<void(bool)>> completion_callbacks;
     std::vector<std::function<void(bool)>> gpu_completion_callbacks;
+    std::mutex retained_mutex;
     std::unordered_map<const void*, std::shared_ptr<void>> retained_resources;
 };
 

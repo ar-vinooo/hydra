@@ -62,7 +62,6 @@ CompareOp decodeCompareOp(u32 value) {
         return static_cast<CompareOp>(value);
     return CompareOp::Always;
 }
-u32 getSamplerHandle(u32 handle) { return extractBits(handle, 20, 12); }
 
 MTL::TextureType toTextureType(TextureType type) {
     switch (type) {
@@ -481,7 +480,9 @@ bool ThreeD::shouldExecute() const {
     }
     switch (mode) {
     case 2:
-        return compare[0] != 0 && compare[1] != 0;
+        // RES_NON_ZERO: the 64-bit report value (a sample count, whose high
+        // word is zero) is nonzero
+        return (compare[0] | compare[1]) != 0;
     case 3:
         return compare[0] == compare[4] && compare[1] == compare[5];
     default:
@@ -1323,9 +1324,30 @@ void ThreeD::bindGroup(const u32 index, const u32 data) {
 
 #pragma GCC diagnostic pop
 
+ColorWriteMask ThreeD::getColorWriteMask(u32 render_target_index) const {
+    // SET_SINGLE_CT_WRITE_CONTROL: every target uses the mask of target 0
+    constexpr u32 REG_SINGLE_CT_WRITE_CONTROL = 0xf90 / 4;
+    if ((regs_raw[REG_SINGLE_CT_WRITE_CONTROL] & 0x1) != 0)
+        return regs.color_write_masks[0];
+    return regs.color_write_masks[render_target_index];
+}
+
+u32 ThreeD::getSamplerIndex(u32 handle) const {
+    if ((regs.sampler_binding & 0x1) != 0) // VIA_HEADER_BINDING
+        return getImageHandle(handle);
+    return extractBits(handle, 20, 12);
+}
+
+// SET_ANTI_ALIAS: the sample layout of every render target
+renderer::MsaaLayout ThreeD::getRenderTargetMsaaLayout() const {
+    constexpr u32 REG_ANTI_ALIAS = 0x15d0 / 4;
+    return renderer::getMsaaLayout(regs_raw[REG_ANTI_ALIAS] & 0xf);
+}
+
 renderer::ITextureView*
 ThreeD::getColorTargetTexture(u32 render_target_index) const {
     const auto& render_target = regs.color_targets[render_target_index];
+    const auto msaa = getRenderTargetMsaaLayout();
 
     const auto gpu_addr = static_cast<u64>(render_target.addr);
     if (gpu_addr == 0x0) {
@@ -1361,8 +1383,11 @@ ThreeD::getColorTargetTexture(u32 render_target_index) const {
                 renderer::getTextureFormatBpp(format);
         stride = render_target.width_or_stride;
     } else {
-        const u32 width_hint = regs.screen_scissor.horizontal.x +
-                               regs.screen_scissor.horizontal.width;
+        // The scissor is in pixels, the surface in samples
+        const u32 width_hint =
+            static_cast<u32>(regs.screen_scissor.horizontal.x +
+                             regs.screen_scissor.horizontal.width)
+            << msaa.samples_x_log2;
         width =
             getMinimumWidth(render_target.width_or_stride, format, width_hint);
         stride = 0;
@@ -1374,7 +1399,7 @@ ThreeD::getColorTargetTexture(u32 render_target_index) const {
         render_target.tile_mode.width_gobs_log2,
         render_target.tile_mode.height_gobs_log2,
         render_target.tile_mode.depth_gobs_log2,
-        render_target.layer_stride * 4);
+        render_target.layer_stride * 4, msaa.samples);
 
     return gpu.getRenderer().getTextureCache().find(
         tls_crnt_command_buffer, descriptor, renderer::TextureUsage::Write);
@@ -1403,7 +1428,8 @@ renderer::ITextureView* ThreeD::getDepthStencilTargetTexture() const {
         regs.depth_target_tile_mode.width_gobs_log2,
         regs.depth_target_tile_mode.height_gobs_log2,
         regs.depth_target_tile_mode.depth_gobs_log2,
-        regs.depth_target_layer_stride * 4);
+        regs.depth_target_layer_stride * 4,
+        getRenderTargetMsaaLayout().samples);
 
     return gpu.getRenderer().getTextureCache().find(
         tls_crnt_command_buffer, descriptor, renderer::TextureUsage::Write);
@@ -1445,6 +1471,8 @@ renderer::RenderPassBase* ThreeD::getRenderPass() const {
             ((regs.depth_target_enabled != 0u) ? getDepthStencilTargetTexture()
                                                : nullptr),
     };
+    constexpr u32 REG_ANTI_ALIAS = 0x15d0 / 4;
+    descriptor.msaa_mode = regs_raw[REG_ANTI_ALIAS] & 0xf;
 
     return gpu.getRenderer().getRenderPassCache().find(descriptor);
 }
@@ -1848,7 +1876,7 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             const auto image = getImageHandle(*handle);
             if (image > regs.tex_header_pool_max_index)
                 continue;
-            const auto sampler = getSamplerHandle(*handle);
+            const auto sampler = getSamplerIndex(*handle);
             const auto& tic = pool[image];
             if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
                 !tic.normalized_coords)
@@ -2062,7 +2090,7 @@ renderer::PipelineBase* ThreeD::getPipeline() {
                 color_target.format =
                     renderer::toTextureFormat(render_target.format);
         }
-        color_target.write_mask = regs.color_write_masks[i];
+        color_target.write_mask = getColorWriteMask(i);
         color_target.blend_enabled =
             static_cast<bool>(regs.color_blend_enabled[i]) &&
             renderer::getIntegerTextureComponentType(color_target.format) == nullptr &&
@@ -2092,6 +2120,15 @@ renderer::PipelineBase* ThreeD::getPipeline() {
                 apply(regs.blend_state);
         }
     }
+
+    descriptor.sample_count = getRenderTargetMsaaLayout().samples;
+
+    // SET_ANTI_ALIAS_ALPHA_CONTROL
+    constexpr u32 REG_ANTI_ALIAS_ALPHA_CONTROL = 0x153c / 4;
+    descriptor.alpha_to_coverage =
+        (regs_raw[REG_ANTI_ALIAS_ALPHA_CONTROL] & 0x1) != 0;
+    descriptor.alpha_to_one =
+        (regs_raw[REG_ANTI_ALIAS_ALPHA_CONTROL] & 0x10) != 0;
 
     // Depth stencil target (must match the render pass)
     if (regs.depth_target_enabled != 0u &&
@@ -2245,11 +2282,23 @@ ThreeD::getTexture(const TextureImageControl& tic,
                                  "Pitch texture with {} levels, {} layers, "
                                  "depth {} (only the first surface is read)",
                                  level_count, layer_count, depth));
+    // A multisampled texture (TIC multi sample count) is read sample by
+    // sample by TLD.MS. Other reads of its memory see the samples as the
+    // texels of the larger image the TIC dimensions describe.
+    const bool multisample_read =
+        shader_type && (*shader_type == MTL::TextureType2DMultisample ||
+                        *shader_type == MTL::TextureType2DMultisampleArray);
+    const auto msaa = renderer::getMsaaLayout(tic.msaa_mode);
+    if (multisample_read && msaa.samples == 1) {
+        ONCE(LOG_WARN(Engines, "Multisample fetch of a single sample texture, "
+                               "not bound"));
+        return nullptr;
+    }
     const renderer::TextureDescriptor descriptor(
         tls_crnt_gmmu->unmapAddr(gpu_addr), type, format, is_linear,
         linear_stride, width, height, depth, level_count, layer_count,
         tic.sparse_tile_width_gobs_log2, tic.tile_height_gobs_log2,
-        tic.tile_depth_gobs_log2);
+        tic.tile_depth_gobs_log2, 0, multisample_read ? msaa.samples : 1);
 
     // The view type must match the type the shader declares, otherwise Metal
     // binds nothing. Reinterpret between array and non-array types when the
@@ -2258,7 +2307,12 @@ ThreeD::getTexture(const TextureImageControl& tic,
     u32 view_layer_count = layer_count;
     auto target_type = type;
     if (shader_type) {
-        target_type = *shader_type;
+        // Views of multisampled textures are multisampled themselves
+        target_type = *shader_type == MTL::TextureType2DMultisample
+                          ? MTL::TextureType2D
+                      : *shader_type == MTL::TextureType2DMultisampleArray
+                          ? MTL::TextureType2DArray
+                          : *shader_type;
     } else {
         // Demote array types to non-array types if possible
         if (type == MTL::TextureType1DArray && layer_count == 1)
@@ -2312,7 +2366,7 @@ ThreeD::getTexture(const TextureImageControl& tic,
     default:
         break;
     }
-    if (shader_type && view_type != *shader_type) {
+    if (shader_type && view_type != target_type) {
         // Sampling a texture with a different dimensionality than the
         // instruction asks for is undefined on hardware, and Metal cannot read
         // it through a differently typed binding. Bind nothing instead of a
@@ -2658,7 +2712,7 @@ void ThreeD::configureShaderStage(
 
             // Image
             const auto image_handle = getImageHandle(texture_handle);
-            const auto sampler_handle = getSamplerHandle(texture_handle);
+            const auto sampler_handle = getSamplerIndex(texture_handle);
             if ((regs.tex_header_pool_max_index != 0 &&
                  image_handle > regs.tex_header_pool_max_index) ||
                 (regs.tex_sampler_pool_max_index != 0 &&
@@ -2969,7 +3023,7 @@ void ThreeD::traceDraw(const char* kind, u32 count, u32 first,
                     const auto* tsc_pool =
                         reinterpret_cast<const TextureSamplerControl*>(
                             tls_crnt_gmmu->unmapAddr(tsc_pool_addr));
-                    const auto& tsc = tsc_pool[getSamplerHandle(handle)];
+                    const auto& tsc = tsc_pool[getSamplerIndex(handle)];
                     str += fmt::format(
                         "[tsc min={} mag={} mip={} compare={} op={}] ",
                         static_cast<u32>(tsc.min_filter),
@@ -3285,7 +3339,7 @@ std::vector<std::string> ThreeD::describeTextureBindings() const {
                 "{} tex{} (host {}): tic={} tsc={} addr={:#x} fmt={} {}x{} "
                 "levels={} layout={} type={}",
                 name, binding, host_binding, getImageHandle(*handle),
-                getSamplerHandle(*handle), makeAddr(tic.addr_lo, tic.addr_hi),
+                getSamplerIndex(*handle), makeAddr(tic.addr_lo, tic.addr_hi),
                 renderer::toTextureFormat(tic.format_word, tic.is_srgb),
                 tic.width_minus_one + 1, tic.height_minus_one + 1,
                 tic.mip_max_levels + 1u, static_cast<TicHdrVersion>(tic.hdr_version),
@@ -3442,16 +3496,16 @@ void ThreeD::captureVisualDraw(bool after) {
             std::memcpy(&tic, bytes.data(), sizeof(tic));
             visual.event("texture_binding", {{"stage", fmt::format("{}", stage)},
                 {"binding", std::to_string(binding)}, {"host_slot", std::to_string(host_binding)},
-                {"handle", std::to_string(*handle)}, {"sampler_index", std::to_string(getSamplerHandle(*handle))},
+                {"handle", std::to_string(*handle)}, {"sampler_index", std::to_string(getSamplerIndex(*handle))},
                 {"address", std::to_string(makeAddr(tic.addr_lo, tic.addr_hi))},
                 {"width", std::to_string(tic.width_minus_one + 1)},
                 {"height", std::to_string(tic.height_minus_one + 1)},
                 {"descriptor_fnv1a64", VisualDiagnostics::contentId(bytes)}});
             const auto name = prefix + fmt::format("-{}-binding{}", stage, binding);
             visual.artifact(name + "-tic.bin", std::span<const uint8_t>(bytes));
-            if (getSamplerHandle(*handle) <= regs.tex_sampler_pool_max_index) {
+            if (getSamplerIndex(*handle) <= regs.tex_sampler_pool_max_index) {
                 const auto sampler = tls_crnt_gmmu->readMappedBytes(
-                    static_cast<u64>(regs.tex_sampler_pool) + u64(getSamplerHandle(*handle)) * sizeof(TextureSamplerControl),
+                    static_cast<u64>(regs.tex_sampler_pool) + u64(getSamplerIndex(*handle)) * sizeof(TextureSamplerControl),
                     sizeof(TextureSamplerControl));
                 visual.artifact(name + "-tsc.bin", std::span<const uint8_t>(sampler));
                 if (sampler.size() == sizeof(TextureSamplerControl)) {
@@ -3509,21 +3563,14 @@ void ThreeD::noteUnimplementedMultisample() {
     const u32 alpha_control = regs_raw[REG_ANTI_ALIAS_ALPHA_CONTROL];
     const bool alpha_to_coverage = (alpha_control & 0x1) != 0;
     const bool alpha_to_one = (alpha_control & 0x10) != 0;
-    if (samples_mode != 0) {
+    // Multisampled targets, pipelines and passes (see getRenderTargetMsaaLayout)
+    if (samples_mode != 0 && PerfStats::isEnabled())
         PerfStats::instance().msaa_draws++;
-        ONCE(LOG_WARN(Engines,
-                      "Draw with SET_ANTI_ALIAS mode {}: MSAA is not implemented, "
-                      "drawing without multisampling",
-                      samples_mode));
-    }
-    if (alpha_to_coverage) {
+    // Both are pipeline state (see getPipeline), counted for the stats
+    if (alpha_to_coverage && PerfStats::isEnabled())
         PerfStats::instance().alpha_to_coverage_draws++;
-        ONCE(LOG_WARN(Engines, "Draw with alpha-to-coverage: not implemented"));
-    }
-    if (alpha_to_one) {
+    if (alpha_to_one && PerfStats::isEnabled())
         PerfStats::instance().alpha_to_one_draws++;
-        ONCE(LOG_WARN(Engines, "Draw with alpha-to-one: not implemented"));
-    }
 }
 
 renderer::DrawState ThreeD::prepareDrawState() {

@@ -87,6 +87,10 @@ enum class SvSemantic {
     FrontFacing,
 };
 
+// PIXLD values, read as system registers outside the S2R range
+constexpr u32 SR_PIXEL_COVERAGE_MASK = 0x1000;
+constexpr u32 SR_PIXEL_SAMPLE_INDEX = 0x1001;
+
 // Attribute addresses of the Maxwell shader I/O space
 constexpr u32 SV_PRIMITIVE_ID_BASE = 0x60;
 constexpr u32 SV_LAYER_BASE = 0x64;
@@ -142,11 +146,15 @@ enum class TextureType {
     CubeArray,
     // Only for images
     Buffer,
+    // Multisampled, read texel by texel with a sample index (TLD.MS)
+    _2DMS,
+    _2DMSArray,
 };
 
 inline bool isTextureArray(TextureType type) {
     return type == TextureType::_1DArray || type == TextureType::_2DArray ||
-           type == TextureType::_3DArray || type == TextureType::CubeArray;
+           type == TextureType::_3DArray || type == TextureType::CubeArray ||
+           type == TextureType::_2DMSArray;
 }
 
 enum class TextureSampleFlags : u32 {
@@ -201,6 +209,9 @@ struct DecompilerContext {
     // Per-thread local memory size in bytes
     u32 local_memory_size{0};
     u32 fragment_depth_register{invalid<u32>()};
+    // The register holding the coverage mask a fragment shader writes, after
+    // its color registers (header OMAP sample mask)
+    u32 fragment_sample_mask_register{invalid<u32>()};
     u32 fragment_output_mask{0xffffffffu};
     union {
         struct {

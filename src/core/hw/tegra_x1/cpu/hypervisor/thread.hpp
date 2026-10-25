@@ -72,6 +72,21 @@ class Thread : public IThread {
     u64 getTpidr() override {
         return has_vcpu ? getSysReg(HV_SYS_REG_TPIDR_EL0) : saved_tpidr;
     }
+    // In an exception (the EL1 trampoline), EL0's PSTATE is in SPSR_EL1
+    u32 getUserPstate() override {
+        if (!exception)
+            return state.pstate;
+        return static_cast<u32>(has_vcpu ? getSysReg(HV_SYS_REG_SPSR_EL1)
+                                         : saved_spsr);
+    }
+    void setUserPstate(u32 pstate) override {
+        if (!exception)
+            state.pstate = pstate;
+        else if (has_vcpu)
+            setSysReg(HV_SYS_REG_SPSR_EL1, pstate);
+        else
+            saved_spsr = pstate;
+    }
 
   private:
     Cpu& cpu;
@@ -121,6 +136,8 @@ class Thread : public IThread {
     u64 tlb_generation_seen{0};
     bool local_tlb_flush{false};
     u64 selectTrampoline();
+    // Horizon's user exception handling, unless a debugger takes it
+    bool deliverUserException(u32 esr, u64 far);
     // HYDRA_PERF_STATS: guest run time and VM exits by kind
     void countExit(std::chrono::steady_clock::time_point run_start);
 

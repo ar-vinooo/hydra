@@ -8,7 +8,7 @@ DEFINE_SERVICE_COMMAND_TABLE(IAsyncContext, 0, getSystemEvent, 1, cancel, 2,
                              hasDone, 3, getResult)
 
 IAsyncContext::IAsyncContext(result_t result_)
-    : result{result_}, event{std::make_unique<kernel::Event>(
+    : result{result_}, event{kernel::makeAutoObject<kernel::Event>(
                            true, "IAsyncContext system event")} {}
 
 result_t

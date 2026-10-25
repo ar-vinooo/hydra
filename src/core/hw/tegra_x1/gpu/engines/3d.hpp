@@ -400,7 +400,11 @@ struct Regs3D {
         bool volume;
     } depth_target_array_mode;
 
-    u32 padding_0x48d[0x26];
+    // 0x48d SET_SAMPLER_BINDING: bit 0 set means the sampler index is the
+    // texture header index (the handle's sampler bits are ignored)
+    u32 sampler_binding;
+
+    u32 padding_0x48e[0x25];
 
     // 0x4b3
     bool32 depth_test_enabled;
@@ -784,6 +788,10 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     renderer::ITextureView*
     getColorTargetTexture(u32 render_target_index) const;
     renderer::ITextureView* getDepthStencilTargetTexture() const;
+    renderer::MsaaLayout getRenderTargetMsaaLayout() const;
+    // The TSC index of a texture handle (see SET_SAMPLER_BINDING)
+    u32 getSamplerIndex(u32 handle) const;
+    ColorWriteMask getColorWriteMask(u32 render_target_index) const;
 
     // Reads the handle a shader texture binding refers to
     std::optional<u32> readTextureHandle(u32 stage_index,

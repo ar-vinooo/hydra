@@ -33,6 +33,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <random>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -63,6 +64,15 @@ struct ThreeDTestAccess {
         target.tile_mode.is_linear = 1;
         target.array_mode.layers = 1;
         engine.regs.depth_target_enabled = 0;
+    }
+    static u32 samplerIndex(const ThreeD& engine, u32 handle) {
+        return engine.getSamplerIndex(handle);
+    }
+    static void setColorWriteMask(ThreeD& engine, u32 index, ColorWriteMask mask) {
+        engine.regs.color_write_masks[index] = mask;
+    }
+    static ColorWriteMask colorWriteMask(const ThreeD& engine, u32 index) {
+        return engine.getColorWriteMask(index);
     }
     static renderer::RenderPassBase* targets(ThreeD& engine) {
         auto* pass = engine.resolveDrawTargets();
@@ -1780,6 +1790,191 @@ void benchmarkCommands() {
         submit_ns);
 }
 
+// A multisampled texture uploaded from and read back to guest memory, where
+// its pixels are blocks of samples, gives back the same bytes (every sample
+// goes through the host multisampled texture)
+void testMultisampleGuestRoundTrip() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = gpu.getRenderer();
+    std::mt19937 rng(7);
+    for (const auto format : {TextureFormat::RGBA8Unorm, TextureFormat::R32Uint,
+                              TextureFormat::Z32Float, TextureFormat::Z24Unorm_S8Uint}) {
+        for (const u32 samples : {1u, 2u, 4u, 8u}) {
+            const auto layout = getMsaaLayoutForSamples(samples);
+            const u32 width = 8u << layout.samples_x_log2;
+            const u32 height = 4u << layout.samples_y_log2;
+            const u32 bpp = getTextureFormatBpp(format);
+            const TextureDescriptor descriptor(
+                0x10000, MTL::TextureType2D, format, true, width * bpp, width,
+                height, 1, 1, 1, 0, 0, 0, 0, samples);
+            std::unique_ptr<ITexture> texture(renderer.createTexture(descriptor));
+            const u64 bytes = static_cast<u64>(width) * height * bpp;
+            std::unique_ptr<BufferBase> upload(renderer.allocateTemporaryBuffer(bytes));
+            std::unique_ptr<BufferBase> readback(renderer.allocateTemporaryBuffer(bytes));
+            auto* data = reinterpret_cast<u8*>(upload->getPtr());
+            for (u64 i = 0; i < bytes / 4; i++) {
+                u32 word = static_cast<u32>(rng());
+                if (format == TextureFormat::Z32Float)
+                    // Depth outputs are clamped to [0, 1]
+                    word = std::bit_cast<u32>(static_cast<f32>(word % 1000) / 999.0f);
+                std::memcpy(data + i * 4, &word, 4);
+            }
+            std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+            texture->copyFrom(commands.get(), upload.get());
+            std::unique_ptr<ITextureView> view(texture->createView(TextureViewDescriptor(
+                MTL::TextureType2D, format, ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1))));
+            readback->copyFrom(commands.get(), view.get(), MTL::Origin(0, 0, 0),
+                               MTL::Size(width, height, 1), ztd::Range<u32>(0, 1),
+                               ztd::Range<u32>(0, 1), 0);
+            renderer.synchronize(commands.get());
+            // A device with fewer samples keeps the first ones: guest sample
+            // i comes back from host sample i % host samples
+            auto* device = static_cast<metal::Renderer&>(renderer).getDevice();
+            u32 host_samples = samples;
+            while (!device->supportsTextureSampleCount(host_samples))
+                host_samples >>= 1;
+            std::vector<u8> expected(data, data + bytes);
+            const u32 block_width = 1u << layout.samples_x_log2;
+            const u32 block_height = 1u << layout.samples_y_log2;
+            for (u32 y = 0; y < height; y++) {
+                for (u32 x = 0; x < width; x++) {
+                    const u32 local_x = x % block_width;
+                    const u32 local_y = y % block_height;
+                    u32 sample = 0;
+                    for (u32 i = 0; i < samples; i++)
+                        if (getMsaaSampleTexel(samples, i) == std::pair{local_x, local_y})
+                            sample = i;
+                    const auto [kept_x, kept_y] =
+                        getMsaaSampleTexel(samples, sample % host_samples);
+                    const u32 source_x = x - local_x + kept_x;
+                    const u32 source_y = y - local_y + kept_y;
+                    std::memcpy(expected.data() + (static_cast<u64>(y) * width + x) * bpp,
+                                data + (static_cast<u64>(source_y) * width + source_x) * bpp,
+                                bpp);
+                }
+            }
+            expect(std::memcmp(expected.data(),
+                               reinterpret_cast<const u8*>(readback->getPtr()),
+                               bytes) == 0,
+                   fmt::format("{} with {} samples survives guest memory", format,
+                               samples).c_str());
+        }
+    }
+    std::cout << "PASS: textures (multisampled or not, Z24 included) round trip "
+                 "through guest memory\n";
+}
+
+// Rendering to a multisampled target: guest sample i is host sample i (at
+// the texel nouveau places it), and the samples are at the Maxwell positions
+void testMultisampleRendering() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = gpu.getRenderer();
+    const auto run = [&](u32 samples, u32 msaa_mode, const char* fragment_code,
+                         const char* vertex_code, u32 vertex_count) {
+        const auto layout = getMsaaLayoutForSamples(samples);
+        const u32 width = 2u << layout.samples_x_log2;
+        const u32 height = 2u << layout.samples_y_log2;
+        const TextureDescriptor descriptor(
+            0x20000, MTL::TextureType2D, TextureFormat::R32Uint, true, width * 4,
+            width, height, 1, 1, 1, 0, 0, 0, 0, samples);
+        std::unique_ptr<ITexture> texture(renderer.createTexture(descriptor));
+        std::unique_ptr<ITextureView> view(texture->createView(TextureViewDescriptor(
+            MTL::TextureType2D, TextureFormat::R32Uint, ztd::Range<u32>(0, 1),
+            ztd::Range<u32>(0, 1))));
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        // Start from zero in every sample
+        std::unique_ptr<BufferBase> zero(renderer.allocateTemporaryBuffer(width * height * 4));
+        std::memset(reinterpret_cast<void*>(zero->getPtr()), 0, width * height * 4);
+        texture->copyFrom(commands.get(), zero.get());
+        RenderPassDescriptor pass_descriptor{};
+        pass_descriptor.color_targets[0].texture = view.get();
+        pass_descriptor.msaa_mode = msaa_mode;
+        std::unique_ptr<RenderPassBase> pass(renderer.createRenderPass(pass_descriptor));
+        const auto shader = [&](ShaderType type, const char* code) {
+            ShaderDescriptor shader_descriptor{};
+            shader_descriptor.type = type;
+            shader_descriptor.backend = ShaderBackend::Msl;
+            shader_descriptor.code.assign(code, code + std::strlen(code));
+            return std::unique_ptr<ShaderBase>(renderer.createShader(shader_descriptor));
+        };
+        auto vertex = shader(ShaderType::Vertex, vertex_code);
+        auto fragment = shader(ShaderType::Fragment, fragment_code);
+        PipelineDescriptor pipeline_descriptor{};
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        pipeline_descriptor.color_target_states[0].format = TextureFormat::R32Uint;
+        pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        pipeline_descriptor.sample_count = samples;
+        std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+        renderer.bindRenderPass(pass.get());
+        renderer.bindPipeline(pipeline.get());
+        for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+            renderer.setScissor(i, MTL::ScissorRect{0, 0, 2, 2});
+            renderer.setViewport(i, MTL::Viewport{0, 0, 2, 2, 0, 1});
+        }
+        renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
+        renderer.setDepthTestEnabled(false);
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, vertex_count, 0, 1);
+        std::unique_ptr<BufferBase> readback(renderer.allocateTemporaryBuffer(width * height * 4));
+        readback->copyFrom(commands.get(), view.get(), MTL::Origin(0, 0, 0),
+                           MTL::Size(width, height, 1), ztd::Range<u32>(0, 1),
+                           ztd::Range<u32>(0, 1), 0);
+        renderer.synchronize(commands.get());
+        std::vector<u32> texels(width * height);
+        std::memcpy(texels.data(), reinterpret_cast<const void*>(readback->getPtr()),
+                    texels.size() * 4);
+        return texels;
+    };
+    constexpr const char* FULL_SCREEN = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+    return float4(p[id], 0.5, 1);
+})";
+    // Each sample writes its index + 1
+    const auto by_sample = run(4, 0x2, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment uint4 main_(uint sample_id [[sample_id]]) { return uint4(sample_id + 1); }
+)", FULL_SCREEN, 3);
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++) {
+            u32 sample = 0;
+            for (u32 i = 0; i < 4; i++)
+                if (getMsaaSampleTexel(4, i) == std::pair{x & 1, y & 1})
+                    sample = i;
+            expect(by_sample[y * 4 + x] == sample + 1,
+                   "Each sample is stored at its texel of the pixel's block");
+        }
+    // The left half of each pixel covers only the sample at x = 4/16 of the
+    // Maxwell 2x pattern, sample 0 (Metal's own pattern has it at index 1)
+    const auto left_half = run(2, 0x1, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment uint4 main_() { return uint4(1); }
+)", R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    // Two pixels wide: the left halves of both pixel columns
+    float2 p[] = {float2(-1,-1), float2(-0.5,-1), float2(-1,1),
+                  float2(-0.5,-1), float2(-0.5,1), float2(-1,1),
+                  float2(0,-1), float2(0.5,-1), float2(0,1),
+                  float2(0.5,-1), float2(0.5,1), float2(0,1)};
+    return float4(p[id], 0.5, 1);
+})", 12);
+    for (u32 y = 0; y < 2; y++)
+        for (u32 x = 0; x < 4; x++)
+            expect(left_half[y * 4 + x] == ((x & 1) == 0 ? 1u : 0u),
+                   "Samples are at the Maxwell positions");
+    std::cout << "PASS: multisampled rendering places samples like Maxwell\n";
+}
+
 // Buffer textures are their backing buffer: capture reads and restores its bytes
 void testBufferTextureContents() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
@@ -1911,6 +2106,119 @@ void testDrawResourceValidation() {
                "Retired GMMU is rejected without dereferencing its old address");
     }
     std::cout << "PASS: command registry rejects retired resources and used mappings before encoding\n";
+}
+
+// While a game counts samples, render passes start with their visibility
+// buffer: the first counted draw of an open pass does not end it (storing and
+// reloading its attachments)
+void testOcclusionKeepsRenderPass() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto& commands = rig.commands;
+    const auto draw = [&] {
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+    };
+    const auto report = [&] {
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(OcclusionRig::REPORT));
+        engine.method(0x6c3, 2 | (0x15u << 23));
+        renderer.flushReports(
+            commands.get(),
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(rig.report_memory.data()),
+                                       rig.report_memory.size()));
+        u64 value = 0;
+        std::memcpy(&value, rig.report_memory.data(), sizeof(value));
+        return value;
+    };
+
+    // The game counts once, then draws without counting in a new submission
+    renderer.setOcclusionCounterEnabled(true);
+    draw();
+    renderer.setOcclusionCounterEnabled(false);
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    renderer.clearDepth(commands.get(), 0, 0.75f);
+    draw();
+    auto* metal_commands = static_cast<metal::CommandBuffer*>(commands.get());
+    const auto encoders = metal_commands->getRenderEncoderCount();
+    expect(metal_commands->getVisibilityResultBuffer() != nullptr,
+           "A pass started while the game counts has a visibility buffer");
+
+    // Passes of other threads (presentation) leave the counter alone: it is
+    // not synchronized with the thread counting the guest draws
+    bool other_has_visibility = true;
+    std::thread([&] {
+        std::unique_ptr<ICommandBuffer> other(renderer.createCommandBuffer());
+        renderer.clearDepth(other.get(), 0, 0.5f);
+        other_has_visibility = static_cast<metal::CommandBuffer*>(other.get())
+                                   ->getVisibilityResultBuffer() != nullptr;
+    }).join();
+    expect(!other_has_visibility,
+           "A pass of another thread has no visibility buffer");
+
+    // Counting starts in the open pass
+    renderer.setOcclusionCounterEnabled(true);
+    engine.method(0x54c, 1);
+    draw();
+    draw();
+    expect(metal_commands->getRenderEncoderCount() == encoders,
+           "Counted draws continue the open render pass");
+    expect(report() == 32, "Draws counted in the open pass report their samples");
+    std::cout << "PASS: counted draws keep the open render pass\n";
+}
+
+// SET_ANTI_ALIAS_ALPHA_CONTROL alpha-to-coverage: with one sample a pixel is
+// kept or dropped by the alpha of output 0
+void testAlphaToCoverage() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto& commands = rig.commands;
+    const auto count = [&](f32 alpha, bool coverage) {
+        ShaderDescriptor fragment_descriptor{};
+        fragment_descriptor.type = ShaderType::Fragment;
+        fragment_descriptor.backend = ShaderBackend::Msl;
+        const auto code = fmt::format(R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_() {{ return float4(1, 1, 1, {}); }}
+)", alpha);
+        fragment_descriptor.code.assign(code.begin(), code.end());
+        std::unique_ptr<ShaderBase> fragment(renderer.createShader(fragment_descriptor));
+        PipelineDescriptor descriptor{};
+        descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = rig.vertex.get();
+        descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+        descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        descriptor.depth_stencil_format = TextureFormat::Z32Float;
+        descriptor.alpha_to_coverage = coverage;
+        std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(descriptor));
+        renderer.bindPipeline(pipeline.get());
+        renderer.clearDepth(commands.get(), 0, 0.75f);
+        renderer.setOcclusionCounterEnabled(true);
+        engine.method(0x54c, 1);
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(OcclusionRig::REPORT));
+        engine.method(0x6c3, 2 | (0x15u << 23));
+        renderer.flushReports(
+            commands.get(),
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(rig.report_memory.data()),
+                                       rig.report_memory.size()));
+        u64 value = 0;
+        std::memcpy(&value, rig.report_memory.data(), sizeof(value));
+        renderer.bindPipeline(rig.pipeline.get());
+        return value;
+    };
+    expect(count(0.25f, false) == 16, "Without alpha-to-coverage alpha does not drop pixels");
+    expect(count(0.25f, true) == 0, "Alpha-to-coverage drops pixels with a low alpha");
+    expect(count(0.75f, true) == 16, "Alpha-to-coverage keeps pixels with a high alpha");
+    std::cout << "PASS: alpha-to-coverage keeps or drops single-sample pixels by alpha\n";
 }
 
 void testOcclusionReports() {
@@ -2908,6 +3216,32 @@ void testReportSemaphoreReductionAndAcquire() {
     std::cout << "PASS: report semaphore reduction and acquire\n";
 }
 
+// SET_SAMPLER_BINDING (0x48d) and SET_SINGLE_CT_WRITE_CONTROL (0x3e4)
+void testSamplerBindingAndCommonWriteMask() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    // TIC 0x123, TSC 0x45
+    constexpr u32 HANDLE = 0x123 | (0x45u << 20);
+    engine.method(0x48d, 0);
+    expect(engines::ThreeDTestAccess::samplerIndex(engine, HANDLE) == 0x45,
+           "Independent sampler binding takes the handle's sampler index");
+    engine.method(0x48d, 1);
+    expect(engines::ThreeDTestAccess::samplerIndex(engine, HANDLE) == 0x123,
+           "Sampler binding via the header uses the texture header index");
+    engine.method(0x48d, 0);
+
+    engines::ThreeDTestAccess::setColorWriteMask(engine, 0, engines::ColorWriteMask::Red);
+    engines::ThreeDTestAccess::setColorWriteMask(engine, 2, engines::ColorWriteMask::None);
+    engine.method(0x3e4, 0);
+    expect(engines::ThreeDTestAccess::colorWriteMask(engine, 2) == engines::ColorWriteMask::None,
+           "Per-target write masks apply without the common control");
+    engine.method(0x3e4, 1);
+    expect(engines::ThreeDTestAccess::colorWriteMask(engine, 2) == engines::ColorWriteMask::Red,
+           "The common write control applies mask 0 to every target");
+    std::cout << "PASS: sampler binding via header and common color write mask\n";
+}
+
 void testConditionalRendering() {
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
     Gpu gpu;
@@ -2926,14 +3260,18 @@ void testConditionalRendering() {
     expect(!engine.shouldExecute(), "FALSE rendering mode disables execution");
     engine.method(0x556, 1);
     expect(engine.shouldExecute(), "TRUE rendering mode enables execution");
+    // Conditional (RES_NON_ZERO) tests the 64-bit report value: an occlusion
+    // count has a zero high word
     engine.method(0x556, 2);
-    expect(engine.shouldExecute(), "Conditional mode requires both initial words nonzero");
-    compare[0] = 0;
-    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial sequence");
-    compare[0] = 5;
+    expect(engine.shouldExecute(), "Conditional mode renders for a nonzero value");
     compare[1] = 0;
-    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial mode");
+    expect(engine.shouldExecute(),
+           "Conditional mode renders for a count below 2^32 (high word zero)");
+    compare[0] = 0;
+    expect(!engine.shouldExecute(), "Conditional mode rejects a zero value");
     compare[1] = 1;
+    expect(engine.shouldExecute(), "Conditional mode renders for a count of 2^32");
+    compare[0] = 5;
     engine.method(0x556, 3);
     expect(engine.shouldExecute(), "RENDER_IF_EQUAL compares both report words");
     compare[5] = 2;
@@ -4822,6 +5160,10 @@ void testGpuWorkTracker() {
 }
 
 int main(int argc, char** argv) {
+    // Exercise the draw queue (opt-in in production) unless the run asks
+    // for synchronous encoding
+    if (std::getenv("HYDRA_SYNC_ENCODE") == nullptr)
+        setenv("HYDRA_ASYNC_ENCODE", "1", 0);
     if (argc == 2 && std::string_view(argv[1]) == "--gpu-work-tracker") {
         // Statistics are only collected with HYDRA_PERF_STATS
         expect(hydra::hw::tegra_x1::gpu::PerfStats::isEnabled(),
@@ -4896,11 +5238,15 @@ int main(int argc, char** argv) {
         testComputeCommandsAndCapture();
         testCaptureAndReplay();
         testBufferTextureContents();
+        testMultisampleGuestRoundTrip();
+        testMultisampleRendering();
         if (std::getenv("HYDRA_GPU_BENCH"))
             benchmarkCommands();
         testDrawResourceLeases();
         testRenderTargetMappingMemo();
         testOcclusionReports();
+        testOcclusionKeepsRenderPass();
+        testAlphaToCoverage();
         testCompletionQueueOrder();
         testSubmissionSaturation();
         testManagedMetalSubmissions();
@@ -4910,6 +5256,7 @@ int main(int argc, char** argv) {
         testShaderInvalidationWaitsOnlyForGuestWrites();
         testReportSemaphoreReductionAndAcquire();
         testConditionalRendering();
+        testSamplerBindingAndCommonWriteMask();
         testIndexDecoding();
         testPrimitiveRestart();
         testInlineIndices();

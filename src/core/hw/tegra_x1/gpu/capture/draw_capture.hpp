@@ -27,7 +27,7 @@
 namespace hydra::hw::tegra_x1::gpu::capture {
 
 constexpr char MAGIC[8] = {'H', 'Y', 'D', 'R', 'A', 'C', 'A', 'P'};
-constexpr u32 VERSION = 4;
+constexpr u32 VERSION = 5;
 
 using Contents = std::vector<std::vector<u8>>;
 
@@ -76,6 +76,9 @@ struct PipelineRecord {
     std::vector<u8> color_targets;
     u32 depth_stencil_format;
     u32 topology_class;
+    // Version 5: bit 0 alpha-to-coverage, bit 1 alpha-to-one
+    u32 alpha_flags{0};
+    u32 sample_count{1};
 };
 
 struct TargetRecord {

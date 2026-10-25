@@ -255,7 +255,10 @@ class ScopedGpuWorkRoot {
 
 class ScopedGpuWork {
   public:
-    explicit ScopedGpuWork(GpuWork work) : enabled{gpu_work_tracker.active} {
+    // The thread-local is only touched with the stats on: on macOS every
+    // access is a _tlv_get_addr call, and this runs several times per draw
+    explicit ScopedGpuWork(GpuWork work)
+        : enabled{PerfStats::isEnabled() && gpu_work_tracker.active} {
         if (!enabled)
             return;
         previous = gpu_work_tracker.work;

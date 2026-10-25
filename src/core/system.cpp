@@ -1,4 +1,5 @@
 #include "core/system.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 
 #include "common/frame_generation_timing.hpp"
 
@@ -741,6 +742,9 @@ void System::progressFrame(u32 width, u32 height,
                              1e6 / std::max(frames, 1.0),
                          per_frame(exit_total), exits);
                 LOG_INFO(Other, "GUEST SVC wall time per frame:{}", top_svcs);
+                LOG_INFO(Other, "DRAW QUEUE waits: {}",
+                         hw::tegra_x1::gpu::renderer::takeDrawQueueReport(
+                             frames));
                 LOG_INFO(Other,
                          "REPORTS: {:.1f} queued/frame, {} forced a wait",
                          per_frame(stats.reports_queued.exchange(0)),
@@ -1074,6 +1078,14 @@ void System::takeScreenshot() {
 }
 
 void System::captureGpuFrame() {
+    // With HYDRA_GPU_CAPTURE, a replayable capture of what follows (more than
+    // a frame, see LiveCapture) instead of a Metal GPU trace
+    if (const char* directory = std::getenv("HYDRA_GPU_CAPTURE")) {
+        std::ofstream(std::filesystem::path(directory) / "trigger")
+            << "commands=3000 limit_mb=1500";
+        LOG_INFO(Gpu, "GPU capture requested");
+        return;
+    }
     // TODO: allow multiple frames
     gpu.getRenderer().captureFrames(1);
 }

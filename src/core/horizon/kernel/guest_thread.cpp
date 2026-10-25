@@ -70,6 +70,11 @@ void GuestThread::run() {
              [this] {
                  DEBUGGER_MANAGER_INSTANCE.getDebugger(process).breakpointHit(
                      this);
+             },
+         .user_exception =
+             [this](hw::tegra_x1::cpu::IThread* hw_thread,
+                    const hw::tegra_x1::cpu::GuestException& info) {
+                 return process->enterUserException(this, *hw_thread, info);
              }},
         tls_mem, tls_addr);
 

@@ -207,7 +207,7 @@ std::shared_ptr<UploadBufferPool> snapshotBufferPool(MTL::Device* device) {
 BufferBase* Renderer::createCpuBufferSnapshotHot3(ztd::Range<uptr> range) {
     static const bool disabled =
         std::getenv("HYDRA_DISABLE_BUFFER_SNAPSHOTS") != nullptr;
-    if (disabled || range.getSize() > 64 * 1024)
+    if (disabled || range.getSize() > BUFFER_SNAPSHOT_MAX_SIZE)
         return nullptr;
     ScopedGpuWork work(GpuWork::Buffer);
     BufferBase* snapshot =
@@ -454,9 +454,14 @@ SamplerBase* Renderer::createSamplerHot10(const SamplerDescriptor& descriptor) {
 }
 
 ICommandBuffer* Renderer::createCommandBufferHot11() {
-    if (mtl4_context)
-        return new CommandBuffer(mtl4_context, completions);
-    return new CommandBuffer(command_queue, completions);
+    auto* command_buffer = mtl4_context
+                               ? new CommandBuffer(mtl4_context, completions)
+                               : new CommandBuffer(command_queue, completions);
+    command_buffer->setVisibilitySource(
+        [counter = occlusion.get()](CommandBuffer& buffer) {
+            return counter->pageForNewPass(buffer);
+        });
+    return command_buffer;
 }
 
 RenderPassBase*
@@ -511,7 +516,10 @@ void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target
     ClearColorPipelineDescriptor pipeline_descriptor{
         .render_target_id = render_target_id,
         .mask = mask,
-        .depth_stencil_pixel_format = getDepthStencilPixelFormat()};
+        .depth_stencil_pixel_format = getDepthStencilPixelFormat(),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_color_pipeline_cache.find(pipeline_descriptor));
@@ -550,7 +558,10 @@ void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
 
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
-            toMtlPixelFormat(texture->getDescriptor().format)};
+            toMtlPixelFormat(texture->getDescriptor().format),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));
@@ -583,7 +594,10 @@ void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
     // the write mask, while keeping depth intact
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
-            toMtlPixelFormat(texture->getDescriptor().format)};
+            toMtlPixelFormat(texture->getDescriptor().format),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));

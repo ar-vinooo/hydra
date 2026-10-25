@@ -11,9 +11,11 @@ DEFINE_SERVICE_COMMAND_TABLE(IRequest, 0, getRequestState, 1, getResult, 2,
 
 IRequest::IRequest(bool online_)
     : online{online_},
-      events{
-          std::make_unique<kernel::Event>(false, "IRequest system event 0"),
-          std::make_unique<kernel::Event>(false, "IRequest system event 1")} {}
+      events{kernel::makeAutoObject<kernel::Event>(false,
+                                                   "IRequest system event 0"),
+             kernel::makeAutoObject<kernel::Event>(false,
+                                                   "IRequest system event 1")} {
+}
 
 result_t IRequest::getRequestState(RequestState* out_state) {
     if (online) {

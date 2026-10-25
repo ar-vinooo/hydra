@@ -325,6 +325,9 @@ void Thread::run() {
                     bool far_valid = (esr & 0x00000400) == 0;
                     ASSERT_DEBUG(far_valid, Hypervisor, "FAR not valid");
 
+                    if (!CONFIG_INSTANCE.getRecoverFromSegfault() &&
+                        deliverUserException(esr, far))
+                        break;
                     if (CONFIG_INSTANCE.getRecoverFromSegfault()) {
                         LOG_ERROR(
                             Hypervisor,
@@ -341,6 +344,11 @@ void Thread::run() {
                     break;
                 }
                 default:
+                    // Undefined instructions, alignment faults, instruction
+                    // aborts, ...: Horizon hands them to the process
+                    serializeSimd();
+                    if (deliverUserException(esr, far))
+                        break;
                     LOG_ERROR(
                         Hypervisor,
                         "Unknown HVC code (EC: {}, ESR: 0x{:08x}, PC: "
@@ -369,6 +377,9 @@ void Thread::run() {
                 LOG_FATAL(Hypervisor, "SMC");
                 break;
             case ExceptionClass::BrkAarch64:
+                // Without a debugger, BRK is a user exception on Horizon
+                if (deliverUserException(static_cast<u32>(syndrome), 0x0))
+                    break;
                 GET_CURRENT_PROCESS_DEBUGGER().breakOnThisThread(
                     "BRK instruction");
                 return;
@@ -503,6 +514,19 @@ void Thread::countExit(std::chrono::steady_clock::time_point run_start) {
         }
     }
     stats.cpu_exits[static_cast<usize>(kind)]++;
+}
+
+bool Thread::deliverUserException(u32 esr, u64 far) {
+    if (CONFIG_INSTANCE.getGdbEnabled() || !callbacks.user_exception)
+        return false;
+    GuestException guest_exception{.esr = esr, .far = far};
+    if (exception && has_vcpu) {
+        guest_exception.afsr0 =
+            static_cast<u32>(getSysReg(HV_SYS_REG_AFSR0_EL1));
+        guest_exception.afsr1 =
+            static_cast<u32>(getSysReg(HV_SYS_REG_AFSR1_EL1));
+    }
+    return callbacks.user_exception(this, guest_exception);
 }
 
 u64 Thread::selectTrampoline() {

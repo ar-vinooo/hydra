@@ -20,7 +20,18 @@ namespace hydra::horizon::kernel {
 Process::Process(System& system_, std::string_view debug_name)
     : SynchronizationObject(TYPE_ID, false, debug_name), system{system_},
       mmu{system.getCpu().createMmu(system)}, gmmu(mmu.get()),
-      applet_state(system.getOs().getKernel()) {
+      applet_state(system.getOs().getKernel()),
+      resource_limit{new ResourceLimit()} {
+    // Atmosphere's pm limits for applications (the thread limit boosted, as
+    // pm does for every application). Memory is what TotalMemorySize reports.
+    resource_limit->setLimitValue(LimitableResource::PhysicalMemoryMax,
+                                  static_cast<i64>(APPLICATION_MEMORY_SIZE));
+    resource_limit->setLimitValue(LimitableResource::ThreadCountMax, 256);
+    resource_limit->setLimitValue(LimitableResource::EventCountMax, 0);
+    resource_limit->setLimitValue(LimitableResource::TransferMemoryCountMax,
+                                  32);
+    resource_limit->setLimitValue(LimitableResource::SessionCountMax, 1);
+
     // TODO: use title ID and name as debugger name?
     DEBUGGER_MANAGER_INSTANCE.attachDebugger(
         this,
@@ -33,6 +44,168 @@ Process::Process(System& system_, std::string_view debug_name)
         random_e = gen();
 }
 
+namespace {
+
+// Layouts from Atmosphere's svc_types_common.hpp (aarch64)
+struct ExceptionInfo {
+    u64 r[9];
+    u64 lr;
+    u64 sp;
+    u64 pc;
+    u32 pstate;
+    u32 afsr0;
+    u32 afsr1;
+    u32 esr;
+    u64 far;
+};
+static_assert(sizeof(ExceptionInfo) == 0x78);
+constexpr u64 PROCESS_LOCAL_REGION_SIZE = 0x200;
+static_assert(PROCESS_LOCAL_REGION_SIZE <= TLS_SIZE);
+// The data before the info is the handler's stack
+constexpr u64 EXCEPTION_INFO_OFFSET = 0x1c0 - sizeof(ExceptionInfo);
+constexpr u32 EL0_AARCH64_PSR_MASK = 0xf0000000; // NZCV
+
+// svc::ExceptionType for an ESR, as mesosphere's HandleUserException maps it
+u32 exceptionType(u32 esr) {
+    constexpr u32 INSTRUCTION_ABORT = 0x100;
+    constexpr u32 DATA_ABORT = 0x101;
+    constexpr u32 UNALIGNED_INSTRUCTION = 0x102;
+    constexpr u32 UNALIGNED_DATA = 0x103;
+    constexpr u32 MEMORY_SYSTEM_ERROR = 0x106;
+    constexpr u32 INVALID_SYSTEM_CALL = 0x301;
+    switch (esr >> 26) {
+    case 0x00: // Unknown
+    case 0x0e: // Illegal execution state
+    case 0x03: // CP15 MCR/MRC
+    case 0x04: // CP15 MCRR/MRRC
+    case 0x05: // CP14 MCR/MRC
+    case 0x0c: // CP14 MRRC
+    case 0x18: // System instruction
+    case 0x19: // SVE
+    case 0x38: // BKPT
+    case 0x3c: // BRK
+    case 0x20: // Instruction abort from EL0
+        return INSTRUCTION_ABORT;
+    case 0x22:
+        return UNALIGNED_INSTRUCTION;
+    case 0x26:
+        return UNALIGNED_DATA;
+    case 0x11: // SVC (AArch32)
+    case 0x15: // SVC (AArch64)
+        return INVALID_SYSTEM_CALL;
+    case 0x2f:
+        return MEMORY_SYSTEM_ERROR;
+    case 0x24: // Data abort from EL0: alignment faults are unaligned data
+        return (esr & 0x3f) == 0b100001 ? UNALIGNED_DATA : DATA_ABORT;
+    default:
+        return DATA_ABORT;
+    }
+}
+
+} // namespace
+
+ResourceLimit* Process::getResourceLimit() {
+    resource_limit->setCurrentValue(
+        LimitableResource::PhysicalMemoryMax,
+        static_cast<i64>(getUsedUserMemorySize() +
+                         std::min<u64>(system_resource_size, 64ull * 1024)));
+    return resource_limit;
+}
+
+vaddr_t Process::getProcessLocalRegion() {
+    std::scoped_lock lock(exception_mutex);
+    if (local_region == 0x0) {
+        vaddr_t base;
+        local_region_mem.reset(createTlsMemory(base));
+        local_region = base;
+    }
+    return local_region;
+}
+
+bool Process::enterUserException(IThread* thread,
+                                 hw::tegra_x1::cpu::IThread& cpu_thread,
+                                 const hw::tegra_x1::cpu::GuestException& info) {
+    if (entry_point == 0x0)
+        return false;
+    const auto region = getProcessLocalRegion();
+    {
+        std::unique_lock lock(exception_mutex);
+        if (exception_thread == thread)
+            return false;
+        // One thread handles an exception at a time
+        exception_cv.wait(lock, [&] {
+            return exception_thread == nullptr || thread->isStoppingOrStopped();
+        });
+        if (thread->isStoppingOrStopped())
+            return false;
+        exception_thread = thread;
+    }
+
+    // Faulting kernel addresses report a translation fault (ISFC 4)
+    u32 esr = info.esr;
+    u64 far = info.far;
+    const u32 ec = esr >> 26;
+    if (ec == 0x20 || ec == 0x24) {
+        if ((esr & 0x43f) == 0x410)
+            far = 0x0;
+        else if (far >= (1ull << 39))
+            esr = (esr & 0xffffffc0) | 4;
+    }
+
+    auto& regs = cpu_thread.getState();
+    ExceptionInfo exception_info{};
+    for (u32 i = 0; i < 9; i++)
+        exception_info.r[i] = regs.r[i];
+    exception_info.lr = regs.lr;
+    exception_info.sp = regs.sp;
+    exception_info.pc = regs.pc;
+    exception_info.pstate = cpu_thread.getUserPstate() & EL0_AARCH64_PSR_MASK;
+    exception_info.afsr0 = info.afsr0;
+    exception_info.afsr1 = info.afsr1;
+    exception_info.esr = esr;
+    exception_info.far = far;
+    std::memcpy(reinterpret_cast<void*>(mmu->unmapAddr(region + EXCEPTION_INFO_OFFSET)),
+                &exception_info, sizeof(exception_info));
+
+    LOG_INFO(Kernel,
+             "User exception {:#x} (ESR {:#x}, FAR {:#x}) at PC {:#x}, "
+             "entering the process handler",
+             exceptionType(esr), esr, far, regs.pc);
+    // Enter at the entry point, on the stack below the info
+    regs.pc = entry_point;
+    regs.r[0] = exceptionType(esr);
+    regs.r[1] = region + EXCEPTION_INFO_OFFSET;
+    regs.sp = alignDown(region + EXCEPTION_INFO_OFFSET, u64{0x10});
+    cpu_thread.setUserPstate(0);
+    return true;
+}
+
+bool Process::leaveUserException(IThread* thread,
+                                 hw::tegra_x1::cpu::IThread& cpu_thread) {
+    {
+        std::scoped_lock lock(exception_mutex);
+        if (exception_thread != thread || local_region == 0x0)
+            return false;
+        exception_thread = nullptr;
+    }
+    exception_cv.notify_one();
+
+    ExceptionInfo exception_info;
+    std::memcpy(&exception_info,
+                reinterpret_cast<const void*>(
+                    mmu->unmapAddr(local_region + EXCEPTION_INFO_OFFSET)),
+                sizeof(exception_info));
+    auto& regs = cpu_thread.getState();
+    for (u32 i = 0; i < 9; i++)
+        regs.r[i] = exception_info.r[i];
+    regs.lr = exception_info.lr;
+    regs.sp = exception_info.sp;
+    regs.pc = exception_info.pc;
+    cpu_thread.setUserPstate((exception_info.pstate & EL0_AARCH64_PSR_MASK) |
+                             (cpu_thread.getUserPstate() & ~EL0_AARCH64_PSR_MASK));
+    return true;
+}
+
 void Process::setApplicationControlProperty(
     std::unique_ptr<services::ns::ApplicationControlProperty> property) {
     control_property = std::move(property);
@@ -40,6 +213,7 @@ void Process::setApplicationControlProperty(
 
 Process::~Process() {
     cleanUp();
+    resource_limit->release();
     DEBUGGER_MANAGER_INSTANCE.detachDebugger(this);
 }
 

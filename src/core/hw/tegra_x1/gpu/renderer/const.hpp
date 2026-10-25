@@ -240,6 +240,29 @@ struct SwizzleChannels {
 SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word,
                                          bool is_srgb);
 
+// Maxwell multisample layout (SET_ANTI_ALIAS samples mode and the TIC multi
+// sample count share the encoding). A multisampled surface is stored as a
+// larger single-sample image: every pixel is a block of samples_x * samples_y
+// texels (nouveau: width0 << ms_x), and surface dimensions in registers and
+// texture headers are those of the larger image.
+struct MsaaLayout {
+    u32 samples{1};
+    u32 samples_x_log2{0};
+    u32 samples_y_log2{0};
+    // Coverage sampling (VC) modes have extra coverage samples, the color
+    // samples are those of the layout
+    bool coverage_samples{false};
+    // The D3D patterns have other sample positions in the pixel
+    bool d3d_positions{false};
+};
+MsaaLayout getMsaaLayout(u32 mode);
+MsaaLayout getMsaaLayoutForSamples(u32 samples);
+// Position of sample `index` in its pixel's block of the larger image
+// (nouveau nvc0_get_sample_locations: surface coords)
+std::pair<u32, u32> getMsaaSampleTexel(u32 samples, u32 index);
+// Sample position in the pixel, in 1/16 pixel
+std::pair<u32, u32> getMsaaSamplePosition(const MsaaLayout& layout, u32 index);
+
 struct TextureDescriptor {
     uptr ptr;
     MTL::TextureType type;
@@ -256,21 +279,34 @@ struct TextureDescriptor {
     u32 block_depth_gobs_log2;
     u32 layer_size;
     u32 size;
+    // Samples per pixel. width and height stay those of the guest surface,
+    // whose pixels are blocks of samples (see MsaaLayout): the host texture
+    // is multisampled at width >> samples_x_log2.
+    u32 sample_count{1};
 
     TextureDescriptor(uptr ptr_, MTL::TextureType type_, TextureFormat format_,
                       bool is_linear_, u32 linear_stride_, u32 width_,
                       u32 height_, u32 depth_, u32 level_count_,
                       u32 layer_count_, u32 block_width_gobs_log2_,
                       u32 block_height_gobs_log2_, u32 block_depth_gobs_log2_,
-                      u32 layer_size_ = 0)
+                      u32 layer_size_ = 0, u32 sample_count_ = 1)
         : ptr{ptr_}, type{type_}, format{format_}, is_linear{is_linear_},
           linear_stride{linear_stride_}, width{width_}, height{height_},
           depth{depth_}, level_count{level_count_}, layer_count{layer_count_},
           block_width_gobs_log2{block_width_gobs_log2_},
           block_height_gobs_log2{block_height_gobs_log2_},
           block_depth_gobs_log2{block_depth_gobs_log2_},
-          layer_size{layer_size_} {
+          layer_size{layer_size_}, sample_count{sample_count_} {
         calculateSize();
+    }
+
+    bool isMultisampled() const { return sample_count > 1; }
+    // Pixels of the multisampled image
+    u32 getPixelWidth() const {
+        return std::max(width >> getMsaaLayoutForSamples(sample_count).samples_x_log2, 1u);
+    }
+    u32 getPixelHeight() const {
+        return std::max(height >> getMsaaLayoutForSamples(sample_count).samples_y_log2, 1u);
     }
 
     ztd::Range<uptr> getRange() const {
@@ -453,6 +489,8 @@ struct RenderTargetDescriptor {
 struct RenderPassDescriptor {
     RenderTargetDescriptor color_targets[COLOR_TARGET_COUNT];
     RenderTargetDescriptor depth_stencil_target;
+    // SET_ANTI_ALIAS samples mode of multisampled targets (sample positions)
+    u32 msaa_mode{0};
 };
 
 struct ClearState {
@@ -651,6 +689,12 @@ struct PipelineDescriptor {
     // Required when the vertex shader selects the layer or viewport
     MTL::PrimitiveTopologyClass topology_class{
         MTL::PrimitiveTopologyClassUnspecified};
+    // SET_ANTI_ALIAS_ALPHA_CONTROL: coverage from the alpha of output 0, and
+    // that alpha replaced by 1
+    bool alpha_to_coverage{false};
+    bool alpha_to_one{false};
+    // Samples of the render targets (SET_ANTI_ALIAS)
+    u32 sample_count{1};
 };
 
 usize getVertexFormatSize(engines::VertexAttribSize size);
@@ -735,7 +779,8 @@ ENABLE_STRUCT_FORMATTING(hydra::hw::tegra_x1::gpu::renderer::TextureDescriptor,
                          block_width_gobs_log2, "", "log2(block width in GOBs)",
                          block_height_gobs_log2, "",
                          "log2(block height in GOBs)", block_depth_gobs_log2,
-                         "", "log2(block depth in GOBs)", layer_size, ":#x",
+                         "", "log2(block depth in GOBs)", sample_count, "",
+                         "samples", layer_size, ":#x",
                          "layer size", size, ":#x", "size")
 
 ENABLE_STRUCT_FORMATTING(

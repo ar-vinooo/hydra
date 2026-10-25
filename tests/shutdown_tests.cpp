@@ -2686,6 +2686,7 @@ int runSharedMemoryCases(System& system, const char* input_path, const char* out
 void testSharedMemoryCleanup(System& system);
 void testStageAMemory(System& system);
 void testTlbMaintenance(System& system);
+void testUserException(System& system);
 int runDeviceSharedCases(System& system, const char* input_path, const char* output_path);
 
 int main(int argc, char** argv) {
@@ -2701,6 +2702,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--check-tlb-maintenance") {
             System system(ui);
             testTlbMaintenance(system);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-user-exception") {
+            System system(ui);
+            testUserException(system);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--check-stage-a-memory") {

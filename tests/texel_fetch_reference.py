@@ -32,6 +32,27 @@ def bits_f32(b):
     return struct.unpack('<f', struct.pack('<I', b))[0]
 
 
+# Texel of guest sample i in its pixel's block (nouveau
+# nvc0_get_sample_locations surface coords), and the block size
+MS_TEXELS = {2: [(0, 0), (1, 0)], 4: [(0, 0), (1, 0), (0, 1), (1, 1)]}
+MS_BLOCK = {2: (2, 1), 4: (2, 2)}
+
+
+def make_ms_case(rng, samples):
+    """TLDS 2D.LZ.MS x=R4 y=R5 sample=R6 on a texture uploaded as guest
+    memory: its pixels are blocks of samples of the larger image."""
+    bw, bh = MS_BLOCK[samples]
+    pw, ph = rng.choice([3, 4, 5]), rng.choice([2, 3, 4])
+    w, h = pw * bw, ph * bh
+    texels = [[rng.random() for _ in range(4)] for _ in range(w * h)]
+    fetches = []
+    for _ in range(16):
+        x, y, s = rng.randrange(pw), rng.randrange(ph), rng.randrange(samples)
+        tx, ty = MS_TEXELS[samples][s]
+        fetches.append(((x, y, s, 0), texels[(y * bh + ty) * w + x * bw + tx]))
+    return '2dms', w, h, samples, 1, 6, {(0, 0): texels}, fetches
+
+
 def make_case(rng, kind, target):
     if kind == '1d':
         w, h, d, levels = rng.choice([5, 8, 16, 3]), 1, 1, 1
@@ -78,6 +99,8 @@ def main():
     names = {('1d', 0): '1D.LZ', ('1d', 1): '1D.LL', ('2d', 2): '2D.LZ', ('2d', 5): '2D.LL',
              ('3d', 7): '3D.LZ', ('2darray', 8): '2D array LZ'}
     cases = [make_case(rng, kind, target) for kind, target in targets for _ in range(40)]
+    cases += [make_ms_case(rng, samples) for samples in (2, 4) for _ in range(20)]
+    names.update({('2dms', 6): '2D.LZ.MS'})
     lines = []
     for kind, w, h, d, levels, target, data, samples in cases:
         lines.append('TYPE %s %d %d %d %d %d' % (kind, w, h, d, levels, target))

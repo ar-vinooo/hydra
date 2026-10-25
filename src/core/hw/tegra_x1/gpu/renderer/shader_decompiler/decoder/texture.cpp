@@ -570,9 +570,11 @@ void emitTexelFetchSwizzled(DecoderContext& context, InstTlds inst) {
         lod = reg(src_b);
         lod_zero = false;
         break;
-    case 6: // 2D.LZ.MS
-        SHADER_UNSUPPORTED_ONCE("TLDS multisample fetch");
+    case 6: // 2D.LZ.MS: the sample index in register B
+        type = TextureType::_2DMS;
         coords = {reg(src_a), reg(offsetRegister(src_a, 1))};
+        lod = reg(src_b);
+        lod_zero = false;
         break;
     case 7: // 3D.LZ
         type = TextureType::_3D;
@@ -625,7 +627,7 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
                         bool int_coords, TextureDimension dim, reg_t dst,
                         u8 component_mask, reg_t src_a, reg_t src_b,
                         u32 cbuf_index, Lod lod_mode = Lod{},
-                        bool aoffi = false, bool dc = false) {
+                        bool aoffi = false, bool dc = false, bool ms = false) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     u32 src_a_offset = 0;
@@ -728,6 +730,21 @@ void emitTextureSample2(DecoderContext& context, pred_t pred, bool pred_inv,
                 ir::Value::createConstantU(4)));
         texel_offset = b.opVectorConstruct(ir::ScalarType::I32, values);
         flags |= TextureSampleFlags::Offset;
+    }
+    // TLD.MS: the sample index follows the LOD and the offset (a
+    // multisampled texture has one level). It takes the place of the LOD of
+    // the texel read.
+    if (ms) {
+        if (type == TextureType::_2D)
+            type = TextureType::_2DMS;
+        else if (type == TextureType::_2DArray)
+            type = TextureType::_2DMSArray;
+        else
+            SHADER_UNSUPPORTED("Multisample fetch of a {} texture",
+                               static_cast<u32>(type));
+        flags &= ~(TextureSampleFlags::LodZero | TextureSampleFlags::Bias);
+        flags |= TextureSampleFlags::Lod;
+        lod = RB();
     }
     ir::Value cmp_value = ir::Value::createUndefined();
     if (dc) {
@@ -1123,12 +1140,11 @@ void emitTexB(DecoderContext& context, InstTexB inst) {
                        inst.lod, inst.aoffi, inst.dc);
 }
 
-// TODO: multisample index
 void emitTld(DecoderContext& context, InstTld inst) {
     emitTextureSample2(context, inst.pred, inst.pred_inv, true, inst.dim,
                        inst.dst, inst.write_mask, inst.src_a, inst.src_b,
                        inst.cbuf_index, inst.lod ? Lod::Ll : Lod::Lz,
-                       inst.aoffi);
+                       inst.aoffi, false, inst.ms);
 }
 
 void emitTldB(DecoderContext& context, InstTldB inst) {
@@ -1138,7 +1154,8 @@ void emitTldB(DecoderContext& context, InstTldB inst) {
     emitTextureSample2(context, inst.pred, inst.pred_inv, true, inst.dim,
                        inst.dst, inst.write_mask, inst.src_a,
                        offsetRegister(inst.src_b.get(), 1), *index,
-                       inst.lod ? Lod::Ll : Lod::Lz, inst.aoffi);
+                       inst.lod ? Lod::Ll : Lod::Lz, inst.aoffi, false,
+                       inst.ms);
 }
 
 void emitTld4B(DecoderContext& context, InstTld4B inst) {

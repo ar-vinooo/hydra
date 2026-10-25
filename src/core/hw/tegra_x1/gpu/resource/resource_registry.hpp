@@ -35,7 +35,10 @@ class ResourceHandle {
     friend class ResourceRegistry;
     u64 id{0};
     u64 generation{0};
-    std::weak_ptr<ResourceRecord> record;
+    // Keeps the record (not the resource) alive: checking a handle is then
+    // plain loads, without locking a weak pointer. A retired record stays
+    // dead.
+    std::shared_ptr<const ResourceRecord> record;
 };
 
 class ResourceRegistry {

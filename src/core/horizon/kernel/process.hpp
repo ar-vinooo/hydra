@@ -1,10 +1,14 @@
 #pragma once
 
+#include <condition_variable>
+
 #include "core/horizon/handle_pool.hpp"
 #include "core/horizon/kernel/applet_state.hpp"
 #include "core/horizon/kernel/synchronization_object.hpp"
+#include "core/horizon/kernel/resource_limit.hpp"
 #include "core/horizon/kernel/thread.hpp"
 #include "core/hw/tegra_x1/cpu/memory.hpp"
+#include "core/hw/tegra_x1/cpu/thread.hpp"
 #include "core/hw/tegra_x1/gpu/gmmu.hpp"
 
 // TODO: remove dependency
@@ -74,6 +78,7 @@ class Process : public SynchronizationObject {
     void registerThread(IThread* thread) {
         std::scoped_lock lock(thread_mutex);
         threads.push_back(thread);
+        resource_limit->add(LimitableResource::ThreadCountMax);
         if (stopping)
             thread->stop();
     }
@@ -82,7 +87,8 @@ class Process : public SynchronizationObject {
 
     void unregisterThread(IThread* thread) {
         std::scoped_lock lock(thread_mutex);
-        std::erase(threads, thread);
+        if (std::erase(threads, thread) != 0)
+            resource_limit->remove(LimitableResource::ThreadCountMax);
 
         // Signal
         if (threads.empty())
@@ -257,6 +263,16 @@ class Process : public SynchronizationObject {
 
     std::unique_ptr<services::ns::ApplicationControlProperty> control_property;
 
+    ResourceLimit* resource_limit;
+
+    // User exception handling
+    vaddr_t entry_point{0x0};
+    std::mutex exception_mutex;
+    std::condition_variable exception_cv;
+    IThread* exception_thread{nullptr};
+    std::unique_ptr<hw::tegra_x1::cpu::IMemory> local_region_mem;
+    vaddr_t local_region{0x0};
+
     // Thread
     GuestThread* main_thread{nullptr};
     // From the ThreadInfo kernel capability and the NPDM: the cores and
@@ -292,6 +308,25 @@ class Process : public SynchronizationObject {
     GETTER(main_thread, getMainThread);
     u64 getProcessId() const { return process_id; }
     GETTER_AND_SETTER(core_mask, getCoreMask, setCoreMask);
+    // The limits pm gives applications, with the current memory use
+    ResourceLimit* getResourceLimit();
+
+    // User exception handling (svc::ReturnFromException). Exceptions enter
+    // the process at its entry point with x0 = the exception type and x1 =
+    // the ExceptionInfo in the process local region, one thread at a time.
+    void setEntryPoint(vaddr_t entry_point_) { entry_point = entry_point_; }
+    // The process local region (0x200 bytes, UserExceptionContextAddress)
+    vaddr_t getProcessLocalRegion();
+    // False if the process has no handler, or `thread` is in an exception
+    // already (a fault in the handler is not handled)
+    bool enterUserException(IThread* thread,
+                            hw::tegra_x1::cpu::IThread& cpu_thread,
+                            const hw::tegra_x1::cpu::GuestException& info);
+    // Restores the context the handler left in the ExceptionInfo. False if
+    // `thread` is not handling an exception.
+    bool leaveUserException(IThread* thread,
+                            hw::tegra_x1::cpu::IThread& cpu_thread);
+
     // The application's control.nacp, if it has one
     const services::ns::ApplicationControlProperty*
     getApplicationControlProperty() const {

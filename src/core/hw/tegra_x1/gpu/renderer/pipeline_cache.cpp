@@ -56,6 +56,9 @@ u32 PipelineCache::hashHot1(const PipelineDescriptor& descriptor) {
 
     hash.add(static_cast<u32>(descriptor.depth_stencil_format));
     hash.add(static_cast<u32>(descriptor.topology_class));
+    hash.add(descriptor.alpha_to_coverage);
+    hash.add(descriptor.alpha_to_one);
+    hash.add(descriptor.sample_count);
 
     return hash.toHashCode();
 }
@@ -104,7 +107,9 @@ bool PipelineCache::equals(const PipelineDescriptor& a,
     }
 
     return a.depth_stencil_format == b.depth_stencil_format &&
-           a.topology_class == b.topology_class;
+           a.topology_class == b.topology_class &&
+           a.alpha_to_coverage == b.alpha_to_coverage &&
+           a.alpha_to_one == b.alpha_to_one && a.sample_count == b.sample_count;
 }
 
 void PipelineCache::destroyElement(PipelineBase* pipeline) { delete pipeline; }

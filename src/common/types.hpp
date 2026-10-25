@@ -365,19 +365,29 @@ class CacheBase {
     ZTD_MAKE_NON_COPYABLE(CacheBase);
 
     T& find(const DescriptorT& descriptor) {
-        u32 hash = THIS->hash(descriptor);
         if constexpr (compare_descriptors) {
+            // Consecutive draws mostly look the same object up again: the
+            // last hit skips hashing and the tree. Entries are never erased.
+            if (last_hit != nullptr &&
+                Subclass::equals(last_hit->descriptor, descriptor)) [[likely]] {
+                THIS->update(last_hit->value);
+                return last_hit->value;
+            }
+            u32 hash = THIS->hash(descriptor);
             auto& bucket = cache[hash];
             for (auto& entry : bucket) {
                 if (Subclass::equals(entry.descriptor, descriptor)) {
                     THIS->update(entry.value);
+                    last_hit = &entry;
                     return entry.value;
                 }
             }
             // List elements keep their address when the bucket grows
-            return bucket.emplace_back(Entry{descriptor, createOwned(descriptor)})
-                .value;
+            last_hit = &bucket.emplace_back(
+                Entry{descriptor, createOwned(descriptor)});
+            return last_hit->value;
         } else {
+            u32 hash = THIS->hash(descriptor);
             auto it = cache.find(hash);
             if (it == cache.end()) {
                 it = cache.insert({hash, createOwned(descriptor)}).first;
@@ -407,6 +417,7 @@ class CacheBase {
     std::conditional_t<compare_descriptors, std::map<u32, std::list<Entry>>,
                        std::map<u32, T>>
         cache;
+    Entry* last_hit{nullptr};
 };
 
 } // namespace hydra

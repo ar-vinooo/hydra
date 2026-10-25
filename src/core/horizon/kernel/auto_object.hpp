@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "core/horizon/kernel/const.hpp"
 
 namespace hydra::horizon::kernel {
@@ -19,6 +21,7 @@ enum class AutoObjectTypeId {
     SharedMemory,
     Thread,
     TransferMemory,
+    ResourceLimit,
 };
 
 class AutoObject {
@@ -90,6 +93,19 @@ class AutoObject {
     GETTER(type_id, getTypeId);
 };
 
+// Owns one reference of an object the guest can hold handles to: the object
+// lives until the last handle is closed too
+struct AutoObjectReleaser {
+    void operator()(AutoObject* object) const { object->release(); }
+};
+template <typename T>
+using AutoObjectPtr = std::unique_ptr<T, AutoObjectReleaser>;
+
+template <typename T, typename... Args>
+AutoObjectPtr<T> makeAutoObject(Args&&... args) {
+    return AutoObjectPtr<T>(new T(std::forward<Args>(args)...));
+}
+
 } // namespace hydra::horizon::kernel
 
 ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::AutoObjectTypeId, ClientPort,
@@ -98,4 +114,5 @@ ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::AutoObjectTypeId, ClientPort,
                        "server session", Session, "session", CodeMemory,
                        "code memory", Event, "event", Process, "process",
                        SharedMemory, "shared memory", Thread, "thread",
-                       TransferMemory, "transfer memory")
+                       TransferMemory, "transfer memory", ResourceLimit,
+                       "resource limit")

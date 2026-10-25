@@ -40,6 +40,7 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
     // be set. Use the smallest layer count among all attachments.
     u32 array_length = invalid<u32>();
     const auto add_attachment = [&](MTL::Texture* texture) {
+        sample_count = static_cast<u32>(texture->sampleCount());
         array_length =
             std::min(array_length, getRenderTargetArrayLength(texture));
         width = std::min(width, static_cast<u32>(texture->width()));
@@ -129,6 +130,31 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
 
     if (array_length != invalid<u32>())
         render_pass_descriptor->setRenderTargetArrayLength(array_length);
+
+    // The sample positions of the guest pattern. With fewer samples on the
+    // host than the guest uses, the host count's standard pattern covers the
+    // pixel (the first samples of a larger pattern do not).
+    if (sample_count > 1) {
+        MTL::Device* mtl_device = nullptr;
+        for (u32 i = 0; i < COLOR_TARGET_COUNT && mtl_device == nullptr; i++)
+            if (auto* texture =
+                    render_pass_descriptor->colorAttachments()->object(i)->texture())
+                mtl_device = texture->device();
+        if (mtl_device == nullptr && render_pass_descriptor->depthAttachment()->texture())
+            mtl_device = render_pass_descriptor->depthAttachment()->texture()->device();
+        if (mtl_device != nullptr && mtl_device->areProgrammableSamplePositionsSupported()) {
+            auto layout = getMsaaLayout(descriptor.msaa_mode);
+            if (layout.samples != sample_count)
+                layout = getMsaaLayoutForSamples(sample_count);
+            std::array<MTL::SamplePosition, 16> positions{};
+            for (u32 i = 0; i < sample_count; i++) {
+                const auto [x, y] = getMsaaSamplePosition(layout, i);
+                positions[i] = MTL::SamplePosition(static_cast<f32>(x) / 16.0f,
+                                                   static_cast<f32>(y) / 16.0f);
+            }
+            render_pass_descriptor->setSamplePositions(positions.data(), sample_count);
+        }
+    }
 }
 
 RenderPass::~RenderPass() { render_pass_descriptor->release(); }

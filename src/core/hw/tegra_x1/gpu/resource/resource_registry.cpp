@@ -79,8 +79,17 @@ ResourceHandle ResourceRegistry::track(ResourceLifetime& lifetime,
                                        ResourceKind kind, const void* object) {
     if (!object)
         throw std::invalid_argument("Cannot register a null GPU resource");
-    std::scoped_lock lock(state->mutex);
     auto& record = lifetime.record;
+    // Already registered here: only creating a record needs the registry
+    if (record && belongsTo(*record) && record->kind == kind &&
+        record->object == object) [[likely]] {
+        ResourceHandle handle;
+        handle.id = record->id;
+        handle.generation = record->generation.load(std::memory_order_acquire);
+        handle.record = record;
+        return handle;
+    }
+    std::scoped_lock lock(state->mutex);
     if (record && !belongsTo(*record)) {
         if (!record->registry.expired())
             throw std::logic_error("GPU resource belongs to another registry");
@@ -109,7 +118,7 @@ ResourceHandle ResourceRegistry::track(ResourceLifetime& lifetime,
 
 std::optional<ResourceInfo>
 ResourceRegistry::inspect(const ResourceHandle& handle) const {
-    const auto record = handle.record.lock();
+    const auto* record = handle.record.get();
     if (!record || !belongsTo(*record) ||
         !record->alive.load(std::memory_order_acquire) ||
         record->id != handle.id ||

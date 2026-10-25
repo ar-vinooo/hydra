@@ -16,7 +16,7 @@ constexpr u64 stringAsU64(std::string_view str) {
 // TODO: rework?
 inline std::string u64AsString(u64 value) {
     char* str = reinterpret_cast<char*>(&value);
-    return {str, std::min<usize>(strlen(str), 8)};
+    return {str, strnlen(str, sizeof(value))};
 }
 
 constexpr u64 operator""_u64(const char* str, unsigned long len) {

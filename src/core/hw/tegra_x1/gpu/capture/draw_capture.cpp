@@ -339,6 +339,8 @@ std::vector<u8> CaptureFile::serialize() const {
         w.putBytes(p.color_targets);
         w.put(p.depth_stencil_format);
         w.put(p.topology_class);
+        w.put(p.alpha_flags);
+        w.put(p.sample_count);
     }
     w.put<u64>(passes.size());
     for (const auto& p : passes) {
@@ -451,7 +453,7 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
         if (r.get<char>() != expected)
             throw std::runtime_error("Not a Hydra GPU capture");
     const auto version = r.get<u32>();
-    if (version != 3 && version != VERSION)
+    if (version < 3 || version > VERSION)
         throw std::runtime_error("Unsupported capture version");
 
     CaptureFile f;
@@ -502,6 +504,10 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
         p.color_targets = r.getBytes();
         p.depth_stencil_format = r.get<u32>();
         p.topology_class = r.get<u32>();
+        if (version >= 5) {
+            p.alpha_flags = r.get<u32>();
+            p.sample_count = r.get<u32>();
+        }
     }
     f.passes.resize(r.count());
     for (auto& p : f.passes) {
@@ -739,6 +745,9 @@ i32 Recorder::pipeline(ICommandBuffer*, PipelineBase* object) {
     record.color_targets = std::move(targets);
     record.depth_stencil_format = static_cast<u32>(d.depth_stencil_format);
     record.topology_class = static_cast<u32>(d.topology_class);
+    record.alpha_flags = (d.alpha_to_coverage ? 1u : 0u) |
+                         (d.alpha_to_one ? 2u : 0u);
+    record.sample_count = d.sample_count;
     const auto id = static_cast<i32>(file.pipelines.size());
     file.pipelines.push_back(std::move(record));
     pipelines[object] = id;
@@ -1143,6 +1152,9 @@ ReplayResult replay(IRenderer& renderer, const CaptureFile& file,
                 static_cast<TextureFormat>(p.depth_stencil_format);
             d.topology_class =
                 static_cast<MTL::PrimitiveTopologyClass>(p.topology_class);
+            d.alpha_to_coverage = (p.alpha_flags & 1) != 0;
+            d.alpha_to_one = (p.alpha_flags & 2) != 0;
+            d.sample_count = p.sample_count;
             pipelines.emplace_back(renderer.createPipeline(d));
         }
         for (const auto& p : file.passes) {

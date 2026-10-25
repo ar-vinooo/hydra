@@ -252,7 +252,19 @@ class TextureCache {
     IRenderer& renderer;
 
     std::mutex mutex;
+    // Disjoint intervals, by their begin
     std::map<uptr, TextureMem> entries;
+
+    // The entries that intersect `range`, without visiting the others
+    template <typename F>
+    void forEachIntersecting(ztd::Range<uptr> range, F&& f) {
+        auto it = entries.upper_bound(range.getBegin());
+        if (it != entries.begin())
+            it--;
+        for (; it != entries.end() && it->first < range.getEnd(); it++)
+            if (it->second.range.intersects(range))
+                f(it->second);
+    }
     u64 epoch{0};
     // DEBUG: set around the first decode of a new render target, which then
     // uploads zeros instead of the guest memory contents (HYDRA_RT_ZERO_INIT)

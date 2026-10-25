@@ -91,21 +91,24 @@ TextureCache::findDepthStencilAlias(const TextureDescriptor& descriptor) {
     if (format_info.is_depth_stencil)
         return std::nullopt;
 
-    for (auto& [base, mem] : entries) {
-        if (!mem.range.contains(descriptor.ptr))
-            continue;
-        for (auto& [group_key, group] : mem.cache) {
-            for (auto& [storage_key, storage] : group.cache) {
-                const auto& other = storage.base->getDescriptor();
-                if (other.ptr != descriptor.ptr ||
-                    other.width != descriptor.width ||
-                    other.height != descriptor.height)
-                    continue;
-                const auto& other_info = getTextureFormatInfo(other.format);
-                if (other_info.is_depth_stencil &&
-                    other_info.bytes_per_block == format_info.bytes_per_block)
-                    return other.format;
-            }
+    // Only the entry containing the address can hold the texture
+    auto it = entries.upper_bound(descriptor.ptr);
+    if (it == entries.begin())
+        return std::nullopt;
+    auto& mem = std::prev(it)->second;
+    if (!mem.range.contains(descriptor.ptr))
+        return std::nullopt;
+    for (auto& [group_key, group] : mem.cache) {
+        for (auto& [storage_key, storage] : group.cache) {
+            const auto& other = storage.base->getDescriptor();
+            if (other.ptr != descriptor.ptr ||
+                other.width != descriptor.width ||
+                other.height != descriptor.height)
+                continue;
+            const auto& other_info = getTextureFormatInfo(other.format);
+            if (other_info.is_depth_stencil &&
+                other_info.bytes_per_block == format_info.bytes_per_block)
+                return other.format;
         }
     }
 
@@ -113,34 +116,32 @@ TextureCache::findDepthStencilAlias(const TextureDescriptor& descriptor) {
 }
 
 bool TextureCache::overlapsCompressedStorage(ztd::Range<uptr> range) {
-    for (auto& [base, mem] : entries) {
-        if (!mem.range.intersects(range))
-            continue;
+    bool found = false;
+    forEachIntersecting(range, [&](TextureMem& mem) {
         for (auto& [group_key, group] : mem.cache) {
             for (auto& [storage_key, storage] : group.cache) {
                 const auto& descriptor = storage.base->getDescriptor();
                 if (isTextureFormatCompressed(descriptor.format) &&
                     descriptor.getRange().intersects(range))
-                    return true;
+                    found = true;
             }
         }
-    }
-    return false;
+    });
+    return found;
 }
 
 bool TextureCache::hasUnflushedGpuWrites(ztd::Range<uptr> range) {
-    for (auto& [base, mem] : entries) {
-        if (!mem.range.intersects(range))
-            continue;
+    bool found = false;
+    forEachIntersecting(range, [&](TextureMem& mem) {
         for (auto& [group_key, group] : mem.cache) {
             for (auto& [storage_key, storage] : group.cache) {
                 if (storage.gpu_written_timestamp > storage.flushed_timestamp &&
                     storage.base->getDescriptor().getRange().intersects(range))
-                    return true;
+                    found = true;
             }
         }
-    }
-    return false;
+    });
+    return found;
 }
 
 void TextureCache::invalidateMemory(ztd::Range<uptr> range) {
@@ -222,6 +223,7 @@ bool servesRequest(const TextureDescriptor& storage,
         storage.width != request.width || storage.height != request.height ||
         storage.depth != request.depth ||
         storage.layer_size != request.layer_size ||
+        storage.sample_count != request.sample_count ||
         storage.level_count < request.level_count ||
         storage.layer_count < request.layer_count)
         return false;

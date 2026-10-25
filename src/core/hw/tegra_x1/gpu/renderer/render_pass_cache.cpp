@@ -18,6 +18,7 @@ u32 RenderPassCache::hashHot1(const RenderPassDescriptor& descriptor) {
     for (const auto& color_target : descriptor.color_targets)
         hash.add(color_target.texture);
     hash.add(descriptor.depth_stencil_target.texture);
+    hash.add(descriptor.msaa_mode);
 
     return hash.toHashCode();
 }
@@ -29,7 +30,8 @@ bool RenderPassCache::equals(const RenderPassDescriptor& a,
         if (a.color_targets[i].texture != b.color_targets[i].texture)
             return false;
     }
-    return a.depth_stencil_target.texture == b.depth_stencil_target.texture;
+    return a.depth_stencil_target.texture == b.depth_stencil_target.texture &&
+           a.msaa_mode == b.msaa_mode;
 }
 
 void RenderPassCache::destroyElement(RenderPassBase* render_pass) {
