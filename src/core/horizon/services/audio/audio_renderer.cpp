@@ -1,6 +1,7 @@
 #include "core/horizon/services/audio/audio_renderer.hpp"
 
 #include "core/audio/pcm_queue.hpp"
+#include "core/audio/renderer_dsp.hpp"
 #include "core/audio/sample_clock.hpp"
 #include "core/audio/sample_decoder.hpp"
 #include "core/debugger/debugger_manager.hpp"
@@ -9,6 +10,9 @@
 #include "core/system.hpp"
 #include <cmath>
 #include <fstream>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 namespace hydra::horizon::services::audio {
 
@@ -74,10 +78,14 @@ struct WaveBuffer {
     bool is_looping;
     bool end_of_stream;
     bool sent_to_server;
-    u8 _padding1[5];
+    u8 _reserved;
+    // Loops after the first pass, negative: forever
+    i32 loop_count;
     vaddr_t context_addr;
     u64 context_sz;
-    u64 _padding2;
+    // The range of the loops, when not zero
+    u32 loop_first_sample_offset;
+    u32 loop_last_sample_offset;
 };
 
 struct VoiceInfoIn {
@@ -104,7 +112,14 @@ struct VoiceInfoIn {
     u32 dest_splitter_id;
     WaveBuffer wave_buffers[4];
     u32 channel_ids[6];
-    u8 _padding3[24];
+    bool reset_voice_drop;
+    u8 flush_wave_buffer_count;
+    u16 _reserved2;
+    u16 decoding_flags;
+    u8 src_quality;
+    u32 external_context;
+    u32 external_context_size;
+    u8 _reserved3[9];
 };
 
 struct ChannelInfoIn {
@@ -253,16 +268,23 @@ IAudioRenderer::IAudioRenderer(System& system,
             queued_samples.fetch_sub(samples, std::memory_order_relaxed);
         }));
     signal_thread = std::jthread([this](std::stop_token token) {
+#ifdef __APPLE__
+        // The DSP's stand-in: late wakes underrun the device (crackles and
+        // stretched sound), it must not wait behind emulation threads or run
+        // on efficiency cores
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
         auto next_tick = std::chrono::steady_clock::now();
         auto last_signal = next_tick;
         while (!token.stop_requested()) {
             const bool rendered = renderAudio();
             const auto now = std::chrono::steady_clock::now();
+            // An event per DSP frame, and one per period while none renders
             if (rendered || now - last_signal >= std::chrono::milliseconds(5)) {
                 event->signal();
                 last_signal = now;
             }
-            next_tick = std::max(next_tick + std::chrono::milliseconds(2), now);
+            next_tick = std::max(next_tick + std::chrono::milliseconds(1), now);
             std::this_thread::sleep_until(next_tick);
         }
     });
@@ -334,246 +356,66 @@ bool IAudioRenderer::renderAudio() {
     std::lock_guard lock(render_mutex);
     if (!running || render_state->mixes.empty())
         return false;
-    const auto& channels = render_state->channels;
-    const auto& mixes = render_state->mixes;
-    const auto& sinks = render_state->sinks;
-    // Audio frames rendered since the last update (5ms each)
+    // The DSP renders a frame (5 ms) per period of the audio device. Here a
+    // frame is due while less than the lead (forty milliseconds) is queued
+    // ahead of what the device played.
     constexpr auto FRAME_DURATION = std::chrono::milliseconds(5);
     const auto now = std::chrono::steady_clock::now();
-    u32 frame_count = 0;
-    if (last_update_time == std::chrono::steady_clock::time_point{}) {
-        last_update_time = now;
-    } else {
-        frame_count = static_cast<u32>(
-            std::min<i64>((now - last_update_time) / FRAME_DURATION, 20));
-        last_update_time += frame_count * FRAME_DURATION;
-        if (now - last_update_time > 20 * FRAME_DURATION)
-            last_update_time = now;
-    }
-
+    const u64 frame_samples = params.sample_count;
+    bool due = false;
+    bool behind = false;
     const auto stream_stats = output_stream->getStats();
-    if (running && stream_stats.has_sample_clock) {
+    if (stream_stats.has_sample_clock) {
         // Keep the guest's DSP time independent from host queue accounting.
         // The initial eight-frame lead matches the renderer's startup lead.
         elapsed_frames.store(elapsedDspFrames(stream_stats.sample_clock_frames,
                                               sample_clock_origin,
                                               params.sample_count),
                              std::memory_order_relaxed);
+        // Consumed PCM, not silence produced by device underruns: otherwise
+        // every underrun permanently grows the actual queue
         const u64 played = consumedSampleClock(
             stream_stats.sample_clock_frames, sample_clock_origin,
             stream_stats.missing_frames, missing_frames_origin);
-        // Keep forty milliseconds ahead of consumed PCM, not silence produced
-        // by hardware underruns. Otherwise every underrun permanently grows
-        // the actual queue and eventually triggers discarded voice frames.
-        frame_count = framesForSampleClock(played, produced_samples,
-                                           params.sample_count, 1);
+        due = framesForSampleClock(played, produced_samples,
+                                   params.sample_count, 1) != 0;
+        behind = produced_samples < played + 2 * frame_samples;
+    } else {
+        // Without a device clock, by wall time
+        if (last_update_time == std::chrono::steady_clock::time_point{})
+            last_update_time = now;
+        due = now - last_update_time >= FRAME_DURATION;
+        if (due) {
+            last_update_time += FRAME_DURATION;
+            if (now - last_update_time > 20 * FRAME_DURATION)
+                last_update_time = now;
+        }
     }
-    if (!running)
-        frame_count = 0;
-    // Guest clients replenish waves after each DSP event. A large hardware
-    // callback must not consume multiple DSP frames while holding their update
-    // lock, otherwise a single queued wave is followed by artificial silence.
-    frame_count = std::min(frame_count, 1u);
-    // Apply backpressure before advancing voices. A full host queue must not
-    // consume guest waves and silently discard their mixed output.
-    if (queued_samples.load(std::memory_order_relaxed) + params.sample_count >
-        params.sample_rate / 5)
-        frame_count = 0;
-    // A callback jump or a delayed worker wake must not drain the guest's
-    // remaining waves in a burst. Allow a small clock correction, but leave
-    // enough time between DSP frames for the client to refill a consumed wave.
-    if (frame_count &&
-        last_render_time != std::chrono::steady_clock::time_point{} &&
-        now - last_render_time < std::chrono::microseconds(3500))
+    if (!due)
         return false;
-    const usize output_frames =
-        static_cast<usize>(frame_count) * params.sample_count;
-    const usize mix_count = mixes.size();
-    // Each mix has at most 24 channels. CTR uses only the final mix.
-    std::vector<f32> mix_samples(output_frames * mix_count * 24, 0.0f);
-    auto mixIndex = [&](usize mix, usize channel, usize frame) {
-        return (mix * 24 + channel) * output_frames + frame;
-    };
-    for (u32 i = 0; i < params.voice_count; i++) {
-        const auto& voice_in = render_state->voice_inputs[i];
-        auto& voice = voices[i];
-        auto& state = voice_states[i];
-        if (voice_in.is_used &&
-            voice_in.play_state == VoicePlayState::Started &&
-            voice_in.channel_count > 0 && voice_in.channel_count <= 6) {
-            const f64 pitch =
-                std::isfinite(voice_in.pitch) && voice_in.pitch > 0.0f
-                    ? static_cast<f64>(voice_in.pitch)
-                    : 1.0;
-            const f64 step = static_cast<f64>(voice_in.sample_rate) /
-                             params.sample_rate * pitch;
-            usize destination = mix_count;
-            for (usize m = 0; m < mix_count; m++)
-                if (mixes[m].mix_id == voice_in.dest_mix_id && mixes[m].is_used)
-                    destination = m;
+    // Backpressure: a full host queue must not consume guest waves and
+    // silently discard their mixed output
+    if (queued_samples.load(std::memory_order_relaxed) + frame_samples >
+        params.sample_rate / 5)
+        return false;
+    // One frame at a time, each followed by its event: the client refills
+    // the waves a frame consumed before the next one. Leave it time between
+    // frames, unless the device is about to run dry (after a stall of this
+    // thread or the client): then catch up as fast as the client allows.
+    const auto spacing = behind ? std::chrono::microseconds(1000)
+                                : std::chrono::microseconds(3500);
+    if (last_render_time != std::chrono::steady_clock::time_point{} &&
+        now - last_render_time < spacing)
+        return false;
 
-            const auto& coefficients = state.coefficients;
-
-            for (usize frame = 0; frame < output_frames; frame++) {
-                auto& slot = state.slots[state.crnt_slot];
-                if (!slot.valid)
-                    break;
-                if (state.offset < slot.start || state.offset >= slot.end)
-                    state.offset = slot.start;
-                if (voice_in.sample_format == PcmFormat::Adpcm &&
-                    !slot.decoded_ready) {
-                    if (slot.has_context) {
-                        state.history[0] = slot.history[0];
-                        state.history[1] = slot.history[1];
-                    }
-                    slot.decoded =
-                        decodeDspAdpcm(slot.data, coefficients, slot.end,
-                                       state.history[0], state.history[1]);
-                    slot.decoded_ready = true;
-                }
-                for (u32 channel = 0; channel < voice_in.channel_count;
-                     channel++) {
-                    auto sampleAt = [&](const auto& source, u32 offset) {
-                        if (voice_in.sample_format == PcmFormat::Adpcm)
-                            return offset < source.decoded.size()
-                                       ? source.decoded[offset]
-                                       : 0.0f;
-                        return decodePcm(source.data,
-                                         static_cast<usize>(offset) *
-                                                 voice_in.channel_count +
-                                             channel,
-                                         voice_in.sample_format);
-                    };
-                    const auto first = sampleAt(slot, state.offset);
-                    // The interpolation partner of the last sample is the
-                    // start of the loop or of the next wave; holding the last
-                    // sample makes every wave boundary a discontinuity (click)
-                    f32 second;
-                    if (state.offset + 1 < slot.end) {
-                        second = sampleAt(slot, state.offset + 1);
-                    } else if (slot.is_looping) {
-                        second = sampleAt(slot, slot.start);
-                    } else if (const auto& next =
-                                   state.slots[(state.crnt_slot + 1) % 4];
-                               next.valid &&
-                               voice_in.sample_format != PcmFormat::Adpcm &&
-                               next.start < next.end) {
-                        second = sampleAt(next, next.start);
-                    } else {
-                        second = first;
-                    }
-                    const auto sample =
-                        (first +
-                         (second - first) * static_cast<f32>(state.fraction)) *
-                        voice_in.volume;
-                    const u32 channel_id = voice_in.channel_ids[channel];
-                    if (destination < mix_count &&
-                        channel_id < channels.size() && std::isfinite(sample)) {
-                        for (u32 out = 0;
-                             out <
-                             std::min<u32>(mixes[destination].buffer_count, 24);
-                             out++)
-                            mix_samples[mixIndex(destination, out, frame)] +=
-                                sample * channels[channel_id].mix[out];
-                    }
-                }
-                state.fraction += std::clamp(step, 0.0, 16.0);
-                u32 advance = static_cast<u32>(state.fraction);
-                state.fraction -= advance;
-                while (advance && state.slots[state.crnt_slot].valid) {
-                    auto& current = state.slots[state.crnt_slot];
-                    const u32 taken =
-                        std::min(advance, current.end - state.offset);
-                    state.offset += taken;
-                    advance -= taken;
-                    voice.played_sample_count += taken;
-                    if (state.offset == current.end) {
-                        if (current.is_looping) {
-                            state.offset = current.start;
-                        } else {
-                            current.valid = false;
-                            current.data.clear();
-                            current.decoded.clear();
-                            voice.num_wave_buffers_consumed++;
-                            state.crnt_slot = (state.crnt_slot + 1) % 4;
-                            state.offset = state.slots[state.crnt_slot].start;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Apply mix volumes and route submixes in dependency order. Cycles are
-    // ignored rather than repeatedly amplifying the audio.
-    std::vector<bool> processed(mix_count, false);
-    for (usize pass = 0; pass < mix_count; pass++) {
-        bool progress = false;
-        for (usize m = 0; m < mix_count; m++) {
-            if (processed[m] || !mixes[m].is_used)
-                continue;
-            bool waiting = false;
-            for (usize source = 0; source < mix_count; source++)
-                if (source != m && !processed[source] &&
-                    mixes[source].is_used &&
-                    mixes[source].dest_mix_id == mixes[m].mix_id)
-                    waiting = true;
-            if (waiting)
-                continue;
-            processed[m] = true;
-            progress = true;
-            const auto count = std::min<u32>(mixes[m].buffer_count, 24);
-            for (u32 channel = 0; channel < count; channel++)
-                for (usize frame = 0; frame < output_frames; frame++)
-                    mix_samples[mixIndex(m, channel, frame)] *= mixes[m].volume;
-            for (usize dest = 0; dest < mix_count; dest++) {
-                if (dest == m || !mixes[dest].is_used ||
-                    mixes[dest].mix_id != mixes[m].dest_mix_id)
-                    continue;
-                for (u32 src = 0; src < count; src++)
-                    for (u32 out = 0;
-                         out < std::min<u32>(mixes[dest].buffer_count, 24);
-                         out++) {
-                        const f32 gain = mixes[m].mix[src][out];
-                        if (gain == 0.0f)
-                            continue;
-                        for (usize frame = 0; frame < output_frames; frame++)
-                            mix_samples[mixIndex(dest, out, frame)] +=
-                                mix_samples[mixIndex(m, src, frame)] * gain;
-                    }
-            }
-        }
-        if (!progress)
-            break;
-    }
-    std::vector<f32> stereo(output_frames * 2, 0.0f);
-    for (usize m = 0; m < mix_count; m++) {
-        if (!mixes[m].is_used || mixes[m].mix_id != 0)
-            continue;
-        for (const auto& sink : sinks) {
-            if (!sink.is_used || sink.type != 1)
-                continue;
-            u32 count = 0;
-            std::memcpy(&count, sink.data + 256, 4);
-            count = std::min<u32>(count, 6);
-            for (usize frame = 0; frame < output_frames; frame++) {
-                f32 inputs[6]{};
-                for (u32 c = 0; c < count; c++) {
-                    const u8 channel = sink.data[260 + c];
-                    if (channel < std::min<u32>(mixes[m].buffer_count, 24))
-                        inputs[c] = mix_samples[mixIndex(m, channel, frame)];
-                }
-                // Nintendo surround order: front L/R, center, LFE, rear L/R.
-                stereo[frame * 2] += inputs[0] + inputs[2] * 0.70710678f +
-                                     inputs[3] * 0.5f + inputs[4] * 0.70710678f;
-                stereo[frame * 2 + 1] += (count == 1 ? inputs[0] : inputs[1]) +
-                                         inputs[2] * 0.70710678f +
-                                         inputs[3] * 0.5f +
-                                         inputs[5] * 0.70710678f;
-            }
-        }
-    }
-    for (auto& sample : stereo)
+    std::vector<f32> stereo;
+    renderFrame(stereo);
+    stats_frames++;
+    for (auto& sample : stereo) {
+        if (!std::isfinite(sample) || std::abs(sample) > 1.0f)
+            stats_clipped++;
         sample = std::isfinite(sample) ? std::clamp(sample, -1.0f, 1.0f) : 0.0f;
+    }
     if (!logged_output && !stereo.empty()) {
         f32 peak = 0.0f;
         for (const auto sample : stereo)
@@ -587,17 +429,16 @@ bool IAudioRenderer::renderAudio() {
                          queued_samples.load());
         }
     }
-    if (output_frames) {
-        produced_samples += output_frames;
-        last_render_time = now;
-        if (!stream_stats.has_sample_clock)
-            elapsed_frames.store(produced_samples / params.sample_count,
-                                 std::memory_order_relaxed);
-        queued_samples.fetch_add(output_frames, std::memory_order_relaxed);
-        output_stream->enqueueBuffer(
-            output_frames, std::span(reinterpret_cast<const u8*>(stereo.data()),
-                                     stereo.size() * sizeof(f32)));
-    }
+    const usize output_frames = params.sample_count;
+    produced_samples += output_frames;
+    last_render_time = now;
+    if (!stream_stats.has_sample_clock)
+        elapsed_frames.store(produced_samples / params.sample_count,
+                             std::memory_order_relaxed);
+    queued_samples.fetch_add(output_frames, std::memory_order_relaxed);
+    output_stream->enqueueBuffer(
+        output_frames, std::span(reinterpret_cast<const u8*>(stereo.data()),
+                                 stereo.size() * sizeof(f32)));
 
     if ((std::getenv("HYDRA_DUMP_AUDIO") || std::getenv("HYDRA_AUDIO_STATS")) &&
         now - last_stats_time >= std::chrono::seconds(5)) {
@@ -630,15 +471,18 @@ bool IAudioRenderer::renderAudio() {
         std::fprintf(stderr,
                      "Audio sources: %u Hz, updates %llu, active %u, paused "
                      "%u, stopped %u, pitch %.4f..%.4f, RMS %.6f, peak %.6f, "
-                     "head resyncs %llu\n",
+                     "head resyncs %llu | frames %llu, starved voice frames "
+                     "%llu, biquad voice frames %llu, clipped samples %llu\n",
                      params.sample_rate, update_count, active, paused, stopped,
                      static_cast<double>(min_pitch),
                      static_cast<double>(max_pitch), rms,
-                     static_cast<double>(peak), head_resyncs);
+                     static_cast<double>(peak), head_resyncs, stats_frames,
+                     stats_starved, stats_biquad, stats_clipped);
+        stats_frames = stats_starved = stats_biquad = stats_clipped = 0;
         u32 valid_slots = 0;
         for (const auto& state : voice_states)
-            for (const auto& slot : state.slots)
-                valid_slots += slot.valid ? 1u : 0u;
+            for (const auto& buffer : state.source.buffers)
+                valid_slots += buffer.valid ? 1u : 0u;
         std::fprintf(stderr,
                      "Audio timing: %u Hz, hardware %llu, produced %llu, "
                      "missing %llu, queued %llu, consumed clock %llu, valid "
@@ -654,10 +498,231 @@ bool IAudioRenderer::renderAudio() {
                      elapsed_frames.load(std::memory_order_relaxed),
                      valid_slots,
                      voices.empty() ? 0u : voices[0].num_wave_buffers_consumed,
-                     voice_states.empty() ? 0u : voice_states[0].offset,
-                     voice_states.empty() ? 0u : voice_states[0].crnt_slot);
+                     voice_states.empty() ? 0u : voice_states[0].source.offset,
+                     voice_states.empty() ? 0u : voice_states[0].source.index);
     }
-    return output_frames != 0;
+    return true;
+}
+
+void IAudioRenderer::renderFrame(std::vector<f32>& stereo) {
+    namespace dsp = audio::dsp;
+    const auto& channels = render_state->channels;
+    const auto& mixes = render_state->mixes;
+    const auto& sinks = render_state->sinks;
+    const usize sample_count = params.sample_count;
+    const usize mix_count = mixes.size();
+    std::vector<f32> mix_samples(sample_count * mix_count *
+                                     dsp::MIX_BUFFER_COUNT_MAX,
+                                 0.0f);
+    const auto buffer = [&](usize mix, usize channel) {
+        return std::span(mix_samples)
+            .subspan((mix * dsp::MIX_BUFFER_COUNT_MAX + channel) * sample_count,
+                     sample_count);
+    };
+    const auto bufferCount = [&](usize mix) {
+        return std::min<u32>(mixes[mix].buffer_count, dsp::MIX_BUFFER_COUNT_MAX);
+    };
+    depop.resize(mix_count);
+    if (previous_channel_mix.size() < channels.size())
+        previous_channel_mix.resize(channels.size());
+    const auto findMix = [&](u32 mix_id) {
+        for (usize m = 0; m < mix_count; m++)
+            if (mixes[m].is_used && mixes[m].mix_id == mix_id)
+                return m;
+        return mix_count;
+    };
+
+    // Voices: data source, biquad filters, volume ramp, mix ramp
+    std::array<std::vector<f32>, dsp::VOICE_CHANNEL_COUNT_MAX> voice_samples;
+    for (auto& samples : voice_samples)
+        samples.resize(sample_count);
+    for (u32 i = 0; i < params.voice_count; i++) {
+        const auto& voice_in = render_state->voice_inputs[i];
+        auto& state = voice_states[i];
+        const u32 channel_count =
+            std::min<u32>(voice_in.channel_count, dsp::VOICE_CHANNEL_COUNT_MAX);
+        if (!voice_in.is_used || channel_count == 0)
+            continue;
+        const usize destination = findMix(voice_in.dest_mix_id);
+        // Stopped or paused after playing: what the voice left in the mix
+        // buffers fades out (depop) instead of ending in a click
+        if (state.was_playing) {
+            state.was_playing = false;
+            state.previous_volume = 0.0f;
+            if (destination < mix_count)
+                for (u32 c = 0; c < channel_count; c++) {
+                    auto& last = state.channels[c].last_samples;
+                    for (u32 b = 0; b < bufferCount(destination); b++)
+                        depop[destination][b] += last[b];
+                    last.fill(0.0f);
+                }
+            continue;
+        }
+        if (voice_in.play_state != VoicePlayState::Started ||
+            !state.source.hasValidBuffer())
+            continue;
+
+        const dsp::SourceFormat source{
+            .format = voice_in.sample_format,
+            .channel_count = channel_count,
+            .adpcm_coefficients = state.coefficients,
+            .decoding_flags = state.decoding_flags,
+        };
+        const f32 pitch = std::isfinite(voice_in.pitch) && voice_in.pitch > 0.0f
+                              ? voice_in.pitch
+                              : 1.0f;
+        const f32 ratio = static_cast<f32>(voice_in.sample_rate) /
+                          static_cast<f32>(params.sample_rate) * pitch;
+        if (!dsp::processDataSource(state.source, source, state.channels,
+                                    ratio, state.src_quality,
+                                    static_cast<u32>(sample_count),
+                                    voice_samples))
+            stats_starved++;
+        voices[i].played_sample_count = state.source.played;
+        voices[i].num_wave_buffers_consumed = state.source.consumed;
+        if (destination >= mix_count)
+            continue;
+
+        const f32 volume =
+            std::isfinite(voice_in.volume) ? voice_in.volume : 0.0f;
+        for (u32 c = 0; c < channel_count; c++) {
+            auto samples = std::span(voice_samples[c]).first(sample_count);
+            auto& channel = state.channels[c];
+            for (u32 f = 0; f < dsp::BIQUAD_FILTER_COUNT; f++) {
+                const auto& filter = voice_in.biquads[f];
+                if (!filter.enable)
+                    continue;
+                if (c == 0)
+                    stats_biquad++;
+                if (!logged_biquad) {
+                    logged_biquad = true;
+                    LOG_INFO(Services,
+                             "Audio voice biquad: {} {} {} / {} {}",
+                             filter.numerator[0], filter.numerator[1],
+                             filter.numerator[2], filter.denominator[0],
+                             filter.denominator[1]);
+                }
+                // A filter enabled now starts from rest
+                if (!state.biquad_enabled[f])
+                    channel.biquad[f] = {};
+                dsp::processBiquad(samples, filter.numerator,
+                                   filter.denominator, channel.biquad[f]);
+            }
+            dsp::processVolumeRamp(samples, state.previous_volume, volume);
+            const u32 channel_id = voice_in.channel_ids[c];
+            if (channel_id >= channels.size())
+                continue;
+            auto& previous = previous_channel_mix[channel_id];
+            const auto& mix = channels[channel_id].mix;
+            for (u32 b = 0; b < bufferCount(destination); b++) {
+                const f32 to = std::isfinite(mix[b]) ? mix[b] : 0.0f;
+                if (to == 0.0f && previous[b] == 0.0f)
+                    continue;
+                channel.last_samples[b] = dsp::processMixRamp(
+                    buffer(destination, b), samples, previous[b], to);
+            }
+            for (u32 b = 0; b < dsp::MIX_BUFFER_COUNT_MAX; b++)
+                previous[b] = std::isfinite(mix[b]) ? mix[b] : 0.0f;
+        }
+        state.previous_volume = volume;
+        for (u32 f = 0; f < dsp::BIQUAD_FILTER_COUNT; f++)
+            state.biquad_enabled[f] = voice_in.biquads[f].enable;
+    }
+
+    // Mixes in dependency order: depop, volume, then the routing into the
+    // destination mix. Cycles are ignored rather than repeatedly amplifying
+    // the audio.
+    const f32 decay = dsp::depopDecay(params.sample_rate);
+    std::vector<bool> processed(mix_count, false);
+    for (usize pass = 0; pass < mix_count; pass++) {
+        bool progress = false;
+        for (usize m = 0; m < mix_count; m++) {
+            if (processed[m] || !mixes[m].is_used)
+                continue;
+            bool waiting = false;
+            for (usize source = 0; source < mix_count; source++)
+                if (source != m && !processed[source] &&
+                    mixes[source].is_used &&
+                    mixes[source].dest_mix_id == mixes[m].mix_id)
+                    waiting = true;
+            if (waiting)
+                continue;
+            processed[m] = true;
+            progress = true;
+            const u32 count = bufferCount(m);
+            for (u32 channel = 0; channel < count; channel++)
+                if (depop[m][channel] != 0.0f)
+                    depop[m][channel] = dsp::processDepop(
+                        buffer(m, channel), depop[m][channel], decay);
+            const f32 volume =
+                std::isfinite(mixes[m].volume) ? mixes[m].volume : 0.0f;
+            for (u32 channel = 0; channel < count; channel++)
+                for (auto& sample : buffer(m, channel))
+                    sample *= volume;
+            for (usize dest = 0; dest < mix_count; dest++) {
+                if (dest == m || !mixes[dest].is_used ||
+                    mixes[dest].mix_id != mixes[m].dest_mix_id)
+                    continue;
+                for (u32 src = 0; src < count; src++)
+                    for (u32 out = 0; out < bufferCount(dest); out++) {
+                        const f32 gain = mixes[m].mix[src][out];
+                        if (gain == 0.0f || !std::isfinite(gain))
+                            continue;
+                        auto from = buffer(m, src);
+                        auto to = buffer(dest, out);
+                        for (usize frame = 0; frame < sample_count; frame++)
+                            to[frame] += from[frame] * gain;
+                    }
+            }
+        }
+        if (!progress)
+            break;
+    }
+
+    // Device sinks of the final mix, downmixed to the host's stereo
+    stereo.assign(sample_count * 2, 0.0f);
+    const usize final_mix = findMix(0);
+    if (final_mix >= mix_count)
+        return;
+    for (const auto& sink : sinks) {
+        if (!sink.is_used || sink.type != 1)
+            continue;
+        // DeviceParameter: name (0xff), padding, input count, inputs[6],
+        // reserved, downmix enabled, downmix coefficients[4]
+        u32 input_count = 0;
+        std::memcpy(&input_count, sink.data + 256, 4);
+        input_count = std::min<u32>(input_count, dsp::VOICE_CHANNEL_COUNT_MAX);
+        const bool custom_downmix = sink.data[267] != 0;
+        auto coefficients = dsp::DEFAULT_SURROUND_TO_STEREO;
+        if (custom_downmix)
+            std::memcpy(coefficients.data(), sink.data + 268, 16);
+        const auto input = [&](u32 index, usize frame) {
+            const u8 channel = sink.data[260 + index];
+            return channel < bufferCount(final_mix)
+                       ? buffer(final_mix, channel)[frame]
+                       : 0.0f;
+        };
+        for (usize frame = 0; frame < sample_count; frame++) {
+            f32 left, right;
+            if (custom_downmix || input_count == 6) {
+                left = dsp::downmixSurroundToStereo(
+                    coefficients, input(0, frame), input(2, frame),
+                    input(3, frame), input(4, frame));
+                right = dsp::downmixSurroundToStereo(
+                    coefficients, input(1, frame), input(2, frame),
+                    input(3, frame), input(5, frame));
+            } else if (input_count == 1) {
+                left = right = input(0, frame);
+            } else if (input_count != 0) {
+                left = input(0, frame);
+                right = input(1, frame);
+            } else {
+                continue;
+            }
+            stereo[frame * 2] += left;
+            stereo[frame * 2 + 1] += right;
+        }
+    }
 }
 
 result_t IAudioRenderer::requestUpdateImpl(
@@ -845,9 +910,11 @@ result_t IAudioRenderer::requestUpdateImpl(
 
         VoiceInfoOut& voice = voices[i];
         VoiceState& state = voice_states[i];
+        auto& source = state.source;
         if (voice_in.is_new) {
             voice = {};
             state = {};
+            state.previous_volume = voice_in.volume;
         }
 
         if (voice_in.is_used && voice_in.sample_format == PcmFormat::Adpcm &&
@@ -858,91 +925,121 @@ result_t IAudioRenderer::requestUpdateImpl(
             if (coefficients.size() == 32)
                 std::memcpy(state.coefficients.data(), coefficients.data(), 32);
         }
+        // REV5: decoding behaviour and wave buffer flushes, REV8: sample rate
+        // conversion quality
+        if (voice_in.is_used) {
+            if (params.revision >= makeMagic4('R', 'E', 'V', '5')) {
+                std::memcpy(&state.decoding_flags, &voice_in.decoding_flags,
+                            sizeof(state.decoding_flags));
+                state.flush_count += voice_in.flush_wave_buffer_count;
+            }
+            if (params.revision >= makeMagic4('R', 'E', 'V', '8') &&
+                voice_in.src_quality <= 2)
+                state.src_quality =
+                    static_cast<audio::dsp::SrcQuality>(voice_in.src_quality);
+        }
 
         if (voice_in.is_new && voice_in.wave_buffer_head >= 0)
-            state.crnt_slot = static_cast<u32>(voice_in.wave_buffer_head) % 4;
+            source.index = static_cast<u32>(voice_in.wave_buffer_head) %
+                           audio::dsp::WAVE_BUFFER_COUNT;
 
         // Only buffers marked new by the client are copied. The host queue owns
         // mixed PCM, so the guest can recycle buffers as soon as they are
         // consumed.
         if (voice_in.is_used) {
-            for (u32 j = 0; j < 4; j++) {
+            for (u32 j = 0; j < audio::dsp::WAVE_BUFFER_COUNT; j++) {
                 const auto& wave = voice_in.wave_buffers[j];
                 if (wave.sent_to_server || !wave.address ||
                     wave.end_sample_offset <= wave.start_sample_offset)
                     continue;
-                auto& slot = state.slots[j];
-                if (slot.valid && slot.address == wave.address &&
-                    slot.start == wave.start_sample_offset &&
-                    slot.end == wave.end_sample_offset)
+                auto& buffer = source.buffers[j];
+                if (buffer.valid && buffer.address == wave.address &&
+                    buffer.start == wave.start_sample_offset &&
+                    buffer.end == wave.end_sample_offset)
                     continue;
-                slot = {};
-                slot.address = wave.address;
-                slot.start = wave.start_sample_offset;
-                slot.end = wave.end_sample_offset;
-                slot.is_looping = wave.is_looping;
-                slot.data = readGuest(process, wave.address, wave.size);
+                const bool was_current = j == source.index && !buffer.valid;
+                buffer = {};
+                buffer.address = wave.address;
+                buffer.start = wave.start_sample_offset;
+                buffer.end = wave.end_sample_offset;
+                buffer.looping = wave.is_looping;
+                buffer.end_of_stream = wave.end_of_stream;
+                buffer.loop_count = wave.loop_count;
+                buffer.loop_start = wave.loop_first_sample_offset;
+                buffer.loop_end = wave.loop_last_sample_offset;
+                buffer.data = readGuest(process, wave.address, wave.size);
                 if (wave.context_addr && wave.context_sz >= 6) {
                     const auto context =
                         readGuest(process, wave.context_addr, 6);
                     if (context.size() == 6) {
-                        std::memcpy(slot.history, context.data() + 2, 4);
-                        slot.has_context = true;
+                        std::memcpy(buffer.context, context.data() + 2, 4);
+                        buffer.has_context = true;
                     }
                 }
                 const auto bytes = pcmSampleBytes(voice_in.sample_format);
                 const u64 available = voice_in.sample_format == PcmFormat::Adpcm
                                           ? (voice_in.channel_count == 1
-                                                 ? slot.data.size() / 8 * 14
+                                                 ? buffer.data.size() / 8 * 14
                                                  : 0)
                                           : (bytes && voice_in.channel_count
-                                                 ? slot.data.size() / bytes /
+                                                 ? buffer.data.size() / bytes /
                                                        voice_in.channel_count
                                                  : 0);
-                slot.end = static_cast<u32>(std::min<u64>(slot.end, available));
-                slot.valid = slot.end > slot.start;
-                if (j == state.crnt_slot) {
-                    state.offset = slot.start;
-                    state.fraction = 0.0;
+                buffer.end = static_cast<u32>(std::min<u64>(buffer.end, available));
+                buffer.loop_end =
+                    static_cast<u32>(std::min<u64>(buffer.loop_end, available));
+                buffer.valid = buffer.end > buffer.start;
+                // A buffer queued after the voice ran dry starts at its
+                // beginning
+                if (was_current) {
+                    source.offset = 0;
+                    source.loop_counter = 0;
                 }
             }
+        }
+
+        if (state.flush_count != 0) {
+            source.flush(state.flush_count);
+            state.flush_count = 0;
         }
 
         if (voice_in.is_used &&
             voice_in.play_state == VoicePlayState::Started) {
-            const std::array<bool, 4> valid{
-                state.slots[0].valid, state.slots[1].valid,
-                state.slots[2].valid, state.slots[3].valid};
-            const auto head = resumeWaveHead(valid, state.crnt_slot,
+            std::array<bool, audio::dsp::WAVE_BUFFER_COUNT> valid{};
+            for (u32 j = 0; j < audio::dsp::WAVE_BUFFER_COUNT; j++)
+                valid[j] = source.buffers[j].valid;
+            const auto head = resumeWaveHead(valid, source.index,
                                              voice_in.wave_buffer_head);
-            if (head != state.crnt_slot) {
+            if (head != source.index) {
                 head_resyncs++;
-                state.crnt_slot = head;
-                state.offset = state.slots[head].start;
+                source.index = head;
+                source.offset = 0;
+                source.loop_counter = 0;
             }
         }
 
+        const bool was_started = state.previous_play_state ==
+                                 static_cast<u8>(VoicePlayState::Started);
         if (voice_in.is_used &&
             voice_in.play_state == VoicePlayState::Stopped &&
             state.previous_play_state !=
                 static_cast<u8>(VoicePlayState::Stopped)) {
-            for (u32 slot_index = 0; slot_index < 4; slot_index++) {
-                auto& slot = state.slots[state.crnt_slot];
-                if (slot.valid) {
-                    voice.num_wave_buffers_consumed++;
-                    state.crnt_slot = (state.crnt_slot + 1) % 4;
-                } else {
-                    break;
-                }
-                slot = {};
+            source.stop();
+            // The resampler and filter history reset. What the voice last
+            // added to the mix buffers is kept for the depop.
+            for (auto& channel : state.channels) {
+                channel.pitch.fill(0.0f);
+                channel.biquad = {};
             }
-            voice.played_sample_count = 0;
-            state.offset = 0;
-            state.fraction = 0.0;
-            state.history[0] = state.history[1] = 0;
+            state.was_playing = was_started;
         }
+        if (voice_in.is_used &&
+            voice_in.play_state == VoicePlayState::Paused && was_started)
+            state.was_playing = true;
         if (voice_in.is_used)
             state.previous_play_state = static_cast<u8>(voice_in.play_state);
+        voice.played_sample_count = source.played;
+        voice.num_wave_buffers_consumed = source.consumed;
 
         out_stream->write(voice);
     }

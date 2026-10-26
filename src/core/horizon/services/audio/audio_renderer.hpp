@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/audio/renderer_dsp.hpp"
 #include "core/horizon/kernel/kernel.hpp"
 #include "core/horizon/services/audio/const.hpp"
 #include "core/horizon/services/const.hpp"
@@ -43,35 +44,44 @@ class IAudioRenderer : public IService {
     u64 missing_frames_origin{0};
     u64 produced_samples{0};
     u64 head_resyncs{0};
+    // DEBUG: HYDRA_AUDIO_STATS counters, per stats period
+    u64 stats_frames{0};
+    u64 stats_starved{0};
+    u64 stats_biquad{0};
+    u64 stats_clipped{0};
+    bool logged_biquad{false};
     std::chrono::steady_clock::time_point last_stats_time{};
 
     u32 rendering_time_limit{0x1000}; // TODO: what should this be?
     std::vector<VoiceInfoOut> voices;
 
-    // Server-side source positions and owned guest wave buffers.
-    struct WaveBufferSlot {
-        bool valid{false};
-        u32 start{0};
-        u32 end{0};
-        bool is_looping{false};
-        std::vector<u8> data;
-        vaddr_t address{0};
-        std::vector<f32> decoded;
-        bool decoded_ready{false};
-        i16 history[2]{};
-        bool has_context{false};
-    };
+    // Server-side voice state: the wave buffers it owns, its position and the
+    // per channel DSP state (see core/audio/renderer_dsp.hpp)
     struct VoiceState {
-        WaveBufferSlot slots[4];
-        u32 crnt_slot{0};
-        u32 offset{0};
-        f64 fraction{0.0};
-        i16 history[2]{};
+        audio::dsp::VoiceSource source;
+        std::array<audio::dsp::VoiceChannelState,
+                   audio::dsp::VOICE_CHANNEL_COUNT_MAX>
+            channels{};
         std::array<i16, 16> coefficients{};
-        u8 previous_play_state{
-            1}; // Stopped; preserve buffers queued before Start.
+        f32 previous_volume{0.0f};
+        // Stopped or paused after playing: the next frame only depops
+        bool was_playing{false};
+        // Biquad filters enabled in the last frame (their state is kept)
+        std::array<bool, audio::dsp::BIQUAD_FILTER_COUNT> biquad_enabled{};
+        u16 decoding_flags{0};
+        audio::dsp::SrcQuality src_quality{audio::dsp::SrcQuality::Default};
+        u32 flush_count{0};
+        // Stopped; preserve buffers queued before Start.
+        u8 previous_play_state{1};
     };
     std::vector<VoiceState> voice_states;
+    // Channel resource mix volumes of the last frame (mix ramps), by id
+    std::vector<std::array<f32, audio::dsp::MIX_BUFFER_COUNT_MAX>>
+        previous_channel_mix;
+    // Values stopped voices left in the mix buffers, by mix and buffer
+    std::vector<std::array<f32, audio::dsp::MIX_BUFFER_COUNT_MAX>> depop;
+    // Renders one DSP frame of params.sample_count stereo samples
+    void renderFrame(std::vector<f32>& stereo);
     std::chrono::steady_clock::time_point last_update_time{};
     std::chrono::steady_clock::time_point last_render_time{};
     u32 observed_formats{0};

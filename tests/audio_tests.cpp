@@ -1,4 +1,5 @@
 #include "core/audio/pcm_queue.hpp"
+#include "core/audio/renderer_dsp.hpp"
 #include "core/audio/sample_clock.hpp"
 #include "core/audio/sample_decoder.hpp"
 
@@ -7,14 +8,197 @@
 
 using namespace hydra;
 using namespace hydra::audio;
+namespace dsp = hydra::audio::dsp;
 
 void check(bool condition, const char* description) {
     if (!condition)
         throw std::runtime_error(description);
 }
 
+
+// Mono PCM16 wave buffer whose sample i is `value(i)`
+template <typename F>
+dsp::WaveBuffer pcm16Wave(u32 count, F value) {
+    dsp::WaveBuffer buffer;
+    buffer.valid = true;
+    buffer.start = 0;
+    buffer.end = count;
+    buffer.data.resize(count * 2);
+    for (u32 i = 0; i < count; i++) {
+        const i16 sample = value(i);
+        std::memcpy(buffer.data.data() + i * 2, &sample, 2);
+    }
+    return buffer;
+}
+
+std::vector<i32> readIndices(dsp::VoiceSource& voice,
+                             const dsp::SourceFormat& source, u32 count) {
+    std::vector<f32> frames(count);
+    const u32 read = dsp::readSource(voice, source, count, frames);
+    std::vector<i32> indices;
+    for (u32 i = 0; i < read; i++)
+        indices.push_back(static_cast<i32>(std::lround(frames[i] * 32768.0f)));
+    return indices;
+}
+
+void testRendererDsp() {
+    const std::array<i16, 16> no_coefficients{};
+    const dsp::SourceFormat mono{.format = PcmFormat::Int16,
+                                 .channel_count = 1,
+                                 .adpcm_coefficients = no_coefficients};
+    const auto identity = [](u32 i) { return static_cast<i16>(i); };
+
+    // A buffer plays start..end once, then the next one
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(4, identity);
+        voice.buffers[1] = pcm16Wave(3, [](u32 i) { return static_cast<i16>(100 + i); });
+        const auto read = readIndices(voice, mono, 10);
+        check(read == std::vector<i32>({0, 1, 2, 3, 100, 101, 102}),
+              "Wave buffers play in order and the voice starves after them");
+        check(voice.consumed == 2 && voice.index == 2 && voice.played == 7,
+              "Consumed buffers and played samples are counted");
+    }
+    // Looping with a count: the first pass plays start..end, the loops
+    // loop_start..loop_end, then the buffer ends
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(10, identity);
+        voice.buffers[0].looping = true;
+        voice.buffers[0].loop_count = 2;
+        voice.buffers[0].loop_start = 5;
+        voice.buffers[0].loop_end = 8;
+        const auto read = readIndices(voice, mono, 32);
+        check(read == std::vector<i32>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 5, 6, 7,
+                                        5, 6, 7}),
+              "Loop count and loop range follow the Switch data source");
+        check(voice.consumed == 1, "A finite loop ends its buffer");
+    }
+    // Looping forever without a loop range repeats the buffer
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(3, identity);
+        voice.buffers[0].looping = true;
+        voice.buffers[0].loop_count = -1;
+        const auto read = readIndices(voice, mono, 8);
+        check(read == std::vector<i32>({0, 1, 2, 0, 1, 2, 0, 1}) &&
+                  voice.consumed == 0,
+              "An endless loop repeats the whole buffer");
+    }
+    // End of stream resets the played sample count
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(4, identity);
+        voice.buffers[0].end_of_stream = true;
+        readIndices(voice, mono, 4);
+        check(voice.played == 0 && voice.consumed == 1,
+              "End of stream resets the played sample count");
+    }
+    // Flush skips buffers and reports them consumed
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(4, identity);
+        voice.buffers[1] = pcm16Wave(4, [](u32 i) { return static_cast<i16>(50 + i); });
+        voice.flush(1);
+        const auto read = readIndices(voice, mono, 2);
+        check(voice.consumed == 1 && read == std::vector<i32>({50, 51}),
+              "Flushed buffers are skipped and consumed");
+    }
+
+    // Sample rate conversion: every filter phase keeps a constant signal
+    for (const auto quality : {dsp::SrcQuality::Default, dsp::SrcQuality::High}) {
+        for (const f32 ratio : {0.5f, 1.0f, 1.2f, 1.5f}) {
+            dsp::VoiceSource voice;
+            voice.buffers[0] = pcm16Wave(4000, [](u32) { return static_cast<i16>(16384); });
+            std::array<dsp::VoiceChannelState, 1> channels{};
+            std::array<std::vector<f32>, 1> output{std::vector<f32>(240)};
+            for (u32 frame = 0; frame < 3; frame++)
+                dsp::processDataSource(voice, mono, channels, ratio, quality,
+                                       240, output);
+            for (const auto sample : output[0])
+                check(std::abs(sample - 0.5f) < 0.01f,
+                      "Resampled DC keeps its level");
+        }
+    }
+    // The ratio sets the source samples consumed, the fraction carries over
+    {
+        dsp::VoiceSource voice;
+        voice.buffers[0] = pcm16Wave(4000, identity);
+        std::array<dsp::VoiceChannelState, 1> channels{};
+        std::array<std::vector<f32>, 1> output{std::vector<f32>(240)};
+        dsp::processDataSource(voice, mono, channels, 1.5f, dsp::SrcQuality::Default,
+                               240, output);
+        dsp::processDataSource(voice, mono, channels, 1.25f, dsp::SrcQuality::Default,
+                               240, output);
+        check(voice.played == 360 + 300 && voice.fraction == 0.0f,
+              "Resampling consumes ratio x samples per frame");
+    }
+
+    // Biquad: identity passes, state carries between calls
+    {
+        std::array<f32, 4> samples{0.25f, -0.5f, 1.0f, 0.0f};
+        std::array<f32, 2> state{};
+        const i16 identity_num[3]{16384, 0, 0};
+        const i16 zero_den[2]{0, 0};
+        dsp::processBiquad(samples, identity_num, zero_den, state);
+        check(samples == std::array<f32, 4>{0.25f, -0.5f, 1.0f, 0.0f},
+              "Identity biquad");
+        // One sample delay: y[n] = x[n - 1]
+        const i16 delay_num[3]{0, 16384, 0};
+        std::array<f32, 2> first{1.0f, 2.0f}, second{3.0f, 4.0f};
+        state = {};
+        dsp::processBiquad(first, delay_num, zero_den, state);
+        dsp::processBiquad(second, delay_num, zero_den, state);
+        check(first == std::array<f32, 2>{0.0f, 1.0f} &&
+                  second == std::array<f32, 2>{2.0f, 3.0f},
+              "Biquad state continues across frames");
+        // Feedback with a negated denominator: y[n] = x[n] + 0.5 y[n - 1]
+        const i16 one_num[3]{16384, 0, 0};
+        const i16 feedback_den[2]{8192, 0};
+        std::array<f32, 3> impulse{1.0f, 0.0f, 0.0f};
+        state = {};
+        dsp::processBiquad(impulse, one_num, feedback_den, state);
+        check(impulse == std::array<f32, 3>{1.0f, 0.5f, 0.25f},
+              "Biquad denominators are stored negated");
+    }
+
+    // Ramps: from the previous volume to the new one over the frame
+    {
+        std::array<f32, 4> samples{1.0f, 1.0f, 1.0f, 1.0f};
+        dsp::processVolumeRamp(samples, 0.0f, 1.0f);
+        check(samples == std::array<f32, 4>{0.0f, 0.25f, 0.5f, 0.75f},
+              "Volume ramp");
+        std::array<f32, 4> mix{};
+        const std::array<f32, 4> input{1.0f, 1.0f, 1.0f, 1.0f};
+        const f32 last = dsp::processMixRamp(mix, input, 1.0f, 0.0f);
+        check(mix == std::array<f32, 4>{1.0f, 0.75f, 0.5f, 0.25f} &&
+                  last == 0.25f,
+              "Mix ramp returns the last value it added");
+    }
+
+    // Depop: what a stopped voice left decays over the following samples
+    {
+        std::array<f32, 3> buffer{};
+        const f32 decay = dsp::depopDecay(48000);
+        const f32 left = dsp::processDepop(buffer, 1.0f, decay);
+        check(std::abs(buffer[0] - decay) < 1e-6f &&
+                  std::abs(buffer[2] - decay * decay * decay) < 1e-6f &&
+                  std::abs(left - buffer[2]) < 1e-6f,
+              "Depop decays the last sample");
+        check(dsp::depopDecay(32000) == 0.943695f, "Depop decay at 32 kHz");
+    }
+
+    // 5.1 to stereo with the default device coefficients
+    check(std::abs(dsp::downmixSurroundToStereo(dsp::DEFAULT_SURROUND_TO_STEREO,
+                                                1.0f, 1.0f, 1.0f, 1.0f) -
+                   (1.0f + 0.707f + 0.251f + 0.707f)) < 1e-6f,
+          "Surround downmix coefficients");
+    std::cout << "Audio renderer DSP tests passed\n";
+}
+
 int main() {
     try {
+        testRendererDsp();
         const std::array<u8, 4> pcm16{0x00, 0x80, 0xff, 0x7f};
         check(decodePcm(pcm16, 0, PcmFormat::Int16) == -1.0f, "PCM16 minimum");
         check(decodePcm(pcm16, 1, PcmFormat::Int16) == 32767.0f / 32768.0f,
