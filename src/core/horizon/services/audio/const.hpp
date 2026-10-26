@@ -23,7 +23,7 @@ struct AudioRendererParameters {
     u8 _unknown_x20;
     u8 padding1[3];
     u32 splitter_count;
-    u32 _unknown_x2c;
+    u32 splitter_destination_count;
     u32 _unknown_x30;
     u32 revision;
 };
@@ -32,9 +32,14 @@ enum class AudioFeature {
     Splitter,
 };
 
+// The n of a 'REVn' revision magic (the digit byte counts on past '9')
+inline u32 audioRevisionNumber(u32 revision) {
+    return (revision - makeMagic4('R', 'E', 'V', '0')) >> 24;
+}
+
 inline bool isAudioRendererFeatureSupported(const AudioFeature feature,
                                             u32 revision) {
-    const auto version = revision - makeMagic4('R', 'E', 'V', '0');
+    const auto version = audioRevisionNumber(revision);
     // NOLINTNEXTLINE(readability-trivial-switch)
     switch (feature) {
     case AudioFeature::Splitter:

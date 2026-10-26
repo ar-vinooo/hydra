@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/audio/renderer_dsp.hpp"
+#include "core/audio/renderer_effects.hpp"
 #include "core/horizon/kernel/kernel.hpp"
 #include "core/horizon/services/audio/const.hpp"
 #include "core/horizon/services/const.hpp"
@@ -24,6 +25,7 @@ class IAudioRenderer : public IService {
                          u32 id) override;
 
   private:
+    friend struct AudioRendererTestAccess;
     AudioRendererParameters params;
     // TODO: use
     [[maybe_unused]] u64 work_buffer_size;
@@ -75,6 +77,48 @@ class IAudioRenderer : public IService {
         u8 previous_play_state{1};
     };
     std::vector<VoiceState> voice_states;
+
+    // Splitters: a voice or mix sent to several destination mixes, each with
+    // its own buffer volumes (ramped like a channel's mix volumes) and, from
+    // REV12, two biquad filters
+    struct SplitterBiquad {
+        bool enable;
+        u8 _reserved;
+        i16 numerator[3];
+        i16 denominator[2];
+    };
+    struct SplitterDestinationState {
+        u32 mix_id{0x7fffffff}; // UnusedMixId
+        bool used{false};
+        // Mixed through, so the previous volumes catch up after the frame
+        bool need_update{false};
+        std::array<f32, audio::dsp::MIX_BUFFER_COUNT_MAX> volume{};
+        std::array<f32, audio::dsp::MIX_BUFFER_COUNT_MAX> previous{};
+        std::array<SplitterBiquad, audio::dsp::BIQUAD_FILTER_COUNT> biquads{};
+        std::array<bool, audio::dsp::BIQUAD_FILTER_COUNT> biquad_enabled{};
+        std::array<std::array<f32, 2>, audio::dsp::BIQUAD_FILTER_COUNT>
+            biquad_state{};
+        bool isConfigured() const { return used && mix_id != 0x7fffffff; }
+    };
+    struct SplitterState {
+        u32 sample_rate{0};
+        // Destination ids, in order
+        std::vector<u32> destinations;
+    };
+    // Effects of the mixes, and the client process whose memory the aux
+    // and capture effects exchange samples through
+    std::vector<audio::dsp::effects::Effect> effects;
+    audio::dsp::effects::Behaviour effect_behaviour;
+    kernel::Process* guest_process{nullptr};
+
+    std::vector<SplitterState> splitters;
+    std::vector<SplitterDestinationState> splitter_destinations;
+    // Parses (and, with `apply`, takes) the splitter update at `offset`.
+    // Returns where the mixes start, or nothing if the data is invalid.
+    std::optional<u64> updateSplitters(const u8* data, u64 size, u64 offset,
+                                       bool apply);
+    // Destination `index` of a splitter, null past its end
+    SplitterDestinationState* getSplitterDestination(u32 splitter, u32 index);
     // Channel resource mix volumes of the last frame (mix ramps), by id
     std::vector<std::array<f32, audio::dsp::MIX_BUFFER_COUNT_MAX>>
         previous_channel_mix;

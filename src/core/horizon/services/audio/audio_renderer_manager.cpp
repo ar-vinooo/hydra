@@ -56,9 +56,9 @@ IAudioRendererManager::getWorkBufferSize(AudioRendererParameters params,
         (0x20 * (params.effect_count + (4 * params.voice_count))) + 0x50;
     if (isAudioRendererFeatureSupported(AudioFeature::Splitter,
                                         params.revision)) {
-        buffer_sz += static_cast<u64>(0xE0 * params._unknown_x2c);
+        buffer_sz += static_cast<u64>(0xE0 * params.splitter_destination_count);
         buffer_sz += static_cast<u64>(0x20 * params.splitter_count);
-        buffer_sz += align(4 * params._unknown_x2c, 0x10u);
+        buffer_sz += align(4 * params.splitter_destination_count, 0x10u);
     }
     buffer_sz = align(buffer_sz, 0x40ull) +
                 (static_cast<unsigned long long>(0x170 * params.sink_count));
