@@ -144,6 +144,80 @@ bool TextureCache::hasUnflushedGpuWrites(ztd::Range<uptr> range) {
     return found;
 }
 
+bool TextureCache::copyRenderedToGuest(ICommandBuffer* command_buffer,
+                                       const RenderedCopySource& src,
+                                       ztd::Range<uptr> src_range,
+                                       uptr dst_ptr, u64 dst_stride) {
+    // The CPU path writes every texture with pending GPU writes back and
+    // copies the guest bytes: with a single such texture the copied bytes
+    // are its texels
+    TextureStorage* source = nullptr;
+    u32 pending = 0;
+    forEachIntersecting(src_range, [&](TextureMem& mem) {
+        for (auto& [group_key, group] : mem.cache) {
+            for (auto& [storage_key, storage] : group.cache) {
+                if (storage.base == nullptr ||
+                    storage.gpu_written_timestamp <= storage.flushed_timestamp ||
+                    !storage.base->getDescriptor().getRange().intersects(
+                        src_range))
+                    continue;
+                pending++;
+                source = &storage;
+            }
+        }
+    });
+    if (pending != 1)
+        return false;
+    const auto& descriptor = source->base->getDescriptor();
+    // Level 0 of a single sample, uncompressed 2D surface with the DMA
+    // surface's layout
+    const bool uncompressed =
+        getTextureFormatStride(descriptor.format, 4) ==
+            4 * getTextureFormatStride(descriptor.format, 1) &&
+        getTextureFormatRows(descriptor.format, 4) == 4;
+    const u32 bytes_per_pixel = getTextureFormatStride(descriptor.format, 1);
+    const u32 rows_per_block = GOB_HEIGHT << src.block_height_log2;
+    if (bytes_per_pixel == 0 || src.x_bytes % bytes_per_pixel != 0 ||
+        src.line_bytes % bytes_per_pixel != 0 || src.line_bytes == 0 ||
+        src.rows == 0)
+        return false;
+    const u32 x = src.x_bytes / bytes_per_pixel;
+    const u32 width = src.line_bytes / bytes_per_pixel;
+    if (descriptor.ptr != src.ptr || descriptor.is_linear ||
+        descriptor.isMultisampled() || !uncompressed ||
+        (descriptor.type != MTL::TextureType2D &&
+         descriptor.type != MTL::TextureType2DArray) ||
+        descriptor.block_width_gobs_log2 != 0 ||
+        descriptor.block_height_gobs_log2 != src.block_height_log2 ||
+        descriptor.block_depth_gobs_log2 != src.block_depth_log2 ||
+        align(descriptor.width * bytes_per_pixel, GOB_WIDTH) !=
+            align(src.stride, GOB_WIDTH) ||
+        align(descriptor.height, rows_per_block) !=
+            align(src.height, rows_per_block) ||
+        x + width > descriptor.width || src.y + src.rows > descriptor.height)
+        return false;
+
+    const auto dst = renderer.getGuestMemoryBuffer(ztd::Range<uptr>::fromSize(
+        dst_ptr, dst_stride * (src.rows - 1) + src.line_bytes));
+    if (!dst.isValid())
+        return false;
+    LOG_TEXTURE_EVENT("dma_copy_on_gpu", descriptor,
+                      fmt::format("dst={:#x} {}x{}", dst_ptr, width,
+                                  src.rows));
+    command_buffer->retainResource(dst.getOwner());
+    auto* view = getTextureView(
+        *source, TextureViewDescriptor(descriptor.type, descriptor.format,
+                                       ztd::Range<u32>(0, 1),
+                                       ztd::Range<u32>(0, 1)));
+    for (u32 row = 0; row < src.rows; row++)
+        dst.getBase()->copyFrom(command_buffer, view,
+                                MTL::Origin(x, src.y + row, 0),
+                                MTL::Size(width, 1, 1),
+                                ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1),
+                                dst.getOffset() + dst_stride * row);
+    return true;
+}
+
 void TextureCache::invalidateMemory(ztd::Range<uptr> range) {
     epoch++;
     ::hydra::hot::Scope hot_scope;
@@ -936,13 +1010,19 @@ u32 TextureCache::getDataHash(const ITexture* texture) {
 }
 
 void TextureCache::flushMemory(ICommandBuffer* command_buffer,
-                               ztd::Range<uptr> range) {
+                               ztd::Range<uptr> range, const char* origin,
+                               u32 line) {
+    // The outermost caller names the flush
+    const auto previous_origin = tls_texture_flush_origin;
+    if (previous_origin.function == nullptr)
+        tls_texture_flush_origin = {origin, line};
     // Whoever flushes is about to read or overwrite the memory in the order of
     // the command stream: reports queued earlier have to land first
     renderer.flushReports(command_buffer, range);
     epoch++;
     ::hydra::hot::Scope hot_scope;
     HYDRA_HOT_CALL(*this, texture_cache_flush_memory)(command_buffer, range);
+    tls_texture_flush_origin = previous_origin;
 }
 
 void TextureCache::discardGpuWrites(ICommandBuffer* command_buffer,

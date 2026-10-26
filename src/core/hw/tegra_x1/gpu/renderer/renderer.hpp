@@ -211,10 +211,12 @@ class IRenderer {
 
     // Writes GPU-rendered textures in the range back to guest memory, from a
     // CPU thread that is about to access it (memory tracking faults)
-    void flushMemoryForCpu(ztd::Range<uptr> range) {
+    void flushMemoryForCpu(ztd::Range<uptr> range,
+                           const char* origin = __builtin_FUNCTION(),
+                           u32 line = __builtin_LINE()) {
         std::scoped_lock lock(texture_cache.getMutex());
         std::unique_ptr<ICommandBuffer> command_buffer(createCommandBuffer());
-        texture_cache.flushMemory(command_buffer.get(), range);
+        texture_cache.flushMemory(command_buffer.get(), range, origin, line);
     }
 
     virtual u64 getAllocatedResourceBytes() const { return 0; }

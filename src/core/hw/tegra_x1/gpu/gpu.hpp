@@ -53,6 +53,11 @@ struct GpuChannelContext {
     engines::Copy copy;
     std::optional<engines::EngineBase*> subchannels[SUBCHANNEL_COUNT] = {};
     u32 puller_regs[0x40] = {};
+    // SET_REF waits for idle before it writes the reference (dev_pbdma
+    // SET_REF), so the puller writes guest memory after it only once earlier
+    // work completed. Nothing reads the reference (USERD is not emulated):
+    // the wait is deferred to the next such write instead of stalling here.
+    bool idle_pending{false};
 };
 
 class Gpu {

@@ -220,12 +220,12 @@ void Copy::launchDma(const u32 index, const LaunchDMAData data) {
         "dma_copy", capture::currentGuestEventOrigin(), 0, 0, 0,
         static_cast<u32>(data.type));
     // A launch without a transfer only releases its semaphore
-    if (data.type != TransferType::None)
-        executeCopy(data);
-    releaseSemaphore(data);
+    const bool behind_gpu =
+        data.type != TransferType::None && executeCopy(data);
+    releaseSemaphore(data, behind_gpu);
 }
 
-void Copy::releaseSemaphore(const LaunchDMAData data) {
+void Copy::releaseSemaphore(const LaunchDMAData data, bool behind_gpu) {
     if (data.semaphore_type == SemaphoreType::None)
         return;
 
@@ -236,49 +236,83 @@ void Copy::releaseSemaphore(const LaunchDMAData data) {
                          << 32) |
                         regs_raw[REG_SEMAPHORE_A + 1];
     const u32 payload = regs_raw[REG_SEMAPHORE_PAYLOAD];
-    uptr base;
-    const auto as = tls_crnt_gmmu->findAddr(address, base);
     const bool four_words = data.semaphore_type == SemaphoreType::ReleaseFourWords;
     const u64 size = four_words ? 16 : 4;
-    if (!as || as->ptr == 0 || address - base + size > as->size ||
-        (as->ptr + (address - base)) %
-                std::atomic_ref<u32>::required_alignment != 0) {
+    const auto resolve = [address, size](GMmu& gmmu) -> u8* {
+        uptr base;
+        const auto as = gmmu.findAddr(address, base);
+        if (!as || as->ptr == 0 || address - base + size > as->size ||
+            (as->ptr + (address - base)) %
+                    std::atomic_ref<u32>::required_alignment != 0)
+            return nullptr;
+        return reinterpret_cast<u8*>(as->ptr + (address - base));
+    };
+    auto* ptr = resolve(*tls_crnt_gmmu);
+    if (ptr == nullptr) {
         ONCE(LOG_WARN(Engines, "Semaphore release to unmapped memory {:#x}",
                       address));
         return;
     }
-    auto* ptr = reinterpret_cast<u8*>(as->ptr + (address - base));
-    if (four_words) {
-        const u64 timestamp = getGpuTimestamp();
-        std::memcpy(ptr + 8, &timestamp, sizeof(timestamp));
-    }
-    // The payload is published last: a waiter that sees it also sees the copy
-    std::atomic_ref<u32> word(*reinterpret_cast<u32*>(ptr));
-    if (data.semaphore_reduction_enable) {
-        const auto operation = static_cast<u32>(data.semaphore_reduction);
-        const bool is_signed = !data.semaphore_reduction_unsigned;
-        u32 old = word.load(std::memory_order_relaxed);
-        while (!word.compare_exchange_weak(
-            old, reduceDmaSemaphoreWord(operation, is_signed, old, payload),
-            std::memory_order_acq_rel)) {
+    const bool reduce = data.semaphore_reduction_enable;
+    const auto operation = static_cast<u32>(data.semaphore_reduction);
+    const bool is_signed = !data.semaphore_reduction_unsigned;
+    const auto release = [four_words, reduce, operation, is_signed,
+                          payload](u8* target) {
+        if (four_words) {
+            const u64 timestamp = getGpuTimestamp();
+            std::memcpy(target + 8, &timestamp, sizeof(timestamp));
         }
+        // The payload is published last: a waiter that sees it also sees the
+        // copy
+        std::atomic_ref<u32> word(*reinterpret_cast<u32*>(target));
+        if (reduce) {
+            u32 old = word.load(std::memory_order_relaxed);
+            while (!word.compare_exchange_weak(
+                old, reduceDmaSemaphoreWord(operation, is_signed, old, payload),
+                std::memory_order_acq_rel)) {
+            }
+        } else {
+            word.store(payload, std::memory_order_release);
+        }
+    };
+    const auto range =
+        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size);
+    if (behind_gpu && tls_crnt_command_buffer != nullptr) {
+        // Released once the GPU wrote the copy, after the writes queued
+        // before it. The memory is resolved again then, as a report is.
+        gpu.getRenderer().queueGuestWrite(
+            tls_crnt_command_buffer,
+            [release, resolve, size, renderer = &gpu.getRenderer(),
+             gmmu = tls_crnt_gmmu,
+             owner = tls_crnt_decode_state
+                         ? tls_crnt_decode_state->address_space
+                         : std::shared_ptr<GMmu>{}](bool succeeded) {
+                if (!succeeded || gmmu->gpuWorkCancelled())
+                    return;
+                auto* target = resolve(*gmmu);
+                if (target == nullptr)
+                    return;
+                release(target);
+                renderer->queueMemoryInvalidation(ztd::Range<uptr>::fromSize(
+                    reinterpret_cast<uptr>(target), size));
+            },
+            {range});
     } else {
-        word.store(payload, std::memory_order_release);
+        release(ptr);
+        // A CPU reading the semaphore sees fresh bytes; GPU caches mirroring
+        // the range are stale
+        gpu.getRenderer().invalidateMemory(range);
     }
-    // A CPU reading the semaphore sees fresh bytes; GPU caches mirroring the
-    // range are stale
-    gpu.getRenderer().invalidateMemory(
-        ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
     capture::GuestEvents::instance().event("semaphore_release",
                                            capture::currentGuestEventOrigin(),
                                            address, size, 0, payload);
 }
 
-void Copy::executeCopy(const LaunchDMAData data) {
+bool Copy::executeCopy(const LaunchDMAData data) {
     if (data.remap_enable && data.src_memory_layout == MemoryLayout::Pitch &&
         data.dst_memory_layout == MemoryLayout::Pitch) {
         remapPitchCopy(data);
-        return;
+        return false;
     }
 
     // Without REMAP_ENABLE an element is a byte. With it, an element has
@@ -369,10 +403,10 @@ void Copy::executeCopy(const LaunchDMAData data) {
         (data.dst_memory_layout == MemoryLayout::BlockLinear &&
          !valid_surface(regs.dst, dst_stride, bytes_per_pixel))) {
         ONCE(LOG_WARN(Engines, "DMA rectangle outside block-linear surface"));
-        return;
+        return false;
     }
     if (copy_lines == 0 || regs.line_length_in == 0)
-        return;
+        return false;
 
     const auto mapped_base = [](uptr address) -> std::optional<uptr> {
         uptr base;
@@ -385,7 +419,7 @@ void Copy::executeCopy(const LaunchDMAData data) {
     const auto dst_host = mapped_base(regs.offset_out);
     if (!src_host || !dst_host) {
         ONCE(LOG_WARN(Engines, "DMA copy has an unmapped base address"));
-        return;
+        return false;
     }
     const auto src_ptr = *src_host;
     const auto dst_ptr = *dst_host;
@@ -454,7 +488,7 @@ void Copy::executeCopy(const LaunchDMAData data) {
                 !mapped(regs.offset_out, dst_size)) {
                 ONCE(LOG_WARN(Engines,
                               "DMA tiled copy requires mapped host spans"));
-                return;
+                return false;
             }
         }
         if (capture::GuestEvents::instance().enabled()) {
@@ -486,11 +520,56 @@ void Copy::executeCopy(const LaunchDMAData data) {
             }
         }
         auto& texture_cache = gpu.getRenderer().getTextureCache();
-        std::scoped_lock lock(texture_cache.getMutex());
-        texture_cache.flushMemory(tls_crnt_command_buffer,
-                                  ztd::Range<uptr>::fromSize(src_ptr, src_size));
-        texture_cache.flushMemory(tls_crnt_command_buffer,
-                                  ztd::Range<uptr>::fromSize(dst_ptr, dst_size));
+        const auto src_range = ztd::Range<uptr>::fromSize(src_ptr, src_size);
+        const auto dst_range = ztd::Range<uptr>::fromSize(dst_ptr, dst_size);
+        bool on_gpu = false;
+        {
+            std::scoped_lock lock(texture_cache.getMutex());
+            // Out of a surface the GPU rendered (readbacks of GPU results):
+            // the copy runs on the GPU, as on the DMA engine, instead of the
+            // texture being read back with the GPU thread waiting for it
+            if (tls_crnt_command_buffer != nullptr && !generic_remap &&
+                data.src_memory_layout == MemoryLayout::BlockLinear &&
+                data.dst_memory_layout == MemoryLayout::Pitch &&
+                regs.src.depth <= 1 && regs.src.layer == 0 &&
+                texture_cache.hasUnflushedGpuWrites(src_range)) {
+                texture_cache.flushMemory(tls_crnt_command_buffer, dst_range);
+                on_gpu = texture_cache.copyRenderedToGuest(
+                    tls_crnt_command_buffer,
+                    {.ptr = src_ptr,
+                     .stride = src_stride,
+                     .height = regs.src.height,
+                     .block_height_log2 = static_cast<u32>(
+                         getBlockSizeLog2(regs.src.block_size.height)),
+                     .block_depth_log2 = static_cast<u32>(
+                         getBlockSizeLog2(regs.src.block_size.depth)),
+                     .x_bytes = static_cast<u32>(regs.src.origin.x) *
+                                src_bytes_per_pixel,
+                     .y = static_cast<u32>(regs.src.origin.y),
+                     .line_bytes = regs.line_length_in * src_bytes_per_pixel,
+                     .rows = copy_lines},
+                    src_range, dst_ptr, regs.stride_out);
+                if (on_gpu)
+                    texture_cache.markGpuWritesInGuest(dst_range);
+            }
+            if (!on_gpu) {
+                texture_cache.flushMemory(tls_crnt_command_buffer, src_range);
+                texture_cache.flushMemory(tls_crnt_command_buffer, dst_range);
+            }
+        }
+        if (on_gpu) {
+            // GPU reads of the destination use guest memory, which the copy
+            // writes in stream order. Readers of guest memory in the stream
+            // (flushReports) and the semaphore wait for the GPU's copy.
+            auto& renderer = gpu.getRenderer();
+            renderer.getBufferCache().markGpuModified(dst_range);
+            renderer.invalidateMemory(
+                dst_range, renderer::MemoryInvalidationScope::BufferCache |
+                               renderer::MemoryInvalidationScope::TextureCache);
+            renderer.queueGuestWrite(tls_crnt_command_buffer,
+                                     [](bool) {}, {dst_range});
+            return true;
+        }
     }
     if (generic_remap) {
         // Element by element: select source components, constants or leave the
@@ -583,7 +662,7 @@ void Copy::executeCopy(const LaunchDMAData data) {
                     remaining -= bytes;
                 }
             }
-            return;
+            return false;
         } else {
             copySubrect(reinterpret_cast<u8*>(src_ptr), regs.stride_in,
                         reinterpret_cast<u8*>(dst_ptr), regs.dst, dst_stride,
@@ -624,6 +703,7 @@ void Copy::executeCopy(const LaunchDMAData data) {
                                                     rows * stride),
             renderer::MemoryInvalidationScope::TextureCache);
     }
+    return false;
 }
 
 #pragma GCC diagnostic pop

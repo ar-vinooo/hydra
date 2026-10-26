@@ -22,6 +22,13 @@ enum class CheckpointReason : u8 {
     StorageWrite,
     PullerSemaphore,
     ReportWrite,
+    // Puller methods that wait for idle, split out of PullerOther
+    PullerReference,
+    PullerMembar,
+    PullerWaitForIdle,
+    PullerRelease,
+    PullerReduction,
+    PullerSyncpoint,
     Count,
 };
 
@@ -35,6 +42,8 @@ constexpr const char* getCheckpointReasonName(CheckpointReason reason) {
         "acquire",        "puller acquire",    "puller other",
         "texture readback", "storage write",
         "puller semaphore", "report write",
+        "puller reference", "puller membar",   "puller wait for idle",
+        "puller release",   "puller reduction", "puller syncpoint",
     };
     return names[static_cast<usize>(reason)];
 }

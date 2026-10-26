@@ -667,7 +667,10 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
     if (trace_readbacks) {
         static std::map<std::string, u32> seen;
         static auto last = std::chrono::steady_clock::now();
-        seen[fmt::format("ptr={:#x} {} {}x{} lin={} lv={} ly={} range={:#x}+{:#x}", descriptor.ptr, descriptor.format,
+        const auto origin = tls_texture_flush_origin;
+        seen[fmt::format("from {}:{} ptr={:#x} {} {}x{} lin={} lv={} ly={} range={:#x}+{:#x}",
+                         origin.function ? origin.function : "?", origin.line,
+                         descriptor.ptr, descriptor.format,
                          descriptor.width, descriptor.height, descriptor.is_linear,
                          descriptor.level_count, descriptor.layer_count,
                          range.getBegin() - descriptor.ptr, range.getSize())]++;

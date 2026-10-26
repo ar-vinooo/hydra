@@ -4606,6 +4606,97 @@ void testDmaCopies() {
                  "without transfers\n";
 }
 
+// A DMA copy out of a render target (UE4 reads its exposure back this way)
+// runs on the GPU in stream order: nothing waits for the GPU and the texture
+// is not read back, the bytes and the semaphore land once the GPU copied
+void testDmaCopyOfRenderedTexture() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    // Page aligned: the copy writes guest memory through a Metal buffer
+    constexpr usize SIZE = 0x10000;
+    auto* memory = static_cast<u8*>(std::aligned_alloc(0x4000, SIZE));
+    std::memset(memory, 0xee, SIZE);
+    GMmu gmmu(nullptr);
+    constexpr uptr BASE = 0x200000;
+    gmmu.map(BASE, {reinterpret_cast<uptr>(memory), SIZE});
+    tls_crnt_gmmu = &gmmu;
+    auto& renderer = gpu.getRenderer();
+    std::unique_ptr<renderer::ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+
+    // A 1x1 RGBA32F render target the GPU cleared
+    constexpr uptr SOURCE = 0x0, TARGET = 0x4000, SEMAPHORE = 0x8000;
+    const auto source_ptr = reinterpret_cast<uptr>(memory + SOURCE);
+    auto* target_view = renderer.getTextureCache().find(
+        commands.get(),
+        renderer::TextureDescriptor(source_ptr, MTL::TextureType2D,
+                                    renderer::TextureFormat::RGBA32Float, false,
+                                    0, 1, 1, 1, 1, 1, 0, 0, 0),
+        renderer::TextureUsage::Write);
+    expect(target_view != nullptr, "The render target is cached");
+    {
+        auto* texture = static_cast<renderer::metal::Texture*>(target_view->getBase())
+                            ->getTexture();
+        NS_STACK_SCOPED auto pass = MTL::RenderPassDescriptor::alloc()->init();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(texture);
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setClearColor(MTL::ClearColor::Make(0.25, 0.5, 0.75, 1.0));
+        attachment->setStoreAction(MTL::StoreActionStore);
+        auto* metal_commands = static_cast<renderer::metal::CommandBuffer*>(commands.get());
+        metal_commands->getRenderCommandEncoder(pass);
+        metal_commands->endEncoding();
+    }
+
+    gpu.subchannelMethod(0, 0, 0xb0b5);
+    const auto method = [&](u32 index, u32 arg) {
+        gpu.subchannelMethod(0, index, arg);
+    };
+    method(0x100, 0);
+    method(0x101, static_cast<u32>(BASE + SOURCE));
+    method(0x102, 0);
+    method(0x103, static_cast<u32>(BASE + TARGET));
+    method(0x104, 16); // pitch in
+    method(0x105, 16); // pitch out
+    method(0x106, 16); // line length (bytes)
+    method(0x107, 1);
+    // Source: one GOB block, 16 bytes x 1 row
+    method(0x1ca, 0);
+    method(0x1cb, 16);
+    method(0x1cc, 1);
+    method(0x1cd, 1);
+    method(0x1ce, 0);
+    method(0x1cf, 0);
+    method(0x90, 0);
+    method(0x91, static_cast<u32>(BASE + SEMAPHORE));
+    method(0x92, 0x600du);
+    // Pipelined, block linear to pitch (DST_MEMORY_LAYOUT bit 8), one word
+    // semaphore release
+    method(0xc0, 1u | (1u << 3) | (1u << 8));
+
+    // Nothing was submitted yet: a copy on the CPU would have read the
+    // texture back and written both already
+    u32 word;
+    std::memcpy(&word, memory + SEMAPHORE, sizeof(word));
+    expect(memory[TARGET] == 0xee && word == 0xeeeeeeeeu,
+           "The copy and its semaphore wait for the GPU");
+    expect(memory[SOURCE] == 0xee, "The render target is not read back");
+
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    renderer.drainReports();
+    std::array<f32, 4> texel{};
+    std::memcpy(texel.data(), memory + TARGET, sizeof(texel));
+    std::memcpy(&word, memory + SEMAPHORE, sizeof(word));
+    expect(texel == std::array<f32, 4>{0.25f, 0.5f, 0.75f, 1.0f},
+           "The GPU copies the rendered texel to guest memory");
+    expect(memory[TARGET + 16] == 0xee, "The copy writes only its line");
+    expect(word == 0x600du, "The semaphore is released after the copy");
+    tls_crnt_gmmu = nullptr;
+    std::free(memory);
+    std::cout << "PASS: DMA copies of rendered textures run on the GPU\n";
+}
+
 // 2D fixed point coordinates are signed 32.32
 // Regression for the captured light-shaft occlusion draw: explicit alpha
 // REVERSE_SUBTRACT must not turn into color ADD at pipeline construction.
@@ -5179,11 +5270,23 @@ void testChannelMethodsAndFences() {
         static_cast<renderer::metal::CommandBuffer*>(reference_commands.get())
             ->getBlitCommandEncoder()->fillBuffer(reference_buffer, NS::Range(0, 16), 0x7b);
         tls_crnt_command_buffer = reference_commands.get();
+        // dev_pbdma SET_REF: Host waits for idle before the reference. Nothing
+        // reads it, so the wait moves to the next guest memory write.
         method(0x14, 0x12345678);
-        tls_crnt_command_buffer = nullptr;
         expect(gpu.channelContext().puller_regs[0x14] == 0x12345678 &&
-                   static_cast<const u8*>(reference_buffer->contents())[15] == 0x7b,
-               "SET_REFERENCE publishes its value after preceding GPU work completes");
+                   gpu.channelContext().idle_pending,
+               "SET_REFERENCE records its value and defers the idle wait");
+        set_address(0x40);
+        method(0x6, 0x5151u);
+        // Four byte release without RELEASE_WFI
+        method(0x7, 0x2u | (1u << 20) | (1u << 24));
+        tls_crnt_command_buffer = nullptr;
+        u32 released;
+        std::memcpy(&released, memory.data() + 0x40, sizeof(released));
+        expect(released == 0x5151u &&
+                   static_cast<const u8*>(reference_buffer->contents())[15] == 0x7b &&
+                   !gpu.channelContext().idle_pending,
+               "A release after SET_REFERENCE lands after preceding GPU work completes");
     }
 
     set_address(0x80);
@@ -5959,6 +6062,7 @@ int main(int argc, char** argv) {
         testStorageWritesRefreshTextures();
         testInlineToMemory();
         testDmaCopies();
+        testDmaCopyOfRenderedTexture();
         testChannelMethodsAndFences();
         testTwoDFixedPoint();
         testExplicitAlphaBlendEquation();
