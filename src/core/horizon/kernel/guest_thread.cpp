@@ -8,8 +8,6 @@
 #include "core/hw/tegra_x1/cpu/thread.hpp"
 #include "core/system.hpp"
 
-#include <pthread.h>
-
 namespace hydra::horizon::kernel {
 
 GuestThread::GuestThread(System& system_, Process* process,
@@ -47,9 +45,15 @@ void GuestThread::captureContext(ThreadContext& out_context) {
     out_context.tpidr = thread->getTpidr();
 }
 
+void GuestThread::prepareForDebugger() {
+    if (thread != nullptr)
+        thread->completeState();
+}
+
 void GuestThread::run() {
-    // Guest CPU threads are latency critical; keep them on the P-cores
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    // The host QoS was set from the guest priority by IThread::start. Don't
+    // raise it here: low priority threads leave the performance cores to the
+    // game's main threads and the GPU thread.
 
     // Create
     ASSERT(entry_point != invalid<vaddr_t>(), Kernel, "Invalid entry point");

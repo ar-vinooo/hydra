@@ -225,6 +225,7 @@ bool IThread::processMessagesImpl() {
             state = ThreadState::Paused;
             if (msg.supervisor) {
                 supervisor_pause = true;
+                prepareForDebugger();
             } else {
                 guest_pause = true;
                 sync_info = std::nullopt;

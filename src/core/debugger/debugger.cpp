@@ -112,6 +112,8 @@ void Debugger::breakOnThisThreadImpl(const std::string_view reason) {
 
     if (guest_thread && guest_thread->getThread()) {
         auto* cpu_thread = guest_thread->getThread();
+        // This is the guest thread: it may read its stale registers
+        cpu_thread->completeState();
         const auto& state = cpu_thread->getState();
         LOG_ERROR(Debugger,
                   "Guest registers x0=0x{:x}, x1=0x{:x}, x19=0x{:x}, "

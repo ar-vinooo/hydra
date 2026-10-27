@@ -38,6 +38,7 @@ class GuestThread : public IThread {
 
     void run() override;
     void captureContext(ThreadContext& out_context) override;
+    void prepareForDebugger() override;
 
   private:
     System& system;

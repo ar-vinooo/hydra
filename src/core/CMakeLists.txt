@@ -502,6 +502,7 @@ add_library(hydra-core
     hw/tegra_x1/cpu/memory.hpp
     hw/tegra_x1/cpu/mmu.cpp
     hw/tegra_x1/cpu/mmu.hpp
+    hw/tegra_x1/cpu/register_sync.hpp
     hw/tegra_x1/cpu/thread.cpp
     hw/tegra_x1/cpu/thread.hpp
     hw/tegra_x1/cpu/cpu.hpp
@@ -771,6 +772,7 @@ set_source_files_properties(c_api.cpp c_api.h PROPERTIES
 if (HYPERVISOR_ENABLED)
     target_sources(hydra-core PRIVATE
         hw/tegra_x1/cpu/hypervisor/const.hpp
+        hw/tegra_x1/cpu/hypervisor/counter_emulation.hpp
         hw/tegra_x1/cpu/hypervisor/page_allocator.cpp
         hw/tegra_x1/cpu/hypervisor/page_allocator.hpp
         hw/tegra_x1/cpu/hypervisor/page_table.cpp

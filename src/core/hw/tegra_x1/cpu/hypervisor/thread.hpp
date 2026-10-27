@@ -4,6 +4,7 @@
 #include <chrono>
 
 #include "core/hw/tegra_x1/cpu/hypervisor/const.hpp"
+#include "core/hw/tegra_x1/cpu/register_sync.hpp"
 #include "core/hw/tegra_x1/cpu/thread.hpp"
 
 namespace hydra::horizon {
@@ -68,7 +69,7 @@ class Thread : public IThread {
         sendMessage({.type = ThreadMessageType::SingleStep});
     }
 
-    void completeState() override { serializeSimd(); }
+    void completeState() override;
     u64 getTpidr() override {
         return has_vcpu ? getSysReg(HV_SYS_REG_TPIDR_EL0) : saved_tpidr;
     }
@@ -105,8 +106,11 @@ class Thread : public IThread {
 
     void createVcpu();
     void releaseVcpu(bool save_state = true);
+    // Enables Cpu::enableCounterEmulation if a vtimer offset makes the
+    // virtual counter match the host's, by running a probe on this vCPU
+    void probeCounterEmulation();
+    // Exited from the exception vector (the guest's PC is in ELR_EL1)
     bool exception{false};
-    std::optional<ThreadState> exit_register_state;
 
     u64 interrupt_time_delta_ticks;
 
@@ -121,15 +125,62 @@ class Thread : public IThread {
     std::atomic<bool> has_messages{false};
 
     // State
-    // SVCs, timer reads, memory tracking faults and timer interrupts don't
-    // touch SIMD registers, so their exits can skip reading them.
-    // `state.v` is stale until serializeSimd runs.
-    void serializeState(bool skip_simd = false);
-    void serializeSimd();
-    bool canSkipSimdOnExit();
-    bool simd_stale{false};
-    void deserializeState();
+    // Each exit reads only the registers its handler needs into `state`,
+    // completeState reads the rest (see RegisterSync)
+    struct VcpuRegisters {
+        Thread* thread;
 
+        static hv_reg_t generalReg(u8 index) {
+            return index == 29   ? HV_REG_FP
+                   : index == 30 ? HV_REG_LR
+                                 : hv_reg_t(HV_REG_X0 + index);
+        }
+        u64 general(u8 index) const {
+            return thread->getReg(generalReg(index));
+        }
+        void setGeneral(u8 index, u64 value) const {
+            thread->setReg(generalReg(index), value);
+        }
+        u64 sp() const { return thread->getSysReg(HV_SYS_REG_SP_EL0); }
+        void setSp(u64 value) const {
+            thread->setSysReg(HV_SYS_REG_SP_EL0, value);
+        }
+        u64 pc() const {
+            return thread->exception ? thread->getSysReg(HV_SYS_REG_ELR_EL1)
+                                     : thread->getReg(HV_REG_PC);
+        }
+        void setPc(u64 value) const {
+            if (thread->exception)
+                thread->setSysReg(HV_SYS_REG_ELR_EL1, value);
+            else
+                thread->setReg(HV_REG_PC, value);
+        }
+        u32 pstate() const {
+            return static_cast<u32>(thread->getReg(HV_REG_CPSR));
+        }
+        void setPstate(u32 value) const { thread->setReg(HV_REG_CPSR, value); }
+        u32 fpcr() const {
+            return static_cast<u32>(thread->getReg(HV_REG_FPCR));
+        }
+        void setFpcr(u32 value) const { thread->setReg(HV_REG_FPCR, value); }
+        u32 fpsr() const {
+            return static_cast<u32>(thread->getReg(HV_REG_FPSR));
+        }
+        void setFpsr(u32 value) const { thread->setReg(HV_REG_FPSR, value); }
+        u128 simd(u8 index) const { return thread->getSimdFpReg(index); }
+        void setSimd(u8 index, u128 value) const {
+            thread->setSimdFpReg(index, value);
+        }
+    };
+    RegisterSync<VcpuRegisters> registers{VcpuRegisters{this}};
+    RegisterGroup getExitReads();
+    void restoreRegisters();
+    // Exits handled on the vCPU's registers alone, without `state`
+    bool handleFastExit();
+    bool handleFastGuestException();
+
+    // Reads of the counter registers, which EL0 traps on (CNTKCTL_EL1)
+    std::optional<u64> readTrappedSystemRegister(u32 esr) const;
     void instructionTrap(u32 esr);
 
     // TLB maintenance on returning to the guest, see selectTrampoline

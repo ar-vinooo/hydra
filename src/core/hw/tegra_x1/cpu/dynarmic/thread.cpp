@@ -1,6 +1,8 @@
 #include "core/hw/tegra_x1/cpu/dynarmic/thread.hpp"
 
+#include <bitset>
 #include <mach/mach_time.h>
+#include <mutex>
 
 #include <dynarmic/interface/exclusive_monitor.h>
 
@@ -21,14 +23,44 @@ ENABLE_ENUM_FORMATTING(Dynarmic::A64::Exception, UnallocatedEncoding,
 
 namespace hydra::hw::tegra_x1::cpu::dynarmic {
 
-// HACK
-static Dynarmic::ExclusiveMonitor
-    g_exclusive_monitor(4); // TODO: don't hardcode core count
+namespace {
+
+// Every thread needs its own reservation in the global monitor: with a shared
+// one, an exclusive load by any thread fails the exclusive stores of all the
+// others. Threads beyond the slots share the last one.
+constexpr usize EXCLUSIVE_MONITOR_SLOTS = 64;
+constexpr usize SHARED_PROCESSOR_ID = EXCLUSIVE_MONITOR_SLOTS - 1;
+
+Dynarmic::ExclusiveMonitor g_exclusive_monitor(EXCLUSIVE_MONITOR_SLOTS);
+std::mutex g_processor_ids_mutex;
+std::bitset<SHARED_PROCESSOR_ID> g_used_processor_ids;
+
+usize allocateProcessorId() {
+    std::scoped_lock lock(g_processor_ids_mutex);
+    for (usize id = 0; id < g_used_processor_ids.size(); id++) {
+        if (!g_used_processor_ids[id]) {
+            g_used_processor_ids[id] = true;
+            return id;
+        }
+    }
+    return SHARED_PROCESSOR_ID;
+}
+
+void freeProcessorId(usize id) {
+    if (id == SHARED_PROCESSOR_ID)
+        return;
+    g_exclusive_monitor.ClearProcessor(id);
+    std::scoped_lock lock(g_processor_ids_mutex);
+    g_used_processor_ids[id] = false;
+}
+
+} // namespace
 
 Thread::Thread(WallClock& wall_clock, IMmu* mmu,
                const ThreadCallbacks& callbacks, IMemory* tls_mem,
                vaddr_t tls_mem_base)
-    : IThread(wall_clock, mmu, callbacks, tls_mem), tpidrro_el0{tls_mem_base} {
+    : IThread(wall_clock, mmu, callbacks, tls_mem), tpidrro_el0{tls_mem_base},
+      processor_id{allocateProcessorId()} {
     // TODO: tpidr_el0?
 
     // Create JIT
@@ -36,7 +68,7 @@ Thread::Thread(WallClock& wall_clock, IMmu* mmu,
     config.callbacks = this;
 
     // Multi-process state
-    config.processor_id = 0; // TODO: don't hardcode this
+    config.processor_id = processor_id;
     config.global_monitor = &g_exclusive_monitor;
 
     // System registers
@@ -72,7 +104,10 @@ Thread::Thread(WallClock& wall_clock, IMmu* mmu,
     jit = new Dynarmic::A64::Jit(config);
 }
 
-Thread::~Thread() { delete jit; }
+Thread::~Thread() {
+    delete jit;
+    freeProcessorId(processor_id);
+}
 
 void Thread::run() {
     while (true) {

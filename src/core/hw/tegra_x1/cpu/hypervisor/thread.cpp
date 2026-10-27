@@ -1,6 +1,8 @@
 #include "core/hw/tegra_x1/cpu/hypervisor/thread.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/counter_emulation.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/stage2_tracker.hpp"
 
+#include <limits>
 #include <mach/mach_time.h>
 #include <thread>
 
@@ -115,6 +117,42 @@ u32 getVcpuReleaseThreshold() {
     return threshold;
 }
 
+// Exits read only the registers their handler needs and some are handled on
+// the vCPU alone (see RegisterSync). HYDRA_DISABLE_LAZY_REGISTERS reads every
+// general register on every exit, like before; so does
+// HYDRA_DISABLE_REGISTER_WRITE_FILTER, which writes them all back.
+bool lazyRegistersEnabled() {
+    static const bool enabled =
+        std::getenv("HYDRA_DISABLE_LAZY_REGISTERS") == nullptr &&
+        std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") == nullptr;
+    return enabled;
+}
+
+// The host counter, read after every earlier instruction
+// (ztd::getSystemTick has no barrier)
+u64 readHostCounter() {
+    u64 value;
+    asm volatile("isb\n mrs %0, cntvct_el0" : "=r"(value)::"memory");
+    return value;
+}
+
+// mach_absolute_time() - ztd::getSystemTick(), from the reads with the least
+// time between them (exact once both host counter reads are the same tick)
+u64 getMachAbsoluteTimeOffset() {
+    u64 offset = 0;
+    u64 best_window = std::numeric_limits<u64>::max();
+    for (u32 i = 0; i < 1000 && best_window != 0; i++) {
+        const u64 before = readHostCounter();
+        const u64 mach = mach_absolute_time();
+        const u64 after = readHostCounter();
+        if (after - before < best_window) {
+            best_window = after - before;
+            offset = mach - before;
+        }
+    }
+    return offset;
+}
+
 bool mayBlock(u64 svc_id) {
     switch (svc_id) {
     case 0x0b: // SleepThread
@@ -206,6 +244,12 @@ void Thread::createVcpu() {
     HV_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_exceptions(vcpu, true));
     // HYP_ASSERT_SUCCESS(hv_vcpu_set_trap_debug_reg_accesses(vcpu, true));
 
+    // Before any guest code runs on any vCPU
+    std::call_once(cpu.getCounterEmulationOnce(),
+                   [this] { probeCounterEmulation(); });
+    if (const auto offset = cpu.getCounterVtimerOffset())
+        HV_ASSERT_SUCCESS(hv_vcpu_set_vtimer_offset(vcpu, *offset));
+
     // Registers that are not part of `state`
     setReg(HV_REG_PC, saved_pc);
     setSysReg(HV_SYS_REG_SPSR_EL1, saved_spsr);
@@ -229,7 +273,51 @@ void Thread::createVcpu() {
     setupVTimer();
 
     // Every register has to be written on the next run
-    exit_register_state.reset();
+    registers.reset();
+}
+
+void Thread::probeCounterEmulation() {
+    static const bool disabled =
+        std::getenv("HYDRA_DISABLE_COUNTER_EMULATION") != nullptr;
+    // The vector computes the high half of counter * factor
+    const auto factor = wall_clock.getCntpctFactor();
+    if (disabled || (factor >> 64) != 0)
+        return;
+
+    // The vCPU's virtual counter is mach_absolute_time() minus the vtimer
+    // offset (setupVTimer relies on it too), while ztd::getSystemTick reads
+    // the host's CNTVCT_EL0, which mach_absolute_time offsets (by the time
+    // the host slept). Try the offset that cancels that out, then none, and
+    // keep the one with which the probe reads the host's count.
+    u64 original_offset;
+    HV_ASSERT_SUCCESS(hv_vcpu_get_vtimer_offset(vcpu, &original_offset));
+    for (const u64 offset : {getMachAbsoluteTimeOffset(), u64(0)}) {
+        HV_ASSERT_SUCCESS(hv_vcpu_set_vtimer_offset(vcpu, offset));
+        setReg(HV_REG_CPSR, 0x3c5); // EL1h, DAIF masked
+        setReg(HV_REG_PC, KERNEL_REGION_BASE + COUNTER_PROBE_OFFSET);
+        const u64 before = readHostCounter();
+        HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
+        const u64 after = readHostCounter();
+
+        const u64 syndrome = exit->exception.syndrome;
+        const bool probed =
+            exit->reason == HV_EXIT_REASON_EXCEPTION &&
+            static_cast<ExceptionClass>((syndrome >> 26) & 0x3f) ==
+                ExceptionClass::HvcAarch64 &&
+            (syndrome & 0xffff) == COUNTER_PROBE_HVC;
+        const u64 counter = getReg(HV_REG_X0);
+        if (probed && counter >= before && counter <= after) {
+            cpu.enableCounterEmulation(offset, static_cast<u64>(factor));
+            LOG_INFO(Hypervisor,
+                     "Counter reads are emulated in the VM (vtimer offset "
+                     "{:#x})",
+                     offset);
+            return;
+        }
+    }
+    HV_ASSERT_SUCCESS(hv_vcpu_set_vtimer_offset(vcpu, original_offset));
+    LOG_WARN(Hypervisor, "The vCPU counter does not match the host counter, "
+                         "counter reads exit the VM");
 }
 
 void Thread::releaseVcpu(bool save_state) {
@@ -258,15 +346,26 @@ void Thread::run() {
         processMessages();
 
         // Run
-        deserializeState();
+        restoreRegisters();
         const bool perf = gpu::PerfStats::isEnabled();
         const auto run_start = perf ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
         HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
         if (perf)
             countExit(run_start);
-        exception = (getReg(HV_REG_PC) >= cpu.getKernelPageTable().getBase());
-        serializeState(canSkipSimdOnExit());
+        if (handleFastExit()) {
+            // Nothing was read: `state` waits for the next exit or
+            // completeState
+            registers.exit(state, RegisterGroup::None);
+            if (callbacks.stop_requested())
+                break;
+            continue;
+        }
+        // Exited from the exception vector (kernel region) rather than from
+        // guest code. Comparing against the kernel page table's physical
+        // base would misclassify guest code mapped above 4 GiB.
+        exception = (getReg(HV_REG_PC) >= KERNEL_REGION_BASE);
+        registers.exit(state, getExitReads());
 
         // Handle exit
         if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
@@ -287,7 +386,7 @@ void Thread::run() {
                     if (live_vcpu_count >= getVcpuReleaseThreshold() &&
                         mayBlock(esr & 0xffff)) {
                         // The registers are recreated from `state`
-                        serializeSimd();
+                        completeState();
                         releaseVcpu();
                     }
                     if (perf) {
@@ -326,7 +425,7 @@ void Thread::run() {
                     }
 
                     // A real fault: the debugger may show every register
-                    serializeSimd();
+                    completeState();
                     bool far_valid = (esr & 0x00000400) == 0;
                     ASSERT_DEBUG(far_valid, Hypervisor, "FAR not valid");
 
@@ -351,7 +450,7 @@ void Thread::run() {
                 default:
                     // Undefined instructions, alignment faults, instruction
                     // aborts, ...: Horizon hands them to the process
-                    serializeSimd();
+                    completeState();
                     if (deliverUserException(esr, far))
                         break;
                     LOG_ERROR(
@@ -572,149 +671,186 @@ void Thread::updateVTimer() {
     hv_vcpu_set_vtimer_mask(vcpu, false);
 }
 
-bool Thread::canSkipSimdOnExit() {
+void Thread::completeState() {
+    // After a fast exit, `exception` is as old as the rest of `state`
+    if (hasGroup(registers.getStale(), RegisterGroup::Low))
+        exception = (getReg(HV_REG_PC) >= KERNEL_REGION_BASE);
+    registers.complete(state);
+}
+
+RegisterGroup Thread::getExitReads() {
+    // Without the filter every register is written back from `state`
     static const bool disable_filter =
         std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") != nullptr;
-    // Without a baseline or filter every register is written back from `state`
-    if (disable_filter || !exit_register_state || !has_vcpu)
-        return false;
-    // The vCPU keeps the live SIMD registers; only exits whose handler may
-    // read them (debugging) need them in `state`
-    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED)
-        return true;
-    if (exit->reason != HV_EXIT_REASON_EXCEPTION)
-        return false;
-    switch (static_cast<ExceptionClass>((exit->exception.syndrome >> 26) &
-                                        0x3f)) {
-    case ExceptionClass::DataAbortLowerEl: // Stage 2 memory tracking
-        return true;
-    case ExceptionClass::HvcAarch64:
-        break;
-    default:
-        return false;
+    if (disable_filter)
+        return RegisterGroup::All;
+    // The vCPU keeps the registers that the exit's handler does not read;
+    // code that needs them (debugging, user exceptions) completes the state
+    bool skip_high = false;
+    bool skip_simd = false;
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+        skip_simd = true;
+    } else if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
+        switch (static_cast<ExceptionClass>((exit->exception.syndrome >> 26) &
+                                            0x3f)) {
+        case ExceptionClass::DataAbortLowerEl: // Stage 2 memory tracking
+            skip_simd = true;
+            break;
+        case ExceptionClass::HvcAarch64: {
+            const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+            switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+            case ExceptionClass::SvcAarch64:
+                // Arguments and results are in X0-X7. Break and
+                // ReturnFromException show or replace every register.
+                skip_simd = true;
+                skip_high = (esr & 0xffff) != 0x26 && (esr & 0xffff) != 0x28;
+                break;
+            case ExceptionClass::TrappedMsrMrsSystem: // Into any of X0-X30
+                skip_simd = true;
+                break;
+            case ExceptionClass::DataAbortLowerEl: // Stage 1 write tracking
+                skip_simd = true;
+                skip_high = true;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        default:
+            break;
+        }
     }
-    const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
-    switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
-    case ExceptionClass::SvcAarch64:
-    case ExceptionClass::TrappedMsrMrsSystem: // CNTPCT_EL0/CNTFRQ_EL0 reads
-    case ExceptionClass::DataAbortLowerEl:    // Stage 1 write tracking
-        return true;
-    default:
-        return false;
-    }
+    auto reads = RegisterGroup::All;
+    if (skip_high && lazyRegistersEnabled())
+        reads = reads & ~RegisterGroup::High;
+    if (skip_simd)
+        reads = reads & ~RegisterGroup::Simd;
+    return reads;
 }
 
-void Thread::serializeSimd() {
-    if (!simd_stale)
-        return;
-    for (u8 i = 0; i < 32; i++)
-        state.v[i] = getSimdFpReg(i);
-    if (exit_register_state)
-        for (u8 i = 0; i < 32; i++)
-            exit_register_state->v[i] = state.v[i];
-    simd_stale = false;
-}
-
-void Thread::serializeState(bool skip_simd) {
-    for (u8 i = 0; i < 29; i++)
-        state.r[i] = getReg(hv_reg_t(HV_REG_X0 + i));
-    state.fp = getReg(HV_REG_FP);
-    state.lr = getReg(HV_REG_LR);
-    state.sp = getSysReg(HV_SYS_REG_SP_EL0);
-    if (exception)
-        state.pc = getSysReg(HV_SYS_REG_ELR_EL1);
-    else
-        state.pc = getReg(HV_REG_PC);
-    state.pstate = static_cast<u32>(getReg(HV_REG_CPSR));
-    if (!skip_simd) {
-        for (u8 i = 0; i < 32; i++)
-            state.v[i] = getSimdFpReg(i);
-        simd_stale = false;
-    } else {
-        simd_stale = true;
-    }
-    state.fpcr = static_cast<u32>(getReg(HV_REG_FPCR));
-    state.fpsr = static_cast<u32>(getReg(HV_REG_FPSR));
-    exit_register_state = state;
-}
-
-void Thread::deserializeState() {
+void Thread::restoreRegisters() {
     static const bool disable_filter =
         std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") != nullptr;
-    const auto writes = restoreRegisterBank(
-        state,
-        !disable_filter && exit_register_state ? &*exit_register_state
-                                               : nullptr,
-        [&](u8 index, u64 value) {
-            const auto reg = index == 29   ? HV_REG_FP
-                             : index == 30 ? HV_REG_LR
-                                           : hv_reg_t(HV_REG_X0 + index);
-            setReg(reg, value);
-        },
-        [&](u8 index, u128 value) { setSimdFpReg(index, value); });
+    if (disable_filter)
+        registers.reset();
+    const auto writes = registers.restore(state);
     if (gpu::PerfStats::isEnabled()) {
         gpu::PerfStats::instance().register_writes += writes;
         gpu::PerfStats::instance().register_write_skips += 63 - writes;
     }
-    // Like the register bank, skip registers the vCPU still holds from the
-    // last exit
-    const ThreadState* base =
-        !disable_filter && exit_register_state ? &*exit_register_state
-                                               : nullptr;
-    if (!base || state.sp != base->sp)
-        setSysReg(HV_SYS_REG_SP_EL0, state.sp);
-    if (exception)
-        setSysReg(HV_SYS_REG_ELR_EL1, state.pc);
-    else
-        setReg(HV_REG_PC, state.pc);
-    if (!base || state.pstate != base->pstate)
-        setReg(HV_REG_CPSR, state.pstate);
-    if (!base || state.fpcr != base->fpcr)
-        setReg(HV_REG_FPCR, state.fpcr);
-    if (!base || state.fpsr != base->fpsr)
-        setReg(HV_REG_FPSR, state.fpsr);
+}
+
+bool Thread::handleFastExit() {
+    if (!lazyRegistersEnabled())
+        return false;
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+        updateVTimer();
+        return true;
+    }
+    if (exit->reason != HV_EXIT_REASON_EXCEPTION)
+        return false;
+    const u64 syndrome = exit->exception.syndrome;
+    switch (static_cast<ExceptionClass>((syndrome >> 26) & 0x3f)) {
+    case ExceptionClass::TrappedWfeWfiWfetWfit:
+        // Guest spin loops wait with WFE/WFI, which get trapped. There is no
+        // event to wait for, so give the host core away and continue after
+        // the instruction.
+        std::this_thread::yield();
+        setReg(HV_REG_PC, getReg(HV_REG_PC) + 4);
+        return true;
+    case ExceptionClass::DataAbortLowerEl:
+        // Stage 2 memory tracking: the access is retried once the page is
+        // accessible
+        return Stage2Tracker::instance().handleFault(
+            exit->exception.physical_address, (syndrome & (1ull << 6)) != 0);
+    case ExceptionClass::HvcAarch64:
+        return handleFastGuestException();
+    default:
+        return false;
+    }
+}
+
+// Through the exception vector, like the full exits in run
+bool Thread::handleFastGuestException() {
+    const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+    switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+    case ExceptionClass::DataAbortLowerEl: {
+        // Stage 1 write tracking. The access size, when the syndrome holds it
+        // (ISV, SAS); pair and vector accesses do not report one.
+        const bool size_valid = (esr & (1u << 24)) != 0;
+        const u64 access_size =
+            size_valid ? (1ull << ((esr >> 22) & 0x3)) : 16;
+        const u64 far = getSysReg(HV_SYS_REG_FAR_EL1);
+        if (far >= ADDRESS_SPACE_SIZE ||
+            !MMU.trackWrite(ztd::Range<vaddr_t>::fromSize(far, access_size)))
+            return false;
+        // The page is writable now, this core may still hold it read-only
+        local_tlb_flush = true;
+        break;
+    }
+    case ExceptionClass::TrappedMsrMrsSystem: {
+        const auto value = readTrappedSystemRegister(esr);
+        if (!value)
+            return false;
+        const auto rt = static_cast<u8>((esr >> 5) & 0x1f);
+        if (rt != 31) // XZR
+            setReg(VcpuRegisters::generalReg(rt), *value);
+        setSysReg(HV_SYS_REG_ELR_EL1, getSysReg(HV_SYS_REG_ELR_EL1) + 4);
+        break;
+    }
+    default:
+        return false;
+    }
+    setReg(HV_REG_PC, selectTrampoline());
+    return true;
+}
+
+std::optional<u64> Thread::readTrappedSystemRegister(u32 esr) const {
+    if ((esr & 1) == 0) // A write
+        return std::nullopt;
+    // Op0 Op2 Op1 CRn 00000 CRm
+    switch ((esr >> 1) & 0x1ffe0f) {
+    case 0b11'000'011'1110'00000'0000: // CNTFRQ_EL0
+        return GUEST_CNTFRQ;
+    case 0b11'001'011'1110'00000'0000: // CNTPCT_EL0
+    case 0b11'010'011'1110'00000'0000: // CNTVCT_EL0
+        // The guest has no virtual offset, so both counters match
+        return wall_clock.getCntpct();
+    default:
+        return std::nullopt;
+    }
 }
 
 void Thread::instructionTrap(u32 esr) {
-    bool read = (esr & 1) != 0;
-    uint rt = (esr >> 5) & 0x1f;
-
-    // Rt 29/30 are FP/LR, which live outside `r`; 31 is XZR
-    const auto write_rt = [&](u64 value) {
-        if (rt < 29)
-            state.r[rt] = value;
-        else if (rt == 29)
-            state.fp = value;
-        else if (rt == 30)
-            state.lr = value;
-    };
-
-    if (read) {
-        // Op0 Op2 Op1 CRn 00000 CRm
-        switch ((esr >> 1) & 0x1ffe0f) {
-        case 0b11'000'011'1110'00000'0000: // CNTFRQ_EL0
-            write_rt(GUEST_CNTFRQ);
-            break;
-        case 0b11'001'011'1110'00000'0000: // CNTPCT_EL0
-        case 0b11'010'011'1110'00000'0000: // CNTVCT_EL0
-            // The guest has no virtual offset, so both counters match
-            write_rt(wall_clock.getCntpct());
-            break;
-        default:
+    const auto value = readTrappedSystemRegister(esr);
+    if (!value) {
+        if ((esr & 1) != 0) {
             LOG_FATAL(Hypervisor,
                       "Unhandled system register read (ESR: 0x{:08x})", esr);
-            break;
+        } else {
+            LOG_FATAL(Hypervisor,
+                      "Unhandled system register write (ESR: 0x{:08x})", esr);
         }
-    } else {
-        LOG_FATAL(Hypervisor, "Unhandled system register write (ESR: 0x{:08x})",
-                  esr);
+        return;
     }
+
+    // Rt 29/30 are FP/LR, which live outside `r`; 31 is XZR
+    const uint rt = (esr >> 5) & 0x1f;
+    if (rt < 29)
+        state.r[rt] = *value;
+    else if (rt == 29)
+        state.fp = *value;
+    else if (rt == 30)
+        state.lr = *value;
 }
 
 void Thread::processMessages() {
     // Checked on every VM exit; debugger messages are rare
     if (!has_messages.load(std::memory_order_acquire))
         return;
+    // They may change `state`
+    completeState();
     std::scoped_lock lock(msg_mutex);
     has_messages.store(false, std::memory_order_relaxed);
     while (!msg_queue.empty()) {

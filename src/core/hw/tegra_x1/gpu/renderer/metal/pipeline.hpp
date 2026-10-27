@@ -17,8 +17,14 @@ class Pipeline final : public PipelineBase {
     ~Pipeline() override;
 
     // Getters
-    // With a geometry shader, the passthrough draw (see geometry.hpp)
-    MTL::RenderPipelineState* getPipeline() const { return pipeline; }
+    // Null while compiling in the background (see BinaryArchiveCache). With a
+    // geometry shader, the passthrough draw (see geometry.hpp).
+    MTL::RenderPipelineState* getPipeline() const {
+        return state->pipeline.load(std::memory_order_acquire);
+    }
+    bool isCompiling() const {
+        return state->compiling.load(std::memory_order_acquire);
+    }
     // The vertex shader writing its output records, rasterization off
     MTL::RenderPipelineState* getCapturePipeline() const {
         return capture_pipeline;
@@ -39,7 +45,16 @@ class Pipeline final : public PipelineBase {
     bool hasTessellation() const { return tess_factor_pipeline != nullptr; }
 
   private:
-    MTL::RenderPipelineState* pipeline{nullptr};
+    // Shared with a background compilation, which may outlive the pipeline
+    struct State {
+        std::atomic<MTL::RenderPipelineState*> pipeline{nullptr};
+        std::atomic<bool> compiling{false};
+        ~State() {
+            if (auto* p = pipeline.load())
+                p->release();
+        }
+    };
+    std::shared_ptr<State> state{std::make_shared<State>()};
     MTL::RenderPipelineState* capture_pipeline{nullptr};
     MTL::RenderPipelineState* geometry_pipeline{nullptr};
     MTL::RenderPipelineState* tess_control_pipeline{nullptr};

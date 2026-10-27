@@ -186,6 +186,9 @@ class IThread : public SynchronizationObject {
     virtual void captureContext(ThreadContext& out_context) {
         out_context = {};
     }
+    // Called on the thread itself when the debugger pauses it: the debugger
+    // then reads its registers from another thread
+    virtual void prepareForDebugger() {}
 
     // Helpers
     void reset() {

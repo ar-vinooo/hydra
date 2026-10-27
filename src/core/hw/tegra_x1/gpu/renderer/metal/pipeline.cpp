@@ -375,12 +375,41 @@ Pipeline::Pipeline(MTL::Device* device,
     // A fragment shader without a stored source cannot be rebuilt
     const bool rebuildable =
         fragment_shader == nullptr || !sources.fragment.empty();
-    pipeline = binary_archive_cache.createPipeline(
-        pipeline_descriptor, &error,
-        fmt::format("{}:{}", drawing_shader->getCacheKey(),
-                    fragment_shader != nullptr ? fragment_shader->getCacheKey()
-                                               : "no-fragment"),
-        rebuildable ? &sources : nullptr);
+    const auto shader_key = fmt::format(
+        "{}:{}", drawing_shader->getCacheKey(),
+        fragment_shader != nullptr ? fragment_shader->getCacheKey()
+                                   : "no-fragment");
+    MTL::RenderPipelineState* pipeline;
+    if (binary_archive_cache.isAsync()) {
+        // Draws are skipped until the worker publishes the pipeline
+        state->compiling.store(true, std::memory_order_release);
+        pipeline = binary_archive_cache.createPipelineAsync(
+            pipeline_descriptor, &error, shader_key,
+            rebuildable ? &sources : nullptr,
+            [state = state](MTL::RenderPipelineState* compiled,
+                            NS::Error* compile_error) {
+                // The error belongs to the worker's autorelease pool
+                if (compiled == nullptr)
+                    LOG_ERROR(MetalRenderer, "Failed to create pipeline: {}",
+                              compile_error ? compile_error
+                                                  ->localizedDescription()
+                                                  ->utf8String()
+                                            : "unknown error");
+                state->pipeline.store(compiled, std::memory_order_release);
+                state->compiling.store(false, std::memory_order_release);
+            });
+        // Not queued: done is never called. Otherwise the worker may already
+        // have published the pipeline, so leave the state to it.
+        if (pipeline != nullptr || error != nullptr) {
+            state->pipeline.store(pipeline, std::memory_order_release);
+            state->compiling.store(false, std::memory_order_release);
+        }
+    } else {
+        pipeline = binary_archive_cache.createPipeline(
+            pipeline_descriptor, &error, shader_key,
+            rebuildable ? &sources : nullptr);
+        state->pipeline.store(pipeline, std::memory_order_release);
+    }
     if (auto& visual = VisualDiagnostics::instance(); visual.selected())
         visual.event("metal_pipeline_result", {{"available", pipeline ? "1" : "0"},
             {"vertex_key", vertex_shader->getCacheKey()},
@@ -395,9 +424,8 @@ Pipeline::Pipeline(MTL::Device* device,
     }
 }
 
+// The main pipeline belongs to `state`, which a compilation may outlive
 Pipeline::~Pipeline() {
-    if (pipeline != nullptr)
-        pipeline->release();
     if (capture_pipeline != nullptr)
         capture_pipeline->release();
     if (geometry_pipeline != nullptr)

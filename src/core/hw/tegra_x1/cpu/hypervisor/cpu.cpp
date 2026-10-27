@@ -2,6 +2,7 @@
 
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/os.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/counter_emulation.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/mmu.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/thread.hpp"
 
@@ -101,6 +102,8 @@ Cpu::Cpu()
                                    EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET),
            exception_trampoline_shared_tlb,
            sizeof(exception_trampoline_shared_tlb));
+    // Replaces the vector for exceptions from the guest
+    counter_emulation::write(reinterpret_cast<u8*>(kernel_mem.getPtr()));
 
     // Symbols
     // TODO: this should be registered by the process
@@ -119,6 +122,12 @@ Cpu::Cpu()
     // Features
     features = {.supports_native_breakpoints = true,
                 .supports_synchronous_single_step = false};
+}
+
+void Cpu::enableCounterEmulation(u64 vtimer_offset, u64 factor) {
+    counter_emulation::enable(reinterpret_cast<u8*>(kernel_mem.getPtr()),
+                              factor);
+    counter_vtimer_offset = vtimer_offset;
 }
 
 IMmu* Cpu::createMmu(System& system) { return new Mmu(system); }

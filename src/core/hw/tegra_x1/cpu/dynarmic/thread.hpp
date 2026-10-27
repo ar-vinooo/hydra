@@ -43,6 +43,8 @@ class Thread final : public IThread, private Dynarmic::A64::UserCallbacks {
     vaddr_t tpidrro_el0;
     vaddr_t tpidr_el0{0};
 
+    // Slot in the global exclusive monitor
+    usize processor_id;
     Dynarmic::A64::Jit* jit;
     u64 ticks_left{1000};
 
