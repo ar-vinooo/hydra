@@ -6,7 +6,12 @@
 #define NS_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 #define CA_PRIVATE_IMPLEMENTATION
+#define MTLFX_PRIVATE_IMPLEMENTATION
 #include <Metal/Metal.hpp>
+#include <MetalFX/MTL4FXFrameInterpolator.hpp>
+#include <MetalFX/MTL4FXSpatialScaler.hpp>
+#include <MetalFX/MTLFXFrameInterpolator.hpp>
+#include <MetalFX/MTLFXSpatialScaler.hpp>
 #include <QuartzCore/QuartzCore.hpp>
 
 #pragma GCC diagnostic pop

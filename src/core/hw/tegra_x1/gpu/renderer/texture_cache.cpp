@@ -1,9 +1,19 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture_cache.hpp"
+#include "core/hot/table.hpp"
+#include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
+#include "core/hw/tegra_x1/gpu/resource/range_set.hpp"
 
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
+#include <set>
 
+#include "core/hw/tegra_x1/cpu/mmu.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
@@ -11,17 +21,8 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-TextureCache::~TextureCache() {
-    for (auto& [mem_key, mem] : entries) {
-        for (auto& [group_key, group] : mem.cache) {
-            for (auto& [storage_key, storage] : group.cache) {
-                for (auto& [view_key, view] : storage.view_cache)
-                    delete view;
-                delete storage.base;
-            }
-        }
-    }
-}
+
+TextureCache::~TextureCache() = default;
 
 ITextureView* TextureCache::find(ICommandBuffer* command_buffer,
                                  const TextureDescriptor& descriptor,
@@ -40,6 +41,8 @@ ITextureView* TextureCache::find(ICommandBuffer* command_buffer,
                                  const TextureViewDescriptor& view_descriptor,
                                  TextureUsage usage) {
     const auto range = descriptor.getRange();
+    if (usage != TextureUsage::Read)
+        epoch++;
 
     // Check for containing interval
     auto it = entries.upper_bound(range.getBegin());
@@ -54,6 +57,7 @@ ITextureView* TextureCache::find(ICommandBuffer* command_buffer,
     }
 
     // Insert and merge
+    epoch++;
     TextureMem mem{.range = range};
 
     it = entries.lower_bound(range.getBegin());
@@ -81,23 +85,181 @@ ITextureView* TextureCache::find(ICommandBuffer* command_buffer,
                        view_descriptor, usage);
 }
 
-void TextureCache::invalidateMemory(ztd::Range<uptr> range) {
-    auto it = entries.upper_bound(range.getBegin());
-    if (it != entries.begin())
-        it--;
+std::optional<TextureFormat>
+TextureCache::findDepthStencilAlias(const TextureDescriptor& descriptor) {
+    const auto& format_info = getTextureFormatInfo(descriptor.format);
+    if (format_info.is_depth_stencil)
+        return std::nullopt;
 
-    for (; it != entries.end() && it->first < range.getEnd(); it++) {
-        auto& mem = it->second;
-
-        // We assume that textures that have been written to by the GPU are
-        // never modified by the CPU
-        if (mem.info.written_timestamp != TextureCacheTimePoint{})
-            continue;
-
-        // Check if its in the range
-        if (mem.range.getEnd() > range.getBegin())
-            mem.info.markModified();
+    // Only the entry containing the address can hold the texture
+    auto it = entries.upper_bound(descriptor.ptr);
+    if (it == entries.begin())
+        return std::nullopt;
+    auto& mem = std::prev(it)->second;
+    if (!mem.range.contains(descriptor.ptr))
+        return std::nullopt;
+    for (auto& [group_key, group] : mem.cache) {
+        for (auto& [storage_key, storage] : group.cache) {
+            const auto& other = storage.base->getDescriptor();
+            if (other.ptr != descriptor.ptr ||
+                other.width != descriptor.width ||
+                other.height != descriptor.height)
+                continue;
+            const auto& other_info = getTextureFormatInfo(other.format);
+            if (other_info.is_depth_stencil &&
+                other_info.bytes_per_block == format_info.bytes_per_block)
+                return other.format;
+        }
     }
+
+    return std::nullopt;
+}
+
+bool TextureCache::overlapsCompressedStorage(ztd::Range<uptr> range) {
+    bool found = false;
+    forEachIntersecting(range, [&](TextureMem& mem) {
+        for (auto& [group_key, group] : mem.cache) {
+            for (auto& [storage_key, storage] : group.cache) {
+                const auto& descriptor = storage.base->getDescriptor();
+                if (isTextureFormatCompressed(descriptor.format) &&
+                    descriptor.getRange().intersects(range))
+                    found = true;
+            }
+        }
+    });
+    return found;
+}
+
+bool TextureCache::hasUnflushedGpuWrites(ztd::Range<uptr> range) {
+    bool found = false;
+    forEachIntersecting(range, [&](TextureMem& mem) {
+        for (auto& [group_key, group] : mem.cache) {
+            for (auto& [storage_key, storage] : group.cache) {
+                if (storage.gpu_written_timestamp > storage.flushed_timestamp &&
+                    storage.base->getDescriptor().getRange().intersects(range))
+                    found = true;
+            }
+        }
+    });
+    return found;
+}
+
+bool TextureCache::copyRenderedToGuest(ICommandBuffer* command_buffer,
+                                       const RenderedCopySource& src,
+                                       ztd::Range<uptr> src_range,
+                                       uptr dst_ptr, u64 dst_stride) {
+    // The CPU path writes every texture with pending GPU writes back and
+    // copies the guest bytes: with a single such texture the copied bytes
+    // are its texels
+    TextureStorage* source = nullptr;
+    u32 pending = 0;
+    forEachIntersecting(src_range, [&](TextureMem& mem) {
+        for (auto& [group_key, group] : mem.cache) {
+            for (auto& [storage_key, storage] : group.cache) {
+                if (storage.base == nullptr ||
+                    storage.gpu_written_timestamp <= storage.flushed_timestamp ||
+                    !storage.base->getDescriptor().getRange().intersects(
+                        src_range))
+                    continue;
+                pending++;
+                source = &storage;
+            }
+        }
+    });
+    if (pending != 1)
+        return false;
+    const auto& descriptor = source->base->getDescriptor();
+    // Level 0 of a single sample, uncompressed 2D surface with the DMA
+    // surface's layout
+    const bool uncompressed =
+        getTextureFormatStride(descriptor.format, 4) ==
+            4 * getTextureFormatStride(descriptor.format, 1) &&
+        getTextureFormatRows(descriptor.format, 4) == 4;
+    const u32 bytes_per_pixel = getTextureFormatStride(descriptor.format, 1);
+    const u32 rows_per_block = GOB_HEIGHT << src.block_height_log2;
+    if (bytes_per_pixel == 0 || src.x_bytes % bytes_per_pixel != 0 ||
+        src.line_bytes % bytes_per_pixel != 0 || src.line_bytes == 0 ||
+        src.rows == 0)
+        return false;
+    const u32 x = src.x_bytes / bytes_per_pixel;
+    const u32 width = src.line_bytes / bytes_per_pixel;
+    if (descriptor.ptr != src.ptr || descriptor.is_linear ||
+        descriptor.isMultisampled() || !uncompressed ||
+        (descriptor.type != MTL::TextureType2D &&
+         descriptor.type != MTL::TextureType2DArray) ||
+        descriptor.block_width_gobs_log2 != 0 ||
+        descriptor.block_height_gobs_log2 != src.block_height_log2 ||
+        descriptor.block_depth_gobs_log2 != src.block_depth_log2 ||
+        align(descriptor.width * bytes_per_pixel, GOB_WIDTH) !=
+            align(src.stride, GOB_WIDTH) ||
+        align(descriptor.height, rows_per_block) !=
+            align(src.height, rows_per_block) ||
+        x + width > descriptor.width || src.y + src.rows > descriptor.height)
+        return false;
+
+    const auto dst = renderer.getGuestMemoryBuffer(ztd::Range<uptr>::fromSize(
+        dst_ptr, dst_stride * (src.rows - 1) + src.line_bytes));
+    if (!dst.isValid())
+        return false;
+    LOG_TEXTURE_EVENT("dma_copy_on_gpu", descriptor,
+                      fmt::format("dst={:#x} {}x{}", dst_ptr, width,
+                                  src.rows));
+    command_buffer->retainResource(dst.getOwner());
+    auto* view = getTextureView(
+        *source, TextureViewDescriptor(descriptor.type, descriptor.format,
+                                       ztd::Range<u32>(0, 1),
+                                       ztd::Range<u32>(0, 1)));
+    for (u32 row = 0; row < src.rows; row++)
+        dst.getBase()->copyFrom(command_buffer, view,
+                                MTL::Origin(x, src.y + row, 0),
+                                MTL::Size(width, 1, 1),
+                                ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1),
+                                dst.getOffset() + dst_stride * row);
+    return true;
+}
+
+void TextureCache::invalidateMemory(ztd::Range<uptr> range) {
+    epoch++;
+    ::hydra::hot::Scope hot_scope;
+    HYDRA_HOT_CALL(*this, texture_cache_invalidate_memory)(range);
+}
+
+void TextureCache::synchronizeStorageWrites(
+    ICommandBuffer* command_buffer,
+    const std::vector<ztd::Range<uptr>>& ranges) {
+    if (ranges.empty())
+        return;
+    // Texture uploads decode guest bytes on the CPU. Finish the shader's
+    // writes before a later lookup can snapshot those bytes.
+    {
+        ScopedCheckpointReason reason(command_buffer,
+                                      CheckpointReason::StorageWrite);
+        if (optimization::enabled()) {
+            // The backend's issued/synchronized guest-write epochs prove
+            // whether this checkpoint is redundant. Descriptor/cache identity
+            // alone never proves visibility of pending GPU writes.
+            if (!renderer.synchronizeGuestWrites(command_buffer)) {
+                if (tls_crnt_decode_state)
+                    tls_crnt_decode_state->fail(25);
+                return;
+            }
+        } else {
+            renderer.debugSyncCommandBuffer(command_buffer);
+        }
+    }
+    if (optimization::enabled()) {
+        for (const auto& range : resource::coalesceRanges(ranges))
+            invalidateMemory(range);
+    } else {
+        for (const auto& range : ranges)
+            invalidateMemory(range);
+    }
+}
+
+void TextureCache::markGpuWritesInGuest(ztd::Range<uptr> range) {
+    epoch++;
+    ::hydra::hot::Scope hot_scope;
+    HYDRA_HOT_CALL(*this, texture_cache_mark_gpu_writes_in_guest)(range);
 }
 
 void TextureCache::mergeMemories(TextureMem& mem, TextureMem& other) {
@@ -111,14 +273,61 @@ void TextureCache::mergeMemories(TextureMem& mem, TextureMem& other) {
             std::max(mem.info.written_timestamp, other.info.written_timestamp),
     };
 
+    for (const auto& [begin, write] : other.gpu_writes)
+        mem.recordGpuWrite(ztd::Range<uptr>(begin, write.end), write.timestamp);
+
     for (auto& [group_key, other_group] : other.cache) {
         auto group_opt = mem.cache.find(group_key);
         auto& group =
             (group_opt.has_value() ? **group_opt : mem.cache.insert(group_key));
         for (auto& [storage_key, storage] : other_group.cache) {
-            group.cache.insert(storage_key, std::move(storage));
+            group.cache.insert(getFreeStorageKey(group, storage_key),
+                               std::move(storage));
         }
     }
+}
+
+namespace {
+
+// The storage holds the requested texture, possibly with more levels or
+// layers (storages are keyed by the request that created them)
+bool servesRequest(const TextureDescriptor& storage,
+                   const TextureDescriptor& request) {
+    if (storage.ptr != request.ptr || storage.is_linear != request.is_linear ||
+        storage.width != request.width || storage.height != request.height ||
+        storage.depth != request.depth ||
+        storage.layer_size != request.layer_size ||
+        storage.sample_count != request.sample_count ||
+        storage.level_count < request.level_count ||
+        storage.layer_count < request.layer_count)
+        return false;
+    if (storage.is_linear)
+        return storage.linear_stride == request.linear_stride;
+    return storage.block_width_gobs_log2 == request.block_width_gobs_log2 &&
+           storage.block_height_gobs_log2 == request.block_height_gobs_log2 &&
+           storage.block_depth_gobs_log2 == request.block_depth_gobs_log2;
+}
+
+} // namespace
+
+// Storage keys are hashes: storages of other descriptors can have the same
+// key, the following keys are probed
+std::optional<u32> TextureCache::findStorageKey(
+    TextureGroup& group, const TextureDescriptor& descriptor) {
+    for (u32 key = descriptor.getStorageHash();; key++) {
+        const auto storage = group.cache.find(key);
+        if (!storage)
+            return std::nullopt;
+        if ((**storage).base != nullptr &&
+            servesRequest((**storage).base->getDescriptor(), descriptor))
+            return key;
+    }
+}
+
+u32 TextureCache::getFreeStorageKey(TextureGroup& group, u32 key) {
+    while (group.cache.find(key))
+        key++;
+    return key;
 }
 
 namespace {
@@ -132,10 +341,15 @@ bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor, uptr ptr,
     u32 layer_offset = 0;
     if (base_descriptor.layer_count > 1) {
         out_layer = offset / base_descriptor.layer_size;
+        if (out_layer >= base_descriptor.layer_count)
+            return false;
         layer_offset = out_layer * base_descriptor.layer_size;
     }
 
-    // Level
+    // Level. Layered textures whose levels are rendered one at a time may
+    // describe fewer levels than their layer stride holds, so a level past
+    // level_count is accepted here; copies bound it themselves. The loop ends
+    // once the offset is reached or passed
     out_level = 0;
     u32 crnt_level_offset = 0;
     const u32 level_offset = offset - layer_offset;
@@ -147,6 +361,9 @@ bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor, uptr ptr,
     return crnt_level_offset == level_offset;
 }
 
+bool haveCompatibleLayout(const TextureDescriptor& descriptor1, u32 level1,
+                          const TextureDescriptor& descriptor2, u32 level2);
+
 bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor,
                             const TextureDescriptor& view_descriptor,
                             u32& out_level, u32& out_layer) {
@@ -155,11 +372,59 @@ bool calculateLevelAndLayer(const TextureDescriptor& base_descriptor,
         return false;
 
     if (base_descriptor.getLevelDimensions(out_level) !=
-        uint3({view_descriptor.width, view_descriptor.height,
-               view_descriptor.depth}))
+        MTL::Size(view_descriptor.width, view_descriptor.height,
+                  view_descriptor.depth))
         return false;
 
-    return true;
+    // Matching dimensions do not imply matching guest byte layout. In
+    // particular, mode/allocator transitions can change pitch or tiling at
+    // the same address. Such requests need their own decoded storage.
+    return haveCompatibleLayout(base_descriptor, out_level, view_descriptor, 0);
+}
+
+// Layered textures (e.g. cubemaps) whose levels are rendered one at a time:
+// the base texture may describe fewer levels than its layer stride holds, so
+// a later level lies past its range even though it belongs to it
+bool isLevelOfLayeredTexture(const TextureDescriptor& base_descriptor,
+                             const TextureDescriptor& view_descriptor) {
+    // Single layer views (e.g. one cubemap face) don't have a layer stride
+    const bool single_layer =
+        view_descriptor.layer_count == 1 && view_descriptor.layer_size == 0;
+    if (base_descriptor.is_linear || view_descriptor.is_linear ||
+        base_descriptor.layer_count <= 1 || base_descriptor.layer_size == 0 ||
+        (!single_layer &&
+         view_descriptor.layer_size != base_descriptor.layer_size) ||
+        view_descriptor.ptr < base_descriptor.ptr)
+        return false;
+
+    const u64 offset = view_descriptor.ptr - base_descriptor.ptr;
+    const u64 first_layer = offset / base_descriptor.layer_size;
+    return first_layer + view_descriptor.layer_count <=
+           base_descriptor.layer_count;
+}
+
+// Whether two block linear levels share the same memory layout, even if their
+// dimensions differ slightly (e.g. a render target with a padded width)
+bool haveCompatibleLayout(const TextureDescriptor& descriptor1, u32 level1,
+                          const TextureDescriptor& descriptor2, u32 level2) {
+    if (descriptor1.is_linear || descriptor2.is_linear)
+        return descriptor1.is_linear && descriptor2.is_linear &&
+               descriptor1.linear_stride == descriptor2.linear_stride;
+
+    const auto dims1 = descriptor1.getLevelDimensions(level1);
+    const auto dims2 = descriptor2.getLevelDimensions(level2);
+    if (static_cast<u32>(dims1.depth) != static_cast<u32>(dims2.depth))
+        return false;
+
+    const auto block_size_log2 = descriptor1.getLevelBlockSizeLog2(level1);
+    if (block_size_log2 != descriptor2.getLevelBlockSizeLog2(level2))
+        return false;
+
+    const u32 block_width = GOB_WIDTH << static_cast<u32>(block_size_log2.width);
+    return align(getTextureFormatStride(descriptor1.format, static_cast<u32>(dims1.width)),
+                 block_width) ==
+           align(getTextureFormatStride(descriptor2.format, static_cast<u32>(dims2.width)),
+                 block_width);
 }
 
 bool calculateLevelAndLayer(const TextureDescriptor& base1_descriptor,
@@ -176,7 +441,8 @@ bool calculateLevelAndLayer(const TextureDescriptor& base1_descriptor,
         base2_descriptor.getLevelDimensions(out_level2))
         return false;
 
-    return true;
+    return haveCompatibleLayout(base1_descriptor, out_level1,
+                                base2_descriptor, out_level2);
 }
 
 bool calculateLevelAndSlice(const TextureDescriptor& base_descriptor, uptr ptr,
@@ -187,6 +453,9 @@ bool calculateLevelAndSlice(const TextureDescriptor& base_descriptor, uptr ptr,
     out_level = 0;
     u32 level_offset = 0;
     while (level_offset < offset) {
+        // The last level absorbs what lies after it; it is not a new level
+        if (out_level + 1 >= base_descriptor.level_count)
+            break;
         const u32 level_size = base_descriptor.getLevelSize(out_level);
         if (level_offset + level_size >= offset)
             break;
@@ -217,7 +486,7 @@ bool calculateLevelAndSlice(const TextureDescriptor& base1_descriptor,
     const auto dims1 = base1_descriptor.getLevelDimensions(out_level1);
     const auto dims2 = base2_descriptor.getLevelDimensions(out_level2);
     // Z can differ
-    return dims1.x() == dims2.x() && dims1.y() == dims2.y();
+    return static_cast<u32>(dims1.width) == static_cast<u32>(dims2.width) && static_cast<u32>(dims1.height) == static_cast<u32>(dims2.height);
 }
 
 } // namespace
@@ -234,6 +503,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     // Check if it is a new entry
     auto group_opt = mem.cache.find(group_hash);
     if (!group_opt.has_value()) {
+        epoch++;
         auto& group = mem.cache.insert(group_hash);
         auto& storage = group.cache.insert(storage_hash);
         return getTexture(command_buffer, storage, mem, descriptor,
@@ -243,26 +513,51 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     auto& group = **group_opt;
 
     // Check if the storage already exists
-    auto storage_opt = group.cache.find(storage_hash);
-    if (storage_opt) {
-        auto& storage = **storage_opt;
+    if (const auto storage_key = findStorageKey(group, descriptor)) {
+        auto& storage = **group.cache.find(*storage_key);
         return getTextureView(command_buffer, storage, mem, view_descriptor,
                               usage);
+    }
+    epoch++;
+
+    // Buffer subranges are not mip/layer views. Keep exact-sized storages;
+    // overlapping GPU contents are synchronized by byte range in update().
+    if (descriptor.type == MTL::TextureTypeTextureBuffer) {
+        auto& storage =
+            group.cache.insert(getFreeStorageKey(group, storage_hash));
+        return getTexture(command_buffer, storage, mem, descriptor,
+                          view_descriptor, usage);
     }
 
     // ---------------- View ----------------
     for (auto& [key, storage] : group.cache) {
         const auto& other_descriptor = storage.base->getDescriptor();
         const auto other_range = other_descriptor.getRange();
-        if (other_range.contains(range)) {
+        if (other_range.contains(range) ||
+            isLevelOfLayeredTexture(other_descriptor, descriptor)) {
             u32 level;
             u32 layer;
             if (!calculateLevelAndLayer(other_descriptor, descriptor, level,
                                         layer)) {
-                LOG_DEBUG(Gpu,
-                          "Misaligned textures (existing: ({}), new: ({}))",
-                          other_descriptor, descriptor);
-                continue;
+                // Render targets for small levels of layered textures can have
+                // a padded width
+                const bool padded_level =
+                    isLevelOfLayeredTexture(other_descriptor, descriptor) &&
+                    descriptor.level_count == 1 &&
+                    calculateLevelAndLayer(other_descriptor, descriptor.ptr,
+                                           level, layer) &&
+                    static_cast<u32>(other_descriptor.getLevelDimensions(level).height) ==
+                        descriptor.height &&
+                    static_cast<u32>(other_descriptor.getLevelDimensions(level).width) <=
+                        descriptor.width &&
+                    haveCompatibleLayout(other_descriptor, level, descriptor,
+                                         0);
+                if (!padded_level) {
+                    LOG_DEBUG(Gpu,
+                              "Misaligned textures (existing: ({}), new: ({}))",
+                              other_descriptor, descriptor);
+                    continue;
+                }
             }
 
             auto actual_storage = &storage;
@@ -270,23 +565,51 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
             // Check if the base texture has enough levels
             const u32 min_levels = level + descriptor.level_count;
             if (other_descriptor.level_count < min_levels) {
-                // Remove the old storage
+                // Keep what is needed from the old storage: removing it frees
+                // its slot, which the new storage may reuse
+                const auto old_base = storage.base;
+                const auto old_descriptor = other_descriptor;
+                const auto old_gpu_written = storage.gpu_written_timestamp;
+                const auto old_cpu_modified = storage.cpu_modified_timestamp;
+                const auto old_flushed_ranges = storage.flushed_ranges;
+                const auto old_stale_ranges = storage.stale_ranges;
+                auto old_storage = std::move(storage);
+                if (command_buffer) {
+                    command_buffer->retainResource(old_storage.base_owner);
+                    for (const auto& owner : old_storage.view_owners)
+                        command_buffer->retainResource(owner);
+                }
                 group.cache.remove(key);
 
                 // Create a new storage
-                auto new_descriptor = other_descriptor;
+                auto new_descriptor = old_descriptor;
                 new_descriptor.level_count = min_levels;
-                auto& new_storage =
-                    group.cache.insert(new_descriptor.getStorageHash());
+                auto& new_storage = group.cache.insert(getFreeStorageKey(
+                    group, new_descriptor.getStorageHash()));
                 updateStorage(command_buffer, new_storage, mem, new_descriptor,
                               usage);
 
-                // Copy the old storage to the new one
-                new_storage.base->copyFrom(command_buffer, storage.base, 0, 0,
-                                           0, 0, other_descriptor.level_count,
-                                           other_descriptor.layer_count);
-
-                // TODO: destroy the old storage
+                // Copy the old storage to the new one, unless the guest
+                // overwrote all of what the GPU held in it
+                bool old_fresh = false;
+                TextureStorage::forEachOutside(
+                    old_stale_ranges, old_descriptor.getRange(),
+                    [&](ztd::Range<uptr>) { old_fresh = true; });
+                if (old_fresh &&
+                    !new_storage.base->copyFrom(command_buffer, old_base, 0, 0,
+                                                0, 0, old_descriptor.level_count,
+                                                old_descriptor.layer_count))
+                    LOG_TEXTURE_EVENT("copy_unsupported_resize", new_descriptor,
+                                    fmt::format("old={:#x} {} {}",
+                                                old_descriptor.ptr,
+                                                old_descriptor.type,
+                                                old_descriptor.format));
+                new_storage.gpu_written_timestamp = std::max(
+                    new_storage.gpu_written_timestamp, old_gpu_written);
+                new_storage.cpu_modified_timestamp = std::max(
+                    new_storage.cpu_modified_timestamp, old_cpu_modified);
+                new_storage.flushed_ranges = old_flushed_ranges;
+                new_storage.stale_ranges = old_stale_ranges;
 
                 actual_storage = &new_storage;
             }
@@ -342,10 +665,10 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                 layer_count =
                     std::max(layer_count, layer + other_descriptor.layer_count);
             } else {
-                // TODO
-                LOG_NOT_IMPLEMENTED(
-                    Gpu, "Texture combining (existing: ({}), new: ({}))",
-                    other_descriptor, descriptor);
+                // The existing texture starts before the new one: it cannot
+                // be merged into it. Both stay separate storages; their
+                // shared bytes are synchronized by address range (update()).
+                // This happens thousands of times per second in UE4 games.
                 ++it;
                 continue;
             }
@@ -363,20 +686,40 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     new_descriptor.layer_count = layer_count;
 
     // Create a new storage
-    auto& storage = group.cache.insert(storage_hash);
+    auto& storage = group.cache.insert(getFreeStorageKey(group, storage_hash));
     updateStorage(command_buffer, storage, mem, new_descriptor, usage);
 
     // Copy overlapping storages
     for (auto& overlapping_storage : overlapping_storages) {
         const auto other_base = overlapping_storage.storage.base;
+        if (command_buffer) {
+            command_buffer->retainResource(overlapping_storage.storage.base_owner);
+            for (const auto& owner : overlapping_storage.storage.view_owners)
+                command_buffer->retainResource(owner);
+        }
         const auto& other_descriptor = other_base->getDescriptor();
-        storage.base->copyFrom(
-            command_buffer, other_base, 0, 0, overlapping_storage.level,
-            overlapping_storage.layer, other_descriptor.level_count,
-            other_descriptor.layer_count);
+        // What the guest overwrote since the GPU wrote this storage is stale:
+        // the new storage was decoded from the guest's data already
+        bool fresh = false;
+        overlapping_storage.storage.forEachFresh(
+            other_descriptor.getRange(),
+            [&](ztd::Range<uptr>) { fresh = true; });
+        if (!fresh) {
+            LOG_TEXTURE_EVENT("copy_skipped_stale_storage", descriptor,
+                            fmt::format("old={:#x} {} {}", other_descriptor.ptr,
+                                        other_descriptor.type,
+                                        other_descriptor.format));
+            continue;
+        }
+        if (!storage.base->copyFrom(
+                command_buffer, other_base, 0, 0, overlapping_storage.level,
+                overlapping_storage.layer, other_descriptor.level_count,
+                other_descriptor.layer_count))
+            LOG_TEXTURE_EVENT("copy_unsupported_overlap", descriptor,
+                            fmt::format("old={:#x} {} {}", other_descriptor.ptr,
+                                        other_descriptor.type,
+                                        other_descriptor.format));
     }
-
-    // TODO: destroy overlapping storages
 
     // Return view
     return getTextureView(storage, view_descriptor);
@@ -388,7 +731,20 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
                                  TextureUsage usage) {
     if (storage.base == nullptr) {
         storage.base = renderer.createTexture(descriptor);
+        storage.base_owner = storage.base->createResourceOwner();
+        // DEBUG: HYDRA_RT_ZERO_INIT=1 starts render targets in memory the GPU
+        // never wrote with zeros. Decoding guest memory into them shows
+        // whatever other data (e.g. streamed textures) shares that memory.
+        static const bool zero_init =
+            std::getenv("HYDRA_RT_ZERO_INIT") != nullptr;
+        zero_fill_decode = zero_init && usage == TextureUsage::Write &&
+                           mem.info.written_timestamp == TextureCacheTimePoint{};
+        LOG_TEXTURE_EVENT(
+            "create", descriptor,
+            fmt::format("usage={} zero_fill={}", static_cast<u32>(usage),
+                        zero_fill_decode));
         decodeTexture(command_buffer, storage);
+        zero_fill_decode = false;
     }
     update(command_buffer, storage, mem, usage);
 }
@@ -396,12 +752,23 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
 ITextureView*
 TextureCache::getTextureView(TextureStorage& storage,
                              const TextureViewDescriptor& view_descriptor) {
-    auto view_opt = storage.view_cache.find(view_descriptor.getHash());
-    if (view_opt.has_value())
-        return **view_opt;
+    ztd::hash::XxHash32 view_hash;
+    view_hash.add(view_descriptor.getHash());
+    view_hash.add(::hydra::hot::generation());
+    const auto key = view_hash.toHashCode();
+    // Views of other descriptors can have the same key
+    u32 free_key = key;
+    for (;; free_key++) {
+        auto view_opt = storage.view_cache.find(free_key);
+        if (!view_opt.has_value())
+            break;
+        if ((**view_opt)->getDescriptor() == view_descriptor)
+            return **view_opt;
+    }
 
     auto view = storage.base->createView(view_descriptor);
-    storage.view_cache.insert(view_descriptor.getHash(), view);
+    storage.view_owners.push_back(view->createResourceOwner());
+    storage.view_cache.insert(free_key, view);
     return view;
 }
 
@@ -423,76 +790,62 @@ ITextureView* TextureCache::getTexture(
 void TextureCache::update(ICommandBuffer* command_buffer,
                           TextureStorage& storage, TextureMem& mem,
                           TextureUsage usage) {
-    bool sync = false;
-    if (storage.update_timestamp < mem.info.modified_timestamp) {
-        // If modified by the guest
-        sync = true;
-    } else if (storage.update_timestamp < mem.info.written_timestamp) {
-        // Other textures in this memory changed, let's copy them
-        const auto base = storage.base;
-        const auto& descriptor = base->getDescriptor();
-        const auto range = descriptor.getRange();
-        for (auto& [group_key, group] : mem.cache) {
-            for (auto& [storage_key, other_storage] : group.cache) {
-                // Skip this storage
-                if (storage_key ==
-                    storage.base->getDescriptor().getStorageHash())
-                    continue;
-
-                const auto& other_descriptor =
-                    other_storage.base->getDescriptor();
-                const auto other_range = other_descriptor.getRange();
-
-                if (range.intersects(other_range)) {
-                    const auto type_class =
-                        getTextureTypeClass(descriptor.type);
-                    const auto other_type_class =
-                        getTextureTypeClass(other_descriptor.type);
-                    if (type_class == TextureTypeClass::_2D &&
-                        other_type_class == TextureTypeClass::_2D) {
-                        synchronize2DWith2D(command_buffer, storage,
-                                            other_storage);
-                    } else if (type_class == TextureTypeClass::_3D &&
-                               other_type_class == TextureTypeClass::_3D) {
-                        synchronize3DWith3D(command_buffer, storage,
-                                            other_storage);
-                    } else {
-                        LOG_WARN(Gpu,
-                                 "Cannot synchronize textures ({}) and ({})",
-                                 descriptor, other_descriptor);
-                    }
-                }
-            }
-        }
-
-        storage.markUpdated();
-    } else if (mem.info.written_timestamp == TextureCacheTimePoint{}) {
-        // Never written to
-        if (usage == TextureUsage::Present) {
-            // Presented, but never written to
-            sync = true;
-        } else if (usage == TextureUsage::Read) {
-            // Read, but never written to
-        }
-    }
-
-    if (sync)
-        decodeTexture(command_buffer, storage);
-
-    if (usage == TextureUsage::Read)
-        mem.info.markRead();
-    else if (usage == TextureUsage::Write)
-        mem.info.markWritten();
-
-    if (usage == TextureUsage::Write || sync)
-        storage.markUpdated();
+    ::hydra::hot::Scope hot_scope;
+    HYDRA_HOT_CALL(*this, texture_cache_update)(command_buffer, storage, mem, usage);
 }
 
-void TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
+// Block compressed data written (or read) through texels of the size of a
+// block: NVN streams a BC texture mip by mip through RGBA32/RG32 render targets
+// whose texel is one block, placed at the mip's address. The texel texture's
+// dimensions are the compressed level's dimensions in blocks (padded up to the
+// GOB width), so the pixel dimension comparison of calculateLevelAndLayer never
+// matches. Finds the level of the compressed texture that the texel texture
+// covers, with the same memory layout.
+bool calculateBlockTexelAlias(const TextureDescriptor& compressed,
+                              const TextureDescriptor& texel, u32& out_level) {
+    const auto& compressed_info = getTextureFormatInfo(compressed.format);
+    const auto& texel_info = getTextureFormatInfo(texel.format);
+    if (compressed_info.block_width == 1 && compressed_info.block_height == 1)
+        return false;
+    if (texel_info.block_width != 1 || texel_info.block_height != 1 ||
+        texel_info.bytes_per_block != compressed_info.bytes_per_block ||
+        isTextureFormatDepthOrStencil(texel.format) ||
+        getHostTextureFormat(texel.format) != texel.format ||
+        texel.level_count != 1 || texel.layer_count != 1 ||
+        texel.type != MTL::TextureType2D ||
+        compressed.type != MTL::TextureType2D)
+        return false;
+
+    u32 layer;
+    if (!calculateLevelAndLayer(compressed, texel.ptr, out_level, layer) ||
+        layer != 0)
+        return false;
+
+    const auto dims = compressed.getLevelDimensions(out_level);
+    const u32 blocks_x = static_cast<u32>(
+        (static_cast<u32>(dims.width) + compressed_info.block_width - 1) /
+        compressed_info.block_width);
+    const u32 blocks_y = static_cast<u32>(
+        (static_cast<u32>(dims.height) + compressed_info.block_height - 1) /
+        compressed_info.block_height);
+    // A render target may be wider than the level (GOB width padding), never
+    // narrower
+    if (texel.width < blocks_x || texel.height < blocks_y)
+        return false;
+    return haveCompatibleLayout(compressed, out_level, texel, 0);
+}
+
+bool TextureCache::synchronize2DWith2DHot0(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     const auto& descriptor = storage.base->getDescriptor();
     const auto& other_descriptor = other_storage.base->getDescriptor();
+    const auto& format = getTextureFormatInfo(descriptor.format);
+    const auto& other_format = getTextureFormatInfo(other_descriptor.format);
+    // Different byte widths have different texel coordinates. Synchronize
+    // their shared guest bytes instead of reporting an unperformed GPU copy.
+    if (format.bytes_per_block != other_format.bytes_per_block)
+        return false;
     const auto copy_range =
         descriptor.getRange().clampedTo(other_descriptor.getRange());
 
@@ -503,21 +856,98 @@ void TextureCache::synchronize2DWith2D(ICommandBuffer* command_buffer,
     if (!calculateLevelAndLayer(descriptor, other_descriptor,
                                 copy_range.getBegin(), level, layer,
                                 other_level, other_layer)) {
-        LOG_DEBUG(Gpu, "Cannot synchronize 2D textures ({}) and ({})",
-                  descriptor, other_descriptor);
-        return;
+        // Block data through texels of the size of a block (BC mips written
+        // through RGBA32/RG32 render targets): copy one level
+        {
+            u32 compressed_level = 0;
+            const bool to_compressed =
+                calculateBlockTexelAlias(descriptor, other_descriptor,
+                                         compressed_level);
+            const bool from_compressed =
+                !to_compressed &&
+                calculateBlockTexelAlias(other_descriptor, descriptor,
+                                         compressed_level);
+            if (to_compressed || from_compressed) {
+                const auto dst_level = to_compressed ? compressed_level : 0u;
+                const auto src_level = to_compressed ? 0u : compressed_level;
+                const auto& compressed_descriptor =
+                    to_compressed ? descriptor : other_descriptor;
+                const auto& texel_descriptor =
+                    to_compressed ? other_descriptor : descriptor;
+                const auto level_dims =
+                    compressed_descriptor.getLevelDimensions(compressed_level);
+                // Larger than both: the copy clamps to what each side has
+                const MTL::Size size(
+                    std::max(static_cast<u32>(level_dims.width), texel_descriptor.width),
+                    std::max(static_cast<u32>(level_dims.height), texel_descriptor.height),
+                    1);
+                return storage.base->copyFrom(
+                    command_buffer, other_storage.base, MTL::Origin(0, 0, 0),
+                    src_level, 0, MTL::Origin(0, 0, 0), dst_level, 0, size, 1);
+            }
+        }
+        // Same memory layout, but different dimensions: copy the overlapping
+        // region of a single level. A padded render target starts at the same
+        // address. A level of a mip chain written as a texture of its own (the
+        // small levels are written GOB wide) starts inside the other texture;
+        // that is only copied for uncompressed formats, whose regions need no
+        // block alignment.
+        if ((descriptor.ptr != other_descriptor.ptr &&
+             (isTextureFormatCompressed(descriptor.format) ||
+              isTextureFormatCompressed(other_descriptor.format))) ||
+            !calculateLevelAndLayer(descriptor, copy_range.getBegin(), level,
+                                    layer) ||
+            !calculateLevelAndLayer(other_descriptor, copy_range.getBegin(),
+                                    other_level, other_layer) ||
+            !haveCompatibleLayout(descriptor, level, other_descriptor,
+                                  other_level)) {
+            // The caller falls back to synchronizing through guest memory
+            // (e.g. block data written through an RGBA32 render target into
+            // the memory of a BC texture)
+            LOG_DEBUG(Gpu, "Cannot copy 2D textures directly ({}) and ({})",
+                      descriptor, other_descriptor);
+            return false;
+        }
+
+        // The counts below would wrap for a level or layer past the end
+        if (level >= descriptor.level_count ||
+            other_level >= other_descriptor.level_count ||
+            layer >= descriptor.layer_count ||
+            other_layer >= other_descriptor.layer_count)
+            return false;
+
+        const auto dims = descriptor.getLevelDimensions(level);
+        const auto other_dims =
+            other_descriptor.getLevelDimensions(other_level);
+        const MTL::Size size(std::min(static_cast<u32>(dims.width), static_cast<u32>(other_dims.width)),
+                             std::min(static_cast<u32>(dims.height), static_cast<u32>(other_dims.height)),
+                             std::min(static_cast<u32>(dims.depth), static_cast<u32>(other_dims.depth)));
+        // Layers are only comparable at the same stride
+        const u32 layers =
+            descriptor.layer_size == other_descriptor.layer_size
+                ? std::min(descriptor.layer_count - layer,
+                           other_descriptor.layer_count - other_layer)
+                : 1u;
+        return storage.base->copyFrom(
+            command_buffer, other_storage.base, MTL::Origin(0, 0, 0), other_level,
+            other_layer, MTL::Origin(0, 0, 0), level, layer, size, layers);
     }
 
-    storage.base->copyFrom(
-        command_buffer, other_storage.base, other_layer, level, layer,
-        other_level,
+    if (level >= descriptor.level_count ||
+        other_level >= other_descriptor.level_count ||
+        layer >= descriptor.layer_count ||
+        other_layer >= other_descriptor.layer_count)
+        return false;
+    return storage.base->copyFrom(
+        command_buffer, other_storage.base, other_level, other_layer, level,
+        layer,
         std::min(descriptor.level_count - level,
                  other_descriptor.level_count - other_level),
         std::min(descriptor.layer_count - layer,
                  other_descriptor.layer_count - other_layer));
 }
 
-void TextureCache::synchronize3DWith3D(ICommandBuffer* command_buffer,
+bool TextureCache::synchronize3DWith3DHot1(ICommandBuffer* command_buffer,
                                        TextureStorage& storage,
                                        TextureStorage& other_storage) {
     const auto& descriptor = storage.base->getDescriptor();
@@ -534,29 +964,34 @@ void TextureCache::synchronize3DWith3D(ICommandBuffer* command_buffer,
                                 other_level, other_slice)) {
         LOG_DEBUG(Gpu, "Cannot synchronize 3D textures ({}) and ({})",
                   descriptor, other_descriptor);
-        return;
+        return false;
     }
 
+    if (level >= descriptor.level_count ||
+        other_level >= other_descriptor.level_count)
+        return false;
     const auto dims = descriptor.getLevelDimensions(level);
     const auto other_dims = other_descriptor.getLevelDimensions(other_level);
     const u32 level_count =
         std::min(descriptor.level_count - level,
                  other_descriptor.level_count - other_level);
 
-    if (slice == 0 && other_slice == 0 && dims.z() == other_dims.z()) {
+    if (slice == 0 && other_slice == 0 && static_cast<u32>(dims.depth) == static_cast<u32>(other_dims.depth)) {
         // Do a simplified copy in case we are copying whole levels
-        storage.base->copyFrom(command_buffer, other_storage.base, other_level,
-                               0, level, 0, level_count, 1);
+        return storage.base->copyFrom(command_buffer, other_storage.base,
+                                      other_level, 0, level, 0, level_count, 1);
     } else {
         ASSERT_DEBUG(
             level_count == 1, Gpu,
             "Cannot copy multiple 3D levels with non-matching dimensions");
-        const u32 slice_count =
-            std::min(dims.z() - slice, other_dims.z() - other_slice);
-        storage.base->copyFrom(command_buffer, other_storage.base,
-                               uint3({0, 0, other_slice}), other_level, 0,
-                               uint3({0, 0, slice}), level, 0,
-                               uint3({dims.x(), dims.y(), slice_count}), 1);
+        const NS::UInteger slice_count =
+            std::min(static_cast<u32>(dims.depth) - slice, static_cast<u32>(other_dims.depth) - other_slice);
+        return storage.base->copyFrom(
+            command_buffer, other_storage.base,
+            MTL::Origin(0, 0, other_slice), other_level, 0,
+            MTL::Origin(0, 0, slice), level, 0,
+            MTL::Size(static_cast<u32>(dims.width), static_cast<u32>(dims.height), slice_count),
+            1);
     }
 }
 
@@ -574,27 +1009,90 @@ u32 TextureCache::getDataHash(const ITexture* texture) {
     return hash.toHashCode();
 }
 
-void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
+void TextureCache::flushMemory(ICommandBuffer* command_buffer,
+                               ztd::Range<uptr> range, const char* origin,
+                               u32 line) {
+    // The outermost caller names the flush
+    const auto previous_origin = tls_texture_flush_origin;
+    if (previous_origin.function == nullptr)
+        tls_texture_flush_origin = {origin, line};
+    // Whoever flushes is about to read or overwrite the memory in the order of
+    // the command stream: reports queued earlier have to land first
+    renderer.flushReports(command_buffer, range);
+    epoch++;
+    ::hydra::hot::Scope hot_scope;
+    HYDRA_HOT_CALL(*this, texture_cache_flush_memory)(command_buffer, range);
+    tls_texture_flush_origin = previous_origin;
+}
+
+void TextureCache::discardGpuWrites(ICommandBuffer* command_buffer,
+                                    ztd::Range<uptr> range) {
+    // The memory is overwritten, a report queued before must not land after
+    renderer.flushReports(command_buffer, range);
+    epoch++;
+    bool partial = false;
+    auto it = entries.upper_bound(range.getBegin());
+    if (it != entries.begin())
+        it--;
+    for (; it != entries.end() && it->first < range.getEnd(); it++) {
+        auto& mem = it->second;
+        if (mem.range.getEnd() <= range.getBegin())
+            continue;
+        for (auto& [group_key, group] : mem.cache) {
+            for (auto& [storage_key, storage] : group.cache) {
+                if (storage.base == nullptr ||
+                    storage.gpu_written_timestamp <= storage.flushed_timestamp)
+                    continue;
+                const auto texture_range =
+                    storage.base->getDescriptor().getRange();
+                if (!texture_range.intersects(range))
+                    continue;
+                if (texture_range.getBegin() >= range.getBegin() &&
+                    texture_range.getEnd() <= range.getEnd())
+                    storage.flushed_timestamp = storage.gpu_written_timestamp;
+                else
+                    partial = true;
+            }
+        }
+    }
+    if (partial)
+        flushMemory(command_buffer, range);
+}
+
+void TextureCache::encodeTexture(ICommandBuffer* command_buffer,
+                                 TextureStorage& storage,
+                                 ztd::Range<uptr> range) {
+    ::hydra::hot::Scope hot_scope;
+    HYDRA_HOT_CALL(*this, texture_cache_encode_texture)(command_buffer, storage, range);
+}
+
+void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                                  TextureStorage& storage) {
+    ScopedGpuWork work(GpuWork::Texture);
     const auto& descriptor = storage.base->getDescriptor();
 
     // Calculate size
     u32 size = 0;
     for (u32 level = 0; level < descriptor.level_count; level++) {
         const auto dims = descriptor.getLevelDimensions(level);
-        const u32 stride = getTextureFormatStride(descriptor.format, dims.x());
-        const u32 rows = getTextureFormatRows(descriptor.format, dims.y());
+        const u32 stride = getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
+        const u32 rows = getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
         const u32 slice_stride = rows * stride;
-        size += dims.z() * slice_stride;
+        size += static_cast<u32>(dims.depth) * slice_stride;
     }
     size *= descriptor.layer_count;
 
     // Allocate temporary buffer
-    auto tmp_buffer = renderer.allocateTemporaryBuffer(size);
+    const auto upload_start = PerfStats::isEnabled()
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    auto tmp_buffer = renderer.allocateTextureUploadBuffer(size);
 
     const u8* in_data = reinterpret_cast<const u8*>(descriptor.ptr);
     u8* out_data = reinterpret_cast<u8*>(tmp_buffer->getPtr());
-    if (descriptor.is_linear) {
+    if (zero_fill_decode) {
+        std::memset(out_data, 0, size);
+    } else if (descriptor.is_linear) {
         const u32 stride =
             getTextureFormatStride(descriptor.format, descriptor.width);
         const u32 rows =
@@ -606,25 +1104,42 @@ void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
                         stride);
         }
     } else {
+        // Levels and layers are aligned to blocks in guest memory, but packed
+        // in the output
+        const u32 layer_stride =
+            descriptor.layer_size != 0
+                ? descriptor.layer_size
+                : descriptor.getLevelOffset(descriptor.level_count);
         u32 offset = 0;
         for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
             for (u32 level = 0; level < descriptor.level_count; level++) {
+                const usize in_offset =
+                    static_cast<usize>(layer) * layer_stride +
+                    descriptor.getLevelOffset(level);
+
                 // Calculate sizes
                 const auto dims = descriptor.getLevelDimensions(level);
                 const auto block_size_log2 =
                     descriptor.getLevelBlockSizeLog2(level);
                 const u32 stride =
-                    getTextureFormatStride(descriptor.format, dims.x());
+                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
                 const u32 rows =
-                    getTextureFormatRows(descriptor.format, dims.y());
+                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
                 const u32 slice_stride = rows * stride;
 
                 // Convert
+                // The base level's rows are padded to whole blocks in X
+                // (TIC tile width spacing), e.g. 4000 byte rows take 64 GOBs,
+                // not 63. Mip levels aren't (like yuzu).
                 convertBlockLinearToLinear(
-                    stride, rows, dims.z(), block_size_log2.y(),
-                    block_size_log2.z(), in_data + offset,
+                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width)),
+                    rows,
+                    static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height), static_cast<u32>(block_size_log2.depth),
+                    in_data + in_offset,
                     [=](const u8* in_gob, u32 gob_x, u32 gob_y, u32 gob_z) {
                         const u32 x = gob_x * GOB_WIDTH;
+                        if (x >= stride)
+                            return;
                         for (u32 local_y = 0; local_y < GOB_HEIGHT; local_y++) {
                             const u32 y = gob_y * GOB_HEIGHT + local_y;
                             if (y >= rows)
@@ -642,13 +1157,21 @@ void TextureCache::decodeTexture(ICommandBuffer* command_buffer,
                     });
 
                 // Add offset
-                offset += dims.z() * slice_stride;
+                offset += static_cast<u32>(dims.depth) * slice_stride;
             }
         }
     }
 
     storage.base->copyFrom(command_buffer, tmp_buffer);
-    renderer.freeTemporaryBuffer(tmp_buffer);
+    renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);
+    if (PerfStats::isEnabled()) {
+        auto& stats = PerfStats::instance();
+        stats.texture_upload_bytes += size;
+        stats.texture_upload_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - upload_start)
+                .count());
+    }
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

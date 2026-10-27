@@ -6,7 +6,7 @@ auto File::getPosixOpenFlags(OpenFlags flags) noexcept -> i32 {
     i32 res = 0;
 
     // Access mode
-    if (any(flags & (OpenFlags::Read | OpenFlags::Write))) {
+    if (any(flags & OpenFlags::Read) && any(flags & OpenFlags::Write)) {
         res |= O_RDWR;
     } else if (any(flags & OpenFlags::Read)) {
         res |= O_RDONLY;

@@ -3,6 +3,9 @@
 #include "core/hw/tegra_x1/gpu/engines/inline_base.hpp"
 #include "core/hw/tegra_x1/gpu/macro/driver_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
+#include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 class ITextureView;
@@ -111,8 +114,8 @@ struct TextureSamplerControl {
     u32 : 9;
 
     // 0x04
-    u32 mag_filter : 2;
-    u32 : 2;
+    u32 mag_filter : 3;
+    u32 min_lod_clamp_integer_only : 1;
     u32 min_filter : 2;
     u32 mip_filter : 2;
     u32 cubemap_anisotropy : 1;
@@ -147,6 +150,41 @@ struct TextureSamplerControl {
     u32 border_color_a;
 };
 
+// Levels of detail the resource view of a TIC allows. They are absolute mip
+// levels of the texture (the TIC address is always level 0), so they clamp the
+// sampler's LOD range instead of shifting it
+struct TicLodRange {
+    u32 min = 0;
+    u32 max = 15;
+};
+
+TicLodRange getTicLodRange(const TextureImageControl& tic);
+
+// Memory layout a TIC describes. The color key versions share the layout of
+// their plain versions (clb197tex.h: the key sits in the last words); other
+// header versions have no known layout.
+struct TicLayout {
+    bool is_linear;
+    u32 linear_stride;
+};
+std::optional<TicLayout> getTicLayout(const TextureImageControl& tic);
+MTL::StencilOperation decodeStencilOp(u32 value);
+
+// The texture format selects the border color interpretation (integer bits,
+// sRGB border); Invalid for none
+renderer::SamplerDescriptor
+decodeSampler(const TextureSamplerControl& tsc,
+              renderer::TextureFormat texture_format =
+                  renderer::TextureFormat::Invalid,
+              TicLodRange view_lods = {});
+
+// Records the guest sampler state the shader must be specialized for (LOD
+// bias, border emulation) in the shader state of a texture binding
+void specializeShaderSampler(renderer::GuestShaderState& state, u32 index,
+                             const TextureSamplerControl& tsc,
+                             renderer::TextureFormat texture_format,
+                             TicLodRange view_lods);
+
 struct RenderTarget {
     Iova addr;
     u32 width_or_stride;
@@ -170,9 +208,10 @@ struct RenderTarget {
     u32 padding[6];
 };
 
+// Depth mode (clip space Z range)
 enum class ViewportZClip : u32 {
     MinusOneToOne,
-    OneToOne,
+    ZeroToOne,
 };
 
 enum class WindowOriginFlags : u32 {
@@ -200,6 +239,14 @@ inline renderer::ShaderType toRendererShaderType(ShaderStage stage) {
         return renderer::ShaderType::Vertex;
     case ShaderStage::Fragment:
         return renderer::ShaderType::Fragment;
+    case ShaderStage::Compute:
+        return renderer::ShaderType::Compute;
+    case ShaderStage::Geometry:
+        return renderer::ShaderType::Geometry;
+    case ShaderStage::TessCtrl:
+        return renderer::ShaderType::TessControl;
+    case ShaderStage::TessEval:
+        return renderer::ShaderType::TessEvaluation;
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Engines, "Shader stage {}", stage));
         return renderer::ShaderType::Count;
@@ -360,7 +407,11 @@ struct Regs3D {
         bool volume;
     } depth_target_array_mode;
 
-    u32 padding_0x48d[0x26];
+    // 0x48d SET_SAMPLER_BINDING: bit 0 set means the sampler index is the
+    // texture header index (the handle's sampler bits are ignored)
+    u32 sampler_binding;
+
+    u32 padding_0x48e[0x25];
 
     // 0x4b3
     bool32 depth_test_enabled;
@@ -385,7 +436,8 @@ struct Regs3D {
 
     // 0x4cf
     struct {
-        u32 separate_for_alpha; // TODO: is this a bitfield or something?
+        // SET_BLEND_SEPARATE_FOR_ALPHA (clb197.h 0x133c): bit 0
+        u32 separate_for_alpha;
         u32 rgb_op;
         u32 src_rgb_factor;
         u32 dst_rgb_factor;
@@ -433,14 +485,20 @@ struct Regs3D {
 
     u32 end;
     struct {
-        PrimitiveType primitive_type : 26;
+        PrimitiveType primitive_type : 16;
+        u32 : 8;
+        bool32 primitive_id_reset : 1;
+        u32 : 1;
         bool32 instance_next : 1;
         bool32 instance_ctrl : 1; // TODO: is the name correct?
     } begin;
 
     u32 padding_0x587[0x9];
 
-    u32 padding_0x590[0x62];
+    u32 padding_0x590;
+    u32 primitive_restart_enabled;
+    u32 primitive_restart_index;
+    u32 padding_0x593[0x5f];
 
     // 0x5f2 indexed draws
     Iova index_buffer_addr;
@@ -497,7 +555,8 @@ struct Regs3D {
 
     // 0x780
     struct {
-        u32 unknown; // TODO: is this just padding?
+        // SET_BLEND_PER_TARGET_SEPARATE_FOR_ALPHA (clb197.h 0x1e00 + j * 32)
+        u32 separate_for_alpha;
         u32 rgb_op;
         u32 src_rgb_factor;
         u32 dst_rgb_factor;
@@ -543,19 +602,122 @@ struct Regs3D {
     u32 padding_0x983[0x37d];
 
     // 0xd00
-    u32 mme_scratch[0x80];
+    u32 mme_scratch[0x100];
+};
+static_assert(sizeof(Regs3D) == MACRO_METHODS_REGION * sizeof(u32));
+
+// Preserve the explicitly programmed color and alpha equations. The NVIDIA
+// header names SEPARATE_FOR_ALPHA but does not specify a draw-time override of
+// the alpha registers. Inferring that override from glBlendFunc discarded the
+// captured ADD-color / REVERSE_SUBTRACT-alpha light-shaft occlusion equation.
+// Register-write side effects of SEPARATE_FOR_ALPHA still need hardware proof.
+struct BlendEquation {
+    u32 rgb_op;
+    u32 src_rgb_factor;
+    u32 dst_rgb_factor;
+    u32 alpha_op;
+    u32 src_alpha_factor;
+    u32 dst_alpha_factor;
 };
 
-class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
+MTL::BlendOperation getBlendOperation(u32 blend_op);
+MTL::BlendFactor getBlendFactor(u32 blend_factor);
+void invalidateShaderInstructions(Gpu& gpu, u32 flags);
+
+template <typename Blend>
+inline BlendEquation getBlendEquation(const Blend& blend) {
+    return {blend.rgb_op,   blend.src_rgb_factor,   blend.dst_rgb_factor,
+            blend.alpha_op, blend.src_alpha_factor, blend.dst_alpha_factor};
+}
+
+class ThreeD : public EngineWithRegsBase<Regs3D>,
+               public InlineBase,
+               public macro::MacroHost {
+    // Lets tests read the viewport and scissor conversions
+    friend struct ThreeDTestAccess;
+
   public:
     explicit ThreeD(Gpu& gpu_);
 
     void method(u32 method, u32 arg) override;
+    void methodHot(u32 method, u32 arg);
 
     void flushMacro() override;
+    void flushMacroHot();
 
     // Getters
     const Regs3D& getRegs() const { return regs; }
+    // Resolves a binding against the current GPU address space, gathering
+    // separate host mappings into owned CPU memory when necessary.
+    ztd::Range<uptr> getConstBuffer(u32 stage_index, u32 slot,
+                                   u64 required_size = 0) const;
+    renderer::BufferView getConstBufferUpload(u32 stage_index, u32 slot,
+                                             u64 required_size = 0);
+    // Conditional rendering applies to draws and clears.
+    bool shouldExecute() const;
+    const std::vector<u32>& getInlineIndices() const { return inline_indices; }
+
+    // Macros
+    u32 readMacroRegister(u32 reg) override { return getReg(reg); }
+    void callMacroMethod(u32 method, u32 arg) override {
+        if (!isConstBufferData(method))
+            flushConstBufferInvalidation();
+        this->method(method, arg);
+    }
+
+    // LOAD_CONST_BUFFER words invalidate the buffer cache once per run of
+    // words: any other method may read the buffer, so it flushes them first
+    static constexpr bool isConstBufferData(u32 method) {
+        return method >= 0x8e4 && method < 0x8e4 + 16;
+    }
+    void flushConstBufferInvalidation() {
+        if (pending_const_buffer_invalidation.getSize() != 0)
+            flushConstBufferInvalidationImpl();
+    }
+
+    // Helpers (also used by the compute engine)
+    // Write usage is for storage images
+    renderer::ITextureView*
+    getTexture(const TextureImageControl& tic,
+               std::optional<MTL::TextureType> shader_type = std::nullopt,
+               renderer::TextureUsage usage = renderer::TextureUsage::Read) const;
+    renderer::SamplerBase*
+    getSampler(const TextureSamplerControl& tsc,
+               renderer::TextureFormat texture_format =
+                   renderer::TextureFormat::Invalid,
+               TicLodRange view_lods = {}) const;
+    // Samplers are immutable and never evicted, so they are memoized by the
+    // raw TSC words instead of hashing a descriptor for every binding
+    struct SamplerMemo {
+        std::array<u64, 4> key{};
+        u32 view_lods{0};
+        renderer::SamplerBase* sampler{nullptr};
+    };
+    // Indexed by integer texture | sRGB border << 1
+    mutable std::array<std::array<SamplerMemo, 256>, 4> sampler_memos{};
+    // Texture lookups of the previous draws, reused while the texture cache
+    // epoch only changed by this draw's own render target lookups
+    struct TextureMemo {
+        std::array<u64, 4> tic{};
+        u32 type{0};
+        renderer::ITextureView* view{nullptr};
+        std::vector<resource::MappingDependency> mappings;
+    };
+    static constexpr u32 TEXTURE_MEMO_SLOTS = 32;
+    std::array<std::array<TextureMemo, TEXTURE_MEMO_SLOTS>, 5> texture_memo{};
+    u64 texture_memo_epoch{~0ull};
+    u64 texture_memo_mapping_generation{0};
+    resource::ResourceHandle texture_memo_address_space;
+    std::vector<resource::MappingDependency> render_target_memo_mappings;
+    std::map<u64, u32> geometry_layer_sources;
+    const void* texture_memo_render_pass{nullptr};
+    const void* texture_memo_gmmu{nullptr};
+    bool texture_memo_valid{false};
+    // Registers the render target lookups read: with the same values and an
+    // unchanged epoch, the render pass of the previous draw is reused
+    std::vector<u8> render_target_key;
+    std::vector<u8> render_target_memo_key;
+    void makeRenderTargetKey(std::vector<u8>& key) const;
 
   protected:
     void macro(u32 method, u32 arg) override;
@@ -571,58 +733,161 @@ class ThreeD : public EngineWithRegsBase<Regs3D>, public InlineBase {
         renderer::ShaderType::Count)] = {nullptr};
 
     // State
+    // GPU virtual ranges, resolved when consumed rather than at bind time.
     ztd::Range<uptr>
         bound_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
                            [CONST_BUFFER_BINDING_COUNT];
+    struct GatheredConstBuffer {
+        std::vector<u8> bytes;
+        renderer::BufferView upload;
+    };
+    mutable GatheredConstBuffer
+        gathered_const_buffers[static_cast<usize>(ShaderStage::Count) - 1]
+                              [CONST_BUFFER_BINDING_COUNT];
 
     // Methods
     DEFINE_INLINE_ENGINE_METHODS;
+
+    void incrementSyncPoint(u32 index, u32 arg);
+    void noteUnimplementedMultisample();
+    void invalidateShaderCaches(u32 index, u32 flags);
 
     void loadMmeInstructionRamPointer(const u32 index, const u32 ptr);
     void loadMmeInstructionRam(const u32 index, const u32 data);
     void loadMmeStartAddressRamPointer(const u32 index, const u32 ptr);
     void loadMmeStartAddressRam(const u32 index, const u32 data);
 
+    // Instance of the current draw
+    u32 instance_index{0};
+    std::vector<u32> inline_indices;
+    void beginDraw(const u32 index, const u32 arg);
+    void endDraw(const u32 index, const u32 arg);
+    void inlineIndex32(const u32 index, const u32 arg);
+    void inlineIndex16(const u32 index, const u32 arg);
+    void inlineIndex8(const u32 index, const u32 arg);
+    void drawVertexElementsImpl(u32 count,
+                               std::optional<ztd::Range<uptr>> inline_range);
+    void drawAuto(const u32 index, const u32 byte_count);
+    void drawZeroIndex(const u32 index, const u32 count);
+    // DRAW_ZERO_INDEX's indices
+    std::shared_ptr<renderer::BufferBase> zero_indices;
+    // SET_CT_SELECT's target count, at most the 8 targets
+    u32 getColorTargetCount() const {
+        return std::min<u32>(regs.color_target_control.count,
+                             COLOR_TARGET_COUNT);
+    }
+    // A render enable condition (SET_RENDER_ENABLE_A, or the global one)
+    bool evaluateRenderEnable(u32 base_reg) const;
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
+    // Draws with their topology, first vertex or index and count in the
+    // argument. The first draw of an instance group restarts the instances.
+    void drawVertexArrayCompact(const u32 index, const u32 arg);
+    void drawVertexElementsCompact(const u32 index, const u32 arg);
 
     struct ClearBufferData {
         bool depth : 1;
         bool stencil : 1;
         u8 color_mask : 4;
         u32 target_id : 4;
-        u32 layer_id : 11;
+        u32 layer_id : 16;
     };
+
+    // Area a clear is restricted to by the clear control register
+    MTL::ScissorRect getClearRect() const;
 
     void clearBuffer(const u32 index, const ClearBufferData data);
 
     // HACK
+    void resetCounter(const u32 index, const u32 data);
     void setReportSemaphore(const u32 index, const u32 data);
+    // Reports the ZPASS counter without waiting for the GPU
+    void queueCounterReport(u64 address, bool short_query);
+    // Checks that the memory of a report exists and settles what the GPU
+    // wrote there. Returns the host ranges of the report.
+    bool prepareReportWrite(u64 address, usize size,
+                            std::vector<ztd::Range<uptr>>& writes);
 
     void firmwareCall4(const u32 index, const u32 data);
 
     void loadConstBuffer(const u32 index, const u32 data);
+    // Host range written by LOAD_CONST_BUFFER and not invalidated yet
+    ztd::Range<uptr> pending_const_buffer_invalidation;
+    void flushConstBufferInvalidationImpl();
     void bindGroup(const u32 index, const u32 data);
 
     // Helpers
     renderer::ITextureView*
     getColorTargetTexture(u32 render_target_index) const;
     renderer::ITextureView* getDepthStencilTargetTexture() const;
+    renderer::MsaaLayout getRenderTargetMsaaLayout() const;
+    // The TSC index of a texture handle (see SET_SAMPLER_BINDING)
+    u32 getSamplerIndex(u32 handle) const;
+    ColorWriteMask getColorWriteMask(u32 render_target_index) const;
+
+    // Reads the handle a shader texture binding refers to
+    std::optional<u32> readTextureHandle(u32 stage_index,
+                                         u32 binding_index) const;
     renderer::RenderPassBase* getRenderPass() const;
-    renderer::Viewport getViewport(u32 index);
-    renderer::Scissor getScissor(u32 index);
+    // DEBUG: frame tracer
+    void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
+    bool isHighlightedDraw() const;
+    static bool isProfilingDraws();
+    void profileDraw(u32 count);
+    void labelCaptureDraw(u32 count);
+    u32 capture_draw_index{0};
+
+    MTL::Viewport getViewport(u32 index);
+    MTL::ScissorRect getScissor(u32 index);
+    // The scissor alone, without the surface clip
+    MTL::ScissorRect getScissorRect(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
-    renderer::ShaderBase* getShader(ShaderStage stage);
+    renderer::ShaderBase* getShader(ShaderStage stage,
+                                    u32 fragment_input_mask = 0,
+                                    u32 layer_output_addr = 0);
+    u32 getGeometryLayerSource();
+    // Geometry shader emulation (see renderer/geometry.hpp)
+    bool useGeometryShader() const;
+    renderer::ShaderBase*
+    getGeometryPassthrough(const renderer::ShaderBase& geometry_shader,
+                           u32 fragment_input_mask);
+    // The current pipeline has an emulated geometry shader
+    bool geometry_active{false};
+    // Tessellation emulation (see renderer/tessellation.hpp)
+    bool useTessellation() const;
+    renderer::ShaderBase* getTessellationCopy(u32 patch_size);
+    renderer::ShaderBase* getTessellationFactors(u32 domain, bool from_patches,
+                                                 const std::array<f32, 6>& levels);
+    bool tessellation_active{false};
+    // Control points the control shader of the current pipeline outputs
+    u32 tessellation_control_points{0};
+    std::map<u32, std::unique_ptr<renderer::ShaderBase>> tessellation_copies;
+    std::map<std::tuple<u32, bool, std::array<u32, 6>>,
+             std::unique_ptr<renderer::ShaderBase>>
+        tessellation_factor_shaders;
+    std::map<std::tuple<u32, bool, bool, bool, u32, u32, u32, bool, bool, u32>,
+             std::unique_ptr<renderer::ShaderBase>>
+        geometry_passthroughs;
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
-    renderer::ITextureView* getTexture(const TextureImageControl& tic) const;
-    renderer::SamplerBase* getSampler(const TextureSamplerControl& tsc) const;
+    bool isVertexArrayInstanced(u32 vertex_array_index) const;
 
     void configureShaderStage(const ShaderStage stage,
                               const TextureImageControl* tex_header_pool,
-                              const TextureSamplerControl* tex_sampler_pool);
+                              const TextureSamplerControl* tex_sampler_pool,
+                              command_ir::StageBindings& bindings,
+                              std::vector<ztd::Range<uptr>>& storage_writes);
 
-    bool drawInternal();
+    renderer::DrawState prepareDrawState();
+    renderer::RenderPassBase* resolveDrawTargets();
+    bool prepareDraw(command_ir::DrawCommand& command);
+    void executeDrawCommand(command_ir::DrawCommand& command);
+    // Whether the draw can be encoded on the draw queue's thread
+    bool canQueueDraw(const command_ir::DrawCommand& command, bool capturing);
+    void selectVisualResources();
+    // One line per texture the bound shaders sample, from the guest TIC/TSC
+    std::vector<std::string> describeTextureBindings() const;
+    void captureVisualDraw(bool after);
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::engines

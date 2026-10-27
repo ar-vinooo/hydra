@@ -11,12 +11,12 @@ SharedMemory::SharedMemory(hw::tegra_x1::cpu::ICpu& cpu, u64 size,
     memset(reinterpret_cast<void*>(getPtr()), 0, size);
 }
 
-SharedMemory::~SharedMemory() { delete memory; }
+SharedMemory::~SharedMemory() = default;
 
 void SharedMemory::mapToRange(hw::tegra_x1::cpu::IMmu* mmu,
-                              const ztd::Range<uptr> range,
+                              const ztd::Range<vaddr_t> range,
                               MemoryPermission perm) {
-    mmu->map(range.getBegin(), memory,
+    mmu->map(range.getBegin(), memory.get(),
              {.type = MemoryType::Shared,
               .attr = MemoryAttribute::None,
               .perm = perm});

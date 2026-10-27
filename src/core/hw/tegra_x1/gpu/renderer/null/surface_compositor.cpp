@@ -13,6 +13,7 @@ void SurfaceCompositor::drawTexture(
     [[maybe_unused]] bool transparent, [[maybe_unused]] f32 opacity) {}
 
 void SurfaceCompositor::present(
-    [[maybe_unused]] ICommandBuffer* command_buffer) {}
+    [[maybe_unused]] ICommandBuffer* command_buffer,
+    [[maybe_unused]] bool new_frame) {}
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::null

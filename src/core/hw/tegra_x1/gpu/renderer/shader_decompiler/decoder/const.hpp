@@ -13,7 +13,7 @@
     }
 #define COMMENT(f, ...) COMMENT_IMPL(DEBUG, f, f, __VA_ARGS__)
 #define COMMENT_NOT_IMPLEMENTED(f, ...)                                        \
-    COMMENT_IMPL(NOT_IMPLEMENTED, f " (NOT IMPLEMENTED)", f, __VA_ARGS__)
+    SHADER_UNSUPPORTED("Opcode " f, ##__VA_ARGS__)
 
 #define DEFINE_INST_VARIANTS_IMPL(inst_name, reg_name)                         \
     union Inst##inst_name##R {                                                 \
@@ -45,6 +45,7 @@ struct DecoderContext {
     const DecompilerContext& decomp_context;
     ztd::io::IStream* code_stream;
     ir::Builder& builder;
+    u64 code_offset{0};
 };
 
 enum class RoundMode {
@@ -127,6 +128,60 @@ inline ir::Value notIf(ir::Builder& builder, const ir::Value& value,
     return not_ ? builder.opNot(value) : value;
 }
 
+// Maxwell flow tests combine Z, S, C and O independently of predication.
+inline ir::Value getFlowTest(ir::Builder& b, u32 test) {
+    const auto z = ir::Value::createConditionFlag(0);
+    const auto s = ir::Value::createConditionFlag(1);
+    const auto c = ir::Value::createConditionFlag(2);
+    const auto o = ir::Value::createConditionFlag(3);
+    switch (test) {
+    case 0: return ir::Value::createConstantB(false);
+    case 1: return b.opBitwiseXor(b.opBitwiseAnd(s, b.opNot(z)), o);
+    case 2: return b.opBitwiseAnd(b.opNot(s), z);
+    case 3: return b.opBitwiseXor(s, b.opBitwiseOr(z, o));
+    case 4: return b.opBitwiseAnd(b.opBitwiseXor(b.opNot(s), o), b.opNot(z));
+    case 5: return b.opNot(z);
+    case 6: return b.opNot(b.opBitwiseXor(s, o));
+    case 7: return b.opBitwiseOr(b.opNot(s), b.opNot(z));
+    case 8: return b.opBitwiseAnd(s, z);
+    case 9: return b.opBitwiseXor(s, o);
+    case 10: return z;
+    case 11: return b.opBitwiseOr(b.opBitwiseXor(s, o), z);
+    case 12: return b.opBitwiseXor(b.opNot(s), b.opBitwiseOr(z, o));
+    case 13: return b.opBitwiseOr(s, b.opNot(z));
+    case 14: return b.opBitwiseXor(b.opBitwiseOr(b.opNot(s), z), o);
+    case 15: return ir::Value::createConstantB(true);
+    case 16: return b.opNot(o);
+    case 17: return b.opNot(c);
+    case 18: return b.opNot(s);
+    case 19: return b.opBitwiseOr(z, b.opNot(c));
+    case 20: return b.opBitwiseAnd(c, b.opNot(z));
+    case 21: return s;
+    case 22: return c;
+    case 23: return o;
+    case 30: return b.opBitwiseOr(s, z);
+    case 31: return b.opBitwiseAnd(b.opNot(s), b.opNot(z));
+    default:
+        SHADER_UNSUPPORTED("Flow test {}", test);
+        return ir::Value::createConstantB(false);
+    }
+}
+
+inline ir::Value getFlowCondition(ir::Builder& b, pred_t pred, bool inv,
+                                   u32 test) {
+    const auto guard = notIf(b, ir::Value::createPredicate(pred), inv);
+    return test == 15 ? guard : b.opBitwiseAnd(guard, getFlowTest(b, test));
+}
+
+inline void writeSetConditionCodes(ir::Builder& b, ir::Value result,
+                                    bool b_float) {
+    b.opCopy(ir::Value::createConditionFlag(0), b.opNot(result));
+    b.opCopy(ir::Value::createConditionFlag(1),
+             b_float ? ir::Value::createConstantB(false) : result);
+    b.opCopy(ir::Value::createConditionFlag(2), ir::Value::createConstantB(false));
+    b.opCopy(ir::Value::createConditionFlag(3), ir::Value::createConstantB(false));
+}
+
 inline ir::Value saturateIf(ir::Builder& builder, const ir::Value& value,
                             bool sat) {
     return sat ? builder.opClamp(value, ir::Value::createConstantF(0.0f),
@@ -143,13 +198,13 @@ inline ir::Value saturate2xF16If(ir::Builder& builder, const ir::Value& value,
 
 inline bool handlePredCond(ir::Builder& builder, pred_t pred, bool pred_inv) {
     if (pred == PT) {
-        if (!pred_inv) { // Always
-        } else {         // Never
-            // TODO: implement
-            LOG_FATAL(ShaderDecompiler, "Never condition encountered");
+        if (pred_inv) { // Never
+            // The instruction never executes; keep it as dead code
+            builder.opBeginIf({ir::Value::createConstantB(false)});
+            return true;
         }
 
-        return false;
+        return false; // Always
     } else { // Conditional
         builder.opBeginIf(
             {notIf(builder, ir::Value::createPredicate(pred), pred_inv)});
@@ -209,41 +264,93 @@ inline ir::Value getSwizzledHalf(ir::Builder& builder, HalfSwizzle swizzle,
     return builder.opVectorConstruct(ir::ScalarType::F16, {src_v, src_v});
 }
 
+// Half instructions read a constant buffer operand as one F32, used for both
+// halves
+inline ir::Value getHalfConstMemory(ir::Builder& builder, u32 slot,
+                                    u32 offset) {
+    const auto value = builder.opCast(
+        ir::Value::createConstMemory(CMem(slot, RZ, static_cast<u64>(offset) * 4),
+                                     ir::ScalarType::F32),
+        ir::ScalarType::F16);
+    return builder.opVectorConstruct(ir::ScalarType::F16, {value, value});
+}
+
 inline ir::Value getFloatCmp(DecoderContext& context, FloatCmpOp op,
-                             ir::Value a, ir::Value b) {
-    // TODO: handle U versions differently?
-    switch (op) {
-    case FloatCmpOp::F:
+                             ir::Value a, ir::Value b, bool ftz = false) {
+    if (op == FloatCmpOp::F)
         return ir::Value::createConstantB(false);
-    case FloatCmpOp::T:
+    if (op == FloatCmpOp::T)
         return ir::Value::createConstantB(true);
+    // Integer ordering preserves subnormals even on hosts that flush fp32
+    // comparisons. Normalize signed zeros before constructing monotonic keys.
+    auto& builder = context.builder;
+    const auto a_bits = builder.opBitCast(a, ir::ScalarType::U32);
+    const auto b_bits = builder.opBitCast(b, ir::ScalarType::U32);
+    const auto magnitude = [&](ir::Value bits) {
+        return builder.opBitwiseAnd(bits,
+                                    ir::Value::createConstantU(0x7fffffffu));
+    };
+    const auto nan = builder.opBitwiseOr(
+        builder.opCompareGreater(magnitude(a_bits),
+                                 ir::Value::createConstantU(0x7f800000u)),
+        builder.opCompareGreater(magnitude(b_bits),
+                                 ir::Value::createConstantU(0x7f800000u)));
+    if (op == FloatCmpOp::Num)
+        return context.builder.opNot(nan);
+    if (op == FloatCmpOp::Nan)
+        return nan;
+
+    const auto key = [&](ir::Value bits) {
+        const auto zero =
+            ftz ? builder.opCompareLess(magnitude(bits),
+                                        ir::Value::createConstantU(0x00800000u))
+                : builder.opCompareEqual(magnitude(bits),
+                                         ir::Value::createConstantU(0u));
+        bits = builder.opSelect(zero, ir::Value::createConstantU(0u), bits);
+        const auto negative = builder.opCompareNotEqual(
+            builder.opBitwiseAnd(bits, ir::Value::createConstantU(0x80000000u)),
+            ir::Value::createConstantU(0u));
+        return builder.opSelect(
+            negative, builder.opBitwiseNot(bits),
+            builder.opBitwiseXor(bits,
+                                 ir::Value::createConstantU(0x80000000u)));
+    };
+    a = key(a_bits);
+    b = key(b_bits);
+
+    auto comparison = ir::Value::createConstantB(false);
+    switch (op) {
     case FloatCmpOp::Lt:
     case FloatCmpOp::Ltu:
-        return context.builder.opCompareLess(a, b);
+        comparison = context.builder.opCompareLess(a, b);
+        break;
     case FloatCmpOp::Le:
     case FloatCmpOp::Leu:
-        return context.builder.opCompareLessOrEqual(a, b);
+        comparison = context.builder.opCompareLessOrEqual(a, b);
+        break;
     case FloatCmpOp::Gt:
     case FloatCmpOp::Gtu:
-        return context.builder.opCompareGreater(a, b);
+        comparison = context.builder.opCompareGreater(a, b);
+        break;
     case FloatCmpOp::Ge:
     case FloatCmpOp::Geu:
-        return context.builder.opCompareGreaterOrEqual(a, b);
+        comparison = context.builder.opCompareGreaterOrEqual(a, b);
+        break;
     case FloatCmpOp::Eq:
     case FloatCmpOp::Equ:
-        return context.builder.opCompareEqual(a, b);
+        comparison = context.builder.opCompareEqual(a, b);
+        break;
     case FloatCmpOp::Ne:
     case FloatCmpOp::Neu:
-        return context.builder.opCompareNotEqual(a, b);
-    case FloatCmpOp::Num:
-    case FloatCmpOp::Nan: {
-        const auto res = context.builder.opBitwiseOr(a, b);
-        if (op == FloatCmpOp::Num)
-            return context.builder.opNot(res);
-        else
-            return res;
+        comparison = context.builder.opCompareNotEqual(a, b);
+        break;
+    default:
+        unreachable();
     }
-    }
+    // Ordered comparisons are false for NaN; unordered comparisons are true.
+    if (op >= FloatCmpOp::Ltu)
+        return context.builder.opBitwiseOr(comparison, nan);
+    return context.builder.opBitwiseAnd(comparison, context.builder.opNot(nan));
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

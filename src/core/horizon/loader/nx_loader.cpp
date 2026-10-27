@@ -108,6 +108,16 @@ void NxLoader::parseNpdm() {
     auto stream = file->open(filesystem::FileOpenFlags::Read);
 
     const auto meta = stream->read<NpdmMeta>();
+    thread_info = readNpdmThreadInfo(*stream, meta);
+    if (thread_info)
+        LOG_INFO(Loader,
+                 "Thread capabilities: cores {:#x}, priorities {}-{}, main "
+                 "thread core {} priority {}",
+                 thread_info->core_mask, thread_info->highest_priority,
+                 thread_info->lowest_priority, meta.main_thread_core_number,
+                 meta.main_thread_priority);
+    else
+        LOG_WARN(Loader, "No ThreadInfo capability, allowing every core");
 
     delete stream;
 
@@ -214,24 +224,26 @@ void NxLoader::loadCode(System& system, kernel::Process* process,
     if (exefs_dir->getEntry("rtld", e) == filesystem::FsResult::DoesNotExist)
         entry_point = "main";
 
-    for (const auto& [filename, entry] : exefs_dir->getEntries()) {
-        ASSERT(entry->isFile(), Loader, "Code entry is not a file");
-        auto file = static_cast<filesystem::IFile*>(entry);
-        if (filename == "main.npdm") {
-            // Do nothing
-        } else {
-            LOG_DEBUG(Loader, "Loading {}", filename);
-            NsoLoader loader(file, filename, filename == entry_point);
-            loader.setMainThreadParams(main_thread_priority,
-                                       main_thread_core_number,
-                                       main_thread_stack_size);
-            loader.loadProcess(system, process);
-        }
+    for (const auto& [filename, file] : getCodeModulesInLoadOrder(exefs_dir)) {
+        LOG_DEBUG(Loader, "Loading {}", filename);
+        NsoLoader loader(file, filename, filename == entry_point);
+        loader.setMainThreadParams(main_thread_priority,
+                                   main_thread_core_number,
+                                   main_thread_stack_size);
+        loader.loadProcess(system, process);
     }
 
     process->setSystemResourceSize(system_resource_size);
 
-    // TODO: ACI and ACID
+    // Cores and priorities, as the kernel enforces them on hardware
+    if (thread_info) {
+        process->setCoreMask(thread_info->core_mask);
+        process->setThreadPriorityRange(thread_info->highest_priority,
+                                        thread_info->lowest_priority);
+    }
+    process->setIdealCore(main_thread_core_number);
+
+    // TODO: the rest of ACI and ACID
 }
 
 } // namespace hydra::horizon::loader

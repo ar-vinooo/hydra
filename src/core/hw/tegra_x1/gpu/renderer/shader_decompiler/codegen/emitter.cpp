@@ -6,8 +6,14 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen {
 
 void Emitter::emit(const ir::Module& modul) {
     start();
+    // Programs that run before main in the same thread (VertexA) first: main
+    // runs them
     for (const auto& [name, func] : modul.getFunctions())
-        emitFunction(func);
+        if (name != "main")
+            emitFunction(func);
+    for (const auto& [name, func] : modul.getFunctions())
+        if (name == "main")
+            emitFunction(func);
     finish();
 }
 
@@ -40,6 +46,17 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
     case ir::Opcode::Fma:
         emitFma(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
                 inst.getOperand(2));
+        break;
+    case ir::Opcode::QuadShuffleXor:
+        emitQuadShuffleXor(inst.getDst(), inst.getOperand(0),
+                           inst.getOperand(1));
+        break;
+    case ir::Opcode::QuadShuffle:
+        emitQuadShuffle(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
+        break;
+    case ir::Opcode::SwizzleAdd:
+        emitSwizzleAdd(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
+                       inst.getOperand(2).getRawValue<u32>());
         break;
     case ir::Opcode::Min:
         emitMin(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
@@ -159,6 +176,12 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         emitBranchConditional(inst.getOperand(0), inst.getOperand(1).getLabel(),
                               inst.getOperand(2).getLabel());
         break;
+    case ir::Opcode::PushReturn:
+        emitPushReturn(inst.getOperand(0).getLabel());
+        break;
+    case ir::Opcode::ReturnBranch:
+        emitReturnBranch();
+        break;
 
     // Vector
     case ir::Opcode::VectorExtract:
@@ -179,17 +202,29 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
                           inst.getOperand(1).getRawValue<TextureType>(),
                           inst.getOperand(2).getRawValue<TextureSampleFlags>(),
                           inst.getOperand(3), inst.getOperand(4),
-                          inst.getOperand(5), inst.getOperand(6));
+                          inst.getOperand(5), inst.getOperand(6),
+                          inst.getOperand(7), inst.getOperand(8),
+                          inst.getOperand(9), inst.getOperand(10),
+                          inst.getOperand(11).getRawValue<u8>());
         break;
     case ir::Opcode::TextureGather:
         emitTextureGather(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
                           inst.getOperand(1),
-                          inst.getOperand(2).getRawValue<u8>());
+                          inst.getOperand(2).getRawValue<u8>(),
+                          inst.getOperand(3));
         break;
     case ir::Opcode::TextureQueryDimension:
         emitTextureQueryDimension(inst.getDst(),
                                   inst.getOperand(0).getRawValue<u32>(),
-                                  inst.getOperand(1).getRawValue<u32>());
+                                  inst.getOperand(1).getRawValue<u32>(),
+                                  inst.getOperand(2));
+        break;
+    case ir::Opcode::TextureQueryLod:
+        emitTextureQueryLod(inst.getDst(),
+                            inst.getOperand(0).getRawValue<u32>(),
+                            inst.getOperand(1).getRawValue<TextureType>(),
+                            inst.getOperand(2),
+                            inst.getOperand(3).getRawValue<u32>() != 0);
         break;
 
     // Exit
@@ -198,6 +233,112 @@ void Emitter::emitInstruction(const ir::Instruction& inst) {
         break;
     case ir::Opcode::Discard:
         emitDiscard();
+        break;
+
+    // Bit counting
+    case ir::Opcode::PopCount:
+        emitPopCount(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::FindMsb:
+        emitFindMsb(inst.getDst(), inst.getOperand(0),
+                    inst.getOperand(1).getRawValue<bool>());
+        break;
+
+    // Compute
+    case ir::Opcode::ReadSystemRegister:
+        emitReadSystemRegister(inst.getDst(),
+                               inst.getOperand(0).getRawValue<u32>());
+        break;
+    case ir::Opcode::LoadShared:
+        emitLoadShared(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::StoreShared:
+        emitStoreShared(inst.getOperand(0), inst.getOperand(1));
+        break;
+    case ir::Opcode::LoadLocal:
+        emitLoadLocal(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::StoreLocal:
+        emitStoreLocal(inst.getOperand(0), inst.getOperand(1));
+        break;
+    case ir::Opcode::AtomicShared:
+        emitAtomicShared(inst.getDst(), inst.getOperand(0), inst.getOperand(1),
+                         inst.getOperand(2).getRawValue<u32>(),
+                         inst.getOperand(3).getRawValue<bool>());
+        break;
+    case ir::Opcode::AtomicSharedCas:
+        emitAtomicSharedCas(inst.getDst(), inst.getOperand(0),
+                            inst.getOperand(1), inst.getOperand(2));
+        break;
+    case ir::Opcode::LoadStorage:
+        emitLoadStorage(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                        inst.getOperand(1), inst.getOperand(2),
+                        inst.getOperand(3).getRawValue<u32>());
+        break;
+    case ir::Opcode::StoreStorage:
+        emitStoreStorage(inst.getOperand(0).getRawValue<u32>(),
+                         inst.getOperand(1), inst.getOperand(2),
+                         inst.getOperand(3),
+                         inst.getOperand(4).getRawValue<u32>());
+        break;
+    case ir::Opcode::AtomicStorage:
+        emitAtomicStorage(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                          inst.getOperand(1), inst.getOperand(2),
+                          inst.getOperand(3),
+                          inst.getOperand(4).getRawValue<u32>(),
+                          inst.getOperand(5).getRawValue<bool>());
+        break;
+    case ir::Opcode::AtomicStorageCas:
+        emitAtomicStorageCas(inst.getDst(),
+                             inst.getOperand(0).getRawValue<u32>(),
+                             inst.getOperand(1), inst.getOperand(2),
+                             inst.getOperand(3), inst.getOperand(4));
+        break;
+    case ir::Opcode::Barrier:
+        emitBarrier();
+        break;
+    case ir::Opcode::EmitVertex:
+        emitEmitVertex();
+        break;
+    case ir::Opcode::EndPrimitive:
+        emitEndPrimitive();
+        break;
+    case ir::Opcode::ImageStore:
+        emitImageStore(inst.getOperand(0).getRawValue<u32>(),
+                       inst.getOperand(1).getRawValue<TextureType>(),
+                       inst.getOperand(2),
+                       {inst.getOperand(3), inst.getOperand(4),
+                        inst.getOperand(5), inst.getOperand(6)},
+                       inst.getOperand(7).getRawValue<u32>());
+        break;
+    case ir::Opcode::ImageLoad:
+        emitImageLoad(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                      inst.getOperand(1).getRawValue<TextureType>(),
+                      inst.getOperand(2), inst.getOperand(3).getRawValue<u32>());
+        break;
+    case ir::Opcode::ImageAtomic:
+        emitImageAtomic(inst.getDst(), inst.getOperand(0).getRawValue<u32>(),
+                        inst.getOperand(1).getRawValue<TextureType>(),
+                        inst.getOperand(2).getRawValue<u32>(),
+                        inst.getOperand(3), inst.getOperand(4));
+        break;
+
+    // Warp
+    case ir::Opcode::Vote:
+        emitVote(inst.getDst(), inst.getOperand(0),
+                 inst.getOperand(1).getRawValue<u32>());
+        break;
+    case ir::Opcode::Ballot:
+        emitBallot(inst.getDst(), inst.getOperand(0));
+        break;
+    case ir::Opcode::Shuffle:
+        emitShuffle(inst.getDst(), inst.getOperand(0), inst.getOperand(1));
+        break;
+    // Intrinsic
+    case ir::Opcode::Intrinsic:
+        emitIntrinsic(inst.getDst(),
+                      inst.getOperand(0).getRawValue<ir::Intrinsic>(),
+                      std::span<const ir::Value>(inst.getOperands()).subspan(1));
         break;
     }
 }

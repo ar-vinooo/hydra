@@ -1,9 +1,14 @@
 #include "core/hw/tegra_x1/cpu/hypervisor/mmu.hpp"
 
+#include <cstdlib>
+
 #include "core/debugger/debugger_manager.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/const.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/cpu.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/memory.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/stage2_tracker.hpp"
+#include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/system.hpp"
 
 /*
 #define USER_RANGE_MEM_BASE 0x01000000
@@ -16,38 +21,6 @@
 namespace hydra::hw::tegra_x1::cpu::hypervisor {
 
 namespace {
-
-inline ApFlags toApFlags(horizon::kernel::MemoryPermission perm) {
-    if (any(perm & horizon::kernel::MemoryPermission::Read)) {
-        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadWriteExecuteKernelReadWrite;
-            } else {
-                return ApFlags::UserReadWriteKernelReadWrite;
-            }
-        } else {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadExecuteKernelRead;
-            } else {
-                return ApFlags::UserReadKernelRead;
-            }
-        }
-    } else {
-        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadWriteExecuteKernelReadWrite; // TODO
-            } else {
-                return ApFlags::UserReadWriteKernelReadWrite; // TODO
-            }
-        } else {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserExecuteKernelRead; // TODO
-            } else {
-                return ApFlags::UserNoneKernelRead; // TODO
-            }
-        }
-    }
-}
 
 // TODO: this is a horrible way to handle this
 bool page_table_regions[16] = {false};
@@ -77,6 +50,17 @@ void releasePageTableRegion(paddr_t addr) {
 
 Mmu::Mmu(System& system)
     : IMmu(system), user_page_table(findFreePageTableRegion()) {
+    Stage2Tracker::instance().setCallbacks({
+        .flush_gpu_writes =
+            [&system](ztd::Range<uptr> range) {
+                system.getGpu().getRenderer().flushMemoryForCpu(range);
+            },
+        .invalidate_gpu_caches =
+            [&system](ztd::Range<uptr> range) {
+                system.getGpu().getRenderer().invalidateMemory(range);
+            },
+    });
+
     // Loader return address
     // TODO: this should be done in a backend agnostic way (perhaps in the
     // kernel?)
@@ -99,19 +83,42 @@ void Mmu::map(vaddr_t dst_va, ztd::Range<uptr> range,
               const horizon::kernel::MemoryState state) {
     ASSERT_ALIGNMENT(dst_va, GUEST_PAGE_SIZE, Hypervisor, "destination VA");
     ASSERT_ALIGNMENT(range.getSize(), GUEST_PAGE_SIZE, Hypervisor, "size");
-    user_page_table.map(dst_va, range, state, toApFlags(state.perm));
+    const auto physical =
+        PhysicalMemory::instance().fromHost(range.getBegin(), range.getSize());
+    user_page_table.map(dst_va,
+                        ztd::Range<uptr>::fromSize(physical, range.getSize()),
+                        state, toApFlags(state.perm));
 }
 
-// HACK: this assumes that the whole src range is stored contiguously in
-// physical memory
+// The source may be backed by several physical allocations (e.g. memory from
+// MapPhysicalMemory), so map each physically contiguous run separately
 void Mmu::map(vaddr_t dst_va, ztd::Range<vaddr_t> range) {
     ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
     ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    const auto region = user_page_table.queryRegion(range.getBegin());
-    paddr_t pa = region.unmapAddr(range.getBegin());
-    // TODO: also inherit flags
-    user_page_table.map(dst_va, ztd::Range<uptr>::fromSize(pa, range.getSize()),
-                        region.state, toApFlags(region.state.perm));
+
+    vaddr_t run_va = range.getBegin();
+    while (run_va < range.getEnd()) {
+        const auto region = user_page_table.queryRegion(run_va);
+        const paddr_t run_pa = region.unmapAddr(run_va);
+
+        // Extend the run while the next page is physically contiguous and has
+        // the same state
+        vaddr_t end_va = run_va + GUEST_PAGE_SIZE;
+        while (end_va < range.getEnd()) {
+            const auto next = user_page_table.queryRegion(end_va);
+            if (next.unmapAddr(end_va) != run_pa + (end_va - run_va) ||
+                !(next.state == region.state))
+                break;
+            end_va += GUEST_PAGE_SIZE;
+        }
+
+        // TODO: also inherit flags
+        user_page_table.map(
+            dst_va + (run_va - range.getBegin()),
+            ztd::Range<uptr>::fromSize(run_pa, end_va - run_va), region.state,
+            toApFlags(region.state.perm));
+        run_va = end_va;
+    }
 }
 
 void Mmu::unmap(ztd::Range<vaddr_t> range) {
@@ -127,7 +134,9 @@ void Mmu::protect(ztd::Range<vaddr_t> range,
     user_page_table.setMemoryPermission(range, perm, toApFlags(perm));
 }
 
-uptr Mmu::unmapAddr(vaddr_t va) const { return user_page_table.unmapAddr(va); }
+uptr Mmu::unmapAddr(vaddr_t va) const {
+    return PhysicalMemory::instance().toHost(user_page_table.unmapAddr(va));
+}
 
 MemoryRegion Mmu::queryRegion(vaddr_t va) const {
     auto region = user_page_table.queryRegion(va);
@@ -145,22 +154,76 @@ void Mmu::setMemoryAttribute(ztd::Range<vaddr_t> range,
     user_page_table.setMemoryAttribute(range, mask, value);
 }
 
+// Stage 2 (hypervisor) tracking is opt-in with HYDRA_STAGE2_TRACKING: it
+// also makes GPU writes visible to the CPU, but UE4 games still render wrong
+// lighting with it. Guest page table (stage 1) tracking is the default.
+static bool useStage1Tracking() {
+    static const bool value = std::getenv("HYDRA_STAGE2_TRACKING") == nullptr;
+    return value;
+}
+
+bool Mmu::protectsGpuWrites() const { return !useStage1Tracking(); }
+
 void Mmu::setWriteTrackingEnabled(ztd::Range<vaddr_t> range, bool enable) {
     ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
     ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    user_page_table.setWriteTrackingEnabled(range, enable);
+    if (useStage1Tracking()) {
+        user_page_table.setWriteTrackingEnabled(range, enable);
+        return;
+    }
+    // Guest pages can be backed by separate host allocations, track each
+    // contiguous host run at once
+    uptr run_begin = 0x0;
+    uptr run_end = 0x0;
+    const auto flush_run = [&] {
+        if (run_end != run_begin)
+            Stage2Tracker::instance().setWriteTracked(
+                ztd::Range<uptr>(run_begin, run_end), enable);
+        run_begin = run_end = 0x0;
+    };
+    for (vaddr_t va = range.getBegin(); va < range.getEnd();
+         va += GUEST_PAGE_SIZE) {
+        const uptr host = unmapAddr(va);
+        if (host == 0x0 || host != run_end)
+            flush_run();
+        if (host == 0x0)
+            continue;
+        if (run_begin == 0x0)
+            run_begin = host;
+        run_end = host + GUEST_PAGE_SIZE;
+    }
+    flush_run();
 }
 
+// Stage 1 tracking is not used: stage 2 faults are handled by the VM thread
 bool Mmu::trySuspendWriteTracking(ztd::Range<vaddr_t> range) {
-    ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
-    ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    return user_page_table.trySuspendWriteTracking(range);
+    if (useStage1Tracking())
+        return user_page_table.trySuspendWriteTracking(range);
+    return false;
 }
 
 void Mmu::resumeWriteTracking(ztd::Range<vaddr_t> range) {
-    ASSERT_ALIGNMENT(range.getBegin(), GUEST_PAGE_SIZE, Hypervisor, "begin");
-    ASSERT_ALIGNMENT(range.getEnd(), GUEST_PAGE_SIZE, Hypervisor, "end");
-    user_page_table.resumeWriteTracking(range);
+    if (useStage1Tracking())
+        user_page_table.resumeWriteTracking(range);
+}
+
+bool Mmu::trackWrite(ztd::Range<vaddr_t> range) {
+    if (useStage1Tracking())
+        return IMmu::trackWrite(range);
+    return false;
+}
+
+void Mmu::flushTrackedPages() {
+    // Stage 1 pages are rearmed with their invalidations, once per entry
+    if (useStage1Tracking())
+        return;
+    Stage2Tracker::instance().rearmWriteTracking();
+}
+
+void Mmu::protectGpuWritten(ztd::Range<uptr> range) {
+    if (useStage1Tracking())
+        return;
+    Stage2Tracker::instance().protectGpuWritten(range);
 }
 
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

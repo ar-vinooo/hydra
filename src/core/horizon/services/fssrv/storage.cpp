@@ -16,10 +16,12 @@ result_t IStorage::read(u64 offset, u64 size,
                         OutBuffer<BufferAttr::MapAlias> out_buffer) {
     LOG_DEBUG(Services, "Offset: 0x{:08x}, size: 0x{:08x}", offset, size);
 
-    const auto max_size = stream->getSize() - offset;
+    // Reading past the end returns what is left (possibly nothing)
+    const u64 file_size = stream->getSize();
+    const u64 max_size = offset < file_size ? file_size - offset : 0;
     if (size > max_size) {
-        LOG_WARN(Services, "Reading {} bytes, but maximum readable size is {}",
-                 size, max_size);
+        LOG_DEBUG(Services, "Reading {} bytes, but maximum readable size is {}",
+                  size, max_size);
         size = max_size;
     }
 

@@ -2,6 +2,7 @@
 
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/os.hpp"
+#include "core/hw/tegra_x1/cpu/hypervisor/counter_emulation.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/mmu.hpp"
 #include "core/hw/tegra_x1/cpu/hypervisor/thread.hpp"
 
@@ -20,25 +21,40 @@ const u32 exception_handler[] = {
     0xd4200000u, // brk #0
 };
 
+// Return to the guest. This used to start with 0xd508831f, commented as
+// `msr spsel, xzr`, which is TLBI VMALLE1IS: every exception return
+// invalidated the TLBs of all cores. Only page table changes need that now.
 const u32 exception_trampoline[] = {
-    0xd508831fu, // msr spsel, xzr
-
-    // 0x910003e0,  // mov x0, sp
-    // 0xd5384241,  // TODO
-    // 0xd5384202,  // mrs x2, spsel
-    // 0xD4200000u, // brk #0
-
     0xd69f03e0u, // eret
     // Shouldn't happen
+    0xd4200000u, // brk #0
+};
+
+// After this thread relaxed a permission (a write tracking fault): its core
+// may still hold the read-only translation
+const u32 exception_trampoline_local_tlb[] = {
+    0xd508871fu, // tlbi vmalle1
+    0xd503379fu, // dsb nsh
+    0xd5033fdfu, // isb
+    0xd69f03e0u, // eret
+    0xd4200000u, // brk #0
+};
+
+// After page table changes by any thread (see notePageTableChange)
+const u32 exception_trampoline_shared_tlb[] = {
+    0xd5033a9fu, // dsb ishst
+    0xd508831fu, // tlbi vmalle1is
+    0xd5033b9fu, // dsb ish
+    0xd5033fdfu, // isb
+    0xd69f03e0u, // eret
     0xd4200000u, // brk #0
 };
 
 } // namespace
 
 VirtualMachine::VirtualMachine() {
-    // HACK: since we're mapping our address space to the HV's "physical"
-    // space 1:1, we have to extend their space to include all of ours
-    // (or as close as possible as we can)
+    // Use the available guest physical address width. Host allocations are
+    // translated separately and need not fit inside this address space.
     auto config = hv_vm_config_create();
     uint32_t max_bits;
     HV_ASSERT_SUCCESS(hv_vm_config_get_max_ipa_size(&max_bits));
@@ -63,12 +79,13 @@ Cpu::Cpu()
     // simplicity reasons
 
     // Kernel memory
-    kernel_page_table.map(
-        0x0, ztd::Range<uptr>::fromSize(kernel_mem.getPtr(), KERNEL_MEM_SIZE),
-        {.type = horizon::kernel::MemoryType::Kernel,
-         .attr = horizon::kernel::MemoryAttribute::None,
-         .perm = horizon::kernel::MemoryPermission::Execute},
-        ApFlags::UserNoneKernelReadExecute);
+    kernel_page_table.map(0x0,
+                          ztd::Range<uptr>::fromSize(
+                              kernel_mem.getPhysicalAddress(), KERNEL_MEM_SIZE),
+                          {.type = horizon::kernel::MemoryType::Kernel,
+                           .attr = horizon::kernel::MemoryAttribute::None,
+                           .perm = horizon::kernel::MemoryPermission::Execute},
+                          ApFlags::UserNoneKernelReadExecute);
 
     for (u64 offset = 0; offset < 0x780; offset += 0x80) {
         memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() + offset),
@@ -77,6 +94,16 @@ Cpu::Cpu()
     memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
                                    EXCEPTION_TRAMPOLINE_OFFSET),
            exception_trampoline, sizeof(exception_trampoline));
+    memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
+                                   EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET),
+           exception_trampoline_local_tlb,
+           sizeof(exception_trampoline_local_tlb));
+    memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
+                                   EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET),
+           exception_trampoline_shared_tlb,
+           sizeof(exception_trampoline_shared_tlb));
+    // Replaces the vector for exceptions from the guest
+    counter_emulation::write(reinterpret_cast<u8*>(kernel_mem.getPtr()));
 
     // Symbols
     // TODO: this should be registered by the process
@@ -97,6 +124,12 @@ Cpu::Cpu()
                 .supports_synchronous_single_step = false};
 }
 
+void Cpu::enableCounterEmulation(u64 vtimer_offset, u64 factor) {
+    counter_emulation::enable(reinterpret_cast<u8*>(kernel_mem.getPtr()),
+                              factor);
+    counter_vtimer_offset = vtimer_offset;
+}
+
 IMmu* Cpu::createMmu(System& system) { return new Mmu(system); }
 
 IThread* Cpu::createThread(WallClock& wall_clock, IMmu* mmu,
@@ -106,5 +139,9 @@ IThread* Cpu::createThread(WallClock& wall_clock, IMmu* mmu,
 }
 
 IMemory* Cpu::allocateMemory(u64 size) { return new Memory(size); }
+
+IMemory* Cpu::wrapMemory(uptr ptr, u64 size) {
+    return new ExternalMemory(ptr, size);
+}
 
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

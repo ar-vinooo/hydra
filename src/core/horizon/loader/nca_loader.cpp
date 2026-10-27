@@ -39,17 +39,25 @@ NcaLoader::NcaLoader(filesystem::ContentArchive content_archive_)
     auto stream = file->open(filesystem::FileOpenFlags::Read);
 
     const auto meta = stream->read<NpdmMeta>();
+    thread_info = readNpdmThreadInfo(*stream, meta);
+    if (thread_info)
+        LOG_INFO(Loader,
+                 "Thread capabilities: cores {:#x}, priorities {}-{}, main "
+                 "thread core {} priority {}",
+                 thread_info->core_mask, thread_info->highest_priority,
+                 thread_info->lowest_priority, meta.main_thread_core_number,
+                 meta.main_thread_priority);
+    else
+        LOG_WARN(Loader, "No ThreadInfo capability, allowing every core");
 
     delete stream;
 
     ASSERT(meta.magic == makeMagic4('M', 'E', 'T', 'A'), Loader,
            "Invalid NPDM meta magic 0x{:08x}", meta.magic);
 
-    // TODO: support 32-bit games
-    if (!any(meta.flags & NpdmFlags::Is64BitInstruction)) {
-        LOG_WARN(Loader, "32-bit games not supported");
-        return;
-    }
+    // Still load metadata for unsupported architectures so the library can
+    // display the title and explain compatibility when the user starts it.
+    is_64_bit = any(meta.flags & NpdmFlags::Is64BitInstruction);
 
     LOG_DEBUG(Loader, "Name: {}", meta.name);
     LOG_DEBUG(Loader, "Main thread priority: 0x{:02x}",
@@ -98,24 +106,26 @@ void NcaLoader::loadCode(System& system, kernel::Process* process,
     if (dir->getEntry("rtld", e) == filesystem::FsResult::DoesNotExist)
         entry_point = "main";
 
-    for (const auto& [filename, entry] : dir->getEntries()) {
-        ASSERT(entry->isFile(), Loader, "Code entry is not a file");
-        auto file = static_cast<filesystem::IFile*>(entry);
-        if (filename == "main.npdm") {
-            // Do nothing
-        } else {
-            LOG_DEBUG(Loader, "Loading {}", filename);
-            NsoLoader loader(file, filename, filename == entry_point);
-            loader.setMainThreadParams(main_thread_priority,
-                                       main_thread_core_number,
-                                       main_thread_stack_size);
-            loader.loadProcess(system, process);
-        }
+    for (const auto& [filename, file] : getCodeModulesInLoadOrder(dir)) {
+        LOG_DEBUG(Loader, "Loading {}", filename);
+        NsoLoader loader(file, filename, filename == entry_point);
+        loader.setMainThreadParams(main_thread_priority,
+                                   main_thread_core_number,
+                                   main_thread_stack_size);
+        loader.loadProcess(system, process);
     }
 
     process->setSystemResourceSize(system_resource_size);
 
-    // TODO: ACI and ACID
+    // Cores and priorities, as the kernel enforces them on hardware
+    if (thread_info) {
+        process->setCoreMask(thread_info->core_mask);
+        process->setThreadPriorityRange(thread_info->highest_priority,
+                                        thread_info->lowest_priority);
+    }
+    process->setIdealCore(main_thread_core_number);
+
+    // TODO: the rest of ACI and ACID
 }
 
 } // namespace hydra::horizon::loader

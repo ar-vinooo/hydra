@@ -9,6 +9,24 @@
 
 namespace hydra::horizon::services {
 
+IService::~IService() noexcept {
+    if (subservice_pool)
+        for (auto service : *subservice_pool)
+            if (service != this)
+                service->release();
+}
+
+void IService::releaseDomainObjects() {
+    if (!subservice_pool)
+        return;
+    std::vector<IService*> owned;
+    for (auto service : *subservice_pool)
+        owned.push_back(service);
+    subservice_pool.reset();
+    for (auto service : owned)
+        service->release();
+}
+
 void IService::handleRequest(System& system, kernel::Process* caller_process,
                              uptr ptr) {
     // HIPC header
@@ -91,11 +109,18 @@ void IService::handleRequest(System& system, kernel::Process* caller_process,
         kernel::hipc::Metadata meta{
             .type = static_cast<u32>(response_command_type),
             .num_data_words =
-                GET_ARRAY_SIZE(out_stream) + GET_ARRAY_SIZE(out_objects_stream),
+                GET_ARRAY_SIZE(out_stream) + GET_ARRAY_SIZE(out_objects_stream) +
+                (is_tipc ? 0u : 4u),
             .num_copy_handles = GET_ARRAY_SIZE(out_copy_handles_stream),
             .num_move_handles = GET_ARRAY_SIZE(out_move_handles_stream)};
         auto response =
             kernel::hipc::makeRequest(reinterpret_cast<void*>(ptr), meta);
+        // CMIF reserves sixteen bytes for alignment padding in the HIPC raw
+        // data region. Include it in the advertised size, and clear all raw
+        // bytes before placing the aligned payload and any domain objects.
+        if (response.data_words)
+            std::memset(response.data_words, 0,
+                        meta.num_data_words * sizeof(u32));
         if (!is_tipc)
             response.data_words =
                 kernel::hipc::cmif::alignDataStart(response.data_words);
@@ -156,8 +181,9 @@ IService* IService::getService(RequestContext& context, Handle handle) {
 }
 
 void IService::close() {
-    // TODO
-    LOG_FUNC_NOT_IMPLEMENTED(Services);
+    // Services hold no per-session state to release; the object is destroyed
+    // with its session
+    LOG_DEBUG(Services, "{} closed", __func__);
 }
 
 void IService::request(RequestContext& context) {
@@ -257,7 +283,7 @@ void IService::clone(RequestContext& context) {
     new kernel::hipc::Session(server_session, client_session);
 
     // Register server side
-    server->registerSession(server_session, this);
+    server->registerSession(server_session, this->retain());
 
     // Register client side
     const auto handle = context.process->addHandleNoRetain(client_session);

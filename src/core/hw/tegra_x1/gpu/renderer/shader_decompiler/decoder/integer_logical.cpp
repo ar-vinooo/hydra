@@ -4,10 +4,10 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: x, write_cc
+// TODO: x
 void emitLogical(DecoderContext& context, pred_t pred, bool pred_inv,
                  LogicOp op, PredicateOp pred_op, reg_t dst, pred_t dst_pred,
-                 reg_t src_a, bool inv_a, ir::Value src_b, bool inv_b) {
+                 reg_t src_a, bool inv_a, ir::Value src_b, bool inv_b, bool write_cc) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = ir::Value::createRegister(src_a);
@@ -35,6 +35,17 @@ void emitLogical(DecoderContext& context, pred_t pred, bool pred_inv,
         unreachable();
     }
     context.builder.opCopy(ir::Value::createRegister(dst), res);
+
+    if (write_cc) {
+        context.builder.opCopy(ir::Value::createConditionFlag(0),
+            context.builder.opCompareEqual(res, ir::Value::createConstantU(0)));
+        context.builder.opCopy(ir::Value::createConditionFlag(1),
+            context.builder.opCompareNotEqual(
+                context.builder.opBitwiseAnd(res, ir::Value::createConstantU(0x80000000u)),
+                ir::Value::createConstantU(0)));
+        context.builder.opCopy(ir::Value::createConditionFlag(2), ir::Value::createConstantB(false));
+        context.builder.opCopy(ir::Value::createConditionFlag(3), ir::Value::createConstantB(false));
+    }
 
     auto pred_res = ir::Value::createUndefined();
     switch (pred_op) {
@@ -67,7 +78,7 @@ void emitLopR(DecoderContext& context, InstLopR inst) {
     emitLogical(context, inst.base.pred, inst.base.pred_inv, inst.base.op,
                 inst.base.pred_op, inst.base.dst, inst.base.dst_pred,
                 inst.base.src_a, inst.base.inv_a,
-                ir::Value::createRegister(inst.src_b), inst.base.inv_b);
+                ir::Value::createRegister(inst.src_b), inst.base.inv_b, inst.base.write_cc);
 }
 
 void emitLopC(DecoderContext& context, InstLopC inst) {
@@ -77,7 +88,7 @@ void emitLopC(DecoderContext& context, InstLopC inst) {
         inst.base.inv_a,
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4))),
-        inst.base.inv_b);
+        inst.base.inv_b, inst.base.write_cc);
 }
 
 void emitLopI(DecoderContext& context, InstLopI inst) {
@@ -86,13 +97,13 @@ void emitLopI(DecoderContext& context, InstLopI inst) {
                 inst.base.src_a, inst.base.inv_a,
                 ir::Value::createConstantU(
                     getIntImm20(inst.imm20_0, inst.imm20_19, true)),
-                inst.base.inv_b);
+                inst.base.inv_b, inst.base.write_cc);
 }
 
 void emitLop32I(DecoderContext& context, InstLop32I inst) {
     emitLogical(context, inst.pred, inst.pred_inv, inst.op, PredicateOp::F,
                 inst.dst, PT, inst.src_a, inst.inv_a,
-                ir::Value::createConstantU(inst.imm), inst.inv_b);
+                ir::Value::createConstantU(inst.imm), inst.inv_b, inst.write_cc);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

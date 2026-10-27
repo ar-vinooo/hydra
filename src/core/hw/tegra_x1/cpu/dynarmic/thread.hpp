@@ -37,10 +37,14 @@ class Thread final : public IThread, private Dynarmic::A64::UserCallbacks {
         serializeState();
     }
 
+    u64 getTpidr() override { return tpidr_el0; }
+
   private:
     vaddr_t tpidrro_el0;
-    vaddr_t tpidr_el0;
+    vaddr_t tpidr_el0{0};
 
+    // Slot in the global exclusive monitor
+    usize processor_id;
     Dynarmic::A64::Jit* jit;
     u64 ticks_left{1000};
 
@@ -58,9 +62,9 @@ class Thread final : public IThread, private Dynarmic::A64::UserCallbacks {
     void MemoryWrite64(u64 addr, u64 value) override;
     void MemoryWrite128(u64 addr, Dynarmic::A64::Vector value) override;
 
-    bool MemoryWriteExclusive8(u64 addr, u8 value, u8 /*unused*/) override;
-    bool MemoryWriteExclusive16(u64 addr, u16 value, u16 /*unused*/) override;
-    bool MemoryWriteExclusive32(u64 addr, u32 value, u32 /*unused*/) override;
+    bool MemoryWriteExclusive8(u64 addr, u8 value, u8 expected) override;
+    bool MemoryWriteExclusive16(u64 addr, u16 value, u16 expected) override;
+    bool MemoryWriteExclusive32(u64 addr, u32 value, u32 expected) override;
     bool MemoryWriteExclusive64(u64 addr, u64 value, u64 expected) override;
     bool MemoryWriteExclusive128(u64 addr, Dynarmic::A64::Vector value,
                                  Dynarmic::A64::Vector expected) override;

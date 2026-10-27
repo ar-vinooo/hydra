@@ -2,27 +2,6 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-MTL::TextureType toMtlTextureType(TextureType type) {
-    switch (type) {
-    case TextureType::_1D:
-        return MTL::TextureType1D;
-    case TextureType::_1DArray:
-        return MTL::TextureType1DArray;
-    case TextureType::_1DBuffer:
-        return MTL::TextureTypeTextureBuffer;
-    case TextureType::_2D:
-        return MTL::TextureType2D;
-    case TextureType::_2DArray:
-        return MTL::TextureType2DArray;
-    case TextureType::_3D:
-        return MTL::TextureType3D;
-    case TextureType::Cube:
-        return MTL::TextureTypeCube;
-    case TextureType::CubeArray:
-        return MTL::TextureTypeCubeArray;
-    }
-}
-
 #define PIXEL_FORMAT_ENTRY(format, pixel_format, has_depth, has_stencil,       \
                            component_indices)                                  \
     {                                                                          \
@@ -43,7 +22,7 @@ MTL::TextureType toMtlTextureType(TextureType type) {
 #define COLOR_PIXEL_FORMAT_ENTRY_RGBA(format, pixel_format)                    \
     COLOR_PIXEL_FORMAT_ENTRY(format, pixel_format, ZTD_PASS({0, 1, 2, 3}))
 
-std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
+static const std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Unorm, R8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Snorm, R8Snorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R8Uint, R8Uint),
@@ -57,6 +36,7 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R32Uint, R32Uint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(R32Sint, R32Sint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG8Unorm, RG8Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG4Unorm, RG8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG8Snorm, RG8Snorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG8Uint, RG8Uint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG8Sint, RG8Sint),
@@ -68,9 +48,9 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG32Float, RG32Float),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG32Uint, RG32Uint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG32Sint, RG32Sint),
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Float, RGBA32Float), // HACK
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Uint, RGBA32Uint),   // HACK
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Sint, RGBA32Sint),   // HACK
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Float, RGBA32Float),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Uint, RGBA32Uint),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB32Sint, RGBA32Sint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA8Unorm, RGBA8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA8Snorm, RGBA8Snorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA8Uint, RGBA8Uint),
@@ -82,6 +62,7 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA16Sint, RGBA16Sint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Float, RGBA32Float),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Uint, RGBA32Uint),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA32Sint, RGBA32Sint),
     DS_PIXEL_FORMAT_ENTRY(S8Uint, Stencil8, false, true),
     DS_PIXEL_FORMAT_ENTRY(Z16Unorm, Depth16Unorm, true, false),
     DS_PIXEL_FORMAT_ENTRY(Z24Unorm_X8Uint, Depth32Float_Stencil8, true,
@@ -89,15 +70,20 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     DS_PIXEL_FORMAT_ENTRY(Z32Float, Depth32Float, true, false),
     DS_PIXEL_FORMAT_ENTRY(Z24Unorm_S8Uint, Depth32Float_Stencil8, true,
                           true), // HACK
+    DS_PIXEL_FORMAT_ENTRY(S8Uint_Z24Unorm, Depth32Float_Stencil8, true,
+                          true), // HACK
     DS_PIXEL_FORMAT_ENTRY(Z32Float_X24S8Uint, Depth32Float_Stencil8, true,
                           true),                                     // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Unorm_sRGB, RGBA8Unorm_sRGB), // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBA8Unorm_sRGB, RGBA8Unorm_sRGB),
     COLOR_PIXEL_FORMAT_ENTRY(RGBA4Unorm, ABGR4Unorm, ZTD_PASS({3, 2, 1, 0})),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB5Unorm, BGR5A1Unorm), // HACK
-    COLOR_PIXEL_FORMAT_ENTRY(R5G6B5Unorm, B5G6R5Unorm,
-                             ZTD_PASS({2, 1, 0, 3})), // TODO: correct?
+    COLOR_PIXEL_FORMAT_ENTRY(RGB5A1Unorm, BGR5A1Unorm, ZTD_PASS({2, 1, 0, 3})),
+    COLOR_PIXEL_FORMAT_ENTRY(R1G5B5A5Unorm, A1BGR5Unorm,
+                             ZTD_PASS({3, 2, 1, 0})),
+    COLOR_PIXEL_FORMAT_ENTRY(R5G6B5Unorm, B5G6R5Unorm, ZTD_PASS({2, 1, 0, 3})),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB10A2Unorm, RGB10A2Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGR10A2Unorm, BGR10A2Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGB10A2Uint, RGB10A2Uint),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RG11B10Float, RG11B10Float),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(E5BGR9Float, RGB9E5Float), // HACK
@@ -115,8 +101,8 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC5_RGSnorm, BC5_RGSnorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC7_RGBAUnorm, BC7_RGBAUnorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC7_RGBAUnorm_sRGB, BC7_RGBAUnorm_sRGB),
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_SF16_Float, Invalid), // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_UF16_Float, Invalid), // TODO
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_SF16_Float, BC6H_RGBFloat),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(BC6H_RGBA_UF16_Float, BC6H_RGBUfloat),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Unorm, RGBA8Unorm),        // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Snorm, RGBA8Snorm),        // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(RGBX8Uint, RGBA8Uint),          // HACK
@@ -165,17 +151,16 @@ std::map<TextureFormat, PixelFormatInfo> pixel_format_lut = {
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRA8Unorm, BGRA8Unorm),
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRX8Unorm_sRGB, BGRA8Unorm_sRGB), // HACK
     COLOR_PIXEL_FORMAT_ENTRY_RGBA(BGRA8Unorm_sRGB, BGRA8Unorm_sRGB),
-    // TODO: implement ETC formats
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Unorm, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Snorm, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Unorm, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Snorm, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB, Invalid),          // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB, Invalid),      // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA, Invalid),         // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB_sRGB, Invalid),     // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB_sRGB, Invalid), // TODO
-    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA_sRGB, Invalid),    // TODO
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Unorm, EAC_R11Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_R_Snorm, EAC_R11Snorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Unorm, EAC_RG11Unorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RG_Snorm, EAC_RG11Snorm),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB, ETC2_RGB8),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB, ETC2_RGB8A1),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA, EAC_RGBA8),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGB_sRGB, ETC2_RGB8_sRGB),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(PTA_ETC2_RGB_sRGB, ETC2_RGB8A1_sRGB),
+    COLOR_PIXEL_FORMAT_ENTRY_RGBA(ETC2_RGBA_sRGB, EAC_RGBA8_sRGB),
 };
 
 /*
@@ -356,15 +341,15 @@ swizzle COLOR_PIXEL_FORMAT_ENTRY_RGBA(A16B16G16R16_sRGB, Invalid),
 */
 
 const PixelFormatInfo& toMtlPixelFormatInfo(TextureFormat format) {
+    static const PixelFormatInfo invalid_info{MTL::PixelFormatInvalid, false,
+                                              false, {0, 1, 2, 3}};
     auto it = pixel_format_lut.find(format);
-    ASSERT_DEBUG(it != pixel_format_lut.end(), MetalRenderer,
-                 "Unknown format {}", format);
+    if (it == pixel_format_lut.end()) {
+        ONCE(LOG_ERROR(MetalRenderer, "Unknown format {}", format));
+        return invalid_info;
+    }
 
-    const auto& info = it->second;
-    ASSERT_DEBUG(info.pixel_format != MTL::PixelFormatInvalid, MetalRenderer,
-                 "Unimplemented format {}", format);
-
-    return info;
+    return it->second;
 }
 
 MTL::CullMode toMtlCullMode(const engines::CullFaceMode mode) {
@@ -374,9 +359,14 @@ MTL::CullMode toMtlCullMode(const engines::CullFaceMode mode) {
     case engines::CullFaceMode::Back:
         return MTL::CullModeBack;
     case engines::CullFaceMode::FrontAndBack:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "Cull face mode front and back");
+        // Metal has no such mode: the engine skips draws of polygons when
+        // both faces are culled, so this value is never used for rasterizing
         return MTL::CullModeFront;
     }
+
+    LOG_ERROR(MetalRenderer, "Invalid cull face mode {:#x}",
+              static_cast<u32>(mode));
+    return MTL::CullModeNone;
 }
 
 MTL::Winding toMtlWinding(const engines::Winding winding) {
@@ -386,6 +376,10 @@ MTL::Winding toMtlWinding(const engines::Winding winding) {
     case engines::Winding::CounterClockwise:
         return MTL::WindingCounterClockwise;
     }
+
+    LOG_ERROR(MetalRenderer, "Invalid winding {:#x}",
+              static_cast<u32>(winding));
+    return MTL::WindingCounterClockwise;
 }
 
 MTL::PrimitiveType
@@ -421,13 +415,8 @@ MTL::IndexType toMtlIndexType(engines::IndexType index_type) {
 
 MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
                                     engines::VertexAttribSize size, bool bgra) {
-    ASSERT_DEBUG(!bgra || (type == engines::VertexAttribType::Unorm &&
-                           size == engines::VertexAttribSize::_4x8),
-                 MetalRenderer,
-                 "BGRA vertex formats are only supported for uchar4 normalized "
-                 "types (type: {}, size: {})",
-                 type, size);
-
+    // Only uchar4 normalized has a BGRA host format; other attributes swap
+    // R and B in the vertex shader (engines::hostVertexFormatSwapsRb)
     switch (type) {
     case engines::VertexAttribType::Snorm:
         switch (size) {
@@ -605,7 +594,8 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for sint type", size);
+                      "Invalid vertex attribute size {} for sscaled type",
+                      size);
             return MTL::VertexFormatInvalid;
         }
     case engines::VertexAttribType::Uscaled:
@@ -639,19 +629,21 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for uint type", size);
+                      "Invalid vertex attribute size {} for uscaled type",
+                      size);
             return MTL::VertexFormatInvalid;
         }
     case engines::VertexAttribType::Float:
         switch (size) {
+        // Fetched as raw bits, see getRawFloatVertexAttribComponentCount
         case engines::VertexAttribSize::_1x32:
-            return MTL::VertexFormatFloat;
+            return MTL::VertexFormatUInt;
         case engines::VertexAttribSize::_2x32:
-            return MTL::VertexFormatFloat2;
+            return MTL::VertexFormatUInt2;
         case engines::VertexAttribSize::_3x32:
-            return MTL::VertexFormatFloat3;
+            return MTL::VertexFormatUInt3;
         case engines::VertexAttribSize::_4x32:
-            return MTL::VertexFormatFloat4;
+            return MTL::VertexFormatUInt4;
 
         case engines::VertexAttribSize::_1x16:
             return MTL::VertexFormatHalf;
@@ -675,7 +667,7 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 
         default:
             LOG_ERROR(MetalRenderer,
-                      "Invalid vertex attribute size {} for uint type", size);
+                      "Invalid vertex attribute size {} for float type", size);
             return MTL::VertexFormatInvalid;
         }
     default:
@@ -686,6 +678,9 @@ MTL::VertexFormat toMtlVertexFormat(engines::VertexAttribType type,
 }
 
 MTL::CompareFunction toMtlCompareFunc(engines::CompareOp depth_compare_op) {
+    const auto raw = static_cast<u32>(depth_compare_op);
+    if (raw >= 0x200 && raw <= 0x207)
+        depth_compare_op = static_cast<engines::CompareOp>(raw - 0x200 + 1);
     switch (depth_compare_op) {
     case engines::CompareOp::Never:
         return MTL::CompareFunctionNever;
@@ -725,111 +720,25 @@ MTL::TextureSwizzle toMtlSwizzle(const ImageSwizzle swizzle) {
     case ImageSwizzle::OneInt:
     case ImageSwizzle::OneFloat:
         return MTL::TextureSwizzleOne;
-    }
-}
-
-MTL::BlendOperation toMtlBlendOperation(const BlendOperation blend_op) {
-    switch (blend_op) {
-    case BlendOperation::Add:
-        return MTL::BlendOperationAdd;
-    case BlendOperation::Sub:
-        return MTL::BlendOperationSubtract;
-    case BlendOperation::RevSub:
-        return MTL::BlendOperationReverseSubtract;
-    case BlendOperation::Min:
-        return MTL::BlendOperationMin;
-    case BlendOperation::Max:
-        return MTL::BlendOperationMax;
-    }
-}
-
-MTL::BlendFactor toMtlBlendFactor(const BlendFactor blend_factor) {
-    switch (blend_factor) {
-    case BlendFactor::Zero:
-        return MTL::BlendFactorZero;
-    case BlendFactor::One:
-        return MTL::BlendFactorOne;
-    case BlendFactor::SrcColor:
-        return MTL::BlendFactorSourceColor;
-    case BlendFactor::InvSrcColor:
-        return MTL::BlendFactorOneMinusSourceColor;
-    case BlendFactor::SrcAlpha:
-        return MTL::BlendFactorSourceAlpha;
-    case BlendFactor::InvSrcAlpha:
-        return MTL::BlendFactorOneMinusSourceAlpha;
-    case BlendFactor::DstAlpha:
-        return MTL::BlendFactorDestinationAlpha;
-    case BlendFactor::InvDstAlpha:
-        return MTL::BlendFactorOneMinusDestinationAlpha;
-    case BlendFactor::DstColor:
-        return MTL::BlendFactorDestinationColor;
-    case BlendFactor::InvDstColor:
-        return MTL::BlendFactorOneMinusDestinationColor;
-    case BlendFactor::SrcAlphaSaturate:
-        return MTL::BlendFactorSourceAlphaSaturated;
-    case BlendFactor::Src1Color:
-        return MTL::BlendFactorSource1Color;
-    case BlendFactor::InvSrc1Color:
-        return MTL::BlendFactorOneMinusSource1Color;
-    case BlendFactor::Src1Alpha:
-        return MTL::BlendFactorSource1Alpha;
-    case BlendFactor::InvSrc1Alpha:
-        return MTL::BlendFactorOneMinusSource1Alpha;
-    case BlendFactor::ConstColor:
-        return MTL::BlendFactorBlendColor;
-    case BlendFactor::InvConstColor:
-        return MTL::BlendFactorOneMinusBlendColor;
-    case BlendFactor::ConstAlpha:
-        return MTL::BlendFactorBlendAlpha;
-    case BlendFactor::InvConstAlpha:
-        return MTL::BlendFactorOneMinusBlendAlpha;
-    }
-}
-
-MTL::SamplerMinMagFilter toMtlSamplerMinMagFilter(const SamplerFilter filter) {
-    switch (filter) {
-    case SamplerFilter::Nearest:
-        return MTL::SamplerMinMagFilterNearest;
-    case SamplerFilter::Linear:
-        return MTL::SamplerMinMagFilterLinear;
-    }
-}
-
-MTL::SamplerMipFilter toMtlSamplerMipFilter(const SamplerMipFilter filter) {
-    switch (filter) {
-    case SamplerMipFilter::NotMipmapped:
-        return MTL::SamplerMipFilterNotMipmapped;
-    case SamplerMipFilter::Nearest:
-        return MTL::SamplerMipFilterNearest;
-    case SamplerMipFilter::Linear:
-        return MTL::SamplerMipFilterLinear;
+    default:
+        return MTL::TextureSwizzleZero;
     }
 }
 
 MTL::SamplerAddressMode
-toMtlSamplerAddressMode(const SamplerAddressMode address_mode) {
-    switch (address_mode) {
-    case SamplerAddressMode::Repeat:
-        return MTL::SamplerAddressModeRepeat;
-    case SamplerAddressMode::MirroredRepeat:
-        return MTL::SamplerAddressModeMirrorRepeat;
-    case SamplerAddressMode::ClampToEdge:
-        return MTL::SamplerAddressModeClampToEdge;
-    case SamplerAddressMode::ClampToBorder:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "ClampToBorder");
-        return MTL::SamplerAddressModeClampToBorderColor;
-    case SamplerAddressMode::Clamp:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "Clamp");
-        return MTL::SamplerAddressModeClampToEdge;
-    case SamplerAddressMode::MirrorClampToEdge:
-        return MTL::SamplerAddressModeMirrorClampToEdge;
-    case SamplerAddressMode::MirrorClampToBorder:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "MirrorClampToBorder");
-        return MTL::SamplerAddressModeClampToBorderColor;
-    case SamplerAddressMode::MirrorClamp:
-        LOG_NOT_IMPLEMENTED(MetalRenderer, "MirrorClamp");
-        return MTL::SamplerAddressModeMirrorClampToEdge;
+toMtlSamplerAddressMode(const SamplerDescriptor& descriptor, u32 axis) {
+    if (axis >= 3) {
+        LOG_ERROR(MetalRenderer, "Invalid sampler axis {}", axis);
+        return descriptor.address_mode_s;
     }
+    const MTL::SamplerAddressMode modes[] = {descriptor.address_mode_s,
+                                             descriptor.address_mode_t,
+                                             descriptor.address_mode_r};
+    // Mirrored border addressing is emulated in the shader (see the MSL
+    // emitter); the host sampler only needs a mode that doesn't wrap
+    if ((descriptor.mirror_to_border_mask >> axis) & 1u)
+        return MTL::SamplerAddressModeMirrorClampToEdge;
+    return modes[axis];
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

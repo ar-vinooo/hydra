@@ -19,6 +19,8 @@ class ContentArchive final : public Directory {
     explicit ContentArchive(IFile* file);
 
   private:
+    // Shared with section FileViews, which may outlive this archive.
+    std::shared_ptr<IFile> decoded_file;
     ContentArchiveContentType content_type;
     u64 title_id;
 

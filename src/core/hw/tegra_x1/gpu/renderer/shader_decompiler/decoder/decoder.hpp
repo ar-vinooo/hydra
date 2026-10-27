@@ -15,6 +15,9 @@ struct Block {
     BlockStatus status{BlockStatus::Unvisited};
     // TODO: rework this
     std::stack<label_t> sync_point_stack;
+    std::stack<label_t> break_point_stack;
+    std::stack<label_t> continue_point_stack;
+    std::stack<label_t> exit_point_stack;
 };
 
 class Decoder {
@@ -29,8 +32,10 @@ class Decoder {
     std::queue<label_t> to_visit_queue;
     std::map<label_t, Block> blocks;
     Block* crnt_block{nullptr};
+    u32 last_unknown_pc{0xfffffff0};
 
     void parseNextInstruction();
+    bool emitIndirectBranch(instruction_t inst, u32 pc);
 
     // Helpers
     void jump(u32 target) const {
@@ -70,10 +75,21 @@ class Decoder {
         crnt_block->sync_point_stack.push(sync_point);
     }
 
+    void pushBreakPoint(label_t break_point) {
+        crnt_block->break_point_stack.push(break_point);
+    }
+
+    void pushContinuePoint(label_t continue_point) {
+        crnt_block->continue_point_stack.push(continue_point);
+    }
+
     void inheritSyncPoints(label_t label) {
         auto& block = ensureBlock(label);
         // TODO: if the block already has sync points, make sure they match
         block.sync_point_stack = crnt_block->sync_point_stack;
+        block.break_point_stack = crnt_block->break_point_stack;
+        block.continue_point_stack = crnt_block->continue_point_stack;
+        block.exit_point_stack = crnt_block->exit_point_stack;
     }
 };
 

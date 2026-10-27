@@ -15,7 +15,7 @@ class SurfaceCompositor final : public ISurfaceCompositor {
                      const ITextureView* texture, const FloatRect2D src_rect,
                      const FloatRect2D dst_rect, bool transparent,
                      f32 opacity) override;
-    void present(ICommandBuffer* command_buffer) override;
+    void present(ICommandBuffer* command_buffer, bool new_frame) override;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::null

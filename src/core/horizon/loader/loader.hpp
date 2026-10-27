@@ -23,6 +23,7 @@ class ILoader {
     static std::optional<ILoader*> createFromPath(
         std::string_view path,
         std::optional<plugins::Manager*> plugin_manager_opt = std::nullopt);
+    static std::string_view getLastError();
 
     ILoader() noexcept = default;
     virtual ~ILoader() noexcept = default;
@@ -31,6 +32,7 @@ class ILoader {
     ZTD_MAKE_DEFAULT_MOVABLE(ILoader);
 
     virtual u64 getTitleId() const { return invalid<u64>(); }
+    virtual std::string_view getUnsupportedReason() const { return {}; }
 
     virtual void loadProcess(System& system, kernel::Process* process) = 0;
     horizon::services::ns::ApplicationControlProperty* loadNacp();
@@ -47,6 +49,7 @@ class ILoader {
     bool hasExeFs() const { return exefs_dir != nullptr; }
     void extractExeFs(std::string_view path) const;
     bool hasRomFs() const { return romfs_entry != nullptr; }
+    filesystem::IEntry* getRomFs() const { return romfs_entry; }
     void extractRomFs(std::string_view path) const;
 
   protected:

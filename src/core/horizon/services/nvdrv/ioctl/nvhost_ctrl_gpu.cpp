@@ -76,14 +76,9 @@ NvResult NvHostCtrlGpu::zbcSetTable(std::array<u32, 4> color_ds,
 
 NvResult
 NvHostCtrlGpu::getCharacteristics(InOutSingle<u64> inout_buffer_size,
-                                  gpu_vaddr_t buffer_addr,
+                                  [[maybe_unused]] gpu_vaddr_t buffer_addr,
                                   GpuCharacteristics* out_characteristics) {
-    if (buffer_addr == 0x0)
-        LOG_WARN(Services, "Invalid buffer address 0x{:08x}", buffer_addr);
-    if (inout_buffer_size == 0x0)
-        LOG_WARN(Services, "Invalid buffer size 0x{:08x}",
-                 *inout_buffer_size.data);
-
+    // The NV IPC wrapper returns characteristics inline; no guest pointer is used.
     inout_buffer_size = 0xa0;
 
     // Write the characteristics

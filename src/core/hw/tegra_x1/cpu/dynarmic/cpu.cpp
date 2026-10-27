@@ -27,4 +27,8 @@ IMemory* Cpu::allocateMemory(u64 size) {
     return memory;
 }
 
+IMemory* Cpu::wrapMemory(uptr ptr, u64 size) {
+    return new ExternalMemory(ptr, size);
+}
+
 } // namespace hydra::hw::tegra_x1::cpu::dynarmic

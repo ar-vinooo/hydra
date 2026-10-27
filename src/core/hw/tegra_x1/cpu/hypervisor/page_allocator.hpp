@@ -11,6 +11,7 @@ struct Page {
 
 struct Allocation {
     uptr ptr;
+    paddr_t pa;
     u64 page_count;
 };
 

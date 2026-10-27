@@ -4,7 +4,9 @@
 
 namespace hydra::horizon::kernel {
 
-ProcessManager::~ProcessManager() {
+ProcessManager::~ProcessManager() { destroyAllProcesses(); }
+
+void ProcessManager::destroyAllProcesses() {
     for (auto process : processes) {
         if (process->isRunning()) {
             LOG_FATAL(Kernel, "{} is still running", process->getDebugName());
@@ -14,6 +16,7 @@ ProcessManager::~ProcessManager() {
                    process->getDebugName());
         }
     }
+    processes.clear();
 }
 
 Process* ProcessManager::createProcess(const std::string_view name) {

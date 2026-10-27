@@ -1,8 +1,12 @@
 #pragma once
 
+#include <memory>
+
 #include "core/horizon/kernel/const.hpp"
 
 namespace hydra::horizon::kernel {
+
+class SynchronizationObject;
 
 enum class AutoObjectTypeId {
     ClientPort,
@@ -17,6 +21,7 @@ enum class AutoObjectTypeId {
     SharedMemory,
     Thread,
     TransferMemory,
+    ResourceLimit,
 };
 
 class AutoObject {
@@ -46,11 +51,34 @@ class AutoObject {
         return false;
     }
 
+    // Base classes without a type ID match every type derived from them
     template <typename T>
     bool isOfType() const
         requires std::is_base_of_v<AutoObject, T>
     {
-        return type_id == T::TYPE_ID;
+        if constexpr (std::is_same_v<T, AutoObject>) {
+            return true;
+        } else if constexpr (std::is_same_v<T, SynchronizationObject>) {
+            switch (type_id) {
+            case AutoObjectTypeId::ClientPort:
+            case AutoObjectTypeId::ServerPort:
+            case AutoObjectTypeId::ServerSession:
+            case AutoObjectTypeId::Event:
+            case AutoObjectTypeId::Process:
+            case AutoObjectTypeId::Thread:
+                return true;
+            default:
+                return false;
+            }
+        } else {
+            return type_id == T::TYPE_ID;
+        }
+    }
+
+    // nullptr unless the object is a T (there is no RTTI)
+    template <typename T>
+    T* as() {
+        return isOfType<T>() ? static_cast<T*>(this) : nullptr;
     }
 
     std::string_view getDebugName() const { return debug_name; }
@@ -65,6 +93,19 @@ class AutoObject {
     GETTER(type_id, getTypeId);
 };
 
+// Owns one reference of an object the guest can hold handles to: the object
+// lives until the last handle is closed too
+struct AutoObjectReleaser {
+    void operator()(AutoObject* object) const { object->release(); }
+};
+template <typename T>
+using AutoObjectPtr = std::unique_ptr<T, AutoObjectReleaser>;
+
+template <typename T, typename... Args>
+AutoObjectPtr<T> makeAutoObject(Args&&... args) {
+    return AutoObjectPtr<T>(new T(std::forward<Args>(args)...));
+}
+
 } // namespace hydra::horizon::kernel
 
 ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::AutoObjectTypeId, ClientPort,
@@ -73,4 +114,5 @@ ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::AutoObjectTypeId, ClientPort,
                        "server session", Session, "session", CodeMemory,
                        "code memory", Event, "event", Process, "process",
                        SharedMemory, "shared memory", Thread, "thread",
-                       TransferMemory, "transfer memory")
+                       TransferMemory, "transfer memory", ResourceLimit,
+                       "resource limit")

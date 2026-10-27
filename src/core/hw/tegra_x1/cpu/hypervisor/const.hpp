@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Hypervisor/Hypervisor.h>
+#include <mutex>
 
 #include "core/hw/tegra_x1/cpu/const.hpp"
 
@@ -13,7 +14,11 @@ constexpr paddr_t KERNEL_PAGE_TABLE_REGION_BASE = 0x100000000;
 constexpr paddr_t USER_PAGE_TABLE_REGION_BASE =
     KERNEL_PAGE_TABLE_REGION_BASE + PAGE_TABLE_RESERVED_SIZE;
 
+// Returns from the exception handler to the guest: as it is, after
+// invalidating this core's TLB, or after invalidating the TLBs of every core
 constexpr uptr EXCEPTION_TRAMPOLINE_OFFSET = 0x800;
+constexpr uptr EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET = 0x840;
+constexpr uptr EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET = 0x880;
 
 #define HV_ASSERT_SUCCESS(ret)                                                 \
     {                                                                          \
@@ -42,12 +47,12 @@ enum class ApFlags : u64 {
     UserNoneKernelReadExecute = (1ull << UXN_SHIFT) | (2ull << AP_SHIFT),
     UserReadKernelReadExecute = (1ull << UXN_SHIFT) | (3ull << AP_SHIFT),
 
-    UserNoneKernelReadWrite =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (0ull << AP_SHIFT),
-    UserNoneKernelRead =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (2ull << AP_SHIFT),
-    UserReadKernelRead =
-        (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) | (3ull << AP_SHIFT),
+    UserNoneKernelReadWrite = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (0ull << AP_SHIFT),
+    UserNoneKernelRead = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (2ull << AP_SHIFT),
+    UserReadKernelRead = (1ull << PNX_SHIFT) | (1ull << UXN_SHIFT) |
+        (3ull << AP_SHIFT),
 };
 
 constexpr u64 AP_FLAGS_MASK =
@@ -56,9 +61,10 @@ constexpr u64 AP_FLAGS_MASK =
 inline uptr allocateVmMemory(u64 size) {
     ASSERT_ALIGNMENT(size, APPLE_PAGE_SIZE, Hypervisor, "size")
 
-    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    ASSERT(ptr != MAP_FAILED, Hypervisor, "Failed to allocate memory: {:#x}", errno);
-
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT(ptr != MAP_FAILED, Hypervisor, "Failed to allocate memory: {:#x}",
+           errno);
     return reinterpret_cast<uptr>(ptr);
 }
 

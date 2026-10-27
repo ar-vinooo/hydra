@@ -410,6 +410,42 @@ func configGetCustomDisplayResolution() -> UnsafeMutablePointer<HydraUint2> {
     hydraConfigGetCustomDisplayResolution()
 }
 
+func configGetMetalApi() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetMetalApi()
+}
+
+func configGetUpscalingFilter() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetUpscalingFilter()
+}
+
+func configGetFrameRateLimit() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameRateLimit()
+}
+
+func configGetFrameGeneration() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGeneration()
+}
+
+func configGetFrameGenerationRateMode() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationRateMode()
+}
+
+func configGetFrameGenerationTargetFps() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationTargetFps()
+}
+
+func configGetFrameGenerationMultiplier() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetFrameGenerationMultiplier()
+}
+
+func configGetSharpening() -> UnsafeMutablePointer<UInt32> {
+    hydraConfigGetSharpening()
+}
+
+func configGetMetalHud() -> UnsafeMutablePointer<Bool> {
+    hydraConfigGetMetalHud()
+}
+
 func configGetAudioBackend() -> UnsafeMutablePointer<UInt32> {
     hydraConfigGetAudioBackend()
 }
@@ -520,8 +556,11 @@ func configGetGdbWaitForClient() -> UnsafeMutablePointer<Bool> {
 
 // Filesystem
 class HydraFilesystem: MutableHandleClass {
-    init() {
-        super.init(handle: hydraCreateFilesystem())
+    init() throws {
+        guard let handle = hydraCreateFilesystem() else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraFilesystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -544,9 +583,12 @@ class HydraFile: MutableHandleClass {
 class HydraContentArchive: MutableHandleClass {
     private let file: HydraFile  // For ref counting
 
-    init(file: HydraFile) {
+    init(file: HydraFile) throws {
         self.file = file
-        super.init(handle: hydraCreateContentArchive(file.handle))
+        guard let handle = hydraCreateContentArchive(file.handle) else {
+            throw HydraLoaderError.loadFailed("Unable to read NCA. Check prod.keys and the firmware format.")
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -560,8 +602,14 @@ class HydraContentArchive: MutableHandleClass {
 
 // Time zone manager
 class HydraTimeZoneManager: MutableHandleClass {
-    init(filesystem: HydraFilesystem) {
-        super.init(handle: hydraCreateTimeZoneManager(filesystem.handle))
+    private let filesystem: HydraFilesystem
+
+    init(filesystem: HydraFilesystem) throws {
+        self.filesystem = filesystem
+        guard let handle = hydraCreateTimeZoneManager(filesystem.handle) else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraFilesystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {
@@ -578,8 +626,16 @@ class HydraTimeZoneManager: MutableHandleClass {
 }
 
 // Loader
-enum HydraLoaderError: Error {
+enum HydraLoaderError: LocalizedError {
     case unsupported
+    case loadFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupported: return "This game format is not supported."
+        case .loadFailed(let message): return message
+        }
+    }
 }
 
 enum HydraLoaderContent {
@@ -595,6 +651,10 @@ class HydraLoader: MutableHandleClass {
                 hydraCreateLoaderFromPath(hydraPath, pluginManager?.handle)
             })
         else {
+            let message = String(withHydraString: hydraLoaderGetLastError())
+            if !message.isEmpty {
+                throw HydraLoaderError.loadFailed(message)
+            }
             throw HydraLoaderError.unsupported
         }
         self.init(handle: handle)
@@ -911,13 +971,67 @@ struct HydraUser: MutableHandleStruct {
 }
 
 // Emulation context
+func inputDeviceNames(system: HydraSystem?) throws -> [String] {
+    guard let list = hydraInputGetDevices(system?.handle) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+    defer { hydraStringListDestroy(list) }
+    return (0..<hydraStringListGetCount(list)).map {
+        String(withHydraString: hydraStringListGet(list, $0))
+    }
+}
+
+func inputPlayerDevices(_ player: Int) throws -> [String] {
+    guard let list = hydraInputGetPlayerDevices(UInt32(player)) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+    defer { hydraStringListDestroy(list) }
+    return (0..<hydraStringListGetCount(list)).map {
+        String(withHydraString: hydraStringListGet(list, $0))
+    }
+}
+
+func inputSetPlayerDevices(_ player: Int, devices: [String], system: HydraSystem?) throws {
+    let list = hydraCreateStringList()
+    defer { hydraStringListDestroy(list) }
+    for device in devices {
+        device.withHydraString { hydraStringListAppend(list, $0) }
+    }
+    guard hydraInputSetPlayerDevices(system?.handle, UInt32(player), list) else {
+        throw HydraLoaderError.loadFailed(String(withHydraString: hydraInputGetLastError()))
+    }
+}
+
 class HydraSystem: MutableHandleClass {
-    init() {
-        super.init(handle: hydraCreateSystem())
+    #if os(macOS)
+        private var emulationActivity: NSObjectProtocol?
+
+        private func beginEmulationActivity() {
+            guard emulationActivity == nil else { return }
+            emulationActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                reason: "Running game emulation with real-time audio")
+        }
+
+        private func endEmulationActivity() {
+            guard let activity = emulationActivity else { return }
+            ProcessInfo.processInfo.endActivity(activity)
+            emulationActivity = nil
+        }
+    #endif
+
+    init() throws {
+        guard let handle = hydraCreateSystem() else {
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraSystemGetLastError()))
+        }
+        super.init(handle: handle)
     }
 
     deinit {
         hydraSystemDestroy(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     var surface: UnsafeMutableRawPointer {
@@ -930,8 +1044,16 @@ class HydraSystem: MutableHandleClass {
         }
     }
 
-    func loadAndStart(loader: HydraLoader) {
-        hydraSystemLoadAndStart(self.handle, loader.handle)
+    func loadAndStart(loader: HydraLoader) throws {
+        #if os(macOS)
+            beginEmulationActivity()
+        #endif
+        guard hydraSystemLoadAndStart(self.handle, loader.handle) else {
+            #if os(macOS)
+                endEmulationActivity()
+            #endif
+            throw HydraLoaderError.loadFailed(String(withHydraString: hydraSystemGetLastError()))
+        }
     }
 
     func requestStop() {
@@ -940,13 +1062,22 @@ class HydraSystem: MutableHandleClass {
 
     func forceStop() {
         hydraSystemForceStop(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     func pause() {
         hydraSystemPause(self.handle)
+        #if os(macOS)
+            endEmulationActivity()
+        #endif
     }
 
     func resume() {
+        #if os(macOS)
+            beginEmulationActivity()
+        #endif
         hydraSystemResume(self.handle)
     }
 
@@ -964,6 +1095,19 @@ class HydraSystem: MutableHandleClass {
 
     func getLastDeltaTimeAverage() -> Float {
         hydraSystemGetLastDeltaTimeAverage(self.handle)
+    }
+
+    // New images per second the display showed, game frames and generated
+    func getPresentationFrameRate() -> Double {
+        hydraSystemGetPresentationFrameRate(self.handle)
+    }
+
+    func getLastShownFps() -> Float {
+        hydraSystemGetLastShownFps(self.handle)
+    }
+
+    func getLastGeneratedFps() -> Float {
+        hydraSystemGetLastGeneratedFps(self.handle)
     }
 
     func takeScreenshot() {

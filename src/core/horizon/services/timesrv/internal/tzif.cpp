@@ -1,6 +1,7 @@
 #include "core/horizon/services/timesrv/internal/tzif.hpp"
 
 #include <bit>
+#include <cstring>
 
 namespace hydra::horizon::services::timesrv::internal {
 
@@ -48,6 +49,324 @@ bool timeTypeEquals(const TimeZoneRule& rule, u8 a_index, u8 b_index) {
            a.is_gmt == b.is_gmt &&
            std::string_view(rule.chars + a.abbreviation_list_index) ==
                std::string_view(rule.chars + b.abbreviation_list_index);
+}
+
+
+// POSIX TZ rule strings ("EST5EDT,M3.2.0,M11.1.0") in the footer of a TZif
+// file. Port of tzparse() from the IANA tzcode (as in Nintendo's service and
+// Ryujinx): the rule is expanded into explicit transitions from 1970 so that
+// local time stays correct after the last transition stored in the file.
+constexpr int SECONDS_PER_MINUTE = 60;
+constexpr int SECONDS_PER_HOUR = 3600;
+constexpr int SECONDS_PER_DAY = 86400;
+constexpr int DAYS_PER_WEEK = 7;
+constexpr int MONTHS_PER_YEAR = 12;
+constexpr int DAYS_PER_NORMAL_YEAR = 365;
+constexpr int DAYS_PER_LEAP_YEAR = 366;
+constexpr int EPOCH_YEAR = 1970;
+
+constexpr int MONTH_LENGTHS[2][MONTHS_PER_YEAR] = {
+    {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+    {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+};
+
+bool isLeap(i64 year) {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+bool isDigit(char c) { return c >= '0' && c <= '9'; }
+
+enum class PosixRuleType { JulianDay, DayOfYear, MonthNthDayOfWeek };
+
+struct PosixRule {
+    PosixRuleType type;
+    i32 day;
+    i32 week;
+    i32 month;
+    i32 time; // seconds after midnight
+};
+
+// All helpers return nullptr on malformed input.
+const char* getZoneName(const char* str) {
+    while (*str != '\0' && !isDigit(*str) && *str != ',' && *str != '-' &&
+           *str != '+')
+        ++str;
+    return str;
+}
+
+const char* getQuotedZoneName(const char* str, char delimiter) {
+    while (*str != '\0' && *str != delimiter)
+        ++str;
+    return str;
+}
+
+const char* getNumber(const char* str, i32& out, i32 min, i32 max) {
+    if (str == nullptr || !isDigit(*str))
+        return nullptr;
+    i32 num = 0;
+    do {
+        num = num * 10 + (*str - '0');
+        if (num > max)
+            return nullptr;
+        ++str;
+    } while (isDigit(*str));
+    if (num < min)
+        return nullptr;
+    out = num;
+    return str;
+}
+
+const char* getSeconds(const char* str, i32& out) {
+    i32 num;
+    str = getNumber(str, num, 0, 24 * DAYS_PER_WEEK - 1);
+    if (str == nullptr)
+        return nullptr;
+    out = num * SECONDS_PER_HOUR;
+    if (*str == ':') {
+        str = getNumber(str + 1, num, 0, 59);
+        if (str == nullptr)
+            return nullptr;
+        out += num * SECONDS_PER_MINUTE;
+        if (*str == ':') {
+            // 60 allows for leap seconds
+            str = getNumber(str + 1, num, 0, 60);
+            if (str == nullptr)
+                return nullptr;
+            out += num;
+        }
+    }
+    return str;
+}
+
+const char* getOffset(const char* str, i32& out) {
+    bool negative = false;
+    if (*str == '-') {
+        negative = true;
+        ++str;
+    } else if (*str == '+') {
+        ++str;
+    }
+    str = getSeconds(str, out);
+    if (str == nullptr)
+        return nullptr;
+    if (negative)
+        out = -out;
+    return str;
+}
+
+const char* getRule(const char* str, PosixRule& rule) {
+    if (*str == 'J') {
+        rule.type = PosixRuleType::JulianDay;
+        str = getNumber(str + 1, rule.day, 1, DAYS_PER_NORMAL_YEAR);
+    } else if (*str == 'M') {
+        rule.type = PosixRuleType::MonthNthDayOfWeek;
+        str = getNumber(str + 1, rule.month, 1, MONTHS_PER_YEAR);
+        if (str == nullptr || *str++ != '.')
+            return nullptr;
+        str = getNumber(str, rule.week, 1, 5);
+        if (str == nullptr || *str++ != '.')
+            return nullptr;
+        str = getNumber(str, rule.day, 0, DAYS_PER_WEEK - 1);
+    } else if (isDigit(*str)) {
+        rule.type = PosixRuleType::DayOfYear;
+        str = getNumber(str, rule.day, 0, DAYS_PER_LEAP_YEAR - 1);
+    } else {
+        return nullptr;
+    }
+    if (str == nullptr)
+        return nullptr;
+    if (*str == '/')
+        return getOffset(str + 1, rule.time);
+    rule.time = 2 * SECONDS_PER_HOUR;
+    return str;
+}
+
+// Seconds since the epoch of the rule's transition in a year, given the
+// seconds of January 1st 00:00:00 of that year (UTC)
+i64 transitionTime(i64 jan_first, i64 year, const PosixRule& rule,
+                   i32 offset) {
+    const int leap = isLeap(year) ? 1 : 0;
+    i64 value = 0;
+    switch (rule.type) {
+    case PosixRuleType::JulianDay:
+        // Jn: 1..365, February 29th is never counted
+        value = jan_first + (rule.day - 1) * i64{SECONDS_PER_DAY};
+        if (leap != 0 && rule.day >= 60)
+            value += SECONDS_PER_DAY;
+        break;
+    case PosixRuleType::DayOfYear:
+        value = jan_first + rule.day * i64{SECONDS_PER_DAY};
+        break;
+    case PosixRuleType::MonthNthDayOfWeek: {
+        value = jan_first;
+        for (int i = 0; i < rule.month - 1; ++i)
+            value += MONTH_LENGTHS[leap][i] * i64{SECONDS_PER_DAY};
+
+        // Day of the week of the first day of the month (Zeller's congruence)
+        const i64 m1 = (rule.month + 9) % 12 + 1;
+        const i64 yy0 = rule.month <= 2 ? year - 1 : year;
+        const i64 yy1 = yy0 / 100;
+        const i64 yy2 = yy0 % 100;
+        i64 dow = ((26 * m1 - 2) / 10 + 1 + yy2 + yy2 / 4 + yy1 / 4 - 2 * yy1) % 7;
+        if (dow < 0)
+            dow += DAYS_PER_WEEK;
+
+        // First day of the month with the requested weekday, then the Nth
+        i64 d = rule.day - dow;
+        if (d < 0)
+            d += DAYS_PER_WEEK;
+        for (int i = 1; i < rule.week; ++i) {
+            if (d + DAYS_PER_WEEK >= MONTH_LENGTHS[leap][rule.month - 1])
+                break;
+            d += DAYS_PER_WEEK;
+        }
+        value += d * SECONDS_PER_DAY;
+        break;
+    }
+    }
+    return value + rule.time + offset;
+}
+
+struct PosixZone {
+    // Standard time first, then daylight saving time
+    char names[2][TimeZoneRule::MAX_NAME_LEN + 1];
+    i32 std_offset; // seconds west of UTC, as in the string
+    i32 dst_offset;
+    PosixRule start;
+    PosixRule end;
+};
+
+// Parses a name followed by an optional offset. Returns the position after it
+// or nullptr.
+const char* getName(const char* str, char (&out)[TimeZoneRule::MAX_NAME_LEN + 1]) {
+    const char* begin;
+    const char* end;
+    if (*str == '<') {
+        begin = ++str;
+        end = str = getQuotedZoneName(str, '>');
+        if (*str != '>')
+            return nullptr;
+        ++str;
+    } else {
+        begin = str;
+        end = str = getZoneName(str);
+    }
+    const auto length = static_cast<usize>(end - begin);
+    if (length > TimeZoneRule::MAX_NAME_LEN)
+        return nullptr;
+    std::memcpy(out, begin, length);
+    out[length] = '\0';
+    return str;
+}
+
+// Only rules with daylight saving time and explicit start/end dates produce
+// transitions. Strings without DST ("JST-9") describe a single type that the
+// file already contains, and DST names without dates would need the system's
+// default rules (posixrules), which the console does not have either.
+bool parsePosixZone(const char* str, PosixZone& zone) {
+    str = getName(str, zone.names[0]);
+    if (str == nullptr || std::strlen(zone.names[0]) < 3 || *str == '\0')
+        return false;
+    str = getOffset(str, zone.std_offset);
+    if (str == nullptr || *str == '\0')
+        return false;
+
+    str = getName(str, zone.names[1]);
+    if (str == nullptr)
+        return false;
+    if (*str != '\0' && *str != ',' && *str != ';') {
+        str = getOffset(str, zone.dst_offset);
+        if (str == nullptr)
+            return false;
+    } else {
+        zone.dst_offset = zone.std_offset - SECONDS_PER_HOUR;
+    }
+
+    if (*str != ',' && *str != ';')
+        return false;
+    str = getRule(str + 1, zone.start);
+    if (str == nullptr || *str++ != ',')
+        return false;
+    str = getRule(str, zone.end);
+    return str != nullptr && *str == '\0';
+}
+
+// Appends the transitions of the footer rule after the last stored one, like
+// tzload() does with its extension. Returns false if nothing was added.
+bool extendWithPosixRule(TimeZoneRule& rule, const char* footer) {
+    PosixZone zone;
+    if (!parsePosixZone(footer, zone))
+        return false;
+
+    const auto std_length = std::strlen(zone.names[0]);
+    const auto dst_length = std::strlen(zone.names[1]);
+    const usize char_count = std_length + 1 + dst_length + 1;
+    if (rule.type_count + 2 > TimeZoneRule::MAX_TYPE_COUNT ||
+        rule.char_count + char_count > TimeZoneRule::MAX_CHAR_COUNT)
+        return false;
+
+    // Standard time is type 0 and daylight saving time type 1 of the rule
+    const u32 std_type = rule.type_count;
+    const u32 dst_type = rule.type_count + 1;
+    TimeTypeInfo& std_info = rule.type_infos[std_type];
+    TimeTypeInfo& dst_info = rule.type_infos[dst_type];
+    std_info = {};
+    dst_info = {};
+    std_info.gmt_offset = -zone.std_offset;
+    std_info.is_day_saving_time = false;
+    std_info.abbreviation_list_index = rule.char_count;
+    dst_info.gmt_offset = -zone.dst_offset;
+    dst_info.is_day_saving_time = true;
+    dst_info.abbreviation_list_index =
+        rule.char_count + static_cast<u32>(std_length) + 1;
+
+    // Generate the transitions of each year from 1970 until the table is full
+    i64 ats[TimeZoneRule::MAX_TIME_COUNT];
+    u8 types[TimeZoneRule::MAX_TIME_COUNT];
+    u32 count = 0;
+    i64 jan_first = 0;
+    for (i64 year = EPOCH_YEAR; count + 2 <= TimeZoneRule::MAX_TIME_COUNT;
+         ++year) {
+        const i64 start_time =
+            transitionTime(jan_first, year, zone.start, zone.std_offset);
+        const i64 end_time =
+            transitionTime(jan_first, year, zone.end, zone.dst_offset);
+        if (start_time > end_time) {
+            // Southern hemisphere: daylight saving time spans the new year
+            ats[count] = end_time;
+            types[count++] = 0;
+            ats[count] = start_time;
+            types[count++] = 1;
+        } else {
+            ats[count] = start_time;
+            types[count++] = 1;
+            ats[count] = end_time;
+            types[count++] = 0;
+        }
+        jan_first += (isLeap(year) ? DAYS_PER_LEAP_YEAR : DAYS_PER_NORMAL_YEAR) *
+                     i64{SECONDS_PER_DAY};
+    }
+
+    u32 i = 0;
+    if (rule.time_count != 0) {
+        while (i < count && ats[i] <= rule.ats[rule.time_count - 1])
+            ++i;
+    }
+    while (i < count && rule.time_count < TimeZoneRule::MAX_TIME_COUNT) {
+        rule.ats[rule.time_count] = ats[i];
+        rule.type_indices[rule.time_count] =
+            static_cast<u8>(types[i] == 0 ? std_type : dst_type);
+        ++rule.time_count;
+        ++i;
+    }
+
+    std::memcpy(rule.chars + rule.char_count, zone.names[0], std_length + 1);
+    std::memcpy(rule.chars + rule.char_count + std_length + 1, zone.names[1],
+                dst_length + 1);
+    rule.char_count += static_cast<u32>(char_count);
+    rule.chars[rule.char_count] = '\0';
+    rule.type_count += 2;
+    return true;
 }
 
 } // namespace
@@ -170,11 +489,10 @@ void parseTimeZoneBinary(ztd::io::IStream* stream, TimeZoneRule& out_rule) {
         out_rule.type_count + 2 <= TimeZoneRule::MAX_TYPE_COUNT) {
         tmp_name[name_len - 1] = '\0';
 
-        char name[TimeZoneRule::MAX_NAME_LEN];
-        std::memcpy(name, tmp_name + 1, name_len - 1);
-
-        // TODO
-        LOG_NOT_IMPLEMENTED(Services, "Time zone name parsing");
+        // tmp_name[0] is the newline before the POSIX TZ string
+        if (!extendWithPosixRule(out_rule, tmp_name + 1))
+            LOG_DEBUG(Services, "Ignoring time zone footer \"{}\"",
+                      tmp_name + 1);
     }
 
     ASSERT(out_rule.type_count > 0, Services, "Invalid type count");

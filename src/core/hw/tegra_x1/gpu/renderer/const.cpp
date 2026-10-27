@@ -2,23 +2,59 @@
 
 #include "core/hw/tegra_x1/gpu/memory_util.hpp"
 
+#include <array>
+#include <atomic>
+#include <cstdlib>
+
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-TextureTypeClass getTextureTypeClass(TextureType type) {
+TextureTypeClass getTextureTypeClass(MTL::TextureType type) {
     switch (type) {
-    case TextureType::_1D:
-    case TextureType::_1DArray:
+    case MTL::TextureType1D:
+    case MTL::TextureType1DArray:
         return TextureTypeClass::_1D;
-    case TextureType::_1DBuffer:
+    case MTL::TextureTypeTextureBuffer:
         return TextureTypeClass::_1DBuffer;
-    case TextureType::_2D:
-    case TextureType::_2DArray:
-    case TextureType::Cube:
-    case TextureType::CubeArray:
+    case MTL::TextureType2D:
+    case MTL::TextureType2DArray:
+    case MTL::TextureTypeCube:
+    case MTL::TextureTypeCubeArray:
         return TextureTypeClass::_2D;
-    case TextureType::_3D:
+    case MTL::TextureType3D:
         return TextureTypeClass::_3D;
+    default:
+        return TextureTypeClass::_2D;
     }
+}
+
+bool legalizeTextureShape(MTL::TextureType& type, u32 width, u32 height, u32 depth,
+                          u32 layer_count, u32& level_count) {
+    if (layer_count > 1) {
+        if (type == MTL::TextureType1D)
+            type = MTL::TextureType1DArray;
+        else if (type == MTL::TextureType2D)
+            type = MTL::TextureType2DArray;
+        else if (type == MTL::TextureTypeCube && layer_count > 6)
+            type = MTL::TextureTypeCubeArray;
+    }
+
+    constexpr u32 MAX_SIZE = 16384;
+    constexpr u32 MAX_LAYERS = 2048;
+    const bool is_cube =
+        type == MTL::TextureTypeCube || type == MTL::TextureTypeCubeArray;
+    if (width == 0 || height == 0 || depth == 0 || layer_count == 0 ||
+        width > MAX_SIZE || height > MAX_SIZE || depth > MAX_LAYERS ||
+        layer_count > MAX_LAYERS ||
+        (is_cube && (width != height || layer_count % 6 != 0)))
+        return false;
+
+    const u32 max_level_count = static_cast<u32>(std::bit_width(
+        std::max({width, height, type == MTL::TextureType3D ? depth : 1u})));
+    level_count = std::clamp(level_count, 1u, max_level_count);
+    if (type == MTL::TextureType1D || type == MTL::TextureType1DArray ||
+        type == MTL::TextureTypeTextureBuffer)
+        level_count = 1;
+    return true;
 }
 
 namespace {
@@ -163,7 +199,13 @@ TextureFormatInfo texture_format_infos[] = {
     COLOR_FORMAT(8, 4, 4),         // ETC2_RGB_sRGB
     COLOR_FORMAT(8, 4, 4),         // PTA_ETC2_RGB_sRGB
     COLOR_FORMAT(16, 4, 4),        // ETC2_RGBA_sRGB
+    COLOR_FORMAT(4, 1, 1),         // BGR10A2Unorm
+    DEPTH_STENCIL_FORMAT(4, 1, 1), // S8Uint_Z24Unorm
+    COLOR_FORMAT(2, 1, 1),         // R1G5B5A5Unorm
+    COLOR_FORMAT(1, 1, 1),         // RG4Unorm (expanded to RG8 on the host)
 };
+static_assert(std::size(texture_format_infos) ==
+              static_cast<usize>(TextureFormat::RG4Unorm) + 1);
 
 #undef DEPTH_STENCIL_FORMAT
 #undef COLOR_FORMAT
@@ -175,21 +217,70 @@ const TextureFormatInfo& getTextureFormatInfo(TextureFormat format) {
     return texture_format_infos[static_cast<usize>(format)];
 }
 
+TextureFormat getHostTextureFormat(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::RGB32Float: return TextureFormat::RGBA32Float;
+    case TextureFormat::RGB32Uint: return TextureFormat::RGBA32Uint;
+    case TextureFormat::RGB32Sint: return TextureFormat::RGBA32Sint;
+    case TextureFormat::RG4Unorm: return TextureFormat::RG8Unorm;
+    default: return format;
+    }
+}
+
+void expandTexturePixels(TextureFormat format, const u8* guest, u8* host,
+                         usize pixel_count) {
+    if (format == TextureFormat::RG4Unorm) {
+        for (usize i = 0; i < pixel_count; ++i) {
+            host[i * 2] = static_cast<u8>((guest[i] & 15) * 17);
+            host[i * 2 + 1] = static_cast<u8>((guest[i] >> 4) * 17);
+        }
+    } else if (format == TextureFormat::RGB32Float ||
+               format == TextureFormat::RGB32Uint ||
+               format == TextureFormat::RGB32Sint) {
+        const u32 alpha = format == TextureFormat::RGB32Float ? 0x3f800000u : 1u;
+        for (usize i = 0; i < pixel_count; ++i) {
+            std::memcpy(host + i * 16, guest + i * 12, 12);
+            std::memcpy(host + i * 16 + 12, &alpha, sizeof(alpha));
+        }
+    } else {
+        std::memcpy(host, guest,
+                    pixel_count * getTextureFormatInfo(format).bytes_per_block);
+    }
+}
+
 TextureFormat toTextureFormat(NvColorFormat color_format) {
 #define NV_COLOR_FORMAT_CASE(color_format, texture_format)                     \
     case NvColorFormat::color_format:                                          \
         return TextureFormat::texture_format;
 
-    // TODO: check
+    // Formats of presented buffers. The names list the components from the
+    // most significant bits, like the render target and TIC names, so each
+    // entry matches the mapping of its counterpart there
     switch (color_format) {
         NV_COLOR_FORMAT_CASE(A8B8G8R8, RGBA8Unorm)
+        NV_COLOR_FORMAT_CASE(A8B8G8R8_sRGB, RGBA8Unorm_sRGB)
         NV_COLOR_FORMAT_CASE(X8B8G8R8, RGBX8Unorm)
+        NV_COLOR_FORMAT_CASE(X8B8G8R8_sRGB, RGBX8Unorm_sRGB)
+        NV_COLOR_FORMAT_CASE(X8R8G8B8, BGRX8Unorm)
         NV_COLOR_FORMAT_CASE(R8G8B8, Invalid) // Doesn't work
         NV_COLOR_FORMAT_CASE(R5G6B5, B5G6R5Unorm)
-        // NV_COLOR_FORMAT_CASE(B5G6R5, R5G6B5Unorm)
+        NV_COLOR_FORMAT_CASE(B5G6R5, R5G6B5Unorm)
         NV_COLOR_FORMAT_CASE(A8R8G8B8, BGRA8Unorm)
         NV_COLOR_FORMAT_CASE(R5G5B5A1, A1BGR5Unorm) // Doesn't work
         NV_COLOR_FORMAT_CASE(A4B4G4R4, RGBA4Unorm)
+        NV_COLOR_FORMAT_CASE(A1B5G5R5, RGB5A1Unorm)
+        NV_COLOR_FORMAT_CASE(A5B5G5R1, R1G5B5A5Unorm)
+        NV_COLOR_FORMAT_CASE(A2B10G10R10, RGB10A2Unorm)
+        NV_COLOR_FORMAT_CASE(A2R10G10B10, BGR10A2Unorm)
+        NV_COLOR_FORMAT_CASE(A16B16G16R16, RGBA16Unorm)
+        NV_COLOR_FORMAT_CASE(Float_A16B16G16R16, RGBA16Float)
+        NV_COLOR_FORMAT_CASE(Float_B10G11R11, RG11B10Float)
+        NV_COLOR_FORMAT_CASE(R8, R8Unorm)
+        NV_COLOR_FORMAT_CASE(R8G8, RG8Unorm)
+        NV_COLOR_FORMAT_CASE(R16, R16Unorm)
+        NV_COLOR_FORMAT_CASE(R16G16, RG16Unorm)
+        NV_COLOR_FORMAT_CASE(Float_R16, R16Float)
+        NV_COLOR_FORMAT_CASE(Float_R16G16, RG16Float)
     default:
         LOG_NOT_IMPLEMENTED(Gpu, "NV color format {}", color_format);
         return TextureFormat::Invalid;
@@ -198,8 +289,131 @@ TextureFormat toTextureFormat(NvColorFormat color_format) {
 #undef NV_COLOR_FORMAT_CASE
 }
 
+namespace {
+
+// Components of a packed Z24 TIC format holding the depth and the stencil
+std::optional<std::pair<ImageSwizzle, ImageSwizzle>>
+getDepthStencilComponents(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::S8Uint_Z24Unorm:
+        return std::make_pair(ImageSwizzle::G, ImageSwizzle::R);
+    case TextureFormat::Z24Unorm_S8Uint:
+        return std::make_pair(ImageSwizzle::R, ImageSwizzle::G);
+    default:
+        return std::nullopt;
+    }
+}
+
+} // namespace
+
+TextureFormat toSampledTextureFormat(const ImageFormatWord image_format_word,
+                                     bool is_srgb) {
+    const auto format = toTextureFormat(image_format_word, is_srgb);
+    const auto components = getDepthStencilComponents(format);
+    if (!components)
+        return format;
+
+    const auto [depth, stencil] = *components;
+    bool reads_stencil = false;
+    for (const auto swizzle :
+         {image_format_word.swizzle_x, image_format_word.swizzle_y,
+          image_format_word.swizzle_z, image_format_word.swizzle_w}) {
+        if (swizzle == depth)
+            return format;
+        if (swizzle == stencil)
+            reads_stencil = true;
+    }
+
+    return reads_stencil ? TextureFormat::S8Uint : format;
+}
+
+namespace {
+
+// Guest formats whose fourth component is unused (X8B8G8R8 and friends). The
+// host stores them in RGBA formats, where that component holds whatever the
+// guest wrote.
+bool hasUnusedAlpha(TextureFormat format) {
+    switch (format) {
+    case TextureFormat::RGBX8Unorm:
+    case TextureFormat::RGBX8Unorm_sRGB:
+    case TextureFormat::RGBX8Snorm:
+    case TextureFormat::RGBX8Uint:
+    case TextureFormat::RGBX8Sint:
+    case TextureFormat::RGBX16Float:
+    case TextureFormat::RGBX16Unorm:
+    case TextureFormat::RGBX16Snorm:
+    case TextureFormat::RGBX16Uint:
+    case TextureFormat::RGBX16Sint:
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+SwizzleChannels toSampledSwizzleChannels(const ImageFormatWord image_format_word,
+                                         bool is_srgb) {
+    const auto view_format = toSampledTextureFormat(image_format_word, is_srgb);
+    auto x = image_format_word.swizzle_x;
+    auto y = image_format_word.swizzle_y;
+    auto z = image_format_word.swizzle_z;
+    auto w = image_format_word.swizzle_w;
+    // Sampling a component the format does not have reads one, not the bytes
+    // the guest left there
+    if (hasUnusedAlpha(view_format)) {
+        for (auto* swizzle : {&x, &y, &z, &w}) {
+            if (*swizzle == ImageSwizzle::A)
+                *swizzle = ImageSwizzle::OneFloat;
+        }
+    }
+    // Stencil views expose the stencil through R, Z24S8's is its G component
+    if (view_format == TextureFormat::S8Uint &&
+        toTextureFormat(image_format_word, is_srgb) ==
+            TextureFormat::Z24Unorm_S8Uint) {
+        for (auto* swizzle : {&x, &y, &z, &w}) {
+            if (*swizzle == ImageSwizzle::G)
+                *swizzle = ImageSwizzle::R;
+        }
+    }
+
+    return SwizzleChannels(view_format, x, y, z, w);
+}
+
+namespace {
+
+TextureFormat toTextureFormatUncached(const ImageFormatWord image_format_word,
+                                      bool is_srgb);
+
+} // namespace
+
+// Resolved for every texture of every draw: results are cached by the fields
+// the conversion reads
 TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
                               bool is_srgb) {
+    static_assert(static_cast<u32>(TextureFormat::R1G5B5A5Unorm) < 0xff);
+    static std::array<std::atomic<u8>, 1u << 20> cache{};
+    const u32 key = static_cast<u32>(image_format_word.image_format) |
+                    (static_cast<u32>(image_format_word.component_r) << 7) |
+                    (static_cast<u32>(image_format_word.component_g) << 10) |
+                    (static_cast<u32>(image_format_word.component_b) << 13) |
+                    (static_cast<u32>(image_format_word.component_a) << 16) |
+                    ((is_srgb ? 1u : 0u) << 19);
+    // 0 is not cached yet, results are stored plus one
+    const u8 cached = cache[key].load(std::memory_order_relaxed);
+    if (cached != 0)
+        return static_cast<TextureFormat>(cached - 1);
+
+    const auto format = toTextureFormatUncached(image_format_word, is_srgb);
+    cache[key].store(static_cast<u8>(static_cast<u32>(format) + 1),
+                     std::memory_order_relaxed);
+    return format;
+}
+
+namespace {
+
+TextureFormat toTextureFormatUncached(const ImageFormatWord image_format_word,
+                                      bool is_srgb) {
 #define IMAGE_FORMAT_CASE_IMPL(img_format, c_r, c_g, c_b, c_a, texture_format, \
                                is_srgb_)                                       \
     else if (image_format_word.image_format == ImageFormat::img_format &&      \
@@ -222,10 +436,18 @@ TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
     if (image_format_word.image_format == ImageFormat::Invalid) {
         return TextureFormat::Invalid;
     }
+    // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
+    static const bool no_xbgr8 = std::getenv("HYDRA_NO_XBGR8") != nullptr;
+    if (no_xbgr8 && image_format_word.image_format == ImageFormat::XBGR8)
+        return TextureFormat::Invalid;
     IMAGE_FORMAT_CASE(R16, Float, Float, Float, Float, R16Float)
     IMAGE_FORMAT_CASE(R32, Float, Float, Float, Float, R32Float)
     IMAGE_FORMAT_CASE(ARGB8, Unorm, Unorm, Unorm, Unorm, RGBA8Unorm)
     IMAGE_FORMAT_CASE_SRGB(ARGB8, Unorm, Unorm, Unorm, Unorm, RGBA8Unorm_sRGB)
+    // X8B8G8R8: ARGB8 above is NVIDIA's A8B8G8R8 (red in the low byte)
+    IMAGE_FORMAT_CASE(XBGR8, Unorm, Unorm, Unorm, Unorm, RGBX8Unorm)
+    IMAGE_FORMAT_CASE_SRGB(XBGR8, Unorm, Unorm, Unorm, Unorm,
+                           RGBX8Unorm_sRGB)
     IMAGE_FORMAT_CASE(R8, Unorm, Unorm, Unorm, Unorm, R8Unorm)
     IMAGE_FORMAT_CASE(R16, Unorm, Unorm, Unorm, Unorm, R16Unorm)
     IMAGE_FORMAT_CASE(GR8, Unorm, Unorm, Unorm, Unorm, RG8Unorm)
@@ -243,31 +465,141 @@ TextureFormat toTextureFormat(const ImageFormatWord image_format_word,
     IMAGE_FORMAT_CASE_SRGB(DXT45, Unorm, Unorm, Unorm, Unorm, BC3_RGBA_sRGB)
     IMAGE_FORMAT_CASE(DXN2, Unorm, Unorm, Unorm, Unorm, BC5_RGUnorm)
     IMAGE_FORMAT_CASE(DXN2, Snorm, Snorm, Snorm, Snorm, BC5_RGSnorm)
-    IMAGE_FORMAT_CASE(B5G6R5, Unorm, Unorm, Unorm, Unorm, B5G6R5Unorm)
+    // TIC names list the components from the most significant bits
+    IMAGE_FORMAT_CASE(B5G6R5, Unorm, Unorm, Unorm, Unorm, R5G6B5Unorm)
     IMAGE_FORMAT_CASE(ABGR4, Unorm, Unorm, Unorm, Unorm, RGBA4Unorm)
-    IMAGE_FORMAT_CASE(A1BGR5, Unorm, Unorm, Unorm, Unorm, A1BGR5Unorm)
+    IMAGE_FORMAT_CASE(A1BGR5, Unorm, Unorm, Unorm, Unorm, RGB5A1Unorm)
+    IMAGE_FORMAT_CASE(ABG5R1, Unorm, Unorm, Unorm, Unorm, R1G5B5A5Unorm)
     IMAGE_FORMAT_CASE(B10GR11Float, Float, Float, Float, Float, RG11B10Float)
+    IMAGE_FORMAT_CASE(E5BGR9_SHAREDEXP, Float, Float, Float, Float,
+                      E5BGR9Float)
     IMAGE_FORMAT_CASE(A2BGR10, Unorm, Unorm, Unorm, Unorm, RGB10A2Unorm)
+    IMAGE_FORMAT_CASE(A2BGR10, Uint, Uint, Uint, Uint, RGB10A2Uint)
+    IMAGE_FORMAT_CASE(GR8, Uint, Uint, Uint, Uint, RG8Uint)
+    IMAGE_FORMAT_CASE(GR8, Sint, Sint, Sint, Sint, RG8Sint)
+    IMAGE_FORMAT_CASE(DXN1, Snorm, Snorm, Snorm, Snorm, BC4_RSnorm)
+    IMAGE_FORMAT_CASE_SRGB(BC7U, Unorm, Unorm, Unorm, Unorm,
+                           BC7_RGBAUnorm_sRGB)
+    IMAGE_FORMAT_CASE(BC6H_SF16, Float, Float, Float, Float,
+                      BC6H_RGBA_SF16_Float)
+    IMAGE_FORMAT_CASE(BC6H_UF16, Float, Float, Float, Float,
+                      BC6H_RGBA_UF16_Float)
+    IMAGE_FORMAT_CASE(ETC2_RGB, Unorm, Unorm, Unorm, Unorm, ETC2_RGB)
+    IMAGE_FORMAT_CASE_SRGB(ETC2_RGB, Unorm, Unorm, Unorm, Unorm, ETC2_RGB_sRGB)
+    IMAGE_FORMAT_CASE(ETC2_RGB_PTA, Unorm, Unorm, Unorm, Unorm, PTA_ETC2_RGB)
+    IMAGE_FORMAT_CASE_SRGB(ETC2_RGB_PTA, Unorm, Unorm, Unorm, Unorm,
+                           PTA_ETC2_RGB_sRGB)
+    IMAGE_FORMAT_CASE(ETC2_RGBA, Unorm, Unorm, Unorm, Unorm, ETC2_RGBA)
+    IMAGE_FORMAT_CASE_SRGB(ETC2_RGBA, Unorm, Unorm, Unorm, Unorm,
+                           ETC2_RGBA_sRGB)
+    IMAGE_FORMAT_CASE(EAC, Unorm, Unorm, Unorm, Unorm, ETC2_R_Unorm)
+    IMAGE_FORMAT_CASE(EAC, Snorm, Snorm, Snorm, Snorm, ETC2_R_Snorm)
+    IMAGE_FORMAT_CASE(EACX2, Unorm, Unorm, Unorm, Unorm, ETC2_RG_Unorm)
+    IMAGE_FORMAT_CASE(EACX2, Snorm, Snorm, Snorm, Snorm, ETC2_RG_Snorm)
     IMAGE_FORMAT_CASE(ASTC_2D_4X4, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_4x4)
     IMAGE_FORMAT_CASE_SRGB(ASTC_2D_4X4, Unorm, Unorm, Unorm, Unorm,
                            ASTC_RGBA_4x4_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_5X4, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_5x4)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_5X4, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_5x4_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_5X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_5x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_5X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_5x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_6X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_6x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_6X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_6x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_6X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_6x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_6X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_6x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_8X8, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_8x8)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_8X8, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_8x8_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X5, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x5)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X5, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x5_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X6, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x6)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X6, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x6_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X8, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x8)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X8, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x8_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_10X10, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_10x10)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_10X10, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_10x10_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_12X10, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_12x10)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_12X10, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_12x10_sRGB)
+    IMAGE_FORMAT_CASE(ASTC_2D_12X12, Unorm, Unorm, Unorm, Unorm, ASTC_RGBA_12x12)
+    IMAGE_FORMAT_CASE_SRGB(ASTC_2D_12X12, Unorm, Unorm, Unorm, Unorm,
+                           ASTC_RGBA_12x12_sRGB)
     IMAGE_FORMAT_CASE(DXN1, Unorm, Unorm, Unorm, Unorm, BC4_RUnorm)
-    IMAGE_FORMAT_CASE(Z24S8, Uint, Unorm, Unorm, Unorm, Z24Unorm_S8Uint)
+    // G24R8 is the uncompressed sampling alias of a Z24S8 surface. Both keep
+    // the stencil in R (the low byte) and the depth in G, like the Z24S8
+    // render target format they alias.
+    IMAGE_FORMAT_CASE(G24R8, Uint, Unorm, Unorm, Unorm, S8Uint_Z24Unorm)
+    IMAGE_FORMAT_CASE(Z24S8, Uint, Unorm, Unorm, Unorm, S8Uint_Z24Unorm)
+    IMAGE_FORMAT_CASE(Z24S8, Uint, Unorm, Uint, Uint, S8Uint_Z24Unorm)
+    IMAGE_FORMAT_CASE(S8Z24, Unorm, Uint, Uint, Uint, Z24Unorm_S8Uint)
+    IMAGE_FORMAT_CASE(X8Z24, Unorm, Unorm, Unorm, Unorm, Z24Unorm_X8Uint)
+    IMAGE_FORMAT_CASE(X8Z24, Unorm, Uint, Uint, Uint, Z24Unorm_X8Uint)
     IMAGE_FORMAT_CASE(Z16, Unorm, Unorm, Unorm, Unorm, Z16Unorm)
+    IMAGE_FORMAT_CASE(Z16, Unorm, Uint, Uint, Uint, Z16Unorm)
     IMAGE_FORMAT_CASE(ZF32, Float, Float, Float, Float, Z32Float)
+    IMAGE_FORMAT_CASE(ZF32, Float, Uint, Uint, Uint, Z32Float)
     IMAGE_FORMAT_CASE(ZF32_X24S8, Float, Uint, Unorm, Unorm, Z32Float_X24S8Uint)
+    IMAGE_FORMAT_CASE(R32B24G8, Float, Uint, Unorm, Unorm, Z32Float_X24S8Uint)
     IMAGE_FORMAT_CASE(RGBA16, Float, Float, Float, Float, RGBA16Float)
     IMAGE_FORMAT_CASE(RGBA32, Float, Float, Float, Float, RGBA32Float)
     IMAGE_FORMAT_CASE(BC7U, Unorm, Unorm, Unorm, Unorm, BC7_RGBAUnorm)
+    IMAGE_FORMAT_CASE(R8, Snorm, Snorm, Snorm, Snorm, R8Snorm)
+    IMAGE_FORMAT_CASE(R8, Uint, Uint, Uint, Uint, R8Uint)
+    IMAGE_FORMAT_CASE(R8, Sint, Sint, Sint, Sint, R8Sint)
+    IMAGE_FORMAT_CASE(R16, Float, Float, Float, Float, R16Float)
+    IMAGE_FORMAT_CASE(R16, Snorm, Snorm, Snorm, Snorm, R16Snorm)
+    IMAGE_FORMAT_CASE(R16, Uint, Uint, Uint, Uint, R16Uint)
+    IMAGE_FORMAT_CASE(R16, Sint, Sint, Sint, Sint, R16Sint)
+    IMAGE_FORMAT_CASE(R32, Uint, Uint, Uint, Uint, R32Uint)
+    IMAGE_FORMAT_CASE(R32, Sint, Sint, Sint, Sint, R32Sint)
+    IMAGE_FORMAT_CASE(RGB32, Float, Float, Float, Float, RGB32Float)
+    IMAGE_FORMAT_CASE(RGB32, Uint, Uint, Uint, Uint, RGB32Uint)
+    IMAGE_FORMAT_CASE(RGB32, Sint, Sint, Sint, Sint, RGB32Sint)
+    IMAGE_FORMAT_CASE(GR4, Unorm, Unorm, Unorm, Unorm, RG4Unorm)
+    IMAGE_FORMAT_CASE(R32G32, Float, Float, Float, Float, RG32Float)
+    IMAGE_FORMAT_CASE(R32G32, Uint, Uint, Uint, Uint, RG32Uint)
+    IMAGE_FORMAT_CASE(R32G32, Sint, Sint, Sint, Sint, RG32Sint)
+    IMAGE_FORMAT_CASE(ARGB8, Snorm, Snorm, Snorm, Snorm, RGBA8Snorm)
+    IMAGE_FORMAT_CASE(ARGB8, Uint, Uint, Uint, Uint, RGBA8Uint)
+    IMAGE_FORMAT_CASE(ARGB8, Sint, Sint, Sint, Sint, RGBA8Sint)
+    IMAGE_FORMAT_CASE(RGBA16, Unorm, Unorm, Unorm, Unorm, RGBA16Unorm)
+    IMAGE_FORMAT_CASE(RGBA16, Snorm, Snorm, Snorm, Snorm, RGBA16Snorm)
+    IMAGE_FORMAT_CASE(RGBA16, Uint, Uint, Uint, Uint, RGBA16Uint)
+    IMAGE_FORMAT_CASE(RGBA16, Sint, Sint, Sint, Sint, RGBA16Sint)
+    IMAGE_FORMAT_CASE(RGBA32, Uint, Uint, Uint, Uint, RGBA32Uint)
+    IMAGE_FORMAT_CASE(RGBA32, Sint, Sint, Sint, Sint, RGBA32Sint)
     else {
-        LOG_FATAL(Gpu, "Image format {}, components: {}, {}, {}, {}, sRGB: {}",
-                  image_format_word.image_format, image_format_word.component_r,
-                  image_format_word.component_g, image_format_word.component_b,
-                  image_format_word.component_a, is_srgb);
+        // Usually a garbage descriptor; real hardware does not stop either
+        static std::atomic<u32> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 32)
+            LOG_ERROR(Gpu,
+                      "Image format {}, components: {}, {}, {}, {}, sRGB: {}",
+                      image_format_word.image_format,
+                      image_format_word.component_r,
+                      image_format_word.component_g,
+                      image_format_word.component_b,
+                      image_format_word.component_a, is_srgb);
+        return TextureFormat::Invalid;
     }
 
 #undef IMAGE_FORMAT_CASE
 }
+
+} // namespace
 
 TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
 #define COLOR_SURFACE_FORMAT_CASE(color_surface_format, texture_format)        \
@@ -278,6 +610,14 @@ TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
         COLOR_SURFACE_FORMAT_CASE(Invalid, Invalid)
         COLOR_SURFACE_FORMAT_CASE(Bitmap, Invalid)
         COLOR_SURFACE_FORMAT_CASE(Unknown1D, Invalid)
+        COLOR_SURFACE_FORMAT_CASE(A16, R16Unorm)
+        COLOR_SURFACE_FORMAT_CASE(AF16, R16Float)
+        COLOR_SURFACE_FORMAT_CASE(AF32, R32Float)
+        COLOR_SURFACE_FORMAT_CASE(A8R8, RG8Unorm)
+        COLOR_SURFACE_FORMAT_CASE(R16_A16, RG16Unorm)
+        COLOR_SURFACE_FORMAT_CASE(RF16_AF16, RG16Float)
+        COLOR_SURFACE_FORMAT_CASE(RF32_AF32, RG32Float)
+        COLOR_SURFACE_FORMAT_CASE(B8G8R8A8, RGBA8Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Float, RGBA32Float)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Sint, RGBA32Sint)
         COLOR_SURFACE_FORMAT_CASE(RGBA32Uint, RGBA32Uint)
@@ -307,7 +647,7 @@ TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
         COLOR_SURFACE_FORMAT_CASE(RG16Sint, RG16Sint)
         COLOR_SURFACE_FORMAT_CASE(RG16Uint, RG16Uint)
         COLOR_SURFACE_FORMAT_CASE(RG16Float, RG16Float)
-        COLOR_SURFACE_FORMAT_CASE(BGR10A2Unorm, RGB10A2Unorm) // TODO: correct?
+        COLOR_SURFACE_FORMAT_CASE(BGR10A2Unorm, BGR10A2Unorm)
         COLOR_SURFACE_FORMAT_CASE(RG11B10Float, RG11B10Float)
         COLOR_SURFACE_FORMAT_CASE(R32Sint, R32Sint)
         COLOR_SURFACE_FORMAT_CASE(R32Uint, R32Uint)
@@ -329,17 +669,22 @@ TextureFormat toTextureFormat(ColorSurfaceFormat color_surface_format) {
         COLOR_SURFACE_FORMAT_CASE(R8Snorm, R8Snorm)
         COLOR_SURFACE_FORMAT_CASE(R8Sint, R8Sint)
         COLOR_SURFACE_FORMAT_CASE(R8Uint, R8Uint)
-        COLOR_SURFACE_FORMAT_CASE(A8Unorm, Invalid)     // TODO
-        COLOR_SURFACE_FORMAT_CASE(BGR5X1Unorm, Invalid) // TODO
+        COLOR_SURFACE_FORMAT_CASE(A8Unorm, R8Unorm) // alpha written to red
+        COLOR_SURFACE_FORMAT_CASE(BGR5X1Unorm, BGR5Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBX8Unorm, RGBX8Unorm)
         COLOR_SURFACE_FORMAT_CASE(RGBX8Unorm_sRGB, RGBX8Unorm_sRGB)
-        COLOR_SURFACE_FORMAT_CASE(BGR5X1UnormUnknownFB, Invalid)
-        COLOR_SURFACE_FORMAT_CASE(BGR5X1UnormUnknownFC, Invalid)
-        COLOR_SURFACE_FORMAT_CASE(BGRX8UnormUnknownFD, Invalid)
-        COLOR_SURFACE_FORMAT_CASE(BGRX8UnormUnknownFE, Invalid)
+        // Z1R5G5B5/O1R5G5B5 and Z8R8G8B8/O8R8G8B8 write their unused bits as
+        // zeros/ones, which only differs from the X formats in guest memory
+        COLOR_SURFACE_FORMAT_CASE(BGR5X1UnormUnknownFB, BGR5Unorm)
+        COLOR_SURFACE_FORMAT_CASE(BGR5X1UnormUnknownFC, BGR5Unorm)
+        COLOR_SURFACE_FORMAT_CASE(BGRX8UnormUnknownFD, BGRX8Unorm)
+        COLOR_SURFACE_FORMAT_CASE(BGRX8UnormUnknownFE, BGRX8Unorm)
         COLOR_SURFACE_FORMAT_CASE(Y32UintUnknownFF, Invalid)
     default:
-        LOG_FATAL(Gpu, "Color surface format {}", color_surface_format);
+        // Includes the alpha formats 0x40-0x47, which have no host equivalent
+        ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Color surface format {:#x}",
+                                 static_cast<u32>(color_surface_format)));
+        return TextureFormat::Invalid;
     }
 
 #undef COLOR_SURFACE_FORMAT_CASE
@@ -354,16 +699,25 @@ TextureFormat toTextureFormat(DepthSurfaceFormat depth_surface_format) {
         DEPTH_SURFACE_FORMAT_CASE(Invalid, Invalid)
         DEPTH_SURFACE_FORMAT_CASE(Z32Float, Z32Float)
         DEPTH_SURFACE_FORMAT_CASE(Z16Unorm, Z16Unorm)
-        DEPTH_SURFACE_FORMAT_CASE(S8Z24Unorm, Z24Unorm_S8Uint) // TODO
+        // Names list the components from the least significant bits: S8Z24
+        // (NVIDIA's Z24S8) keeps the stencil in the low byte
+        DEPTH_SURFACE_FORMAT_CASE(S8Z24Unorm, S8Uint_Z24Unorm)
+        DEPTH_SURFACE_FORMAT_CASE(Z24X8Unorm, Z24Unorm_X8Uint)
         DEPTH_SURFACE_FORMAT_CASE(Z24S8Unorm, Z24Unorm_S8Uint)
         DEPTH_SURFACE_FORMAT_CASE(S8Uint, S8Uint)
-        DEPTH_SURFACE_FORMAT_CASE(Z24C8Unorm, Invalid)
-        DEPTH_SURFACE_FORMAT_CASE(Z32S8X24Float, Z32Float_X24S8Uint) // TODO
+        // V8Z24 (0x18) has X8Z24's layout, with coverage in the X8 byte
+        DEPTH_SURFACE_FORMAT_CASE(Z24C8Unorm, Z24Unorm_X8Uint)
+        DEPTH_SURFACE_FORMAT_CASE(Z32S8X24Float, Z32Float_X24S8Uint)
+        // X8Z24_X16V8S8 (0x1d): 24-bit depth in a 64-bit pixel, no host format
         DEPTH_SURFACE_FORMAT_CASE(Z24X8S8C8X16Unorm, Invalid)
-        DEPTH_SURFACE_FORMAT_CASE(Z32X8C8X16Float, Invalid)
-        DEPTH_SURFACE_FORMAT_CASE(Z32S8C8X16Float, Invalid)
+        // ZF32_X16V8X8 and ZF32_X16V8S8 (0x1e, 0x1f) have ZF32_X24S8's
+        // layout, with coverage in its X bytes
+        DEPTH_SURFACE_FORMAT_CASE(Z32X8C8X16Float, Z32Float_X24S8Uint)
+        DEPTH_SURFACE_FORMAT_CASE(Z32S8C8X16Float, Z32Float_X24S8Uint)
     default:
-        LOG_FATAL(Gpu, "Depth surface format {}", depth_surface_format);
+        ONCE(LOG_NOT_IMPLEMENTED(Gpu, "Depth surface format {:#x}",
+                                 static_cast<u32>(depth_surface_format)));
+        return TextureFormat::Invalid;
     }
 
 #undef DEPTH_SURFACE_FORMAT_CASE
@@ -403,8 +757,56 @@ bool isTextureFormatDepthOrStencil(const TextureFormat format) {
     return info.is_depth_stencil;
 }
 
-ColorDataType toColorDataType(ColorSurfaceFormat format) {
+ColorOutputSwizzle toColorOutputSwizzle(ColorSurfaceFormat format) {
     switch (format) {
+    case ColorSurfaceFormat::A16:
+    case ColorSurfaceFormat::AF16:
+    case ColorSurfaceFormat::AF32:
+    case ColorSurfaceFormat::A8Unorm:
+        return ColorOutputSwizzle::AlphaToRed;
+    case ColorSurfaceFormat::A8R8:
+    case ColorSurfaceFormat::R16_A16:
+    case ColorSurfaceFormat::RF16_AF16:
+    case ColorSurfaceFormat::RF32_AF32:
+        return ColorOutputSwizzle::AlphaToGreen;
+    case ColorSurfaceFormat::B8G8R8A8:
+        return ColorOutputSwizzle::Argb;
+    default:
+        return ColorOutputSwizzle::Identity;
+    }
+}
+
+void swizzleClearColor(ColorOutputSwizzle swizzle, std::array<u32, 4>& color,
+                       u8& mask) {
+    const auto c = color;
+    switch (swizzle) {
+    case ColorOutputSwizzle::AlphaToRed:
+        color = {c[3], 0, 0, 0};
+        mask = (mask & 0x8) != 0 ? 0x1 : 0x0;
+        break;
+    case ColorOutputSwizzle::AlphaToGreen:
+        color = {c[0], c[3], 0, 0};
+        mask = static_cast<u8>((mask & 0x1) | ((mask & 0x8) >> 2));
+        break;
+    case ColorOutputSwizzle::Argb:
+        color = {c[3], c[0], c[1], c[2]};
+        mask = static_cast<u8>(((mask & 0x8) >> 3) | ((mask & 0x7) << 1));
+        break;
+    default:
+        break;
+    }
+}
+
+MTL::DataType toColorDataType(ColorSurfaceFormat format) {
+    switch (format) {
+    case ColorSurfaceFormat::A16:
+    case ColorSurfaceFormat::AF16:
+    case ColorSurfaceFormat::AF32:
+    case ColorSurfaceFormat::A8R8:
+    case ColorSurfaceFormat::R16_A16:
+    case ColorSurfaceFormat::RF16_AF16:
+    case ColorSurfaceFormat::RF32_AF32:
+    case ColorSurfaceFormat::B8G8R8A8:
     case ColorSurfaceFormat::RGBA32Float:
     case ColorSurfaceFormat::RGBX32Float:
     case ColorSurfaceFormat::RGBA16Unorm:
@@ -439,7 +841,11 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::BGR5X1Unorm:
     case ColorSurfaceFormat::RGBX8Unorm:
     case ColorSurfaceFormat::RGBX8Unorm_sRGB:
-        return ColorDataType::Float;
+    case ColorSurfaceFormat::BGR5X1UnormUnknownFB:
+    case ColorSurfaceFormat::BGR5X1UnormUnknownFC:
+    case ColorSurfaceFormat::BGRX8UnormUnknownFD:
+    case ColorSurfaceFormat::BGRX8UnormUnknownFE:
+        return MTL::DataTypeFloat;
     case ColorSurfaceFormat::RGBA32Sint:
     case ColorSurfaceFormat::RGBX32Sint:
     case ColorSurfaceFormat::RGBA16Sint:
@@ -450,7 +856,7 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::RG8Sint:
     case ColorSurfaceFormat::R16Sint:
     case ColorSurfaceFormat::R8Sint:
-        return ColorDataType::Int;
+        return MTL::DataTypeInt;
     case ColorSurfaceFormat::RGBA32Uint:
     case ColorSurfaceFormat::RGBX32Uint:
     case ColorSurfaceFormat::RGBA16Uint:
@@ -462,213 +868,174 @@ ColorDataType toColorDataType(ColorSurfaceFormat format) {
     case ColorSurfaceFormat::RG8Uint:
     case ColorSurfaceFormat::R16Uint:
     case ColorSurfaceFormat::R8Uint:
-        return ColorDataType::UInt;
+        return MTL::DataTypeUInt;
     default:
-        return ColorDataType::Invalid;
+        return MTL::DataTypeNone;
     }
 }
 
-// TODO: check the logic of this
+// Guest components are remapped to host channels by the renderer (the host
+// format of a packed TIC format can store the components in another order)
 SwizzleChannels::SwizzleChannels(const TextureFormat format,
                                  const ImageSwizzle x, const ImageSwizzle y,
                                  const ImageSwizzle z, const ImageSwizzle w) {
-#define SWIZZLE(r_, g_, b_, a_)                                                \
-    {                                                                          \
-        r = r_;                                                                \
-        g = g_;                                                                \
-        b = b_;                                                                \
-        a = a_;                                                                \
-        break;                                                                 \
-    }
-
-    switch (format) {
-    // TODO: fix these
-    case TextureFormat::R8Unorm:
-    case TextureFormat::R8Snorm:
-    case TextureFormat::R8Uint:
-    case TextureFormat::R8Sint:
-    case TextureFormat::R16Float:
-    case TextureFormat::R16Unorm:
-    case TextureFormat::R16Snorm:
-    case TextureFormat::R16Uint:
-    case TextureFormat::R16Sint:
-    case TextureFormat::R32Float:
-    case TextureFormat::R32Uint:
-    case TextureFormat::R32Sint:
-    case TextureFormat::RG8Unorm:
-    case TextureFormat::RG8Snorm:
-    case TextureFormat::RG8Uint:
-    case TextureFormat::RG8Sint:
-    case TextureFormat::RG16Float:
-    case TextureFormat::RG16Unorm:
-    case TextureFormat::RG16Snorm:
-    case TextureFormat::RG16Uint:
-    case TextureFormat::RG16Sint:
-    case TextureFormat::RG32Float:
-    case TextureFormat::RG32Uint:
-    case TextureFormat::RG32Sint:
-    case TextureFormat::RGB32Float:
-    case TextureFormat::RGB32Uint:
-    case TextureFormat::RGB32Sint:
-    case TextureFormat::RGBA8Unorm:
-    case TextureFormat::RGBA8Snorm:
-    case TextureFormat::RGBA8Uint:
-    case TextureFormat::RGBA8Sint:
-    case TextureFormat::RGBA8Unorm_sRGB:
-    case TextureFormat::RGBX8Unorm:
-    case TextureFormat::RGBX8Snorm:
-    case TextureFormat::RGBX8Uint:
-    case TextureFormat::RGBX8Sint:
-    case TextureFormat::RGBX8Unorm_sRGB:
-    case TextureFormat::RGBA16Float:
-    case TextureFormat::RGBA16Unorm:
-    case TextureFormat::RGBA16Snorm:
-    case TextureFormat::RGBA16Uint:
-    case TextureFormat::RGBA16Sint:
-    case TextureFormat::RGBX16Float:
-    case TextureFormat::RGBX16Unorm:
-    case TextureFormat::RGBX16Snorm:
-    case TextureFormat::RGBX16Uint:
-    case TextureFormat::RGBX16Sint:
-    case TextureFormat::RGBA32Float:
-    case TextureFormat::RGBA32Uint:
-    case TextureFormat::RGBA32Sint:
-    case TextureFormat::RGBX32Float:
-    case TextureFormat::RGBX32Uint:
-    case TextureFormat::RGBX32Sint:
-    case TextureFormat::RGBA4Unorm:
-    case TextureFormat::RGB5Unorm:
-    case TextureFormat::RGB5A1Unorm:
-    case TextureFormat::R5G6B5Unorm:
-    case TextureFormat::RGB10A2Unorm:
-    case TextureFormat::RGB10A2Uint:
-    case TextureFormat::RG11B10Float:
-    case TextureFormat::E5BGR9Float:
-    case TextureFormat::BC1_RGB:
-    case TextureFormat::BC1_RGBA:
-    case TextureFormat::BC1_RGB_sRGB:
-    case TextureFormat::BC1_RGBA_sRGB:
-    case TextureFormat::BC2_RGBA:
-    case TextureFormat::BC3_RGBA:
-    case TextureFormat::BC2_RGBA_sRGB:
-    case TextureFormat::BC3_RGBA_sRGB:
-    case TextureFormat::BC4_RUnorm:
-    case TextureFormat::BC4_RSnorm:
-    case TextureFormat::BC5_RGUnorm:
-    case TextureFormat::BC5_RGSnorm:
-    case TextureFormat::BC7_RGBAUnorm:
-    case TextureFormat::BC7_RGBAUnorm_sRGB:
-    case TextureFormat::BC6H_RGBA_SF16_Float:
-    case TextureFormat::BC6H_RGBA_UF16_Float:
-    case TextureFormat::ASTC_RGBA_4x4:
-    case TextureFormat::ASTC_RGBA_4x4_sRGB:
-    case TextureFormat::ASTC_RGBA_5x4:
-    case TextureFormat::ASTC_RGBA_5x4_sRGB:
-    case TextureFormat::ASTC_RGBA_5x5:
-    case TextureFormat::ASTC_RGBA_5x5_sRGB:
-    case TextureFormat::ASTC_RGBA_6x5:
-    case TextureFormat::ASTC_RGBA_6x5_sRGB:
-    case TextureFormat::ASTC_RGBA_6x6:
-    case TextureFormat::ASTC_RGBA_6x6_sRGB:
-    case TextureFormat::ASTC_RGBA_8x5:
-    case TextureFormat::ASTC_RGBA_8x5_sRGB:
-    case TextureFormat::ASTC_RGBA_8x6:
-    case TextureFormat::ASTC_RGBA_8x6_sRGB:
-    case TextureFormat::ASTC_RGBA_8x8:
-    case TextureFormat::ASTC_RGBA_8x8_sRGB:
-    case TextureFormat::ASTC_RGBA_10x5:
-    case TextureFormat::ASTC_RGBA_10x5_sRGB:
-    case TextureFormat::ASTC_RGBA_10x6:
-    case TextureFormat::ASTC_RGBA_10x6_sRGB:
-    case TextureFormat::ASTC_RGBA_10x8:
-    case TextureFormat::ASTC_RGBA_10x8_sRGB:
-    case TextureFormat::ASTC_RGBA_10x10:
-    case TextureFormat::ASTC_RGBA_10x10_sRGB:
-    case TextureFormat::ASTC_RGBA_12x10:
-    case TextureFormat::ASTC_RGBA_12x10_sRGB:
-    case TextureFormat::ASTC_RGBA_12x12:
-    case TextureFormat::ASTC_RGBA_12x12_sRGB:
-    case TextureFormat::A1BGR5Unorm:
-    case TextureFormat::ETC2_R_Unorm:
-    case TextureFormat::ETC2_R_Snorm:
-    case TextureFormat::ETC2_RG_Unorm:
-    case TextureFormat::ETC2_RG_Snorm:
-    case TextureFormat::ETC2_RGB:
-    case TextureFormat::PTA_ETC2_RGB:
-    case TextureFormat::ETC2_RGB_sRGB:
-    case TextureFormat::PTA_ETC2_RGB_sRGB:
-    case TextureFormat::ETC2_RGBA:
-    case TextureFormat::ETC2_RGBA_sRGB:
-    // TODO: depth stencil correct?
-    case TextureFormat::S8Uint:
-    case TextureFormat::Z16Unorm:
-    case TextureFormat::Z24Unorm_X8Uint:
-    case TextureFormat::Z32Float:
-    case TextureFormat::Z24Unorm_S8Uint:
-    case TextureFormat::Z32Float_X24S8Uint:
-        SWIZZLE(x, y, z, w);
-    case TextureFormat::BGR5A1Unorm:
-    case TextureFormat::BGRA8Unorm:
-    case TextureFormat::BGRA8Unorm_sRGB:
-        SWIZZLE(z, y, x, w);
-    case TextureFormat::B5G6R5Unorm:
-    case TextureFormat::BGR5Unorm:
-    case TextureFormat::BGRX8Unorm:
-    case TextureFormat::BGRX8Unorm_sRGB:
-        SWIZZLE(z, y, x, ImageSwizzle::OneFloat);
-    default:
-        LOG_NOT_IMPLEMENTED(Gpu, "Swizzle for format {}", format);
-        break;
-    }
-
-#undef SWIZZLE
+    // The depth of S8Z24 is its G component, Metal exposes the depth plane
+    // through R. Constant swizzles are preserved.
+    const auto remap = [format](ImageSwizzle swizzle) {
+        if (format == TextureFormat::S8Uint_Z24Unorm &&
+            swizzle == ImageSwizzle::G)
+            return ImageSwizzle::R;
+        return swizzle;
+    };
+    r = remap(x);
+    g = remap(y);
+    b = remap(z);
+    a = remap(w);
 }
 
+// Exact (not a hash): storages of one group can be viewed with each other's
+// formats
 u32 TextureDescriptor::getGroupHash() const {
-    ztd::hash::XxHash32 hash;
-    hash.add(getTextureTypeClass(type));
-
+    static_assert(static_cast<u32>(TextureFormat::R1G5B5A5Unorm) < 0x100);
     const auto& format_info = getTextureFormatInfo(format);
-    // TODO: make sure BC and ASTC formats are incompatible
-    hash.add(format_info.bytes_per_block);
-    hash.add(format_info.block_width);
-    hash.add(format_info.block_height);
-    hash.add(format_info.is_depth_stencil);
+    // Equal block sizes do not imply compatible texture views: BC3, BC5,
+    // BC7 and ASTC can share a footprint but use different encodings.
+    // Keep compressed formats in separate storage groups. Uncompressed
+    // formats retain their existing bit-compatible aliasing behaviour.
+    const bool is_compressed =
+        format_info.block_width > 1 || format_info.block_height > 1;
+    u32 key = static_cast<u32>(getTextureTypeClass(type));
+    key |= (is_compressed ? static_cast<u32>(format) : 0u) << 2;
+    key |= format_info.bytes_per_block << 10;
+    key |= format_info.block_width << 16;
+    key |= format_info.block_height << 20;
+    key |= (format_info.is_depth_stencil ? 1u : 0u) << 24;
+    // Float depth and the packed Z24 formats have no common view format
+    key |= (format == TextureFormat::Z32Float ? 1u : 0u) << 25;
+    return key;
+}
 
-    return hash.toHashCode();
+MsaaLayout getMsaaLayout(u32 mode) {
+    switch (mode) {
+    case 0x1: // 2X1
+        return {2, 1, 0};
+    case 0x5: // 2X1_D3D
+        return {2, 1, 0, false, true};
+    case 0x2: // 2X2
+        return {4, 1, 1};
+    case 0x8: // 2X2_VC_4
+    case 0x9: // 2X2_VC_12
+        return {4, 1, 1, true};
+    case 0x3: // 4X2
+        return {8, 2, 1};
+    case 0x4: // 4X2_D3D
+        return {8, 2, 1, false, true};
+    case 0xa: // 4X2_VC_8
+    case 0xb: // 4X2_VC_24
+        return {8, 2, 1, true};
+    case 0x6: // 4X4
+        return {16, 2, 2};
+    default: // 1X1
+        return {};
+    }
+}
+
+MsaaLayout getMsaaLayoutForSamples(u32 samples) {
+    switch (samples) {
+    case 2:
+        return {2, 1, 0};
+    case 4:
+        return {4, 1, 1};
+    case 8:
+        return {8, 2, 1};
+    case 16:
+        return {16, 2, 2};
+    default:
+        return {};
+    }
+}
+
+std::pair<u32, u32> getMsaaSampleTexel(u32 samples, u32 index) {
+    switch (samples) {
+    case 2: // (0,0), (1,0)
+        return {index & 1, 0};
+    case 4: // (0,0), (1,0), (0,1), (1,1)
+        return {index & 1, (index >> 1) & 1};
+    case 8: // 2x2 blocks of 4: (0,0), (1,0), (0,1), (1,1), (2,0), (3,0), ...
+        return {(index & 1) | ((index >> 2 & 1) << 1), (index >> 1) & 1};
+    case 16: // Four 2x2 blocks of the 8 sample pattern
+        return {(index & 1) | ((index >> 2 & 1) << 1),
+                ((index >> 1) & 1) | ((index >> 3 & 1) << 1)};
+    default:
+        return {0, 0};
+    }
+}
+
+std::pair<u32, u32> getMsaaSamplePosition(const MsaaLayout& layout, u32 index) {
+    // nouveau nvc0_get_sample_locations, in 1/16 pixel
+    static constexpr u8 MS2[2][2] = {{0x4, 0x4}, {0xc, 0xc}};
+    static constexpr u8 MS4[4][2] = {{0x6, 0x2}, {0xe, 0x6}, {0x2, 0xa}, {0xa, 0xe}};
+    static constexpr u8 MS8[8][2] = {{0x1, 0x7}, {0x5, 0x3}, {0x3, 0xd}, {0x7, 0xb},
+                                     {0x9, 0x5}, {0xf, 0x1}, {0xb, 0xf}, {0xd, 0x9}};
+    // The Direct3D standard patterns (offsets from the center, +8)
+    static constexpr u8 D3D2[2][2] = {{0xc, 0xc}, {0x4, 0x4}};
+    static constexpr u8 D3D8[8][2] = {{0x9, 0x5}, {0x7, 0xb}, {0xd, 0x9}, {0x5, 0x3},
+                                      {0x3, 0xd}, {0x1, 0x7}, {0xb, 0xf}, {0xf, 0x1}};
+    const auto pick = [&](const u8 (*table)[2]) {
+        return std::pair<u32, u32>{table[index][0], table[index][1]};
+    };
+    switch (layout.samples) {
+    case 2:
+        return pick(layout.d3d_positions ? D3D2 : MS2);
+    case 4:
+        return pick(MS4);
+    case 8:
+        return pick(layout.d3d_positions ? D3D8 : MS8);
+    default:
+        return {8, 8};
+    }
 }
 
 u32 TextureDescriptor::getStorageHash() const {
     ztd::hash::XxHash32 hash;
     hash.add(ptr);
+    hash.add(is_linear);
     if (is_linear)
         hash.add(linear_stride);
+    else {
+        hash.add(block_width_gobs_log2);
+        hash.add(block_height_gobs_log2);
+        hash.add(block_depth_gobs_log2);
+    }
     hash.add(width);
     hash.add(height);
     hash.add(depth);
     hash.add(level_count);
     hash.add(layer_count);
-    // TODO: block size?
     hash.add(layer_size);
+    hash.add(sample_count);
 
     return hash.toHashCode();
 }
 
 namespace {
 
-u32 adjustDim(u32 dim, u32 level) { return std::max(dim >> level, 1u); }
+u32 adjustDim(u32 dim, u32 level) {
+    // A shift by the width of the type or more is undefined
+    return level >= 32 ? 1u : std::max(dim >> level, 1u);
+}
 
 } // namespace
 
-uint3 TextureDescriptor::getLevelDimensions(u32 level) const {
-    return uint3({adjustDim(width, level), adjustDim(height, level),
-                  adjustDim(depth, level)});
+MTL::Size TextureDescriptor::getLevelDimensions(u32 level) const {
+    return MTL::Size(adjustDim(width, level), adjustDim(height, level),
+                     adjustDim(depth, level));
 }
 
 namespace {
 
 u32 adjustBlockSizeLog2(u32 size_log2, u32 gob_dim, u32 dim) {
-    while (dim <= (gob_dim << (size_log2 - 1)) && size_log2 != 0)
+    while (size_log2 != 0 && dim <= (gob_dim << (size_log2 - 1)))
         size_log2--;
 
     return size_log2;
@@ -676,16 +1043,19 @@ u32 adjustBlockSizeLog2(u32 size_log2, u32 gob_dim, u32 dim) {
 
 } // namespace
 
-uint3 TextureDescriptor::getLevelBlockSizeLog2(u32 level) const {
+MTL::Size TextureDescriptor::getLevelBlockSizeLog2(u32 level) const {
     const auto dims = getLevelDimensions(level);
 
-    const u32 stride = getTextureFormatStride(format, dims.x());
-    const u32 rows = getTextureFormatRows(format, dims.y());
-    const u32 slices = dims.z();
+    const u32 stride =
+        getTextureFormatStride(format, static_cast<u32>(dims.width));
+    const u32 rows =
+        getTextureFormatRows(format, static_cast<u32>(dims.height));
+    const u32 slices = static_cast<u32>(dims.depth);
 
-    return uint3({adjustBlockSizeLog2(block_width_gobs_log2, GOB_WIDTH, stride),
-                  adjustBlockSizeLog2(block_height_gobs_log2, GOB_HEIGHT, rows),
-                  adjustBlockSizeLog2(block_depth_gobs_log2, 1, slices)});
+    return MTL::Size(
+        adjustBlockSizeLog2(block_width_gobs_log2, GOB_WIDTH, stride),
+        adjustBlockSizeLog2(block_height_gobs_log2, GOB_HEIGHT, rows),
+        adjustBlockSizeLog2(block_depth_gobs_log2, 1, slices));
 }
 
 u32 TextureDescriptor::getLevelOffset(u32 level) const {
@@ -700,15 +1070,15 @@ u32 TextureDescriptor::getLevelSize(u32 level) const {
     const auto dims = getLevelDimensions(level);
     const auto block_size_log2 = getLevelBlockSizeLog2(level);
 
-    const u32 block_width = GOB_WIDTH << block_size_log2.x();
-    const u32 block_height = GOB_HEIGHT << block_size_log2.y();
-    const u32 block_depth = 1u << block_size_log2.z();
+    const u32 block_width = GOB_WIDTH << static_cast<u32>(block_size_log2.width);
+    const u32 block_height = GOB_HEIGHT << static_cast<u32>(block_size_log2.height);
+    const u32 block_depth = 1u << static_cast<u32>(block_size_log2.depth);
 
     const u32 stride =
-        align(getTextureFormatStride(format, dims.x()), block_width);
+        align(getTextureFormatStride(format, static_cast<u32>(dims.width)), block_width);
     const u32 rows =
-        align(getTextureFormatRows(format, dims.y()), block_height);
-    const u32 slices = align(dims.z(), block_depth);
+        align(getTextureFormatRows(format, static_cast<u32>(dims.height)), block_height);
+    const u32 slices = align(static_cast<u32>(dims.depth), block_depth);
 
     return slices * rows * stride;
 }
@@ -717,7 +1087,9 @@ namespace {
 
 u32 alignLayerSize(u32 layer_size, u32 height, u32 depth, u32 block_height,
                    u32 block_height_gobs_log2, u32 block_depth_gobs_log2) {
-    height = align(height, block_height);
+    // Block rows, like getLevelBlockSizeLog2 (compressed formats have rows of
+    // block_height texels)
+    height = (height + block_height - 1) / block_height;
     while (block_height_gobs_log2 != 0 &&
            height <= 8U << (block_height_gobs_log2 - 1))
         --block_height_gobs_log2;
@@ -756,7 +1128,16 @@ void TextureDescriptor::calculateSize() {
             } else {
                 // TODO: make sure the layer sizes match?
             }
-            size = layer_count * layer_size;
+            // The last layer only occupies its actual data, not the whole
+            // layer stride. Otherwise a small mip level of a layered texture
+            // (e.g. 1x1 of a cubemap with a large stride) would extend past
+            // the end of the texture that owns it and never be merged into it
+            // The last layer only occupies its actual data, not the whole
+            // layer stride. Otherwise a small mip level of a layered texture
+            // (e.g. 1x1 of a cubemap with a large stride) would extend past
+            // the end of the texture that owns it and never be merged into it
+            size = (layer_count - 1) * layer_size +
+                   std::min(layer_size_, layer_size);
         }
     }
 }
@@ -778,7 +1159,7 @@ u32 TextureViewDescriptor::getHash() const {
 }
 
 usize getVertexFormatSize(engines::VertexAttribSize size) {
-    switch (size) {
+    switch (engines::getFetchSize(size)) {
     case engines::VertexAttribSize::_1x32:
         return 4;
     case engines::VertexAttribSize::_2x32:
@@ -809,6 +1190,8 @@ usize getVertexFormatSize(engines::VertexAttribSize size) {
     case engines::VertexAttribSize::_10_10_10_2:
     case engines::VertexAttribSize::_11_11_10:
         return 4;
+    default:
+        return 0;
     }
 }
 

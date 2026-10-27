@@ -30,6 +30,12 @@ class FileView : public IFile {
         }
     }
 
+    FileView(std::shared_ptr<IFile> base_, u64 offset_,
+             u64 size_ = invalid<u64>())
+        : FileView(base_.get(), offset_, size_) {
+        owned_base = std::move(base_);
+    }
+
     ztd::io::IStream* open(FileOpenFlags flags) override {
         return new OwnedStreamView(base->open(flags), offset, size);
     }
@@ -37,6 +43,8 @@ class FileView : public IFile {
     u64 getSize() const override { return size; }
 
   private:
+    // Section views can outlive the archive that created their decrypted base.
+    std::shared_ptr<IFile> owned_base;
     IFile* base;
     u64 offset;
     u64 size;

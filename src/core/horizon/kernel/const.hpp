@@ -6,19 +6,24 @@ constexpr Handle CURRENT_PROCESS_PSEUDO_HANDLE = 0xffff8001;
 constexpr Handle CURRENT_THREAD_PSEUDO_HANDLE = 0xffff8000;
 
 constexpr ztd::Range<vaddr_t> ADDRESS_SPACE =
-    ztd::Range<vaddr_t>(0x10000000, 0x200000000);
+    ztd::Range<vaddr_t>(0x10000000, 0x1200000000);
 constexpr ztd::Range<vaddr_t> STACK_REGION =
     ztd::Range<vaddr_t>(0x10000000, 0x20000000);
 constexpr ztd::Range<vaddr_t> TLS_REGION =
     ztd::Range<vaddr_t>(0x20000000, 0x30000000);
-constexpr ztd::Range<vaddr_t> ALIAS_REGION =
-    ztd::Range<vaddr_t>(0x30000000, 0x40000000);
 constexpr ztd::Range<vaddr_t> EXECUTABLE_REGION =
     ztd::Range<vaddr_t>(0x40000000, 0x80000000);
 constexpr ztd::Range<vaddr_t> HEAP_REGION =
     ztd::Range<vaddr_t>(0x100000000, 0x200000000);
+// 64 GiB like a 39-bit Horizon address space. nn::os reserves address regions
+// here, e.g. UE4 reserves 62 GiB for its page cache.
+constexpr ztd::Range<vaddr_t> ALIAS_REGION =
+    ztd::Range<vaddr_t>(0x200000000, 0x1200000000);
 
 constexpr u64 HEAP_MEM_ALIGNMENT = 0x200000;
+// The memory an application may use (TotalMemorySize). Horizon gives
+// applications 3285 MiB; less leaves more of the host's memory free.
+constexpr u64 APPLICATION_MEMORY_SIZE = 3ull * 1024ull * 1024ull * 1024ull;
 
 constexpr i64 INFINITE_TIMEOUT = -1;
 
@@ -441,9 +446,10 @@ constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_CORE2 = 2;
 constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_CORE3 = 3;
 constexpr u32 INFO_SUB_TYPE_THREAD_TICK_COUNT_ALL = 0xFFFFFFFF;
 
+// svcSetThreadActivity
 enum class ThreadActivity {
-    None = 0,
-    Runnable = 1,
+    Runnable = 0,
+    Paused = 1,
 };
 
 union CpuRegister {
@@ -657,8 +663,8 @@ ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::SystemInfoType,
                        UsedPhysicalMemorySize, "used physical memory size",
                        InitialProcessIdRange, "initial process id range")
 
-ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ThreadActivity, None, "none",
-                       Runnable, "runnable")
+ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ThreadActivity, Runnable,
+                       "runnable", Paused, "paused")
 
 ENABLE_ENUM_FORMATTING(hydra::horizon::kernel::ArbitrationType, WaitIfLessThan,
                        "wait if less than", DecrementAndWaitIfLessThan,

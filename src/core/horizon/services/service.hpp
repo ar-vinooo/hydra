@@ -27,7 +27,10 @@ struct RequestContext {
 class IService {
   public:
     IService() noexcept = default;
-    virtual ~IService() noexcept = default;
+    virtual ~IService() noexcept;
+
+    // Called by the server with its session reference still alive.
+    void releaseDomainObjects();
 
     ZTD_MAKE_NON_COPYABLE(IService);
 

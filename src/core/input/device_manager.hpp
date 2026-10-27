@@ -14,6 +14,11 @@ class DeviceManager {
 
     void pumpEvents() { device_list->pumpEvents(); }
 
+    std::vector<std::string> getControllerNames() {
+        return device_list->getControllerNames();
+    }
+    static std::vector<std::string> getAvailableControllerNames();
+
     NpadState pollNpad(horizon::services::hid::internal::NpadIndex index);
     std::map<u32, TouchState> pollTouch();
 

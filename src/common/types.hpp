@@ -1,6 +1,9 @@
 #pragma once
 
+#include <list>
 #include <map>
+#include <memory>
+#include <vector>
 #include <string>
 
 #include "common/functions.hpp"
@@ -332,7 +335,11 @@ class strong_number_typedef {
         using strong_number_typedef::strong_number_typedef;                    \
     }
 
-template <typename Subclass, typename T, typename DescriptorT>
+// Objects created from descriptors, found by the hash of the descriptor. With
+// compare_descriptors, Subclass::equals tells descriptors with the same hash
+// apart, otherwise the hash alone identifies an object.
+template <typename Subclass, typename T, typename DescriptorT,
+          bool compare_descriptors = false, bool retain_resources = false>
 class CacheBase {
     friend Subclass;
 
@@ -340,8 +347,16 @@ class CacheBase {
 
   public:
     ~CacheBase() noexcept {
-        for (auto& [key, value] : cache) {
-            THIS->destroyElement(value);
+        if constexpr (retain_resources) {
+            resource_owners.clear();
+        } else if constexpr (compare_descriptors) {
+            for (auto& [key, bucket] : cache) {
+                for (auto& entry : bucket)
+                    THIS->destroyElement(entry.value);
+            }
+        } else {
+            for (auto& [key, value] : cache)
+                THIS->destroyElement(value);
         }
 
         THIS->destroy();
@@ -350,21 +365,59 @@ class CacheBase {
     ZTD_MAKE_NON_COPYABLE(CacheBase);
 
     T& find(const DescriptorT& descriptor) {
-        u32 hash = THIS->hash(descriptor);
-        auto it = cache.find(hash);
-        if (it == cache.end()) {
-            it = cache.insert({hash, THIS->create(descriptor)}).first;
+        if constexpr (compare_descriptors) {
+            // Consecutive draws mostly look the same object up again: the
+            // last hit skips hashing and the tree. Entries are never erased.
+            if (last_hit != nullptr &&
+                Subclass::equals(last_hit->descriptor, descriptor)) [[likely]] {
+                THIS->update(last_hit->value);
+                return last_hit->value;
+            }
+            u32 hash = THIS->hash(descriptor);
+            auto& bucket = cache[hash];
+            for (auto& entry : bucket) {
+                if (Subclass::equals(entry.descriptor, descriptor)) {
+                    THIS->update(entry.value);
+                    last_hit = &entry;
+                    return entry.value;
+                }
+            }
+            // List elements keep their address when the bucket grows
+            last_hit = &bucket.emplace_back(
+                Entry{descriptor, createOwned(descriptor)});
+            return last_hit->value;
+        } else {
+            u32 hash = THIS->hash(descriptor);
+            auto it = cache.find(hash);
+            if (it == cache.end()) {
+                it = cache.insert({hash, createOwned(descriptor)}).first;
+
+                return it->second;
+            }
+
+            THIS->update(it->second);
 
             return it->second;
         }
-
-        THIS->update(it->second);
-
-        return it->second;
     }
 
   private:
-    std::map<u32, T> cache;
+    std::vector<std::shared_ptr<void>> resource_owners;
+    T createOwned(const DescriptorT& descriptor) {
+        auto value = THIS->create(descriptor);
+        if constexpr (retain_resources)
+            if (value)
+                resource_owners.push_back(value->createResourceOwner());
+        return value;
+    }
+    struct Entry {
+        DescriptorT descriptor;
+        T value;
+    };
+    std::conditional_t<compare_descriptors, std::map<u32, std::list<Entry>>,
+                       std::map<u32, T>>
+        cache;
+    Entry* last_hit{nullptr};
 };
 
 } // namespace hydra

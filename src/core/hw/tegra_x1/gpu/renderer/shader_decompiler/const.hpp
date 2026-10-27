@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/unsupported.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp {
 
@@ -22,16 +23,33 @@ struct local_t {
 constexpr reg_t RZ = 0xff;
 constexpr pred_t PT = 0x7;
 
+// Consecutive operands never wrap past the zero register into R0.
+constexpr reg_t offsetRegister(reg_t reg, u32 offset) {
+    const u32 index = static_cast<u32>(reg);
+    return index >= static_cast<u32>(RZ) ||
+                   offset >= static_cast<u32>(RZ) - index
+               ? RZ
+               : reg_t(static_cast<u8>(index + offset));
+}
+
 struct AMem {
     reg_t reg;
     u64 imm;
     bool is_input;
+    // Geometry and tessellation shader inputs: the register holding the
+    // input vertex (control point)
+    reg_t vertex{RZ};
+    // Tessellation shaders: a per patch attribute (ALD/AST.P)
+    bool patch{false};
 
-    AMem(reg_t reg_, u64 imm_, bool is_input_)
-        : reg{reg_}, imm{imm_}, is_input{is_input_} {}
+    AMem(reg_t reg_, u64 imm_, bool is_input_, reg_t vertex_ = RZ,
+         bool patch_ = false)
+        : reg{reg_}, imm{imm_}, is_input{is_input_}, vertex{vertex_},
+          patch{patch_} {}
 
     bool operator==(const AMem& other) const {
-        return reg == other.reg && imm == other.imm;
+        return reg == other.reg && imm == other.imm && vertex == other.vertex &&
+               patch == other.patch;
     }
 };
 
@@ -66,13 +84,36 @@ enum class SvSemantic {
     UserInOut,
     InstanceID,
     VertexID,
-    // TODO: more
+    PrimitiveID,
+    Layer,
+    ViewportIndex,
+    PointSize,
+    // Index selects the group of four distances
+    ClipDistance,
+    PointCoord,
+    TessCoord,
+    FrontFacing,
 };
 
+// PIXLD values, read as system registers outside the S2R range
+constexpr u32 SR_PIXEL_COVERAGE_MASK = 0x1000;
+constexpr u32 SR_PIXEL_SAMPLE_INDEX = 0x1001;
+
+// Attribute addresses of the Maxwell shader I/O space
+constexpr u32 SV_PRIMITIVE_ID_BASE = 0x60;
+constexpr u32 SV_LAYER_BASE = 0x64;
+constexpr u32 SV_VIEWPORT_INDEX_BASE = 0x68;
+constexpr u32 SV_POINT_SIZE_BASE = 0x6c;
 constexpr u32 SV_POSITION_BASE = 0x70;
 constexpr u32 SV_USER_IN_OUT_BASE = 0x80;
+constexpr u32 SV_USER_IN_OUT_END = 0x280;
+constexpr u32 SV_CLIP_DISTANCE_BASE = 0x2c0;
+constexpr u32 SV_POINT_COORD_BASE = 0x2e0;
+constexpr u32 SV_TESS_COORD_BASE = 0x2f0;
 constexpr u32 SV_INSTANCE_ID_BASE = 0x2f8;
 constexpr u32 SV_VERTEX_ID_BASE = 0x2fc;
+constexpr u32 SV_FRONT_FACING_BASE = 0x3fc;
+constexpr u32 CLIP_DISTANCE_COUNT = 8;
 
 struct Sv {
     SvSemantic semantic;
@@ -111,18 +152,32 @@ enum class TextureType {
     _3DArray,
     Cube,
     CubeArray,
+    // Only for images
+    Buffer,
+    // Multisampled, read texel by texel with a sample index (TLD.MS)
+    _2DMS,
+    _2DMSArray,
 };
 
 inline bool isTextureArray(TextureType type) {
     return type == TextureType::_1DArray || type == TextureType::_2DArray ||
-           type == TextureType::_3DArray || type == TextureType::CubeArray;
+           type == TextureType::_3DArray || type == TextureType::CubeArray ||
+           type == TextureType::_2DMSArray;
 }
 
-enum class TextureSampleFlags {
+enum class TextureSampleFlags : u32 {
     None = 0,
     IntCoords = ZTD_BIT(0),
     DepthCompare = ZTD_BIT(1),
     Lod = ZTD_BIT(2),
+    Bias = ZTD_BIT(3),
+    Gather = ZTD_BIT(4),
+    Derivatives = ZTD_BIT(5),
+    Offset = ZTD_BIT(6),
+    Offsets = ZTD_BIT(7),
+    // Bindless handles are resolved to resource bindings by the decoder.
+    Bindless = ZTD_BIT(8),
+    LodZero = ZTD_BIT(9),
 };
 ZTD_ENABLE_ENUM_BITWISE_OPERATORS(TextureSampleFlags)
 
@@ -155,7 +210,42 @@ struct PixelImap {
 constexpr u32 PIXEL_IMAP_COUNT = 32;
 
 struct DecompilerContext {
+    u64* code_read_size{nullptr};
+    std::function<std::optional<u32>(u32, u32)> read_const_word;
+    std::map<std::pair<u32, u32>, u32>* branch_constants{nullptr};
     ShaderType type;
+    // Per-thread local memory size in bytes
+    u32 local_memory_size{0};
+    u32 fragment_depth_register{invalid<u32>()};
+    // The register holding the coverage mask a fragment shader writes, after
+    // its color registers (header OMAP sample mask)
+    u32 fragment_sample_mask_register{invalid<u32>()};
+    u32 fragment_output_mask{0xffffffffu};
+    // A geometry shader, compiled as a vertex function (see geometry.hpp)
+    bool geometry{false};
+    struct {
+        u32 input_vertices{0};
+        engines::PrimitiveType input_primitive{engines::PrimitiveType::Points};
+        // geometry::Output
+        u32 output{0};
+        u32 max_output_vertices{0};
+        u32 invocations{1};
+    } geo;
+    // A vertex shader that writes its outputs to the capture buffer
+    bool geometry_capture{false};
+    // Tessellation shaders (see tessellation.hpp): the control shader runs
+    // as a vertex function per output control point, the evaluation shader
+    // as Metal's post-tessellation vertex function
+    bool tess_control{false};
+    bool tess_eval{false};
+    struct {
+        // Control points per input patch (SET_PATCH)
+        u32 input_vertices{0};
+        // Control points the control shader outputs
+        u32 output_vertices{0};
+        // SET_TESSELLATION_PARAMETERS domain: 1 triangle, 2 quad
+        u32 domain{0};
+    } tess;
     union {
         struct {
             PixelImap pixel_imaps[PIXEL_IMAP_COUNT];
@@ -247,4 +337,8 @@ struct fmt::formatter<hydra::hw::tegra_x1::gpu::renderer::shader_decomp::CMem>
 
 ENABLE_ENUM_FORMATTING(
     hydra::hw::tegra_x1::gpu::renderer::shader_decomp::SvSemantic, Invalid,
-    "invalid", Position, "position", UserInOut, "user in out")
+    "invalid", Position, "position", UserInOut, "user in out", InstanceID,
+    "instance ID", VertexID, "vertex ID", PrimitiveID, "primitive ID", Layer,
+    "layer", ViewportIndex, "viewport index", PointSize, "point size",
+    ClipDistance, "clip distance", PointCoord, "point coord", TessCoord,
+    "tess coord", FrontFacing, "front facing")

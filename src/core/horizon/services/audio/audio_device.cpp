@@ -17,7 +17,8 @@ DEFINE_SERVICE_COMMAND_TABLE(
     getAudioDeviceOutputVolume, 3, getActiveAudioDeviceName, 4,
     queryAudioDeviceSystemEvent, 5, getActiveChannelCount, 6,
     listAudioDeviceNameAuto, 7, setAudioDeviceOutputVolumeAuto, 8,
-    getAudioDeviceOutputVolumeAuto, 10, getActiveAudioDeviceNameAuto)
+    getAudioDeviceOutputVolumeAuto, 10, getActiveAudioDeviceNameAuto, 11,
+    queryAudioDeviceInputEvent, 12, queryAudioDeviceOutputEvent)
 
 result_t
 IAudioDevice::listAudioDeviceName(i32* out_count,
@@ -52,8 +53,8 @@ result_t IAudioDevice::queryAudioDeviceSystemEvent(
 result_t IAudioDevice::getActiveChannelCount(i32* out_count) {
     LOG_FUNC_STUBBED(Services);
 
-    // HACK
-    *out_count = 0;
+    // HACK: stereo output
+    *out_count = 2;
     return RESULT_SUCCESS;
 }
 
@@ -75,6 +76,20 @@ result_t IAudioDevice::getAudioDeviceOutputVolumeAuto(
 result_t IAudioDevice::getActiveAudioDeviceNameAuto(
     OutBuffer<BufferAttr::AutoSelect> out_buffer) {
     return getActiveAudioDeviceNameImpl(out_buffer.stream);
+}
+
+result_t IAudioDevice::queryAudioDeviceInputEvent(
+    kernel::Process* process, OutHandle<HandleAttr::Copy> out_handle) {
+    // Signaled when the input device changes, which never happens
+    out_handle = process->addHandle(input_event);
+    return RESULT_SUCCESS;
+}
+
+result_t IAudioDevice::queryAudioDeviceOutputEvent(
+    kernel::Process* process, OutHandle<HandleAttr::Copy> out_handle) {
+    // Signaled when the output device changes, which never happens
+    out_handle = process->addHandle(output_event);
+    return RESULT_SUCCESS;
 }
 
 result_t IAudioDevice::listAudioDeviceNameImpl(

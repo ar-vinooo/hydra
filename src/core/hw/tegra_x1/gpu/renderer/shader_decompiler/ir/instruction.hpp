@@ -1,8 +1,13 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/intrinsic.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/value.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::ir {
+
+// Raw size of image accesses that convert the texel to or from channel values
+// (the sizes of raw accesses are U8, S8, U16, S16, B32, B64, B128 as 0-6)
+constexpr u32 IMAGE_FORMATTED = 0xff;
 
 enum class Opcode {
     // Data
@@ -58,6 +63,10 @@ enum class Opcode {
     EndIf,
     Branch,
     BranchConditional,
+    // Call stack of subroutines: pushes the label to return to / branches to
+    // the label on top of the stack (ending the shader when it is empty)
+    PushReturn,
+    ReturnBranch,
 
     // Vector
     VectorExtract,
@@ -68,10 +77,49 @@ enum class Opcode {
     TextureSample,
     TextureGather,
     TextureQueryDimension,
+    TextureQueryLod,
 
     // Exit
     Exit,
     Discard,
+
+    // Quad (fragment shaders)
+    QuadShuffleXor,
+    QuadShuffle,
+    SwizzleAdd,
+
+    // Bit counting
+    PopCount,
+    FindMsb,
+
+    // Compute
+    ReadSystemRegister,
+    LoadShared,
+    StoreShared,
+    AtomicShared,
+    AtomicSharedCas,
+    LoadStorage,
+    StoreStorage,
+    AtomicStorage,
+    AtomicStorageCas,
+    LoadLocal,
+    StoreLocal,
+    Barrier,
+    ImageStore,
+    ImageLoad,
+    ImageAtomic,
+
+    // Geometry
+    EmitVertex,
+    EndPrimitive,
+
+    // Warp
+    Vote,
+    Ballot,
+    Shuffle,
+
+    // Backend helper with exact guest semantics
+    Intrinsic,
 };
 
 constexpr usize MAX_INSTRUCTION_OPERANDS = 8;
@@ -117,10 +165,20 @@ ENABLE_ENUM_FORMATTING(
     "cmp_lt", CompareLessOrEqual, "cmp_le", CompareGreater, "cmp_gt",
     CompareGreaterOrEqual, "cmp_ge", CompareEqual, "cmp_eq", CompareNotEqual,
     "cmp_ne", Select, "select", BeginIf, "begin_if", EndIf, "end_if", Branch,
-    "branch", BranchConditional, "branch_cond", VectorExtract, "vec_extract",
+    "branch", BranchConditional, "branch_cond", PushReturn, "push_return",
+    ReturnBranch, "return_branch", VectorExtract, "vec_extract",
     VectorInsert, "vec_insert", VectorConstruct, "vec_construct", TextureSample,
     "tex_sample", TextureGather, "tex_gather", TextureQueryDimension,
-    "tex_query_dim", Exit, "exit", Discard, "discard")
+    "tex_query_dim", TextureQueryLod, "tex_query_lod", Exit, "exit", Discard, "discard", QuadShuffleXor,
+    "quad_shuffle_xor", QuadShuffle, "quad_shuffle", SwizzleAdd, "swizzle_add", PopCount, "popc", FindMsb,
+    "find_msb", ReadSystemRegister, "read_sysreg", LoadShared, "load_shared",
+    StoreShared, "store_shared", AtomicShared, "atomic_shared",
+    AtomicSharedCas, "atomic_shared_cas", LoadStorage, "load_storage",
+    StoreStorage, "store_storage", AtomicStorage, "atomic_storage",
+    AtomicStorageCas, "atomic_storage_cas", LoadLocal, "load_local", StoreLocal, "store_local", Barrier, "barrier", ImageStore, "image_store", ImageLoad, "image_load",
+    ImageAtomic, "image_atomic", EmitVertex, "emit_vertex", EndPrimitive,
+    "end_primitive", Vote, "vote", Ballot, "ballot", Shuffle,
+    "shuffle", Intrinsic, "intrinsic")
 
 template <>
 struct fmt::formatter<

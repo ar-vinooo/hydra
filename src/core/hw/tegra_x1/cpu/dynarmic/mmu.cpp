@@ -1,10 +1,34 @@
 #include "core/hw/tegra_x1/cpu/dynarmic/mmu.hpp"
 
+#include <sys/mman.h>
+
 #include "core/hw/tegra_x1/cpu/dynarmic/memory.hpp"
 
 // TODO: absolute offset page table
 
 namespace hydra::hw::tegra_x1::cpu::dynarmic {
+
+namespace {
+
+template <typename T>
+T* allocateZeroedArray(u64 count) {
+    static_assert(static_cast<u32>(horizon::kernel::MemoryType::Free) == 0);
+    void* ptr = mmap(nullptr, count * sizeof(T), PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT(ptr != MAP_FAILED, Dynarmic, "Failed to allocate page table");
+    return static_cast<T*>(ptr);
+}
+
+} // namespace
+
+Mmu::Mmu(System& system)
+    : IMmu(system), pages{allocateZeroedArray<uptr>(PAGE_COUNT)},
+      states{allocateZeroedArray<horizon::kernel::MemoryState>(PAGE_COUNT)} {}
+
+Mmu::~Mmu() {
+    munmap(pages, PAGE_COUNT * sizeof(uptr));
+    munmap(states, PAGE_COUNT * sizeof(horizon::kernel::MemoryState));
+}
 
 void Mmu::map(vaddr_t dst_va, ztd::Range<uptr> range,
               const horizon::kernel::MemoryState state) {

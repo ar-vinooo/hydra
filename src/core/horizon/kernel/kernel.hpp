@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/horizon/kernel/resource_limit.hpp"
 #include "core/horizon/kernel/applet_resource.hpp"
 #include "core/horizon/kernel/event.hpp"
 #include "core/horizon/kernel/hipc/service_manager.hpp"
@@ -33,6 +34,7 @@ class CodeMemory;
 class Kernel {
   public:
     explicit Kernel(System& system_);
+    ~Kernel() { process_manager.destroyAllProcesses(); }
 
     void supervisorCall(Process* crnt_process, IThread* crnt_thread,
                         hw::tegra_x1::cpu::IThread* guest_thread, u64 id);
@@ -58,7 +60,10 @@ class Kernel {
 
     // SVCs
     result_t setHeapSize(Process* crnt_process, u64 size, uptr& out_base);
-    result_t setMemoryPermission(uptr addr, u64 size, MemoryPermission perm);
+    result_t setMemoryPermission(Process* crnt_process, vaddr_t addr, u64 size,
+                                 MemoryPermission perm);
+    // Page aligned, non-empty and not wrapping around
+    result_t checkMemoryRange(vaddr_t addr, u64 size);
     result_t setMemoryAttribute(Process* crnt_process, vaddr_t addr, u64 size,
                                 MemoryAttribute mask, MemoryAttribute value);
     result_t mapMemory(Process* crnt_process, uptr dst_addr, uptr src_addr,
@@ -73,13 +78,13 @@ class Kernel {
                           i32 priority, i32 processor_id, IThread*& out_thread);
     result_t startThread(IThread* thread);
     void exitThread(IThread* crnt_thread);
-    void sleepThread(i64 nano);
+    void sleepThread(IThread* crnt_thread, i64 nano);
     result_t getThreadPriority(IThread* thread, i32& out_priority);
     result_t setThreadPriority(IThread* thread, i32 priority);
     result_t getThreadCoreMask(IThread* thread, i32& out_core_mask0,
                                u64& out_core_mask1);
     result_t setThreadCoreMask(IThread* thread, i32 core_mask0, u64 core_mask1);
-    void getCurrentProcessorNumber(u32& out_number);
+    void getCurrentProcessorNumber(IThread* crnt_thread, u32& out_number);
     result_t signalEvent(Event* event);
     result_t clearEvent(Event* event);
     result_t mapSharedMemory(Process* crnt_process, SharedMemory* shmem,
@@ -102,20 +107,37 @@ class Kernel {
                                       IThread* crnt_thread, uptr mutex_addr,
                                       uptr var_addr, Handle self_handle,
                                       i64 timeout);
-    result_t signalProcessWideKey(Process* crnt_process, uptr addr, i32 count);
+    result_t signalProcessWideKey(Process* crnt_process, uptr addr,
+                                  i32 count, u64* out_woken = nullptr);
     void getSystemTick(u64& out_tick);
     result_t connectToNamedPort(const std::string_view name,
                                 hipc::ClientSession*& out_client_session);
+    // The message is in the thread's TLS unless a user buffer is given
     result_t sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
-                             hipc::ClientSession* client_session);
+                             hipc::ClientSession* client_session,
+                             vaddr_t buffer = 0x0, u64 buffer_size = 0);
+    result_t sendAsyncRequestWithUserBuffer(Process* crnt_process,
+                                            hipc::ClientSession* client_session,
+                                            vaddr_t buffer, u64 buffer_size,
+                                            Event*& out_event);
+    result_t checkUserBuffer(vaddr_t buffer, u64 buffer_size);
+    result_t createEvent(Process* crnt_process, Event*& out_event);
+    result_t getResourceLimitValue(ResourceLimit* resource_limit,
+                                   LimitableResource which, u32 kind,
+                                   i64& out_value);
+    result_t getProcessId(AutoObject* obj, u64& out_process_id);
     result_t getThreadId(IThread* thread, u64& out_thread_id);
     result_t break_(BreakReason reason, uptr buffer_ptr, u64 buffer_size);
     result_t outputDebugString(const std::string_view str, u64 len);
     result_t getInfo(Process* crnt_process, InfoType info_type, AutoObject* obj,
                      u64 info_sub_type, u64& out_info);
     result_t mapPhysicalMemory(Process* crnt_process, vaddr_t addr, u64 size);
-    result_t setThreadActivity(IThread* thread, ThreadActivity activity);
-    result_t getThreadContext3(IThread* thread,
+    result_t unmapPhysicalMemory(Process* crnt_process, vaddr_t addr,
+                                 u64 size);
+    result_t checkPhysicalMemoryRange(vaddr_t addr, u64 size);
+    result_t setThreadActivity(IThread* crnt_thread, IThread* thread,
+                               ThreadActivity activity);
+    result_t getThreadContext3(IThread* crnt_thread, IThread* thread,
                                ThreadContext& out_thread_context);
     result_t waitForAddress(IThread* crnt_thread, uptr addr,
                             ArbitrationType arbitration_type, u32 value,
@@ -132,8 +154,9 @@ class Kernel {
     result_t replyAndReceive(IThread* crnt_thread,
                              std::span<SynchronizationObject*> sync_objs,
                              hipc::ServerSession* reply_target_session,
-                             i64 timeout, u32& out_signalled_index);
-    result_t createCodeMemory(vaddr_t addr, u64 size,
+                             i64 timeout, u32& out_signalled_index,
+                             uptr buffer = 0x0, u64 buffer_size = 0);
+    result_t createCodeMemory(Process* crnt_process, vaddr_t addr, u64 size,
                               CodeMemory*& out_code_memory);
     result_t controlCodeMemory(CodeMemory* code_memory, CodeMemoryOperation op,
                                vaddr_t addr, u64 size, MemoryPermission perm);
@@ -162,8 +185,7 @@ class Kernel {
     ztd::DoublyLinkedList<IThread*> arbiters;
 
     // Applet resource
-    std::array<bool, MAX_APPLET_RESOURCES> free_applet_resource_user_ids = {
-        true};
+    std::array<bool, MAX_APPLET_RESOURCES> free_applet_resource_user_ids{};
 
     // Helpers
     static void tryAcquireMutex(Process* crnt_process, IThread* thread);

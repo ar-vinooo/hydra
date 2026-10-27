@@ -9,12 +9,16 @@
 #include "core/horizon/loader/nca_loader.hpp"
 #include "core/horizon/loader/nro_loader.hpp"
 #include "core/horizon/loader/nso_loader.hpp"
+#include "core/horizon/loader/nsp_loader.hpp"
 #include "core/horizon/loader/nx_loader.hpp"
 #include "core/horizon/loader/plugins/manager.hpp"
+#include "core/horizon/loader/xci_loader.hpp"
 
 namespace hydra::horizon::loader {
 
 namespace {
+
+thread_local std::string last_error;
 
 uchar4* loadImage(filesystem::IFile* file, u32& out_width, u32& out_height) {
     auto stream = file->open(filesystem::FileOpenFlags::Read);
@@ -81,16 +85,20 @@ uchar4* loadGif(filesystem::IFile* file,
 std::optional<ILoader*>
 ILoader::createFromPath(std::string_view path,
                         std::optional<plugins::Manager*> plugin_manager_opt) {
-    while (path.back() == '/') {
+    last_error.clear();
+    while (!path.empty() && path.back() == '/') {
         path.remove_suffix(1);
     }
 
     // Check if the path exists
-    if (!std::filesystem::exists(path))
+    if (path.empty() || !std::filesystem::exists(path))
         return std::nullopt;
 
     // Create loader
-    const auto ext = std::string_view(path).substr(path.find_last_of('.'));
+    auto ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
     if (ext == ".nx") {
         if (!std::filesystem::is_directory(path))
             return std::nullopt;
@@ -99,6 +107,20 @@ ILoader::createFromPath(std::string_view path,
     } else {
         if (!std::filesystem::is_regular_file(path))
             return std::nullopt;
+        // NSZ/XCZ are NSP/XCI with zstd-compressed NCAs (NCZ).
+        if (ext == ".xci" || ext == ".nsp" || ext == ".xcz" || ext == ".nsz") {
+            try {
+                return ext == ".nsp" || ext == ".nsz"
+                           ? NspLoader::create(path)
+                           : XciLoader::create(path);
+            } catch (const std::exception& error) {
+                last_error = error.what();
+                LOG_ERROR(Loader, "Failed to load {}: {}", ext, last_error);
+                return std::nullopt;
+            }
+        }
+        if (ext.empty())
+            return std::nullopt;
         const auto file = new horizon::filesystem::DiskFile(path);
         if (ext == ".nro") {
             // Assumes that all NROs are Homebrew
@@ -106,7 +128,14 @@ ILoader::createFromPath(std::string_view path,
         } else if (ext == ".nso") {
             return new horizon::loader::NsoLoader(file);
         } else if (ext == ".nca") {
-            return new horizon::loader::NcaLoader(file);
+            try {
+                return new horizon::loader::NcaLoader(file);
+            } catch (const std::exception& error) {
+                delete file;
+                last_error = error.what();
+                LOG_ERROR(Loader, "Failed to load NCA: {}", last_error);
+                return std::nullopt;
+            }
         } else {
             // Check if we need to create a temporary plugin manager
             std::unique_ptr<plugins::Manager> tmp_plugin_manager;
@@ -118,6 +147,7 @@ ILoader::createFromPath(std::string_view path,
 
             // First, check if any of the loader plugins supports this format
             auto plugin = plugin_manager.findPluginForFormat(ext.substr(1));
+            delete file;
             if (plugin == nullptr)
                 return std::nullopt;
 
@@ -125,6 +155,8 @@ ILoader::createFromPath(std::string_view path,
         }
     }
 }
+
+std::string_view ILoader::getLastError() { return last_error; }
 
 horizon::services::ns::ApplicationControlProperty* ILoader::loadNacp() {
     if (nacp_file == nullptr)

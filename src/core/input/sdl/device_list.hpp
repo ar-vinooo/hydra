@@ -17,6 +17,7 @@ class DeviceList : public IDeviceList {
   private:
     bool has_frontend; // Indicates whether the an SDL frontend is used
     u32 keyboard_count;
+    std::map<SDL_JoystickID, std::string> controller_names;
 
     // Helpers
     void connectGenericKeyboard();

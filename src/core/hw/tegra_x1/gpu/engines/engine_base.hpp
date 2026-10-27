@@ -8,15 +8,16 @@
         break;
 
 #define DEFINE_METHOD_TABLE(type, ...)                                         \
-    void type::method(u32 method, u32 arg) {                                   \
+    void type::methodHot(u32 method, u32 arg) {                                   \
         if (method >= MACRO_METHODS_REGION) {                                  \
             macro(method, arg);                                                \
             return;                                                            \
         }                                                                      \
+        /* Macros read the registers of command methods too */              \
+        writeReg(method, arg);                                                 \
         switch (method) {                                                      \
             ZTD_FOR_EACH_0_4(METHOD_CASE, __VA_ARGS__)                         \
         default:                                                               \
-            writeReg(method, arg);                                             \
             break;                                                             \
         }                                                                      \
     }
@@ -52,8 +53,8 @@ class EngineWithRegsBase : public EngineBase {
 #define REG_COUNT (sizeof(RegsT) / sizeof(u32))
 
     u32 getReg(u32 reg) const {
-        ASSERT_DEBUG(reg < REG_COUNT, Engines, "Invalid register 0x{:08x}",
-                     reg);
+        if (reg >= REG_COUNT)
+            return 0;
         return regs_raw[reg];
     }
 
@@ -64,7 +65,15 @@ class EngineWithRegsBase : public EngineBase {
     };
 
     void writeReg(u32 reg, u32 value) {
-        ASSERT_DEBUG(reg < REG_COUNT, Engines, "Invalid reg 0x{:08x}", reg);
+        // Methods past the emulated register file are dropped: the engines
+        // are adjacent in memory, writing past the array corrupts the next
+        if (reg >= REG_COUNT) {
+            ONCE(LOG_WARN(Engines,
+                          "Ignoring write to unemulated register 0x{:03x} "
+                          "(value: 0x{:08x})",
+                          reg, value));
+            return;
+        }
         LOG_DEBUG(Engines, "Writing to reg 0x{:03x} (value: 0x{:08x})", reg,
                   value);
         regs_raw[reg] = value;

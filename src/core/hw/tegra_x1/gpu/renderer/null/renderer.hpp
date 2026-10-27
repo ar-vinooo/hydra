@@ -56,10 +56,10 @@ class Renderer : public IRenderer {
     // Texture
     ITexture* createTexture(const TextureDescriptor& descriptor) override;
     void blitTexture(ICommandBuffer* command_buffer, ITextureView* src,
-                     float3 src_origin, uint3 src_size, u32 src_level,
-                     u32 src_layer, ITextureView* dst, float3 dst_origin,
-                     uint3 dst_size, u32 dst_level, u32 dst_layer,
-                     u32 level_count, u32 layer_count) override;
+                     simd::float3 src_origin, MTL::Size src_size, u32 src_level,
+                     u32 src_layer, ITextureView* dst, simd::float3 dst_origin,
+                     MTL::Size dst_size, u32 dst_level, u32 dst_layer,
+                     u32 level_count, u32 layer_count, const BlitOptions& options) override;
 
     // Sampler
     SamplerBase* createSampler(const SamplerDescriptor& descriptor) override;
@@ -73,8 +73,11 @@ class Renderer : public IRenderer {
     void bindRenderPass(const RenderPassBase* render_pass) override;
 
     // Clear
+    void setClearState(const ClearState& clear_state) override {
+        (void)clear_state;
+    }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
-                    u32 layer, u8 mask, const uint4 color) override;
+                    u32 layer, u8 mask, const simd::uint4 color) override;
     void clearDepth(ICommandBuffer* command_buffer, u32 layer,
                     const float value) override;
     void clearStencil(ICommandBuffer* command_buffer, u32 layer,
@@ -91,10 +94,18 @@ class Renderer : public IRenderer {
     void setDepthTestEnabled(bool enabled) override;
     void setDepthWriteEnabled(bool enabled) override;
     void setDepthCompareOp(engines::CompareOp op) override;
+    void setBlendConstant(const simd::float4 color) override;
+    void setDepthBias(f32 constant, f32 slope, f32 clamp) override;
+    void setStencilState([[maybe_unused]] const StencilState& stencil) override {}
+    void setCullState([[maybe_unused]] bool enabled,
+                      [[maybe_unused]] engines::CullFaceMode mode,
+                      [[maybe_unused]] engines::Winding front_face) override {}
+    void setDepthClamp([[maybe_unused]] bool enabled) override {}
+    void setPolygonLines([[maybe_unused]] bool enabled) override {}
 
     // Viewport and scissor
-    void setViewport(u32 index, const Viewport& viewport) override;
-    void setScissor(u32 index, const Scissor& scissor) override;
+    void setViewport(u32 index, const MTL::Viewport& viewport) override;
+    void setScissor(u32 index, const MTL::ScissorRect& scissor) override;
 
     // Resource binding
     void bindVertexBuffer(const BufferView& buffer, u32 index) override;
@@ -102,11 +113,15 @@ class Renderer : public IRenderer {
                          engines::IndexType index_type) override;
     void bindUniformBuffer(const BufferView& buffer, ShaderType shader_type,
                            u32 index) override;
+    BufferView getGuestMemoryBuffer(ztd::Range<uptr> range) override;
+    void bindStorageBuffer(const BufferView& buffer, ShaderType shader_type,
+                           u32 index) override;
     void bindTexture(ITextureView* texture, SamplerBase* sampler,
                      ShaderType shader_type, u32 index) override;
 
     // Resource unbinding
     void unbindUniformBuffers(ShaderType shader_type) override;
+    void unbindStorageBuffers(ShaderType shader_type) override;
     void unbindTextures(ShaderType shader_type) override;
 
     // Draw

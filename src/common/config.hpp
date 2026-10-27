@@ -27,13 +27,22 @@ enum class GpuRenderer : u32 {
     Metal,
 };
 
+// The Metal API the renderer encodes with
+enum class MetalApi : u32 {
+    Metal3,
+    Metal4, // Explicit barriers, residency and bindings (macOS 26, iOS 26)
+};
+
 enum class ShaderBackend : u32 {
     Msl,
     Air,
 };
 
+// The display resolution reported to the guest. A Switch reports 1080p when
+// docked and 720p in handheld mode (Console); the others are debug overrides
+// that no hardware reports.
 enum class Resolution : u32 {
-    Auto,
+    Auto, // The window size rounded up to a standard resolution
     _720p,
     _1080p,
     _1440p,
@@ -41,9 +50,26 @@ enum class Resolution : u32 {
     _4320p,
     AutoExact,
     Custom,
+    Console,
 };
 
 STRONG_TYPEDEF(CustomResolution, uint2);
+
+// How the presented frame is scaled to the window
+enum class UpscalingFilter : u32 {
+    Bilinear,
+    Nearest,
+    MetalFx, // MetalFX spatial upscaling when the window is larger
+};
+
+// Frames generated between two guest frames
+enum class FrameGeneration : u32 {
+    Off,
+    Interpolate, // Optical flow interpolation
+    MetalFx,     // As Interpolate, with MetalFX for the frames halfway
+};
+
+enum class FrameGenerationRateMode : u32 { Variable, Multiple };
 
 enum class AudioBackend : u32 {
     Null,
@@ -129,11 +155,30 @@ class Config {
         return GpuRenderer::Null;
 #endif
     }
+    static MetalApi getDefaultMetalApi() { return MetalApi::Metal3; }
     static ShaderBackend getDefaultShaderBackend() {
         return ShaderBackend::Msl;
     }
-    static Resolution getDefaultDisplayResolution() { return Resolution::Auto; }
+    static Resolution getDefaultDisplayResolution() {
+        return Resolution::Console;
+    }
     static uint2 getDefaultCustomDisplayResolution() { return {1920, 1080}; }
+    static UpscalingFilter getDefaultUpscalingFilter() {
+        return UpscalingFilter::Bilinear;
+    }
+    // 60 as on a Switch; 0 for unlimited
+    static u32 getDefaultFrameRateLimit() { return 60; }
+    static FrameGeneration getDefaultFrameGeneration() {
+        return FrameGeneration::Off;
+    }
+    static FrameGenerationRateMode getDefaultFrameGenerationRateMode() {
+        return FrameGenerationRateMode::Variable;
+    }
+    static u32 getDefaultFrameGenerationTargetFps() { return 120; }
+    static u32 getDefaultFrameGenerationMultiplier() { return 2; }
+    // Contrast adaptive sharpening of presented frames, 0 (off) to 100
+    static u32 getDefaultSharpening() { return 0; }
+    static bool getDefaultMetalHud() { return false; }
     static AudioBackend getDefaultAudioBackend() {
 #ifdef HYDRA_CUBEB_ENABLED
         return AudioBackend::Cubeb;
@@ -186,9 +231,18 @@ class Config {
     std::vector<std::string> input_profiles;
     CpuBackend cpu_backend;
     GpuRenderer gpu_renderer;
+    MetalApi metal_api;
     ShaderBackend shader_backend;
     Resolution display_resolution;
     uint2 custom_display_resolution;
+    UpscalingFilter upscaling_filter;
+    u32 frame_rate_limit;
+    FrameGeneration frame_generation;
+    FrameGenerationRateMode frame_generation_rate_mode;
+    u32 frame_generation_target_fps;
+    u32 frame_generation_multiplier;
+    u32 sharpening;
+    bool metal_hud;
     AudioBackend audio_backend;
     uuid_t user_id;
     std::string device_nickname;
@@ -216,9 +270,18 @@ class Config {
     REF_GETTER(input_profiles, getInputProfiles);
     REF_GETTER(cpu_backend, getCpuBackend);
     REF_GETTER(gpu_renderer, getGpuRenderer);
+    REF_GETTER(metal_api, getMetalApi);
     REF_GETTER(shader_backend, getShaderBackend);
     REF_GETTER(display_resolution, getDisplayResolution);
     REF_GETTER(custom_display_resolution, getCustomDisplayResolution);
+    REF_GETTER(upscaling_filter, getUpscalingFilter);
+    REF_GETTER(frame_rate_limit, getFrameRateLimit);
+    REF_GETTER(frame_generation, getFrameGeneration);
+    REF_GETTER(frame_generation_rate_mode, getFrameGenerationRateMode);
+    REF_GETTER(frame_generation_target_fps, getFrameGenerationTargetFps);
+    REF_GETTER(frame_generation_multiplier, getFrameGenerationMultiplier);
+    REF_GETTER(sharpening, getSharpening);
+    REF_GETTER(metal_hud, getMetalHud);
     REF_GETTER(audio_backend, getAudioBackend);
     REF_GETTER(user_id, getUserId);
     REF_GETTER(device_nickname, getDeviceNickname);
@@ -247,11 +310,22 @@ ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, CpuBackend, AppleHypervisor,
                                    "Apple Hypervisor", Dynarmic, "dynarmic")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, GpuRenderer, Null, "Null", Metal,
                                    "Metal")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, MetalApi, Metal3, "Metal 3", Metal4,
+                                   "Metal 4")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, ShaderBackend, Msl, "MSL", Air, "AIR")
-ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "auto", _720p,
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, Resolution, Auto, "window", _720p,
                                    "720p", _1080p, "1080p", _1440p, "1440p",
                                    _2160p, "2160p", _4320p, "4320p", AutoExact,
-                                   "Auto exact", Custom, "custom")
+                                   "Auto exact", Custom, "custom", Console,
+                                   "console")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, UpscalingFilter, Bilinear,
+                                   "Bilinear", Nearest, "Nearest", MetalFx,
+                                   "MetalFX")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, FrameGeneration, Off, "Off",
+                                   Interpolate, "Interpolate", MetalFx,
+                                   "MetalFX")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, FrameGenerationRateMode, Variable,
+                                   "Variable", Multiple, "Multiple")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, AudioBackend, Null, "Null", Cubeb,
                                    "Cubeb")
 ENABLE_ENUM_FORMATTING_AND_CASTING(

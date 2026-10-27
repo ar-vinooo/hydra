@@ -14,7 +14,7 @@ class IMemory {
 
     // The memory needs to be unmapped before resizing
     void resize(u64 new_size) {
-        size = new_size;
+        size = align(new_size, GUEST_PAGE_SIZE);
         resizeImpl();
     }
 

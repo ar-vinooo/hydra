@@ -150,20 +150,22 @@ void IHOSBinderDriver::transactParcelImpl(
     switch (code) {
     case TransactCode::RequestBuffer: {
         i32 slot = parcel_reader.read<i32>();
-        if (slot > static_cast<i32>(display::MAX_BINDER_BUFFER_COUNT)) {
-            LOG_WARN(Services, "Invalid slot: {}", slot);
-            parcel_writer.write<u32>(0x0);
-            break;
+        // Copy under the binder lock; the producer can disconnect while
+        // the reply is being serialized.
+        const auto buffer = binder.getBuffer(slot);
+        if (!buffer) {
+            b_result = BinderResult::BadValue;
+            parcel_writer.write<u32>(0);
+        } else {
+            parcel_writer.writeStrongPointer(&*buffer);
         }
-
-        // Buffer
-        const auto& buffer = binder.getBuffer(slot);
-        parcel_writer.writeStrongPointer(&buffer);
 
         break;
     }
     case TransactCode::DequeueBuffer: {
         i32 slot = binder.getAvailableSlot();
+        if (slot < 0)
+            b_result = BinderResult::NoInit;
 
         parcel_writer.write(slot);
 
@@ -181,7 +183,8 @@ void IHOSBinderDriver::transactParcelImpl(
         const auto& input =
             *parcel_reader.readFlattenedObject<display::BqBufferInput>();
 
-        binder.queueBuffer(system, slot, input);
+        if (!binder.queueBuffer(system, slot, input))
+            b_result = BinderResult::BadValue;
 
         // Buffer output
         const auto res = system.getOs().getDisplayResolution();
@@ -189,9 +192,15 @@ void IHOSBinderDriver::transactParcelImpl(
             .width = res.x(),
             .height = res.y(),
             .transform_hint = 0,                                     // HACK
-            .num_pending_buffers = display::MAX_BINDER_BUFFER_COUNT, // HACK
+            .num_pending_buffers = binder.getPendingBufferCount(),
         });
 
+        break;
+    }
+    case TransactCode::CancelBuffer: {
+        const auto slot = parcel_reader.read<i32>();
+        if (!binder.cancelBuffer(slot))
+            b_result = BinderResult::BadValue;
         break;
     }
     case TransactCode::Query: {
@@ -224,7 +233,7 @@ void IHOSBinderDriver::transactParcelImpl(
             .width = res.x(),
             .height = res.y(),
             .transform_hint = 0,                                     // HACK
-            .num_pending_buffers = display::MAX_BINDER_BUFFER_COUNT, // HACK
+            .num_pending_buffers = binder.getPendingBufferCount(),
         });
 
         break;
@@ -243,8 +252,11 @@ void IHOSBinderDriver::transactParcelImpl(
 
         // Input buffer
         auto buffer = parcel_reader.readStrongPointer<display::GraphicBuffer>();
+        // A null buffer frees the slot
         if (buffer == nullptr) {
-            LOG_ERROR(Services, "No graphic buffer");
+            if (slot >= 0 &&
+                slot < static_cast<i32>(display::MAX_BINDER_BUFFER_COUNT))
+                binder.removeBuffer(slot);
             break;
         }
 
@@ -261,7 +273,8 @@ void IHOSBinderDriver::transactParcelImpl(
                   plane.size);
 #endif
 
-        binder.addBuffer(slot, *buffer);
+        if (!binder.addBuffer(slot, *buffer))
+            b_result = BinderResult::BadValue;
 
         break;
     }

@@ -24,10 +24,10 @@ void emitFadd(DecoderContext& context, pred_t pred, bool pred_inv,
         context.builder.opEndIf();
 }
 
-// TODO: round_mode, fmz, write_cc
+// TODO: round_mode, write_cc
 void emitFmul(DecoderContext& context, pred_t pred, bool pred_inv,
               MultiplyScale scale, bool saturate, reg_t dst, reg_t src_a,
-              ir::Value src_b, bool neg_b) {
+              ir::Value src_b, bool neg_b, u32 fmz) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v = ir::Value::createRegister(src_a, ir::ScalarType::F32);
@@ -59,8 +59,15 @@ void emitFmul(DecoderContext& context, pred_t pred, bool pred_inv,
             src_a_v, ir::Value::createConstantF(scale_f));
     }
 
-    auto res = context.builder.opMultiply(src_a_v,
-                                          negIf(context.builder, src_b, neg_b));
+    const auto src_b_v = negIf(context.builder, src_b, neg_b);
+    auto res = context.builder.opMultiply(src_a_v, src_b_v);
+    if (fmz == 2 && !saturate) {
+        const auto zero = ir::Value::createConstantF(0.0f);
+        const auto any_zero = context.builder.opBitwiseOr(
+            context.builder.opCompareEqual(src_a_v, zero),
+            context.builder.opCompareEqual(src_b_v, zero));
+        res = context.builder.opSelect(any_zero, zero, res);
+    }
     res = saturateIf(context.builder, res, saturate);
     context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::F32),
                            res);
@@ -72,7 +79,8 @@ void emitFmul(DecoderContext& context, pred_t pred, bool pred_inv,
 // TODO: round_mode, ftz, write_cc
 void emitFfma(DecoderContext& context, pred_t pred, bool pred_inv,
               bool saturate, reg_t dst, reg_t src_a, bool neg_a,
-              ir::Value src_b, bool neg_b, ir::Value src_c, bool neg_c) {
+              ir::Value src_b, bool neg_b, ir::Value src_c, bool neg_c,
+              u32 fmz) {
     const auto conditional = handlePredCond(context.builder, pred, pred_inv);
 
     auto src_a_v =
@@ -82,6 +90,13 @@ void emitFfma(DecoderContext& context, pred_t pred, bool pred_inv,
     auto src_c_v = negIf(context.builder, src_c, neg_c);
 
     auto res = context.builder.opFma(src_a_v, src_b_v, src_c_v);
+    if (fmz == 2 && !saturate) {
+        const auto zero = ir::Value::createConstantF(0.0f);
+        const auto any_zero = context.builder.opBitwiseOr(
+            context.builder.opCompareEqual(src_a_v, zero),
+            context.builder.opCompareEqual(src_b_v, zero));
+        res = context.builder.opSelect(any_zero, src_c_v, res);
+    }
     res = saturateIf(context.builder, res, saturate);
     context.builder.opCopy(ir::Value::createRegister(dst, ir::ScalarType::F32),
                            res);
@@ -128,7 +143,7 @@ void emitFmulR(DecoderContext& context, InstFmulR inst) {
     emitFmul(context, inst.base.pred, inst.base.pred_inv, inst.base.scale,
              inst.base.sat, inst.base.dst, inst.base.src_a,
              ir::Value::createRegister(inst.src_b, ir::ScalarType::F32),
-             inst.base.neg_b);
+             inst.base.neg_b, inst.base.fmz);
 }
 
 void emitFmulC(DecoderContext& context, InstFmulC inst) {
@@ -138,7 +153,7 @@ void emitFmulC(DecoderContext& context, InstFmulC inst) {
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
             ir::ScalarType::F32),
-        inst.base.neg_b);
+        inst.base.neg_b, inst.base.fmz);
 }
 
 void emitFmulI(DecoderContext& context, InstFmulI inst) {
@@ -146,13 +161,13 @@ void emitFmulI(DecoderContext& context, InstFmulI inst) {
         context, inst.base.pred, inst.base.pred_inv, inst.base.scale,
         inst.base.sat, inst.base.dst, inst.base.src_a,
         ir::Value::createConstantF(getFloatImm20(inst.imm20_0, inst.imm20_19)),
-        inst.base.neg_b);
+        inst.base.neg_b, inst.base.fmz);
 }
 
 void emitFmul32I(DecoderContext& context, InstFmul32I inst) {
     emitFmul(context, inst.pred, inst.pred_inv, MultiplyScale::None, inst.sat,
              inst.dst, inst.src_a,
-             ir::Value::createConstant(inst.imm, ir::ScalarType::F32), false);
+             ir::Value::createConstant(inst.imm, ir::ScalarType::F32), false, inst.fmz);
 }
 
 void emitFfmaR(DecoderContext& context, InstFfmaR inst) {
@@ -161,7 +176,7 @@ void emitFfmaR(DecoderContext& context, InstFfmaR inst) {
              ir::Value::createRegister(inst.src_b, ir::ScalarType::F32),
              inst.base.neg_b,
              ir::Value::createRegister(inst.src_c, ir::ScalarType::F32),
-             inst.base.neg_c);
+             inst.base.neg_c, inst.base.fmz);
 }
 
 void emitFfmaRC(DecoderContext& context, InstFfmaRC inst) {
@@ -173,7 +188,7 @@ void emitFfmaRC(DecoderContext& context, InstFfmaRC inst) {
         ir::Value::createConstMemory(
             CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
             ir::ScalarType::F32),
-        inst.base.neg_c);
+        inst.base.neg_c, inst.base.fmz);
 }
 
 void emitFfmaC(DecoderContext& context, InstFfmaC inst) {
@@ -185,7 +200,7 @@ void emitFfmaC(DecoderContext& context, InstFfmaC inst) {
             ir::ScalarType::F32),
         inst.base.neg_b,
         ir::Value::createRegister(inst.src_c, ir::ScalarType::F32),
-        inst.base.neg_c);
+        inst.base.neg_c, inst.base.fmz);
 }
 
 void emitFfmaI(DecoderContext& context, InstFfmaI inst) {
@@ -195,7 +210,7 @@ void emitFfmaI(DecoderContext& context, InstFfmaI inst) {
         ir::Value::createConstantF(getFloatImm20(inst.imm20_0, inst.imm20_19)),
         inst.base.neg_b,
         ir::Value::createRegister(inst.src_c, ir::ScalarType::F32),
-        inst.base.neg_c);
+        inst.base.neg_c, inst.base.fmz);
 }
 
 void emitFfma32I(DecoderContext& context, InstFfma32I inst) {
@@ -203,7 +218,7 @@ void emitFfma32I(DecoderContext& context, InstFfma32I inst) {
              inst.neg_a,
              ir::Value::createConstant(inst.imm, ir::ScalarType::F32), false,
              ir::Value::createRegister(inst.dst, ir::ScalarType::F32),
-             inst.neg_c);
+             inst.neg_c, inst.fmz);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

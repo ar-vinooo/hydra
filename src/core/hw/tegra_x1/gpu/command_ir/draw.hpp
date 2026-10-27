@@ -1,0 +1,119 @@
+#pragma once
+
+#include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
+
+#include "core/hw/tegra_x1/gpu/command_ir/resource_set.hpp"
+
+#include "core/hw/tegra_x1/gpu/renderer/texture_binding.hpp"
+
+#include <vector>
+
+namespace hydra::hw::tegra_x1::gpu {
+class GMmu;
+}
+
+namespace hydra::hw::tegra_x1::gpu::renderer {
+class PipelineBase;
+class RenderPassBase;
+class SamplerBase;
+} // namespace hydra::hw::tegra_x1::gpu::renderer
+
+namespace hydra::hw::tegra_x1::gpu::command_ir {
+
+struct BufferBinding {
+    u32 index;
+    renderer::BufferView buffer;
+};
+
+using TextureBinding = renderer::TextureBinding;
+
+// Bindings of a draw: vertex, fragment, geometry and tessellation stages
+constexpr usize DRAW_STAGE_COUNT = 5;
+inline renderer::ShaderType getDrawStageShaderType(usize index) {
+    constexpr renderer::ShaderType TYPES[DRAW_STAGE_COUNT] = {
+        renderer::ShaderType::Vertex, renderer::ShaderType::Fragment,
+        renderer::ShaderType::Geometry, renderer::ShaderType::TessControl,
+        renderer::ShaderType::TessEvaluation};
+    return TYPES[index];
+}
+
+struct StageBindings {
+    bool active{false};
+    // Producer snapshots inherited slots when descriptor pools are absent.
+    bool reset_textures{false};
+    std::vector<BufferBinding> uniforms;
+    std::vector<BufferBinding> storage;
+    std::vector<TextureBinding> textures;
+};
+
+// Host-resolved command, consumed synchronously before caches or mappings
+// change. Cache resources and owned buffers carry leases; external raw
+// resources still require caller ownership through encoding.
+struct DrawCommand {
+    CommandOrigin origin;
+    renderer::PipelineBase* pipeline{nullptr};
+    renderer::RenderPassBase* render_pass{nullptr};
+    renderer::DrawState state{};
+    bool occlusion_enabled{false};
+    std::array<renderer::BufferView, VERTEX_ARRAY_COUNT> vertices{};
+    std::array<StageBindings, DRAW_STAGE_COUNT> stages{};
+    std::vector<ztd::Range<uptr>> storage_writes;
+    std::vector<ResourceReference> resource_refs;
+    std::vector<std::shared_ptr<void>> resource_owners;
+    usize direct_resource_count{0};
+    GMmu* address_space{nullptr};
+    resource::ResourceHandle address_space_handle;
+    u64 mapping_generation{0};
+    std::vector<resource::MappingDependency> mapping_dependencies;
+    bool resources_sealed{false};
+    // Guest memory read and written, versioned when the command was sealed
+    resource::ContentManifest contents;
+
+    engines::PrimitiveType primitive{engines::PrimitiveType::Triangles};
+    engines::IndexType index_type{engines::IndexType::None};
+    renderer::BufferView indices;
+    u32 first{0};
+    u32 count{0};
+    u32 base_vertex{0};
+    u32 base_instance{0};
+    u32 instance_count{1};
+};
+
+void captureDrawAddressSpace(renderer::IRenderer& renderer,
+                             DrawCommand& command, GMmu* address_space);
+bool sealDrawResources(renderer::IRenderer& renderer, DrawCommand& command);
+bool validateDrawResources(renderer::IRenderer& renderer,
+                           const DrawCommand& command);
+// Whether every byte the draw reads is still what it was when sealed. A draw
+// executed later than it was prepared (deferred or reordered) needs this, or
+// a snapshot of what it read.
+bool validateDrawContents(renderer::IRenderer& renderer,
+                          const DrawCommand& command);
+
+enum class DrawExecution {
+    // Executed later than sealed: the resources are validated again
+    Validate,
+    // Sealed right before, with nothing in between that could retire its
+    // resources
+    Sealed,
+    // Sealed and its guest writes issued at sealing (DrawQueue), which
+    // syncs everything that could change its resources
+    Deferred,
+};
+
+bool executeDraw(renderer::IRenderer& renderer,
+                 renderer::ICommandBuffer* command_buffer,
+                 const DrawCommand& command,
+                 DrawExecution execution = DrawExecution::Validate);
+// Whether executeDraw can encode a sealed command (not counting resource
+// validation)
+bool canExecuteDraw(const DrawCommand& command,
+                    const renderer::ICommandBuffer* command_buffer);
+// Records the guest memory the draw writes, in decode order. executeDraw does
+// it unless the draw is deferred.
+void issueDrawWrites(renderer::IRenderer& renderer,
+                     renderer::ICommandBuffer* command_buffer,
+                     const DrawCommand& command);
+
+} // namespace hydra::hw::tegra_x1::gpu::command_ir

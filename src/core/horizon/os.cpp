@@ -125,9 +125,10 @@ uint2 roundUpToNearestStandardResolution(uint2 surface_resolution) {
 
 OS::OS(System& system_)
     : system{system_}, kernel(system), nvservices_server(system),
-      others_server(system), display_driver(system),
-      hid_resource_manager(system), shared_font_manager(system),
-      time_manager(system), ir_sensor_manager(system) {
+      others_server(system), display_server(system), socket_server(system),
+      display_driver(system), hid_resource_manager(system),
+      shared_font_manager(system), time_manager(system),
+      ir_sensor_manager(system) {
     // Sysmodules
     const auto& sysmodules_path = CONFIG_INSTANCE.getSysmodulesPath();
     if (std::filesystem::exists(sysmodules_path)) {
@@ -214,10 +215,10 @@ OS::OS(System& system_)
     // PCV
     REGISTER_SERVICE(others, pcv::IPcvService, "pcv");
 
-    // Socket
-    REGISTER_SERVICE(others, socket::IClient, "bsd:u", "bsd:s", "bsd:a");
+    // Socket (a server of their own, as socket calls can block)
+    REGISTER_SERVICE(socket, socket::IClient, "bsd:u", "bsd:s", "bsd:a");
     REGISTER_SERVICE(others, nsd::IManager, "nsd:u", "nsd:a");
-    REGISTER_SERVICE(others, socket::resolver::IResolver, "sfdnsres");
+    REGISTER_SERVICE(socket, socket::resolver::IResolver, "sfdnsres");
 
     // Capsrv
     REGISTER_SERVICE(others, mmnv::IRequest, "mm:u");
@@ -229,7 +230,7 @@ OS::OS(System& system_)
     REGISTER_SERVICE(others, lbl::ILblController, "lbl");
 
     // Nvnflinger
-    REGISTER_SERVICE(others, hosbinder::IHOSBinderDriver, "dispdrv");
+    REGISTER_SERVICE(display, hosbinder::IHOSBinderDriver, "dispdrv");
 
     // PTM
     REGISTER_SERVICE(others, psm::IPsmServer, "psm");
@@ -284,7 +285,7 @@ OS::OS(System& system_)
     REGISTER_SERVICE(others, settings::IFactorySettingsServer, "set:cal");
 
     // Ssl
-    REGISTER_SERVICE(others, ssl::sf::ISslService, "ssl");
+    REGISTER_SERVICE(socket, ssl::sf::ISslService, "ssl");
 
     // Spl
     REGISTER_SERVICE(others, spl::IRandomInterface, "csrng");
@@ -312,6 +313,9 @@ OS::OS(System& system_)
     REGISTER_SERVICE(others, lm::ILogService, "lm");
 
     others_server.start();
+    display_server.start();
+    socket_server.start();
+    display_driver.startVSync();
 
     // Sysmodules
     if (std::filesystem::exists(sysmodules_path)) {
@@ -346,6 +350,8 @@ void OS::notifyOperationModeChanged() {
     for (auto& it : kernel.getProcessManager()) {
         it->getAppletState().sendMessage(
             kernel::AppletMessage::OperationModeChanged);
+        it->getAppletState().sendMessage(
+            kernel::AppletMessage::PerformanceModeChanged);
     }
 }
 
@@ -359,6 +365,8 @@ uint2 OS::getDisplayResolution() const {
         return {1280, 720}; // Handheld display resolution is fixed
     } else {
         switch (CONFIG_INSTANCE.getDisplayResolution()) {
+        case Resolution::Console:
+            return {1920, 1080}; // Docked
         case Resolution::Auto:
             return roundUpToNearestStandardResolution(surface_resolution);
         case Resolution::_720p:

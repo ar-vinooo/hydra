@@ -9,6 +9,7 @@ PageAllocator::PageAllocator(paddr_t base_pa_, usize page_count)
 
 PageAllocator::~PageAllocator() {
     for (const auto allocation : allocations) {
+        HV_ASSERT_SUCCESS(hv_vm_unmap(allocation.pa, GUEST_PAGE_SIZE * allocation.page_count));
         freeVmMemory(allocation.ptr, GUEST_PAGE_SIZE * allocation.page_count);
     }
 }
@@ -37,7 +38,7 @@ void PageAllocator::allocate(usize page_count) {
     HV_ASSERT_SUCCESS(
         hv_vm_map(reinterpret_cast<void*>(ptr), pa, size, HV_MEMORY_READ));
 
-    allocations.push_back({.ptr = ptr, .page_count = page_count});
+    allocations.push_back({.ptr = ptr, .pa = pa, .page_count = page_count});
 }
 
 } // namespace hydra::hw::tegra_x1::cpu::hypervisor

@@ -1,6 +1,8 @@
 #include "core/horizon/display/driver.hpp"
 
+#include "common/config.hpp"
 #include "core/system.hpp"
+#include "core/horizon/display/vsync_schedule.hpp"
 
 namespace hydra::horizon::display {
 
@@ -9,13 +11,47 @@ Driver::Driver(System& system_) : system{system_} {
                  "Fail to create display");
 }
 
+void Driver::startVSync() {
+    if (vsync_thread.joinable())
+        return;
+    // Above 60, the guest display refreshes at the frame rate limit (1000 Hz
+    // for unlimited), for titles that pace themselves on its vsync
+    const u32 limit = CONFIG_INSTANCE.getFrameRateLimit();
+    const u32 rate = limit == 0 ? 1000 : std::max(limit, 60u);
+    vsync_thread = std::jthread([this, rate](std::stop_token stop) {
+        using Clock = std::chrono::steady_clock;
+        VSyncSchedule schedule(Clock::now(), rate);
+        std::unique_lock lock(vsync_mutex);
+        while (!stop.stop_requested()) {
+            vsync_cv.wait_until(lock, stop, schedule.nextDeadline(),
+                               [] { return false; });
+            if (stop.stop_requested())
+                break;
+            if (schedule.advance(Clock::now())) {
+                lock.unlock();
+                signalVSync();
+                lock.lock();
+            }
+        }
+    });
+}
+
+void Driver::stopVSync() {
+    if (vsync_thread.joinable()) {
+        vsync_thread.request_stop();
+        vsync_cv.notify_all();
+        vsync_thread.join();
+    }
+}
+
 bool Driver::acquirePresentTextures(
     hw::tegra_x1::gpu::renderer::ICommandBuffer* command_buffer) {
     bool acquired = false;
     {
         std::scoped_lock lock(layer_mutex);
         for (const auto& layer : layer_pool) {
-            acquired |= layer->acquirePresentTexture(command_buffer);
+            if (layer->isVisible())
+                acquired |= layer->acquirePresentTexture(command_buffer);
         }
     }
 
@@ -29,6 +65,8 @@ void Driver::present(
     std::scoped_lock lock(layer_mutex);
     std::vector<Layer*> sorted_layers;
     for (const auto& layer : layer_pool) {
+        if (!layer->isVisible())
+            continue;
         // Find the correct position
         bool inserted = false;
         for (u32 i = 0; i < sorted_layers.size(); i++) {
@@ -65,6 +103,12 @@ void Driver::present(
     for (u32 i = 0; i < sorted_layers.size(); i++)
         sorted_layers[i]->present(command_buffer, compositor, dst_rect,
                                   dst_scale, i != 0);
+}
+
+void Driver::shutdownQueues() {
+    std::scoped_lock lock(binder_mutex);
+    for (const auto& binder : binder_pool)
+        binder->unqueueAllBuffers();
 }
 
 void Driver::signalVSync() {

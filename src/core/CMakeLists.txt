@@ -1,7 +1,26 @@
 add_library(hydra-core
+    execution/work_manager.cpp
+    execution/work_manager.hpp
+    hot/hot_reload.cpp
+    hot/table.cpp
+    hot/routes.cpp
+    hot/table.hpp
+    hot/texture_cache_hot.cpp
+    hw/tegra_x1/gpu/visual_diagnostics.cpp
+    hw/tegra_x1/gpu/visual_diagnostics.hpp
+    hw/tegra_x1/gpu/optimization_policy.cpp
+    hw/tegra_x1/gpu/optimization_policy.hpp
+    hw/tegra_x1/gpu/resource/range_set.hpp
+    video/submit_trace.cpp
+    video/submit_trace.hpp
+    video/submit.hpp
+    video/host1x.hpp
+    video/h264.hpp
     horizon/const.hpp
     horizon/handle_pool.hpp
     horizon/os.cpp
+    horizon/online/online.cpp
+    horizon/online/online.hpp
     horizon/os.hpp
     horizon/kernel/const.hpp
     horizon/kernel/applet_resource.hpp
@@ -61,6 +80,14 @@ add_library(hydra-core
     horizon/filesystem/partition_filesystem.hpp
     horizon/filesystem/content_archive.cpp
     horizon/filesystem/content_archive.hpp
+    horizon/filesystem/bktr.cpp
+    horizon/filesystem/compressed_storage.cpp
+    horizon/filesystem/compressed_storage.hpp
+    horizon/filesystem/bktr.hpp
+    horizon/filesystem/nca_file.cpp
+    horizon/filesystem/nca_file.hpp
+    horizon/filesystem/ncz_file.cpp
+    horizon/filesystem/ncz_file.hpp
     horizon/filesystem/romfs/const.hpp
     horizon/filesystem/romfs/parser.cpp
     horizon/filesystem/romfs/parser.hpp
@@ -76,6 +103,9 @@ add_library(hydra-core
     horizon/loader/nso_loader.hpp
     horizon/loader/nca_loader.cpp
     horizon/loader/nca_loader.hpp
+    horizon/loader/xci_loader.cpp
+    horizon/loader/xci_loader.hpp
+    horizon/loader/content_package.hpp
     horizon/loader/nx_loader.cpp
     horizon/loader/nx_loader.hpp
     horizon/loader/homebrew_loader.cpp
@@ -289,6 +319,8 @@ add_library(hydra-core
     horizon/services/account/notifier.cpp
     horizon/services/account/notifier.hpp
     horizon/services/account/account_service.cpp
+    horizon/services/account/async_context.cpp
+    horizon/services/account/async_context.hpp
     horizon/services/account/account_service.hpp
     horizon/services/account/account_service_for_administrator.cpp
     horizon/services/account/account_service_for_administrator.hpp
@@ -310,6 +342,8 @@ add_library(hydra-core
     horizon/services/apm/session.cpp
     horizon/services/apm/session.hpp
     horizon/services/socket/client.cpp
+    horizon/services/socket/host_sockets.cpp
+    horizon/services/socket/host_sockets.hpp
     horizon/services/socket/client.hpp
     horizon/services/socket/resolver/resolver.cpp
     horizon/services/socket/resolver/resolver.hpp
@@ -325,6 +359,8 @@ add_library(hydra-core
     horizon/services/audio/audio_renderer_manager.cpp
     horizon/services/audio/audio_renderer_manager.hpp
     horizon/services/ssl/sf/const.hpp
+    horizon/services/ssl/sf/ssl_connection.cpp
+    horizon/services/ssl/sf/ssl_connection.hpp
     horizon/services/ssl/sf/ssl_context.cpp
     horizon/services/ssl/sf/ssl_context.hpp
     horizon/services/ssl/sf/ssl_service.cpp
@@ -452,6 +488,9 @@ add_library(hydra-core
     horizon/ui/handler_base.hpp
     audio/const.hpp
     audio/stream.hpp
+    audio/pcm_queue.hpp
+    audio/sample_clock.hpp
+    audio/sample_decoder.hpp
     audio/core.hpp
     audio/null/stream.hpp
     audio/null/core.cpp
@@ -463,6 +502,7 @@ add_library(hydra-core
     hw/tegra_x1/cpu/memory.hpp
     hw/tegra_x1/cpu/mmu.cpp
     hw/tegra_x1/cpu/mmu.hpp
+    hw/tegra_x1/cpu/register_sync.hpp
     hw/tegra_x1/cpu/thread.cpp
     hw/tegra_x1/cpu/thread.hpp
     hw/tegra_x1/cpu/cpu.hpp
@@ -481,6 +521,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/gmmu.hpp
     hw/tegra_x1/gpu/pfifo.cpp
     hw/tegra_x1/gpu/pfifo.hpp
+    hw/tegra_x1/gpu/management/metal_submission.cpp
+    hw/tegra_x1/gpu/management/metal_submission.hpp
     hw/tegra_x1/gpu/gpu.cpp
     hw/tegra_x1/gpu/gpu.hpp
     hw/tegra_x1/gpu/engines/const.hpp
@@ -489,6 +531,30 @@ add_library(hydra-core
     hw/tegra_x1/gpu/engines/inline_base.hpp
     hw/tegra_x1/gpu/engines/3d.cpp
     hw/tegra_x1/gpu/engines/3d.hpp
+    hw/tegra_x1/gpu/capture/draw_capture.cpp
+    hw/tegra_x1/gpu/capture/draw_capture.hpp
+    hw/tegra_x1/gpu/capture/guest_events.cpp
+    hw/tegra_x1/gpu/capture/guest_events.hpp
+    hw/tegra_x1/gpu/command_ir/draw.cpp
+    hw/tegra_x1/gpu/command_ir/draw.hpp
+    hw/tegra_x1/gpu/command_ir/resource_set.cpp
+    hw/tegra_x1/gpu/command_ir/resource_set.hpp
+    hw/tegra_x1/gpu/command_ir/clear.cpp
+    hw/tegra_x1/gpu/command_ir/clear.hpp
+    hw/tegra_x1/gpu/command_ir/copy.cpp
+    hw/tegra_x1/gpu/command_ir/copy.hpp
+    hw/tegra_x1/gpu/command_ir/compute.cpp
+    hw/tegra_x1/gpu/command_ir/compute.hpp
+    hw/tegra_x1/gpu/command_ir/compute_limits.hpp
+    hw/tegra_x1/gpu/resource/resource_lifetime.hpp
+    hw/tegra_x1/gpu/resource/resource_registry.hpp
+    hw/tegra_x1/gpu/resource/resource_registry.cpp
+    hw/tegra_x1/gpu/resource/content_version.hpp
+    hw/tegra_x1/gpu/resource/content_version.cpp
+    hw/tegra_x1/gpu/resource/mapping_capture.hpp
+    hw/tegra_x1/gpu/resource/mapping_capture.cpp
+    hw/tegra_x1/gpu/renderer/draw_state.cpp
+    hw/tegra_x1/gpu/renderer/draw_state.hpp
     hw/tegra_x1/gpu/engines/compute.cpp
     hw/tegra_x1/gpu/engines/compute.hpp
     hw/tegra_x1/gpu/engines/inline.cpp
@@ -513,6 +579,7 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/block.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/function.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/ir/builder.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/ir/intrinsic.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/const.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.hpp
@@ -528,6 +595,11 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_min_max.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_logical.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_logical.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/integer_misc.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/double_arithmetic.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/video.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/video.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/comparison_helper.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/float_comparison.hpp
@@ -548,6 +620,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/texture.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/warp.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/compute.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/compute.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/warp.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/exit.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/exit.hpp
@@ -564,6 +638,8 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/emitter.hpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.cpp
     hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/intrinsics.cpp
+    hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/intrinsics.hpp
     hw/tegra_x1/gpu/renderer/const.cpp
     hw/tegra_x1/gpu/renderer/const.hpp
     hw/tegra_x1/gpu/renderer/command_buffer.hpp
@@ -574,11 +650,14 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/buffer_cache.hpp
     hw/tegra_x1/gpu/renderer/texture.hpp
     hw/tegra_x1/gpu/renderer/texture_view.cpp
+    hw/tegra_x1/gpu/renderer/texture_binding.hpp
     hw/tegra_x1/gpu/renderer/texture_view.hpp
     hw/tegra_x1/gpu/renderer/texture_cache.cpp
     hw/tegra_x1/gpu/renderer/texture_cache.hpp
     hw/tegra_x1/gpu/renderer/sampler_base.hpp
     hw/tegra_x1/gpu/renderer/sampler_cache.cpp
+    hw/tegra_x1/gpu/renderer/draw_queue.cpp
+    hw/tegra_x1/gpu/renderer/draw_queue.hpp
     hw/tegra_x1/gpu/renderer/sampler_cache.hpp
     hw/tegra_x1/gpu/renderer/render_pass_base.hpp
     hw/tegra_x1/gpu/renderer/render_pass_cache.cpp
@@ -606,11 +685,26 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/impl.cpp
     hw/tegra_x1/gpu/renderer/metal/command_buffer.cpp
     hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp
+    hw/tegra_x1/gpu/renderer/metal/completion_queue.cpp
+    hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp
+    hw/tegra_x1/gpu/renderer/metal/occlusion.cpp
+    hw/tegra_x1/gpu/renderer/metal/occlusion.hpp
+    hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.cpp
+    hw/tegra_x1/gpu/renderer/metal/gpu_pass_profiler.hpp
+    hw/tegra_x1/gpu/renderer/metal/encoder.cpp
+    hw/tegra_x1/gpu/renderer/metal/encoder.hpp
+    hw/tegra_x1/gpu/renderer/metal/frame_presenter.cpp
+    hw/tegra_x1/gpu/renderer/metal/frame_presenter.hpp
+    hw/tegra_x1/gpu/renderer/metal/mtl4_context.cpp
+    hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp
+    hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.cpp
+    hw/tegra_x1/gpu/renderer/metal/spatial_upscaler.hpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.cpp
     hw/tegra_x1/gpu/renderer/metal/surface_compositor.hpp
     hw/tegra_x1/gpu/renderer/metal/buffer.cpp
     hw/tegra_x1/gpu/renderer/metal/buffer.hpp
     hw/tegra_x1/gpu/renderer/metal/texture.cpp
+    hw/tegra_x1/gpu/renderer/metal/texture_io.cpp
     hw/tegra_x1/gpu/renderer/metal/texture.hpp
     hw/tegra_x1/gpu/renderer/metal/texture_view.cpp
     hw/tegra_x1/gpu/renderer/metal/texture_view.hpp
@@ -618,13 +712,19 @@ add_library(hydra-core
     hw/tegra_x1/gpu/renderer/metal/sampler.hpp
     hw/tegra_x1/gpu/renderer/metal/render_pass.cpp
     hw/tegra_x1/gpu/renderer/metal/render_pass.hpp
+    hw/tegra_x1/gpu/renderer/metal/shader_library_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/shader.cpp
     hw/tegra_x1/gpu/renderer/metal/shader.hpp
     hw/tegra_x1/gpu/renderer/metal/pipeline.cpp
     hw/tegra_x1/gpu/renderer/metal/pipeline.hpp
+    hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/binary_archive_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.cpp
     hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.cpp
+    hw/tegra_x1/gpu/renderer/metal/msaa_converter.cpp
+    hw/tegra_x1/gpu/renderer/metal/msaa_converter.hpp
     hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp
     hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.cpp
     hw/tegra_x1/gpu/renderer/metal/clear_color_pipeline_cache.hpp
@@ -672,12 +772,14 @@ set_source_files_properties(c_api.cpp c_api.h PROPERTIES
 if (HYPERVISOR_ENABLED)
     target_sources(hydra-core PRIVATE
         hw/tegra_x1/cpu/hypervisor/const.hpp
+        hw/tegra_x1/cpu/hypervisor/counter_emulation.hpp
         hw/tegra_x1/cpu/hypervisor/page_allocator.cpp
         hw/tegra_x1/cpu/hypervisor/page_allocator.hpp
         hw/tegra_x1/cpu/hypervisor/page_table.cpp
         hw/tegra_x1/cpu/hypervisor/page_table.hpp
         hw/tegra_x1/cpu/hypervisor/memory.hpp
         hw/tegra_x1/cpu/hypervisor/mmu.cpp
+        hw/tegra_x1/cpu/hypervisor/stage2_tracker.cpp
         hw/tegra_x1/cpu/hypervisor/mmu.hpp
         hw/tegra_x1/cpu/hypervisor/thread.cpp
         hw/tegra_x1/cpu/hypervisor/thread.hpp
@@ -707,9 +809,10 @@ if (SDL_ENABLED)
     )
 endif ()
 
+include("${CMAKE_SOURCE_DIR}/cmake/GpuOptimizationGate.cmake")
 target_include_directories(hydra-core SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/externals/libyaz0/include)
 # TODO: only link Apple frameworks if Apple
-target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common)
+target_link_libraries(hydra-core PRIVATE hydra_compile_options "-framework Foundation" "-framework Metal" "-framework MetalFX" "-framework QuartzCore" "-framework GameController" dynarmic hatch libyaz0 nx2elf date::date date::date-tz hydra-common libzstd_static)
 
 if (HYPERVISOR_ENABLED)
     target_link_libraries(hydra-core PRIVATE "-framework Hypervisor")
@@ -731,4 +834,47 @@ if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
 endif ()
 
+# Opus decoding for the hardware Opus decoder service; optional
+find_path(HYDRA_OPUS_INCLUDE opus.h
+    HINTS "${Opus_ROOT}/include/opus" "${Opus_ROOT}/include"
+          /opt/homebrew/include/opus /usr/local/include/opus)
+find_library(HYDRA_OPUS_LIBRARY NAMES opus
+    HINTS "${Opus_ROOT}/lib" /opt/homebrew/lib /usr/local/lib)
+if (HYDRA_OPUS_INCLUDE AND HYDRA_OPUS_LIBRARY)
+    target_compile_definitions(hydra-core PRIVATE HYDRA_OPUS_ENABLED=1)
+    target_include_directories(hydra-core SYSTEM PRIVATE "${HYDRA_OPUS_INCLUDE}")
+    target_link_libraries(hydra-core PRIVATE "${HYDRA_OPUS_LIBRARY}")
+else ()
+    message(WARNING "libopus not found (set Opus_ROOT); Opus audio will be silent")
+endif ()
+
 # TODO: link luft if AIR shader backend is enabled
+if (HYDRA_FFMPEG_VIDEO)
+    target_compile_definitions(hydra-core PRIVATE HYDRA_FFMPEG_VIDEO=1)
+    # An explicit prefix also works on systems without pkg-config, and keeps
+    # FFmpeg optional for existing macOS/iOS build configurations.
+    find_path(HYDRA_FFMPEG_INCLUDE libavcodec/avcodec.h
+        HINTS "${FFmpeg_ROOT}/include" /opt/homebrew/opt/ffmpeg/include)
+    foreach (component avcodec avutil swscale)
+        find_library(HYDRA_FFMPEG_${component}_LIBRARY NAMES ${component}
+            HINTS "${FFmpeg_ROOT}/lib" /opt/homebrew/opt/ffmpeg/lib)
+        if (NOT HYDRA_FFMPEG_${component}_LIBRARY)
+            message(FATAL_ERROR "FFmpeg ${component} library not found; set FFmpeg_ROOT")
+        endif ()
+    endforeach ()
+    if (NOT HYDRA_FFMPEG_INCLUDE)
+        message(FATAL_ERROR "FFmpeg headers not found; set FFmpeg_ROOT")
+    endif ()
+    add_library(hydra-video STATIC video/decoder.cpp video/decoder.hpp)
+    target_include_directories(hydra-video PUBLIC "${CMAKE_SOURCE_DIR}/src")
+    target_include_directories(hydra-video SYSTEM PRIVATE "${HYDRA_FFMPEG_INCLUDE}")
+    target_link_libraries(hydra-video PRIVATE hydra_compile_options
+        "${HYDRA_FFMPEG_avcodec_LIBRARY}" "${HYDRA_FFMPEG_avutil_LIBRARY}"
+        "${HYDRA_FFMPEG_swscale_LIBRARY}")
+    if (APPLE)
+        target_link_libraries(hydra-video PRIVATE "-framework VideoToolbox"
+            "-framework CoreMedia" "-framework CoreVideo"
+            "-framework CoreFoundation")
+    endif()
+    target_link_libraries(hydra-core PRIVATE hydra-video)
+endif ()

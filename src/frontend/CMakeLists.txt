@@ -42,6 +42,8 @@ elseif (FRONTEND STREQUAL "SwiftUI")
         swiftui/GridGamePreview.swift
         swiftui/GamePreviewContainer.swift
         swiftui/GameExtractButton.swift
+        swiftui/GameOnlineSettingsView.swift
+        swiftui/RyuNetAccount.swift
         swiftui/GameListView.swift
         swiftui/GameStopView.swift
         swiftui/helpers/Error.swift
@@ -58,6 +60,7 @@ elseif (FRONTEND STREQUAL "SwiftUI")
         swiftui/settings/LoaderPluginView.swift
         swiftui/settings/LoaderPluginListView.swift
         swiftui/settings/GeneralSettingsView.swift
+        swiftui/settings/KeysImportButton.swift
         swiftui/settings/InputSettingsView.swift
         swiftui/settings/CpuSettingsView.swift
         swiftui/settings/GraphicsSettingsView.swift

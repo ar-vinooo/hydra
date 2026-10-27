@@ -1,5 +1,9 @@
 #pragma once
 
+#include <optional>
+
+#include "ztd/io/stream.hpp"
+
 namespace hydra::horizon::loader {
 
 enum class NpdmFlags : u8 {
@@ -36,5 +40,54 @@ struct NpdmMeta {
     u32 acid_offset;
     u32 acid_size;
 };
+
+// ThreadInfo kernel capability: the cores and priorities a process may use
+struct NpdmThreadInfo {
+    u64 core_mask;
+    u8 highest_priority; // Numerically lowest
+    u8 lowest_priority;
+};
+
+// Reads the ThreadInfo capability from the ACI0 of an NPDM. Layouts from
+// switchbrew (NPDM, Kernel capabilities): ACI0 holds the kernel capability
+// offset and size at 0x30; a ThreadInfo descriptor ends in 0b0111 and holds
+// the lowest priority in bits 4-9, the highest in 10-15 and the core range
+// in 16-23 and 24-31.
+inline std::optional<NpdmThreadInfo>
+readNpdmThreadInfo(ztd::io::IStream& stream, const NpdmMeta& meta) {
+    constexpr u32 ACI0_MAGIC = 0x30494341; // "ACI0"
+    constexpr u64 ACI0_KERNEL_CAPS_OFFSET = 0x30;
+    const u64 size = stream.getSize();
+    if (meta.aci_size < ACI0_KERNEL_CAPS_OFFSET + 8 ||
+        meta.aci_offset + u64(meta.aci_size) > size)
+        return std::nullopt;
+    stream.seekTo(meta.aci_offset);
+    if (stream.read<u32>() != ACI0_MAGIC)
+        return std::nullopt;
+    stream.seekTo(meta.aci_offset + ACI0_KERNEL_CAPS_OFFSET);
+    const u32 caps_offset = stream.read<u32>();
+    const u32 caps_size = stream.read<u32>();
+    if (u64(caps_offset) + caps_size > meta.aci_size)
+        return std::nullopt;
+    stream.seekTo(meta.aci_offset + caps_offset);
+    for (u32 i = 0; i < caps_size / sizeof(u32); i++) {
+        const u32 descriptor = stream.read<u32>();
+        if ((descriptor & 0xf) != 0b0111)
+            continue;
+        const u32 lowest_priority = (descriptor >> 4) & 0x3f;
+        const u32 highest_priority = (descriptor >> 10) & 0x3f;
+        const u32 min_core = (descriptor >> 16) & 0xff;
+        const u32 max_core = (descriptor >> 24) & 0xff;
+        if (highest_priority > lowest_priority || min_core > max_core ||
+            max_core >= 4)
+            return std::nullopt;
+        u64 core_mask = 0;
+        for (u32 core = min_core; core <= max_core; core++)
+            core_mask |= 1ull << core;
+        return NpdmThreadInfo{core_mask, static_cast<u8>(highest_priority),
+                              static_cast<u8>(lowest_priority)};
+    }
+    return std::nullopt;
+}
 
 } // namespace hydra::horizon::loader

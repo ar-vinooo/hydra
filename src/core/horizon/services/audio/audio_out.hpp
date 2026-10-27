@@ -22,6 +22,7 @@ class IAudioOut : public IService {
   public:
     IAudioOut(System& system, PcmFormat format, u32 sample_rate,
               u16 channel_count);
+    ~IAudioOut() override;
 
   protected:
     result_t requestImpl([[maybe_unused]] RequestContext& context,

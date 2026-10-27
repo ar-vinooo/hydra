@@ -37,6 +37,12 @@ result_t ICommonStateGetter::getOperationMode(OperationMode* out_mode) {
     return RESULT_SUCCESS;
 }
 
+result_t ICommonStateGetter::getPerformanceMode(PerformanceMode* out_mode) {
+    *out_mode = CONFIG_INSTANCE.getHandheldMode() ? PerformanceMode::Normal
+                                                  : PerformanceMode::Boost;
+    return RESULT_SUCCESS;
+}
+
 result_t ICommonStateGetter::getDefaultDisplayResolution(System* system,
                                                          i32* out_width,
                                                          i32* out_height) {

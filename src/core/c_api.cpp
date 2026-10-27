@@ -4,16 +4,23 @@
 #include "core/horizon/filesystem/content_archive.hpp"
 #include "core/horizon/filesystem/disk_file.hpp"
 #include "core/horizon/loader/nca_loader.hpp"
+#include "core/horizon/loader/content_package.hpp"
 #include "core/horizon/loader/plugins/manager.hpp"
 #include "core/horizon/services/timesrv/internal/time_zone_manager.hpp"
 #include "core/horizon/ui/handler_base.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
+#include "core/input/player_assignment.hpp"
 #include "core/system.hpp"
 
 #define HYDRA_EXPORT extern "C" __attribute__((visibility("default")))
 
 namespace {
+
+thread_local std::string system_error;
+thread_local std::string filesystem_error;
+thread_local std::string input_error;
+thread_local std::string content_install_result;
 
 HydraString hydraStringFromStringView(std::string_view str) {
     return HydraString{.data = str.data(), .size = str.size()};
@@ -66,7 +73,7 @@ HYDRA_EXPORT uint32_t hydraStringViewListGetCount(const void* list) {
 }
 
 HYDRA_EXPORT HydraString hydraStringViewListGet(const void* list,
-                                                 uint32_t index) {
+                                                uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<const std::vector<std::string_view>*>(list)->at(
             index));
@@ -103,7 +110,7 @@ HYDRA_EXPORT uint32_t hydraStringToStringMapGetCount(const void* map) {
 }
 
 HYDRA_EXPORT HydraString hydraStringToStringMapGetKey(const void* map,
-                                                       uint32_t index) {
+                                                      uint32_t index) {
     auto it = reinterpret_cast<const std::map<std::string, std::string>*>(map)
                   ->begin();
     std::advance(it, index);
@@ -111,15 +118,15 @@ HYDRA_EXPORT HydraString hydraStringToStringMapGetKey(const void* map,
 }
 
 HYDRA_EXPORT HydraString hydraStringToStringMapGetValue(const void* map,
-                                                         uint32_t index) {
+                                                        uint32_t index) {
     auto it = reinterpret_cast<const std::map<std::string, std::string>*>(map)
                   ->begin();
     std::advance(it, index);
     return hydraStringFromStringView(it->second);
 }
 
-HYDRA_EXPORT HydraString
-hydraStringToStringMapGetValueByKey(const void* map, HydraString key) {
+HYDRA_EXPORT HydraString hydraStringToStringMapGetValueByKey(const void* map,
+                                                             HydraString key) {
     return hydraStringFromStringView(
         reinterpret_cast<const std::map<std::string, std::string>*>(map)->at(
             std::string(stringViewFromHydraString(key))));
@@ -219,6 +226,45 @@ HYDRA_EXPORT uint32_t* hydraConfigGetShaderBackend() {
 HYDRA_EXPORT uint32_t* hydraConfigGetDisplayResolution() {
     return reinterpret_cast<uint32_t*>(
         &hydra::CONFIG_INSTANCE.getDisplayResolution());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetMetalApi() {
+    return reinterpret_cast<uint32_t*>(&hydra::CONFIG_INSTANCE.getMetalApi());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetUpscalingFilter() {
+    return reinterpret_cast<uint32_t*>(
+        &hydra::CONFIG_INSTANCE.getUpscalingFilter());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameRateLimit() {
+    return &hydra::CONFIG_INSTANCE.getFrameRateLimit();
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGeneration() {
+    return reinterpret_cast<uint32_t*>(
+        &hydra::CONFIG_INSTANCE.getFrameGeneration());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationRateMode() {
+    return reinterpret_cast<uint32_t*>(
+        &hydra::CONFIG_INSTANCE.getFrameGenerationRateMode());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationTargetFps() {
+    return &hydra::CONFIG_INSTANCE.getFrameGenerationTargetFps();
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationMultiplier() {
+    return &hydra::CONFIG_INSTANCE.getFrameGenerationMultiplier();
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetSharpening() {
+    return &hydra::CONFIG_INSTANCE.getSharpening();
+}
+
+HYDRA_EXPORT bool* hydraConfigGetMetalHud() {
+    return &hydra::CONFIG_INSTANCE.getMetalHud();
 }
 
 HYDRA_EXPORT HydraUint2* hydraConfigGetCustomDisplayResolution() {
@@ -387,9 +433,35 @@ hydraLoaderPluginOptionConfigGetPathContentTypes(const void* config) {
                 ->path_content_types;
 }
 
+HYDRA_EXPORT bool hydraInstallContentPackage(HydraString path) {
+    try {
+        content_install_result = hydra::horizon::loader::installContentPackage(stringViewFromHydraString(path));
+        return true;
+    } catch (const std::exception& error) {
+        content_install_result = error.what();
+        return false;
+    }
+}
+HYDRA_EXPORT HydraString hydraContentInstallGetResult() {
+    return hydraStringFromStringView(content_install_result);
+}
+
 // Filesystem
 HYDRA_EXPORT void* hydraCreateFilesystem() {
-    return new hydra::horizon::filesystem::Filesystem();
+    filesystem_error.clear();
+    try {
+        return new hydra::horizon::filesystem::Filesystem();
+    } catch (const std::exception& error) {
+        filesystem_error = error.what();
+        using namespace hydra;
+        LOG_ERROR(Filesystem, "Unable to load firmware for settings: {}",
+                  error.what());
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraFilesystemGetLastError() {
+    return hydraStringFromStringView(filesystem_error);
 }
 
 HYDRA_EXPORT void hydraFilesystemDestroy(void* fs) {
@@ -406,8 +478,14 @@ HYDRA_EXPORT void hydraFileClose(void* file) {
 }
 
 HYDRA_EXPORT void* hydraCreateContentArchive(void* file) {
-    return new hydra::horizon::filesystem::ContentArchive(
-        reinterpret_cast<hydra::horizon::filesystem::IFile*>(file));
+    try {
+        return new hydra::horizon::filesystem::ContentArchive(
+            reinterpret_cast<hydra::horizon::filesystem::IFile*>(file));
+    } catch (const std::exception& error) {
+        using namespace hydra;
+        LOG_ERROR(Loader, "Could not read NCA: {}", error.what());
+        return nullptr;
+    }
 }
 
 HYDRA_EXPORT void hydraContentArchiveDestroy(void* content_archive) {
@@ -425,8 +503,18 @@ hydraContentArchiveGetContentType(void* content_archive) {
 
 // Time zone manager
 HYDRA_EXPORT void* hydraCreateTimeZoneManager(void* filesystem) {
-    return new hydra::horizon::services::timesrv::internal::TimeZoneManager(
-        *static_cast<hydra::horizon::filesystem::Filesystem*>(filesystem));
+    filesystem_error.clear();
+    if (!filesystem) {
+        filesystem_error = "Filesystem is unavailable.";
+        return nullptr;
+    }
+    try {
+        return new hydra::horizon::services::timesrv::internal::TimeZoneManager(
+            *static_cast<hydra::horizon::filesystem::Filesystem*>(filesystem));
+    } catch (const std::exception& error) {
+        filesystem_error = error.what();
+        return nullptr;
+    }
 }
 
 HYDRA_EXPORT void hydraTimeZoneManagerDestroy(void* manager) {
@@ -444,7 +532,7 @@ HYDRA_EXPORT uint32_t hydraTimeZoneManagerGetLocationCount(void* manager) {
 }
 
 HYDRA_EXPORT HydraString hydraTimeZoneManagerGetLocation(void* manager,
-                                                          uint32_t index) {
+                                                         uint32_t index) {
     // HACK
     auto it =
         static_cast<
@@ -475,6 +563,11 @@ HYDRA_EXPORT void hydraLoaderDestroy(void* loader) {
     delete reinterpret_cast<hydra::horizon::loader::ILoader*>(loader);
 }
 
+HYDRA_EXPORT HydraString hydraLoaderGetLastError() {
+    return hydraStringFromStringView(
+        hydra::horizon::loader::ILoader::getLastError());
+}
+
 HYDRA_EXPORT uint64_t hydraLoaderGetTitleId(void* loader) {
     return reinterpret_cast<hydra::horizon::loader::ILoader*>(loader)
         ->getTitleId();
@@ -496,8 +589,7 @@ HYDRA_EXPORT bool hydraLoaderHasIcon(const void* loader) {
         ->hasIcon();
 }
 
-HYDRA_EXPORT void hydraLoaderExtractIcon(const void* loader,
-                                         HydraString path) {
+HYDRA_EXPORT void hydraLoaderExtractIcon(const void* loader, HydraString path) {
     reinterpret_cast<const hydra::horizon::loader::ILoader*>(loader)
         ->extractIcon(stringViewFromHydraString(path));
 }
@@ -590,8 +682,8 @@ hydraLoaderPluginGetSupportedFormatCount(const void* plugin) {
             .size());
 }
 
-HYDRA_EXPORT HydraString
-hydraLoaderPluginGetSupportedFormat(const void* plugin, uint32_t index) {
+HYDRA_EXPORT HydraString hydraLoaderPluginGetSupportedFormat(const void* plugin,
+                                                             uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<const hydra::horizon::loader::plugins::Plugin*>(plugin)
             ->getSupportedFormats()[index]);
@@ -681,7 +773,7 @@ HYDRA_EXPORT uint32_t hydraUserManagerGetUserCount(void* user_manager) {
 }
 
 HYDRA_EXPORT HydraU128 hydraUserManagerGetUserId(void* user_manager,
-                                                  uint32_t index) {
+                                                 uint32_t index) {
     return std::bit_cast<HydraU128>(
         reinterpret_cast<
             hydra::horizon::services::account::internal::UserManager*>(
@@ -725,7 +817,7 @@ HYDRA_EXPORT uint32_t hydraUserManagerGetAvatarCount(void* user_manager) {
 }
 
 HYDRA_EXPORT HydraString hydraUserManagerGetAvatarPath(void* user_manager,
-                                                        uint32_t index) {
+                                                       uint32_t index) {
     return hydraStringFromStringView(
         reinterpret_cast<
             hydra::horizon::services::account::internal::UserManager*>(
@@ -795,7 +887,22 @@ class UiHandler : public hydra::horizon::ui::IHandler {
 };
 
 HYDRA_EXPORT void* hydraCreateSystem() {
-    return new hydra::System(*(new UiHandler()));
+    system_error.clear();
+    auto handler = std::make_unique<UiHandler>();
+    try {
+        auto system = new hydra::System(*handler);
+        handler.release();
+        return system;
+    } catch (const std::exception& error) {
+        system_error = error.what();
+        using namespace hydra;
+        LOG_ERROR(Loader, "Unable to initialize emulation: {}", system_error);
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraSystemGetLastError() {
+    return hydraStringFromStringView(system_error);
 }
 
 HYDRA_EXPORT void hydraSystemDestroy(void* system) {
@@ -807,9 +914,16 @@ HYDRA_EXPORT void hydraSystemSetSurface(void* system, void* surface) {
     reinterpret_cast<hydra::System*>(system)->setSurface(surface);
 }
 
-HYDRA_EXPORT void hydraSystemLoadAndStart(void* system, void* loader) {
-    reinterpret_cast<hydra::System*>(system)->loadAndStart(
-        reinterpret_cast<hydra::horizon::loader::ILoader*>(loader));
+HYDRA_EXPORT bool hydraSystemLoadAndStart(void* system, void* loader) {
+    system_error.clear();
+    try {
+        reinterpret_cast<hydra::System*>(system)->loadAndStart(
+            reinterpret_cast<hydra::horizon::loader::ILoader*>(loader));
+        return true;
+    } catch (const std::exception& error) {
+        system_error = error.what();
+        return false;
+    }
 }
 
 HYDRA_EXPORT void hydraSystemRequestStop(void* system) {
@@ -841,6 +955,18 @@ HYDRA_EXPORT void hydraSystemProgressFrame(void* system, uint32_t width,
 
 HYDRA_EXPORT bool hydraSystemIsRunning(void* system) {
     return reinterpret_cast<hydra::System*>(system)->isRunning();
+}
+
+HYDRA_EXPORT double hydraSystemGetPresentationFrameRate(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getPresentationFrameRate();
+}
+
+HYDRA_EXPORT float hydraSystemGetLastShownFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastShownFps();
+}
+
+HYDRA_EXPORT float hydraSystemGetLastGeneratedFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastGeneratedFps();
 }
 
 HYDRA_EXPORT float hydraSystemGetLastDeltaTimeAverage(void* system) {
@@ -890,6 +1016,103 @@ hydraSystemTextureCacheGetTextureMemory(void* system, uint32_t index) {
                 .getRenderer()
                 .getTextureCache()
                 .getMemory(index);
+}
+
+// Input
+HYDRA_EXPORT void* hydraInputGetDevices(void* system) {
+    try {
+        input_error.clear();
+        auto names =
+            system ? reinterpret_cast<hydra::System*>(system)
+                         ->getInputDeviceManager()
+                         .getControllerNames()
+                   : hydra::input::DeviceManager::getAvailableControllerNames();
+        return new std::vector<std::string>(std::move(names));
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT void* hydraInputGetPlayerDevices(uint32_t player) {
+    try {
+        input_error.clear();
+        if (player >= 8)
+            throw std::runtime_error("Invalid player number");
+        const auto& profiles = hydra::CONFIG_INSTANCE.getInputProfiles();
+        std::vector<std::string> devices;
+        if (player < profiles.size() && !profiles[player].empty()) {
+            hydra::input::Profile profile(
+                static_cast<hydra::horizon::services::hid::internal::NpadIndex>(
+                    player),
+                profiles[player]);
+            devices = profile.getDeviceNames();
+        }
+        return new std::vector<std::string>(std::move(devices));
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return nullptr;
+    }
+}
+
+HYDRA_EXPORT bool hydraInputSetPlayerDevices(void* system, uint32_t player,
+                                             const void* devices) {
+    try {
+        input_error.clear();
+        if (system && reinterpret_cast<hydra::System*>(system)->isRunning())
+            throw std::runtime_error(
+                "Stop the game before changing player assignments");
+        if (player >= 8 || !devices)
+            throw std::runtime_error("Invalid player assignment");
+        const auto selected =
+            *reinterpret_cast<const std::vector<std::string>*>(devices);
+        auto& configured = hydra::CONFIG_INSTANCE.getInputProfiles();
+        auto updated = configured;
+        updated.resize(hydra::horizon::services::hid::NPAD_COUNT);
+        std::array<std::optional<hydra::input::Profile>, 8> profiles;
+        hydra::input::PlayerDevices original;
+        for (uint32_t i = 0; i < 8; i++) {
+            if (i != player && updated[i].empty())
+                continue;
+            const auto index =
+                static_cast<hydra::horizon::services::hid::internal::NpadIndex>(
+                    i);
+            auto name = updated[i];
+            if (name.empty()) {
+                name = fmt::format("Hydra Player {}", i + 1);
+                const auto path =
+                    fmt::format("{}/input_profiles/{}.toml",
+                                hydra::CONFIG_INSTANCE.getAppDataPath(), name);
+                if (!std::filesystem::exists(path))
+                    name = "Default";
+            }
+            profiles[i].emplace(index, name);
+            if (!updated[i].empty())
+                original[i] = profiles[i]->getDeviceNames();
+        }
+        auto assigned = original;
+        hydra::input::assignPlayerDevices(assigned, player, selected);
+        for (uint32_t i = 0; i < 8; i++) {
+            if (i != player && assigned[i] == original[i])
+                continue;
+            // Dedicated profiles preserve mappings without editing Default or
+            // another player's shared source profile.
+            const auto name = fmt::format("Hydra Player {}", i + 1);
+            if (!profiles[i]->saveAs(name, assigned[i]))
+                throw std::runtime_error("Unable to save controller profile");
+            updated[i] = assigned[i].empty() ? "" : name;
+        }
+        configured = std::move(updated);
+        hydra::CONFIG_INSTANCE.serialize();
+        return true;
+    } catch (const std::exception& error) {
+        input_error = error.what();
+        return false;
+    }
+}
+
+HYDRA_EXPORT HydraString hydraInputGetLastError() {
+    return hydraStringFromStringView(input_error);
 }
 
 // Debugger
@@ -1134,11 +1357,27 @@ HYDRA_EXPORT uint64_t hydraTextureDescriptorGetPtr(const void* descriptor) {
 
 HYDRA_EXPORT HydraTextureType
 hydraTextureDescriptorGetType(const void* descriptor) {
-    return static_cast<HydraTextureType>(
-        static_cast<
-            const hydra::hw::tegra_x1::gpu::renderer::TextureDescriptor*>(
-            descriptor)
-            ->type);
+    switch (static_cast<
+                const hydra::hw::tegra_x1::gpu::renderer::TextureDescriptor*>(
+                descriptor)
+                ->type) {
+    case MTL::TextureType1D:
+        return HYDRA_TEXTURE_TYPE_1D;
+    case MTL::TextureType1DArray:
+        return HYDRA_TEXTURE_TYPE_1D_ARRAY;
+    case MTL::TextureTypeTextureBuffer:
+        return HYDRA_TEXTURE_TYPE_1D_BUFFER;
+    case MTL::TextureType2DArray:
+        return HYDRA_TEXTURE_TYPE_2D_ARRAY;
+    case MTL::TextureType3D:
+        return HYDRA_TEXTURE_TYPE_3D;
+    case MTL::TextureTypeCube:
+        return HYDRA_TEXTURE_TYPE_CUBE;
+    case MTL::TextureTypeCubeArray:
+        return HYDRA_TEXTURE_TYPE_CUBE_ARRAY;
+    default:
+        return HYDRA_TEXTURE_TYPE_2D;
+    }
 }
 
 HYDRA_EXPORT HydraTextureFormat

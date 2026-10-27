@@ -37,6 +37,8 @@ class GuestThread : public IThread {
     u64 args[2] = {0};
 
     void run() override;
+    void captureContext(ThreadContext& out_context) override;
+    void prepareForDebugger() override;
 
   private:
     System& system;

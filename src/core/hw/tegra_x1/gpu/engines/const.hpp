@@ -2,7 +2,48 @@
 
 #include "core/hw/tegra_x1/gpu/const.hpp"
 
+#include <chrono>
+#include <cstdlib>
+
 namespace hydra::hw::tegra_x1::gpu::engines {
+
+// GPU timestamp of semaphore releases: ticks at 614.4 MHz derived from the
+// host clock
+inline u64 getGpuTimestamp() {
+    const u64 ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    return ns / 625 * 384;
+}
+
+// Reductions of the DMA semaphores (copy engine NVB0B5 and inline engine
+// NVA140 REDUCTION_OP): IMIN, IMAX, IXOR, IAND, IOR, IADD, INC, DEC
+inline u32 reduceDmaSemaphoreWord(u32 operation, bool is_signed, u32 old,
+                                  u32 payload) {
+    switch (operation) {
+    case 0:
+        return is_signed ? static_cast<u32>(std::min(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::min(old, payload);
+    case 1:
+        return is_signed ? static_cast<u32>(std::max(static_cast<i32>(old),
+                                                     static_cast<i32>(payload)))
+                         : std::max(old, payload);
+    case 2:
+        return old ^ payload;
+    case 3:
+        return old & payload;
+    case 4:
+        return old | payload;
+    case 6:
+        return old >= payload ? 0u : old + 1;
+    case 7:
+        return (old == 0 || old > payload) ? payload : old - 1;
+    default:
+        return old + payload;
+    }
+}
 
 struct Iova {
     u32 hi;
@@ -96,7 +137,34 @@ enum class VertexAttribSize : u32 {
     // Misc arrangements
     _10_10_10_2 = 0x30,
     _11_11_10 = 0x31,
+
+    // Arrangements fetched like the ones above (packed forms of the same
+    // byte order)
+    A8B8G8R8 = 0x2f,
+    G8R8 = 0x32,
+    X8B8G8R8 = 0x33,
+    A8 = 0x34,
 };
+
+// The fetch size the arrangement is read as
+inline VertexAttribSize getFetchSize(VertexAttribSize size) {
+    // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
+    static const bool no_a8b8g8r8 =
+        std::getenv("HYDRA_NO_VERTEX_A8B8G8R8") != nullptr;
+    if (no_a8b8g8r8 && size == VertexAttribSize::A8B8G8R8)
+        return size;
+    switch (size) {
+    case VertexAttribSize::G8R8:
+        return VertexAttribSize::_2x8;
+    case VertexAttribSize::A8B8G8R8:
+    case VertexAttribSize::X8B8G8R8:
+        return VertexAttribSize::_4x8;
+    case VertexAttribSize::A8:
+        return VertexAttribSize::_1x8;
+    default:
+        return size;
+    }
+}
 
 struct VertexAttribState {
     u32 buffer_id : 5;
@@ -105,8 +173,17 @@ struct VertexAttribState {
     u32 offset : 14;
     VertexAttribSize size : 6;
     VertexAttribType type : 3;
-    bool bgra : 1;
+    u32 padding2 : 1;
+    bool bgra : 1; // Bit 31
 };
+static_assert(sizeof(VertexAttribState) == sizeof(u32));
+
+// SWAP_R_AND_B applies to every attribute format. Metal only has a BGRA
+// variant of uchar4 normalized, the shader swaps the others.
+inline bool hostVertexFormatSwapsRb(const VertexAttribState& state) {
+    return state.type == VertexAttribType::Unorm &&
+           state.size == VertexAttribSize::_4x8;
+}
 
 enum class ShaderStage : u32 {
     VertexA,
@@ -117,6 +194,9 @@ enum class ShaderStage : u32 {
     Fragment,
 
     Count,
+
+    // Kepler compute, not part of the 3D pipeline
+    Compute = 0x10,
 };
 
 enum class CompareOp : u32 {
@@ -204,7 +284,7 @@ ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::engines::ShaderStage, VertexA,
                        "vertex A", VertexB, "vertex B", TessCtrl,
                        "tessellation control", TessEval,
                        "tessellation evaluation", Geometry, "geometry",
-                       Fragment, "fragment")
+                       Fragment, "fragment", Compute, "compute")
 
 ENABLE_ENUM_FORMATTING(hydra::hw::tegra_x1::gpu::engines::CompareOp, Invalid,
                        "invalid", Never, "never", Less, "less", Equal, "equal",

@@ -48,11 +48,20 @@ void emitMultifunction(DecoderContext& context, pred_t pred, bool pred_inv,
         res = context.builder.opReciprocalSqrt(src_v);
         break;
     case MultifunctionOp::Rcp64h:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Double reciprocal");
-        break;
-    case MultifunctionOp::Rsq64h:
-        LOG_NOT_IMPLEMENTED(ShaderDecompiler, "Double reciprocal square root");
-        break;
+    case MultifunctionOp::Rsq64h: {
+        // The high word of a double, as raw bits
+        auto raw = src;
+        raw.type = ir::ScalarType::U32;
+        const auto result = context.builder.opIntrinsic(
+            op == MultifunctionOp::Rcp64h ? ir::Intrinsic::Rcp64H
+                                          : ir::Intrinsic::Rsq64H,
+            ir::ScalarType::U32, {raw});
+        context.builder.opCopy(
+            ir::Value::createRegister(dst, ir::ScalarType::U32), result);
+        if (conditional)
+            context.builder.opEndIf();
+        return;
+    }
     case MultifunctionOp::Sqrt:
         res = context.builder.opSqrt(src_v);
         break;

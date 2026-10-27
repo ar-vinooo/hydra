@@ -31,7 +31,7 @@ union InstHadd2R {
     BitField64<bool, 30, 1> abs_b;
     BitField64<bool, 31, 1> neg_b;
     BitField64<bool, 32, 1> sat;
-    BitField64<bool, 38, 1> neg_a;
+    BitField64<bool, 43, 1> neg_a;
 };
 
 void emitHadd2R(DecoderContext& context, InstHadd2R inst);

@@ -5,6 +5,50 @@
 
 namespace hydra::hw::tegra_x1::cpu::hypervisor {
 
+inline ApFlags toApFlags(horizon::kernel::MemoryPermission perm) {
+    if (any(perm & horizon::kernel::MemoryPermission::Read)) {
+        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
+            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
+                return ApFlags::UserReadWriteExecuteKernelReadWrite;
+            } else {
+                return ApFlags::UserReadWriteKernelReadWrite;
+            }
+        } else {
+            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
+                return ApFlags::UserReadExecuteKernelRead;
+            } else {
+                return ApFlags::UserReadKernelRead;
+            }
+        }
+    } else {
+        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
+            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
+                return ApFlags::UserReadWriteExecuteKernelReadWrite; // TODO
+            } else {
+                return ApFlags::UserReadWriteKernelReadWrite; // TODO
+            }
+        } else {
+            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
+                return ApFlags::UserExecuteKernelRead; // TODO
+            } else {
+                return ApFlags::UserNoneKernelRead; // TODO
+            }
+        }
+    }
+}
+
+// Write tracked pages are read-only until written
+inline ApFlags toTrackedApFlags(horizon::kernel::MemoryPermission perm) {
+    return toApFlags(perm & ~horizon::kernel::MemoryPermission::Write);
+}
+
+// Changes of guest translations that TLBs may still hold the old version of
+// (unmapping, remapping, restricting permissions). A vCPU invalidates the
+// TLBs of every core before running the guest again once this changed.
+// Defined in the host so live modules share it.
+u64 getTlbGeneration();
+void notePageTableChange();
+
 class PageAllocator;
 
 constexpr usize BLOCK_SHIFT_DIFF = 9;

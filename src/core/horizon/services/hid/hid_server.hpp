@@ -6,13 +6,14 @@
 
 namespace hydra::horizon::services::hid {
 
+// libnx HidVibrationDeviceHandle: 4 bytes
 struct VibrationDeviceHandle {
-    u32 type_value;
     u8 npad_style_index;
-    NpadIdType player_number;
-    u8 device_index;
+    u8 player_number;
+    u8 device_index; // 0 left, 1 right, 2 none
     u8 pad;
 };
+static_assert(sizeof(VibrationDeviceHandle) == 4);
 
 struct VibrationDeviceInfo {
     VibrationDeviceType device_type;

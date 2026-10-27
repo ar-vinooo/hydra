@@ -78,6 +78,10 @@ void Window::run() {
         }
 
         if (system.isRunning()) {
+            const bool frame_generation =
+                CONFIG_INSTANCE.getFrameGeneration() != FrameGeneration::Off;
+            SDL_SetRenderVSync(renderer, frame_generation ? 0 : 1);
+            const auto present_start = std::chrono::steady_clock::now();
             // Present
             i32 width;
             i32 height;
@@ -89,6 +93,18 @@ void Window::run() {
             // Update window title
             if (dt_average_updated)
                 updateWindowTitle();
+            if (frame_generation) {
+                // Pace generated output by its own configuration, not the
+                // guest rendering limit or host display refresh rate.
+                const auto period = std::chrono::duration<f64>(
+                    1.0 / system.getPresentationFrameRate());
+                const auto remaining = period -
+                    (std::chrono::steady_clock::now() - present_start);
+                if (remaining.count() > 0.0)
+                    SDL_DelayPrecise(static_cast<Uint64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            remaining).count()));
+            }
         }
     }
 }

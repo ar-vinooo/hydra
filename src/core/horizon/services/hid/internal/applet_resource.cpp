@@ -17,17 +17,34 @@ AppletResource::AppletResource(System& system)
              NPAD_INTERNAL_STATE(2), NPAD_INTERNAL_STATE(3),
              NPAD_INTERNAL_STATE(4), NPAD_INTERNAL_STATE(5),
              NPAD_INTERNAL_STATE(6), NPAD_INTERNAL_STATE(7),
-             NPAD_INTERNAL_STATE(8), NPAD_INTERNAL_STATE(9)}} {}
+             NPAD_INTERNAL_STATE(8), NPAD_INTERNAL_STATE(9)}} {
+    // SharedMemory allocates zeroed bytes; construct the HID layout so each
+    // ring header gets its capacity and the guest can read valid samples.
+    ::new (reinterpret_cast<void*>(shared_mem->getPtr())) SharedMemory{};
+
+    for (auto& npad : npads)
+        npad.update({});
+
+    // Readers copy nothing from an empty lifo, leaving their output
+    // uninitialized, so always provide a "no touches" sample
+    updateTouch({});
+    // These devices are not exposed to the guest yet. A neutral sample lets
+    // unconditional SDK reads return initialized data instead of no state.
+    SHARED_MEMORY.keyboard.lifo.writeNext({});
+    SHARED_MEMORY.mouse.lifo.writeNext({});
+    SHARED_MEMORY.debug_pad.lifo.writeNext({});
+}
 
 #undef NPAD_INTERNAL_STATE
 
-AppletResource::~AppletResource() { delete shared_mem; }
+AppletResource::~AppletResource() { shared_mem->release(); }
 
 void AppletResource::activateNpads(NpadRevision revision) {
     active = true;
+    (void)revision;
 
     // TODO: revision affects style sets?
-    LOG_NOT_IMPLEMENTED(Services, "{}", revision);
+    LOG_DEBUG(Services, "Npad activation with {}", revision);
 
     setupNpads();
 }
@@ -66,7 +83,9 @@ void AppletResource::setupNpads() {
         // TODO: auto-remap ProController to JoyDual and vice-versa
 
         // Check if supported
-        if (supported_npads[i] && !any(supported_style_sets & style_set))
+        const auto& profiles = CONFIG_INSTANCE.getInputProfiles();
+        if (i >= profiles.size() || profiles[i].empty() ||
+            !supported_npads[i] || !any(supported_style_sets & style_set))
             style_set = NpadStyleSet::None;
 
         npads[i].setup(style_set);
@@ -75,22 +94,26 @@ void AppletResource::setupNpads() {
 
 void AppletResource::updateTouch(
     const std::map<u32, input::TouchState>& new_state) {
-    if (!shouldAcceptInput())
-        return;
-
     auto& lifo = SHARED_MEMORY.touch_screen.lifo;
 
+    // Like the real HID service, keep sampling even when input is ignored, as
+    // games read the touch screen unconditionally
+    const bool accept = shouldAcceptInput();
+
     // State
-    TouchScreenState state{
-        .count = static_cast<i32>(new_state.size()),
-    };
+    TouchScreenState state{};
     u32 index = 0;
     for (const auto& [finger_id, touch_state] : new_state) {
+        if (!accept || index >= std::size(state.touches))
+            break;
         state.touches[index++] = {
-            .finger_id = finger_id, .x = touch_state.x, .y = touch_state.y,
+            .finger_id = finger_id,
+            .x = touch_state.x,
+            .y = touch_state.y,
             // TODO: more
         };
     }
+    state.count = static_cast<i32>(index);
     lifo.writeNext(state);
 }
 

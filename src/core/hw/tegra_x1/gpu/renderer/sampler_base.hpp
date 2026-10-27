@@ -1,10 +1,12 @@
 #pragma once
 
+#include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
+
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
 
-class SamplerBase {
+class SamplerBase : public resource::TrackedResource {
   public:
     explicit SamplerBase(const SamplerDescriptor& descriptor_)
         : descriptor{descriptor_} {}

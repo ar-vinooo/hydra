@@ -1,5 +1,9 @@
 #include "core/horizon/services/nifm/general_service.hpp"
 
+#include <cstring>
+
+#include "core/horizon/kernel/process.hpp"
+#include "core/horizon/online/online.hpp"
 #include "core/horizon/services/nifm/request.hpp"
 
 namespace hydra::horizon::services::nifm {
@@ -49,10 +53,23 @@ struct SfNetworkProfileData {
 
 } // namespace
 
-DEFINE_SERVICE_COMMAND_TABLE(IGeneralService, 4, createRequest, 5,
+DEFINE_SERVICE_COMMAND_TABLE(IGeneralService, 1, getClientId, 4, createRequest, 5,
                              getCurrentNetworkProfile, 12, getCurrentIpAddress,
                              15, getCurrentIpConfigInfo, 18,
-                             getInternetConnectionStatus)
+                             getInternetConnectionStatus, 21,
+                             isAnyInternetRequestAccepted, 22,
+                             isAnyForegroundRequestAccepted)
+
+result_t IGeneralService::getClientId(
+    OutBuffer<BufferAttr::HipcPointer> out_buffer) {
+    // nifmGetClientId returns a nonzero 32-bit ID through a pointer buffer.
+    // This service instance represents the single emulated network client.
+    if (!out_buffer.isValid() || out_buffer.stream->getSize() < sizeof(u32))
+        return MAKE_RESULT(Svc, 0);
+    out_buffer.stream->write<u32>(1);
+    LOG_INFO(Services, "Online: network client ID returned");
+    return RESULT_SUCCESS;
+}
 
 result_t IGeneralService::createRequest(RequestContext* ctx,
                                         i32 requirement_preset) {
@@ -60,7 +77,8 @@ result_t IGeneralService::createRequest(RequestContext* ctx,
     LOG_FUNC_WITH_ARGS_STUBBED(Services, "requirement preset: {}",
                                requirement_preset);
 
-    addService(*ctx, new IRequest());
+    addService(*ctx, new IRequest(online::getConfig(
+                         ctx->process->getTitleId()) != nullptr));
     return RESULT_SUCCESS;
 }
 
@@ -104,7 +122,15 @@ result_t IGeneralService::getCurrentNetworkProfile(
     return RESULT_SUCCESS;
 }
 
-result_t IGeneralService::getCurrentIpAddress(IpV4Address* out_ip) {
+result_t IGeneralService::getCurrentIpAddress(kernel::Process* process,
+                                              IpV4Address* out_ip) {
+    // Online, the title tells its peers this address, to reach it on the LAN
+    if (const auto* config = online::getConfig(process->getTitleId())) {
+        const u32 address = online::getLocalAddress(*config);
+        std::memcpy(out_ip->addr, &address, sizeof(address));
+        return RESULT_SUCCESS;
+    }
+
     LOG_FUNC_STUBBED(Services);
 
     // HACK
@@ -140,6 +166,20 @@ result_t IGeneralService::getInternetConnectionStatus(
     *out_type = InternetConnectionType::WiFi;
     *out_wifi_strength = 0;
     *out_status = InternetConnectionStatus::Connected;
+    return RESULT_SUCCESS;
+}
+
+result_t IGeneralService::isAnyInternetRequestAccepted(
+    kernel::Process* process,
+    InBuffer<BufferAttr::HipcPointer> client_id_buffer, bool* out_accepted) {
+    (void)client_id_buffer;
+    *out_accepted = online::getConfig(process->getTitleId()) != nullptr;
+    return RESULT_SUCCESS;
+}
+
+result_t IGeneralService::isAnyForegroundRequestAccepted(
+    kernel::Process* process, bool* out_accepted) {
+    *out_accepted = online::getConfig(process->getTitleId()) != nullptr;
     return RESULT_SUCCESS;
 }
 

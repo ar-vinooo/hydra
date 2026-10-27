@@ -3,10 +3,20 @@
 #include "core/horizon/kernel/hipc/client_session.hpp"
 #include "core/horizon/services/service.hpp"
 
+// DEBUG: HYDRA_TRACE_IPC logs every service command and its result
 #define SERVICE_COMMAND_CASE(service, id, func)                                \
-    case id:                                                                   \
+    case id: {                                                                 \
         LOG_DEBUG(Services, #func);                                            \
-        return invokeCommand(context, *this, &service::func);
+        static const bool trace_ipc = std::getenv("HYDRA_TRACE_IPC") != nullptr; \
+        if (trace_ipc) {                                                       \
+            const auto traced_result =                                         \
+                invokeCommand(context, *this, &service::func);                 \
+            LOG_INFO(Services, "DEBUG IPC " #service "::" #func " -> {:#x}",   \
+                     static_cast<u32>(traced_result));                         \
+            return traced_result;                                              \
+        }                                                                      \
+        return invokeCommand(context, *this, &service::func);                  \
+    }
 
 #define DEFINE_SERVICE_COMMAND_TABLE(service, ...)                             \
     result_t service::requestImpl([[maybe_unused]] RequestContext& context,    \
@@ -14,7 +24,7 @@
         switch (id) {                                                          \
             ZTD_FOR_EACH_1_2(SERVICE_COMMAND_CASE, service, __VA_ARGS__)       \
         default:                                                               \
-            LOG_WARN(Services, "Unknown request {}", id);                      \
+            LOG_WARN(Services, "Unknown request {} for " #service, id);       \
             return MAKE_RESULT(Svc, 0); /* TODO */                             \
         }                                                                      \
     }

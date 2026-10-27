@@ -62,7 +62,30 @@ typedef enum : uint32_t {
     HYDRA_RESOLUTION_4320P,
     HYDRA_RESOLUTION_AUTO_EXACT,
     HYDRA_RESOLUTION_CUSTOM,
+    HYDRA_RESOLUTION_CONSOLE,
 } HydraResolution;
+
+typedef enum : uint32_t {
+    HYDRA_METAL_API_METAL3,
+    HYDRA_METAL_API_METAL4,
+} HydraMetalApi;
+
+typedef enum : uint32_t {
+    HYDRA_UPSCALING_FILTER_BILINEAR,
+    HYDRA_UPSCALING_FILTER_NEAREST,
+    HYDRA_UPSCALING_FILTER_METALFX,
+} HydraUpscalingFilter;
+
+typedef enum : uint32_t {
+    HYDRA_FRAME_GENERATION_OFF,
+    HYDRA_FRAME_GENERATION_INTERPOLATE,
+    HYDRA_FRAME_GENERATION_METALFX,
+} HydraFrameGeneration;
+
+typedef enum : uint32_t {
+    HYDRA_FRAME_GENERATION_RATE_VARIABLE,
+    HYDRA_FRAME_GENERATION_RATE_MULTIPLE,
+} HydraFrameGenerationRateMode;
 
 typedef enum : uint32_t {
     HYDRA_AUDIO_BACKEND_NULL,
@@ -165,7 +188,7 @@ uint32_t hydraStringToStringMapGetCount(const void* map);
 HydraString hydraStringToStringMapGetKey(const void* map, uint32_t index);
 HydraString hydraStringToStringMapGetValue(const void* map, uint32_t index);
 HydraString hydraStringToStringMapGetValueByKey(const void* map,
-                                                 HydraString key);
+                                                HydraString key);
 void hydraStringToStringMapRemoveAll(void* map);
 void hydraStringToStringMapSetByKey(void* map, HydraString key,
                                     HydraString value);
@@ -196,6 +219,15 @@ uint32_t* hydraConfigGetGpuRenderer();
 uint32_t* hydraConfigGetShaderBackend();
 uint32_t* hydraConfigGetDisplayResolution();
 HydraUint2* hydraConfigGetCustomDisplayResolution();
+uint32_t* hydraConfigGetMetalApi();
+uint32_t* hydraConfigGetUpscalingFilter();
+uint32_t* hydraConfigGetFrameRateLimit();
+uint32_t* hydraConfigGetFrameGeneration();
+uint32_t* hydraConfigGetFrameGenerationRateMode();
+uint32_t* hydraConfigGetFrameGenerationTargetFps();
+uint32_t* hydraConfigGetFrameGenerationMultiplier();
+uint32_t* hydraConfigGetSharpening();
+bool* hydraConfigGetMetalHud();
 uint32_t* hydraConfigGetAudioBackend();
 HydraU128* hydraConfigGetUserId();
 HydraString hydraConfigGetDeviceNickname();
@@ -244,6 +276,7 @@ hydraLoaderPluginOptionConfigGetPathContentTypes(const void* config);
 
 // Filesystem
 void* hydraCreateFilesystem();
+HydraString hydraFilesystemGetLastError(void);
 void hydraFilesystemDestroy(void* fs);
 
 void* hydraOpenFile(HydraString path);
@@ -260,8 +293,13 @@ void hydraTimeZoneManagerDestroy(void* manager);
 uint32_t hydraTimeZoneManagerGetLocationCount(void* manager);
 HydraString hydraTimeZoneManagerGetLocation(void* manager, uint32_t index);
 
+// Update and DLC installation (result text valid until the next call on this thread).
+bool hydraInstallContentPackage(HydraString path);
+HydraString hydraContentInstallGetResult(void);
+
 // Loader
 void* hydraCreateLoaderFromPath(HydraString path, void* plugin_manager);
+HydraString hydraLoaderGetLastError(void);
 void hydraLoaderDestroy(void* loader);
 uint64_t hydraLoaderGetTitleId(void* loader);
 void* hydraLoaderLoadNacp(void* loader);
@@ -290,7 +328,7 @@ HydraString hydraLoaderPluginGetName(const void* plugin);
 HydraString hydraLoaderPluginGetDisplayVersion(const void* plugin);
 uint32_t hydraLoaderPluginGetSupportedFormatCount(const void* plugin);
 HydraString hydraLoaderPluginGetSupportedFormat(const void* plugin,
-                                                 uint32_t index);
+                                                uint32_t index);
 uint32_t hydraLoaderPluginGetOptionConfigCount(const void* plugin);
 const void* hydraLoaderPluginGetOptionConfig(const void* plugin,
                                              uint32_t index);
@@ -328,11 +366,12 @@ void hydraUserSetAvatarPath(void* user, HydraString path);
 
 // System
 void* hydraCreateSystem();
+HydraString hydraSystemGetLastError(void);
 void hydraSystemDestroy(void* system);
 
 void hydraSystemSetSurface(void* system, void* surface);
 
-void hydraSystemLoadAndStart(void* system, void* loader);
+bool hydraSystemLoadAndStart(void* system, void* loader);
 void hydraSystemRequestStop(void* system);
 void hydraSystemForceStop(void* system);
 
@@ -346,6 +385,9 @@ void hydraSystemProgressFrame(void* system, uint32_t width, uint32_t height,
 
 bool hydraSystemIsRunning(void* system);
 float hydraSystemGetLastDeltaTimeAverage(void* system);
+double hydraSystemGetPresentationFrameRate(void* system);
+float hydraSystemGetLastShownFps(void* system);
+float hydraSystemGetLastGeneratedFps(void* system);
 
 void hydraSystemTakeScreenshot(void* system);
 void hydraSystemCaptureGpuFrame(void* system);
@@ -357,7 +399,12 @@ const void* hydraSystemTextureCacheGetTextureMemory(void* system,
                                                     uint32_t index);
 
 // Input
-// TODO
+// Returned lists are owned by the caller and must be destroyed.
+void* hydraInputGetDevices(void* system);
+void* hydraInputGetPlayerDevices(uint32_t player);
+bool hydraInputSetPlayerDevices(void* system, uint32_t player,
+                                const void* devices);
+HydraString hydraInputGetLastError();
 
 // Debugger
 

@@ -28,8 +28,13 @@ class ISslContext : public IService {
     [[maybe_unused]] SslVersion version;
 
     // Commands
+    result_t setOption(u32 option, i32 value);
+    result_t createConnection(RequestContext* ctx);
     result_t importServerPki(CertificateFormat cert_format,
                              InBuffer<BufferAttr::MapAlias> in_buffer,
+                             u64* out_id);
+    result_t importClientPki(InBuffer<BufferAttr::MapAlias> in_cert_buffer,
+                             InBuffer<BufferAttr::MapAlias> in_password_buffer,
                              u64* out_id);
     result_t registerInternalPki(InternalPki pki, u64* out_id);
 };

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 
 #include "core/horizon/kernel/const.hpp"
 #include "core/hw/tegra_x1/cpu/memory.hpp"
@@ -15,6 +16,12 @@ struct MemoryRegion {
     vaddr_t va;
     uptr size;
     horizon::kernel::MemoryState state;
+};
+
+struct DeviceMappingState {
+    struct Span { vaddr_t guest; uptr host; u64 size; };
+    std::mutex mutex;
+    std::map<const void*, std::vector<Span>> spaces;
 };
 
 // This class doesn't really represent a real MMU, but rather the page table, as
@@ -44,6 +51,7 @@ class IMmu {
                                     horizon::kernel::MemoryAttribute value) = 0;
 
     horizon::kernel::MemoryInfo queryMemory(vaddr_t va) const;
+    const std::shared_ptr<DeviceMappingState>& getDeviceMappings() const { return device_mappings; }
     vaddr_t findFreeMemory(ztd::Range<vaddr_t> region, u64 size) const;
 
     // Write tracking
@@ -53,8 +61,24 @@ class IMmu {
     void disableWriteTracking(ztd::Range<vaddr_t> range) {
         setWriteTrackingEnabled(range, false);
     }
-    bool trackWrite(ztd::Range<vaddr_t> range);
-    void flushTrackedPages();
+    virtual bool trackWrite(ztd::Range<vaddr_t> range);
+    // Called before each draw and dispatch
+    virtual void flushTrackedPages();
+    // Applies GPU cache invalidations queued by trackWrite and rearms the
+    // written pages. Called by the GPU thread before each PFIFO entry, so CPU
+    // threads never wait on the cache locks a draw holds.
+    void applyPendingInvalidations();
+    // Queues an invalidation of host memory changed outside the guest (e.g.
+    // cleared by the host), applied like those of trackWrite
+    void queueHostInvalidation(ztd::Range<uptr> range);
+
+    // GPU-written memory: the GPU's contents are not in guest memory, so CPU
+    // accesses must fault and have them written back first. Takes host
+    // pointers, as used by the GPU caches.
+    virtual void protectGpuWritten([[maybe_unused]] ztd::Range<uptr> range) {}
+    // Whether CPU accesses to GPU written memory fault and write the GPU
+    // contents back first (protectGpuWritten)
+    virtual bool protectsGpuWrites() const { return false; }
 
     // Read
     template <typename T>
@@ -92,11 +116,16 @@ class IMmu {
                      va);
     }
 
+    // Stores only if memory still holds the value of the exclusive load
     template <typename T>
-    void writeExclusive(vaddr_t va, T value) const {
+    bool writeExclusive(vaddr_t va, T value, T expected) const {
         auto ptr = unmapAddr(va);
         ASSERT_DEBUG(ptr != 0x0, Cpu, "Failed to unmap va 0x{:08x}", va);
-        atomicStore(reinterpret_cast<T*>(ptr), value);
+        if (ptr == 0x0) [[unlikely]]
+            return false;
+
+        return atomicCompareExchangeStrong(reinterpret_cast<T*>(ptr), expected,
+                                           value);
     }
 
   protected:
@@ -106,11 +135,17 @@ class IMmu {
     virtual bool trySuspendWriteTracking(ztd::Range<vaddr_t> range) = 0;
     virtual void resumeWriteTracking(ztd::Range<vaddr_t> range) = 0;
 
+  protected:
+    System& getSystem() const { return system; }
+
   private:
     System& system;
+    std::shared_ptr<DeviceMappingState> device_mappings = std::make_shared<DeviceMappingState>();
 
     std::mutex write_tracking_mutex;
     std::vector<ztd::Range<vaddr_t>> tracked_pages;
+    std::vector<ztd::Range<uptr>> pending_invalidations;
+    std::atomic<bool> has_pending_invalidations{false};
 };
 
 } // namespace hydra::hw::tegra_x1::cpu

@@ -6,7 +6,13 @@ namespace hydra::horizon::services::nvdrv::ioctl {
 
 class NvHostNvDec : public ChannelBase {
   public:
+    NvHostNvDec();
+    ~NvHostNvDec() override;
   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+    NvResult executeVideo(IoctlContext& context) override;
+    std::string_view videoEngineName() const override { return "nvdec"; }
     // Ioctls
 };
 

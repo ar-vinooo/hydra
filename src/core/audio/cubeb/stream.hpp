@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/audio/cubeb/const.hpp"
+#include "core/audio/pcm_queue.hpp"
 #include "core/audio/stream.hpp"
 
 struct cubeb_stream;
@@ -20,14 +21,20 @@ class Stream final : public IStream {
 
     void enqueueBuffer(buffer_id_t id, std::span<const u8> buffer) override;
 
+    StreamStats getStats() const override;
+
   private:
     Core& core;
 
     cubeb_stream* stream;
 
-    std::mutex buffer_mutex;
-    std::queue<std::pair<buffer_id_t, std::span<const u8>>> buffer_queue;
-    u32 pos_in_buffer{};
+    PcmQueue buffer_queue;
+    std::atomic<u64> requested_frames{0};
+    std::atomic<u64> missing_frames{0};
+    mutable std::mutex clock_mutex;
+    std::chrono::steady_clock::time_point callback_time{};
+    u64 callback_frames{0};
+    mutable u64 last_sample_clock{0};
 
     static long dataCallback(cubeb_stream* stream, void* user_data,
                              const void* input_buffer, void* output_buffer,

@@ -139,6 +139,7 @@ class IFileSystemProxy : public IService {
     result_t openDataStorageByProgramId(RequestContext* ctx, System* system,
                                         u64 program_id);
     result_t openDataStorageByDataId(RequestContext* ctx, System* system,
+                                     kernel::Process* process,
                                      Aligned<ncm::StorageID, 8> storage_id,
                                      u64 data_id);
     result_t openPatchDataStorageByCurrentProcess(RequestContext* ctx,

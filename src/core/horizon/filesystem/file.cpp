@@ -5,21 +5,21 @@ namespace hydra::horizon::filesystem {
 void IFile::save(std::string_view host_path) const {
     // Create file
     // HACK: construct a temporary string
-    ZTD_ASSIGN_OR(auto file,
-                  ztd::fs::openFileAbsolute(std::string(host_path),
-                                            ztd::fs::File::OpenFlags::Write),
-                  {
-                      LOG_ERROR(Services, "Failed to write user at path {}",
-                                host_path);
-                      return;
-                  });
+    ZTD_ASSIGN_OR(
+        auto file,
+        ztd::fs::createFileAbsolute(std::string(host_path),
+                                    ztd::fs::File::CreateFlags::Truncate),
+        {
+            LOG_ERROR(Services, "Failed to write user at path {}", host_path);
+            return;
+        });
     ztd::io::FileStream out_stream(file);
 
     // Read
     const auto stream =
         const_cast<IFile*>(this)->open(FileOpenFlags::Read); // HACK
 
-    std::array<u8, 0x800> buffer;
+    std::array<u8, 0x10000> buffer;
     while (stream->getSeek() < stream->getSize()) {
         std::span<u8> span(buffer.data(),
                            buffer.data() +

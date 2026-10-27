@@ -26,6 +26,8 @@ class ICpu {
                                   const ThreadCallbacks& callbacks,
                                   IMemory* tls_mem, vaddr_t tls_mem_base) = 0;
     virtual IMemory* allocateMemory(u64 size) = 0;
+    // Exposes existing host memory to the guest without taking ownership
+    virtual IMemory* wrapMemory(uptr ptr, u64 size) = 0;
 
   protected:
     CpuFeatures features;

@@ -4,6 +4,7 @@
 #include "core/horizon/filesystem/directory.hpp"
 #include "core/horizon/filesystem/disk_file.hpp"
 #include "core/horizon/filesystem/memory_file.hpp"
+#include "core/horizon/filesystem/nca_file.hpp"
 
 #define GET_MOUNT(path)                                                        \
     if (path.empty())                                                          \
@@ -152,31 +153,58 @@ void Filesystem::installFirmware() {
         {"0100000000000814/data", "FontChineseSimple"},
     };
 
-    // Iterate over the directory
+    // Only metadata is needed to mount firmware. Parsing every ExeFS/RomFS
+    // here repeats work and decrypts unused sections during each startup.
+    NcaFile::Keys keys;
+    bool keys_loaded = false;
     for (const auto& entry :
          std::filesystem::directory_iterator(firmware_path)) {
-        auto file = new DiskFile(entry.path().string());
-        ContentArchive content_archive(file);
-
-        auto res = addEntry(fmt::format(FS_FIRMWARE_PATH "/{:016x}/{}",
-                                        content_archive.getTitleId(),
-                                        content_archive.getContentType()),
-                            file, true);
-        ASSERT(res == FsResult::Success, Horizon,
-               "Failed to add firmware entry {:016x}: {}",
-               content_archive.getTitleId(), res);
+        if (!entry.is_regular_file() || entry.path().extension() != ".nca")
+            continue;
+        auto file = std::make_unique<DiskFile>(entry.path().string());
+        if (file->getSize() < 0xc00)
+            throw std::runtime_error("Truncated firmware NCA header.");
+        std::unique_ptr<ztd::io::IStream> probe(
+            file->open(FileOpenFlags::Read));
+        probe->seekTo(0x200);
+        if (probe->read<u32>() != makeMagic4('N', 'C', 'A', '3') &&
+            !keys_loaded) {
+            keys = NcaFile::loadDefaultKeys();
+            keys_loaded = true;
+        }
+        bool plaintext = false;
+        const auto header =
+            NcaFile::readHeader(*file, 0, file->getSize(), keys, plaintext);
+        u64 title_id = 0;
+        std::memcpy(&title_id, header.data() + 0x210, sizeof(title_id));
+        const auto content_type =
+            static_cast<ContentArchiveContentType>(header[0x205]);
+        if (header[0x205] >
+            static_cast<u8>(ContentArchiveContentType::PublicData))
+            throw std::runtime_error("Invalid firmware NCA content type.");
+        auto res = addEntry(
+            fmt::format(FS_FIRMWARE_PATH "/{:016x}/{}", title_id, content_type),
+            file.get(), true);
+        if (res != FsResult::Success)
+            throw std::runtime_error(fmt::format(
+                "Failed to mount firmware title {:016x}: {}", title_id, res));
+        file.release();
     }
 
     for (const auto& [path, filename] : firmware_titles_map) {
         filesystem::IFile* file;
         auto res = getFile(fmt::format(FS_FIRMWARE_PATH "/{}", path), file);
-        ASSERT(res == FsResult::Success, Horizon,
-               "Failed to get firmware entry {}: {}", path, res);
+        if (res != FsResult::Success)
+            throw std::runtime_error(
+                fmt::format("Firmware is incomplete: missing {} ({}). Choose a "
+                            "complete firmware folder.",
+                            filename, path));
 
         res =
             addEntry(fmt::format(FS_FIRMWARE_PATH "/{}", filename), file, true);
-        ASSERT(res == FsResult::Success, Horizon,
-               "Failed to add firmware entry alias \"{}\": {}", filename, res);
+        if (res != FsResult::Success)
+            throw std::runtime_error(fmt::format(
+                "Failed to mount firmware resource {}: {}", filename, res));
     }
 }
 

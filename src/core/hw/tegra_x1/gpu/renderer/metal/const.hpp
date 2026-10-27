@@ -1,15 +1,7 @@
 #pragma once
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-conversion"
-#pragma GCC diagnostic ignored "-Wold-style-cast"
-
-#include <Metal/Metal.hpp>
-#include <QuartzCore/QuartzCore.hpp>
-
-#pragma GCC diagnostic pop
-
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/metal_cpp.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
@@ -55,6 +47,47 @@ constexpr usize SAMPLER_COUNT = 16;
 
 inline u32 getVertexBufferIndex(u32 index) { return BUFFER_COUNT - index - 1; }
 
+inline void
+setDepthStencilPixelFormat(MTL::RenderPipelineDescriptor* pipeline_descriptor,
+                           MTL::PixelFormat pixel_format) {
+    bool has_depth = false;
+    bool has_stencil = false;
+    switch (pixel_format) {
+    case MTL::PixelFormatDepth16Unorm:
+    case MTL::PixelFormatDepth32Float:
+        has_depth = true;
+        break;
+    case MTL::PixelFormatDepth24Unorm_Stencil8:
+    case MTL::PixelFormatDepth32Float_Stencil8:
+        has_depth = true;
+        has_stencil = true;
+        break;
+    case MTL::PixelFormatStencil8:
+    case MTL::PixelFormatX24_Stencil8:
+    case MTL::PixelFormatX32_Stencil8:
+        has_stencil = true;
+        break;
+    default:
+        break;
+    }
+    pipeline_descriptor->setDepthAttachmentPixelFormat(
+        has_depth ? pixel_format : MTL::PixelFormatInvalid);
+    pipeline_descriptor->setStencilAttachmentPixelFormat(
+        has_stencil ? pixel_format : MTL::PixelFormatInvalid);
+}
+
+inline u32 getRenderTargetArrayLength(MTL::Texture* texture) {
+    switch (texture->textureType()) {
+    case MTL::TextureType3D:
+        return static_cast<u32>(texture->depth());
+    case MTL::TextureTypeCube:
+    case MTL::TextureTypeCubeArray:
+        return static_cast<u32>(texture->arrayLength()) * 6;
+    default:
+        return static_cast<u32>(texture->arrayLength());
+    }
+}
+
 inline MTL::Library* createLibraryFromSource(MTL::Device* device,
                                              const std::string_view source) {
     NS::Error* error;
@@ -71,6 +104,15 @@ inline MTL::Library* createLibraryFromSource(MTL::Device* device,
     }
 
     return library;
+}
+
+// The most samples the device supports up to the guest's count (Apple M1
+// has no 8 sample targets)
+inline u32 getHostSampleCount(MTL::Device* device, u32 samples) {
+    for (u32 count = samples; count > 1; count >>= 1)
+        if (device->supportsTextureSampleCount(count))
+            return count;
+    return 1;
 }
 
 inline MTL::Function* createFunctionFromSource(MTL::Device* device,

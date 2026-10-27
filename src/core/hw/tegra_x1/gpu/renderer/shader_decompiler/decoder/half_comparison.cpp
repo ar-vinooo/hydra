@@ -4,72 +4,176 @@ namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
 
-// TODO: ftz
-void emitHalf2SetPredicate(DecoderContext& context, pred_t pred, bool pred_inv,
-                           FloatCmpOp op, BoolOp b_op, bool h_and,
-                           pred_t dst_pred, pred_t dst_inv_pred, reg_t src_a,
-                           HalfSwizzle swizzle_a, bool abs_a, bool neg_a,
-                           ir::Value src_b, bool abs_b, bool neg_b,
-                           pred_t src_pred, bool src_pred_inv) {
-    const auto conditional = handlePredCond(context.builder, pred, pred_inv);
+// Half operands are compared as F32: the conversion is exact, so the results
+// match an F16 comparison, and F32 swizzles keep their full precision
+struct HalfPair {
+    ir::Value lhs;
+    ir::Value rhs;
+};
 
-    auto src_a_v = absNegIf(context.builder,
-                            getSwizzledHalf(context.builder, swizzle_a, src_a),
-                            abs_a, neg_a);
-    auto src_b_v = absNegIf(context.builder, src_b, abs_b, neg_b);
-    auto res0 =
-        getFloatCmp(context, op, context.builder.opVectorExtract(src_a_v, 0),
-                    context.builder.opVectorExtract(src_b_v, 0));
-    auto res1 =
-        getFloatCmp(context, op, context.builder.opVectorExtract(src_a_v, 1),
-                    context.builder.opVectorExtract(src_b_v, 1));
+ir::Value halfToF32(ir::Builder& b, const ir::Value& word, bool high,
+                    bool ftz) {
+    auto bits = high ? b.opShiftRight(word, ir::Value::createConstantU(16))
+                     : b.opBitwiseAnd(word, ir::Value::createConstantU(0xffff));
+    // Denormal halves (exponent zero) flush to a signed zero
+    if (ftz) {
+        const auto denormal = b.opCompareEqual(
+            b.opBitwiseAnd(bits, ir::Value::createConstantU(0x7c00)),
+            ir::Value::createConstantU(0));
+        bits = b.opSelect(denormal,
+                          b.opBitwiseAnd(bits, ir::Value::createConstantU(0x8000)),
+                          bits);
+    }
+    const auto half = b.opBitCast(b.opCast(bits, ir::ScalarType::U16),
+                                  ir::ScalarType::F16);
+    return b.opCast(half, ir::ScalarType::F32);
+}
 
-    if (h_and) {
-        res0 = context.builder.opBitwiseAnd(res0, res1);
-        res0 = context.builder.opBitwiseNot(res0);
+HalfPair extractHalves(ir::Builder& b, const ir::Value& word,
+                       HalfSwizzle swizzle, bool ftz) {
+    switch (swizzle) {
+    case HalfSwizzle::F16:
+        return {halfToF32(b, word, false, ftz), halfToF32(b, word, true, ftz)};
+    case HalfSwizzle::F32: {
+        auto value = b.opBitCast(word, ir::ScalarType::F32);
+        if (ftz) {
+            const auto denormal = b.opCompareEqual(
+                b.opBitwiseAnd(word, ir::Value::createConstantU(0x7f800000)),
+                ir::Value::createConstantU(0));
+            value = b.opSelect(
+                denormal,
+                b.opBitCast(b.opBitwiseAnd(word,
+                                           ir::Value::createConstantU(0x80000000)),
+                            ir::ScalarType::F32),
+                value);
+        }
+        return {value, value};
+    }
+    case HalfSwizzle::H0H0: {
+        const auto value = halfToF32(b, word, false, ftz);
+        return {value, value};
+    }
+    case HalfSwizzle::H1H1: {
+        const auto value = halfToF32(b, word, true, ftz);
+        return {value, value};
+    }
+    }
+    unreachable();
+}
+
+struct HalfCompare {
+    ir::Value lhs;
+    ir::Value rhs;
+};
+
+HalfCompare compareHalves(DecoderContext& context, instruction_t inst,
+                          HalfOperandForm form, bool ftz) {
+    auto& b = context.builder;
+    const auto src_a = static_cast<reg_t>(extractBits(inst, 8, 8));
+    const auto swizzle_a = static_cast<HalfSwizzle>(extractBits(inst, 47, 2));
+    const bool neg_a = extractBits(inst, 43, 1) != 0;
+    const bool abs_a = extractBits(inst, 44, 1) != 0;
+
+    ir::Value src_b = ir::Value::createUndefined();
+    HalfSwizzle swizzle_b = HalfSwizzle::F16;
+    bool neg_b = false;
+    bool abs_b = false;
+    FloatCmpOp op;
+    switch (form) {
+    case HalfOperandForm::Register:
+        src_b = b.opCopy(ir::Value::createRegister(
+            static_cast<reg_t>(extractBits(inst, 20, 8))));
+        swizzle_b = static_cast<HalfSwizzle>(extractBits(inst, 28, 2));
+        abs_b = extractBits(inst, 30, 1) != 0;
+        neg_b = extractBits(inst, 31, 1) != 0;
+        op = static_cast<FloatCmpOp>(extractBits(inst, 35, 4));
+        break;
+    case HalfOperandForm::ConstBuffer:
+        // The constant is a single F32 compared with both halves
+        src_b = b.opCopy(ir::Value::createConstMemory(
+            CMem(static_cast<u32>(extractBits(inst, 34, 5)), RZ,
+                 extractBits(inst, 20, 14) * 4)));
+        swizzle_b = HalfSwizzle::F32;
+        neg_b = extractBits(inst, 56, 1) != 0;
+        op = static_cast<FloatCmpOp>(extractBits(inst, 49, 4));
+        break;
+    case HalfOperandForm::Immediate: {
+        const auto low = static_cast<u32>(extractBits(inst, 20, 9));
+        const auto neg_low = static_cast<u32>(extractBits(inst, 29, 1));
+        const auto high = static_cast<u32>(extractBits(inst, 30, 9));
+        const auto neg_high = static_cast<u32>(extractBits(inst, 56, 1));
+        src_b = ir::Value::createConstantU((low << 6) | (neg_low << 15) |
+                                           (high << 22) | (neg_high << 31));
+        op = static_cast<FloatCmpOp>(extractBits(inst, 49, 4));
+        break;
+    }
     }
 
-    const auto pred_v = notIf(
-        context.builder, ir::Value::createPredicate(src_pred), src_pred_inv);
-    res0 = getLogical(context, b_op, res0, pred_v);
-    res1 = getLogical(context, b_op, res1, pred_v);
+    auto a = extractHalves(b, b.opCopy(ir::Value::createRegister(src_a)),
+                           swizzle_a, ftz);
+    auto bb = extractHalves(b, src_b, swizzle_b, ftz);
+    a.lhs = absNegIf(b, a.lhs, abs_a, neg_a);
+    a.rhs = absNegIf(b, a.rhs, abs_a, neg_a);
+    bb.lhs = absNegIf(b, bb.lhs, abs_b, neg_b);
+    bb.rhs = absNegIf(b, bb.rhs, abs_b, neg_b);
 
-    context.builder.opCopy(ir::Value::createPredicate(dst_pred), res0);
-    context.builder.opCopy(ir::Value::createPredicate(dst_inv_pred), res1);
-
-    if (conditional)
-        context.builder.opEndIf();
+    const auto pred = notIf(
+        b, ir::Value::createPredicate(static_cast<pred_t>(extractBits(inst, 39, 3))),
+        extractBits(inst, 42, 1) != 0);
+    const auto bop = static_cast<BoolOp>(extractBits(inst, 45, 2));
+    return {getLogical(context, bop, getFloatCmp(context, op, a.lhs, bb.lhs), pred),
+            getLogical(context, bop, getFloatCmp(context, op, a.rhs, bb.rhs), pred)};
 }
 
 } // namespace
 
-void emitHsetp2R(DecoderContext& context, InstHsetp2R inst) {
-    emitHalf2SetPredicate(
-        context, inst.base.pred, inst.base.pred_inv, inst.op, inst.base.b_op,
-        inst.h_and, inst.base.dst_pred, inst.base.dst_inv_pred, inst.base.src_a,
-        inst.base.swizzle_a, inst.base.abs_a, inst.base.neg_a,
-        getSwizzledHalf(context.builder, inst.swizzle_b, inst.src_b),
-        inst.abs_b, inst.neg_b, inst.base.src_pred, inst.base.src_pred_inv);
+void emitHset2(DecoderContext& context, instruction_t inst,
+               HalfOperandForm form) {
+    auto& b = context.builder;
+    const auto conditional =
+        handlePredCond(b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+                       extractBits(inst, 19, 1) != 0);
+    const bool bf = extractBits(inst, form == HalfOperandForm::Register ? 49 : 53,
+                                1) != 0;
+    const bool ftz = extractBits(inst, form == HalfOperandForm::Register ? 50 : 54,
+                                 1) != 0;
+    const auto result = compareHalves(context, inst, form, ftz);
+    const u32 true_value = bf ? 0x3c00 : 0xffff;
+    const auto zero = ir::Value::createConstantU(0);
+    const auto value = b.opBitwiseOr(
+        b.opSelect(result.lhs, ir::Value::createConstantU(true_value), zero),
+        b.opSelect(result.rhs, ir::Value::createConstantU(true_value << 16), zero));
+    b.opCopy(ir::Value::createRegister(static_cast<reg_t>(extractBits(inst, 0, 8))),
+             value);
+    if (conditional)
+        b.opEndIf();
 }
 
-void emitHsetp2C(DecoderContext& context, InstHsetp2C inst) {
-    emitHalf2SetPredicate(
-        context, inst.base.pred, inst.base.pred_inv, inst.op, inst.base.b_op,
-        inst.h_and, inst.base.dst_pred, inst.base.dst_inv_pred, inst.base.src_a,
-        inst.base.swizzle_a, inst.base.abs_a, inst.base.neg_a,
-        ir::Value::createConstMemory(
-            CMem(inst.cbuf_slot, RZ, static_cast<u64>(inst.cbuf_offset * 4)),
-            ir::VectorType(ir::ScalarType::F16, 2)),
-        inst.abs_b, inst.neg_b, inst.base.src_pred, inst.base.src_pred_inv);
-}
-
-void emitHsetp2I(DecoderContext& context, InstHsetp2I inst) {
-    emitHalf2SetPredicate(
-        context, inst.base.pred, inst.base.pred_inv, inst.op, inst.base.b_op,
-        inst.h_and, inst.base.dst_pred, inst.base.dst_inv_pred, inst.base.src_a,
-        inst.base.swizzle_a, inst.base.abs_a, inst.base.neg_a,
-        getHalf2Const20(context.builder, inst.h0_imm10, inst.getH1Imm10()),
-        false, false, inst.base.src_pred, inst.base.src_pred_inv);
+void emitHsetp2(DecoderContext& context, instruction_t inst,
+                HalfOperandForm form) {
+    auto& b = context.builder;
+    const auto conditional =
+        handlePredCond(b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+                       extractBits(inst, 19, 1) != 0);
+    const bool ftz = extractBits(inst, 6, 1) != 0;
+    const bool h_and =
+        extractBits(inst, form == HalfOperandForm::Register ? 49 : 53, 1) != 0;
+    if (form == HalfOperandForm::ConstBuffer && extractBits(inst, 54, 1) != 0)
+        SHADER_UNSUPPORTED_ONCE("HSETP2 cbuf |b|");
+    auto result = compareHalves(context, inst, form, ftz);
+    // The AND of both halves and its inverse
+    if (h_and) {
+        const auto both = b.opBitwiseAnd(result.lhs, result.rhs);
+        result = {both, b.opNot(both)};
+    }
+    const auto dst_a = static_cast<pred_t>(extractBits(inst, 3, 3));
+    const auto dst_b = static_cast<pred_t>(extractBits(inst, 0, 3));
+    if (dst_a != PT)
+        b.opCopy(ir::Value::createPredicate(dst_a), result.lhs);
+    if (dst_b != PT)
+        b.opCopy(ir::Value::createPredicate(dst_b), result.rhs);
+    if (conditional)
+        b.opEndIf();
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder

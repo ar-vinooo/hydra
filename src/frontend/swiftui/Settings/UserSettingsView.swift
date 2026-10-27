@@ -1,11 +1,14 @@
 import SwiftUI
 
 class UserSettingsState: ObservableObject {
-    var filesystem = HydraFilesystem()
+    var filesystem: HydraFilesystem?
     var userManager = HydraUserManager()
 
     init() {
-        self.userManager.loadSystemAvatars(filesystem: self.filesystem)
+        self.filesystem = try? HydraFilesystem()
+        if let filesystem = self.filesystem {
+            self.userManager.loadSystemAvatars(filesystem: filesystem)
+        }
     }
 }
 

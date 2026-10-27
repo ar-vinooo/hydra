@@ -4,17 +4,24 @@
 #include "core/horizon/kernel/synchronization_object.hpp"
 
 namespace hydra::horizon::kernel {
+class Event;
 class Process;
-}
+} // namespace hydra::horizon::kernel
 
 namespace hydra::horizon::kernel::hipc {
 
 class Session;
 
+constexpr u64 MSG_BUFFER_MAX_SIZE = 0x2000; // TODO: what should this be?
+
 struct SessionRequest {
     Process* client_process;
     IThread* client_thread;
+    // The client's message buffer: its TLS, or a user buffer
     uptr ptr;
+    u64 size;
+    // Signalled instead of resuming the client for asynchronous requests
+    Event* reply_event;
 };
 
 // TODO: should maintain a reference to the parent session
@@ -35,7 +42,8 @@ class ServerSession : public SynchronizationObject {
 
     // Server
     void receive(IThread* crnt_thread);
-    void reply(uptr ptr);
+    void receive(uptr ptr, u64 size);
+    void reply(uptr ptr, u64 size = MSG_BUFFER_MAX_SIZE);
 
     bool hasRequests() {
         std::scoped_lock lock(mutex);
@@ -50,7 +58,8 @@ class ServerSession : public SynchronizationObject {
 
     // Client
     void enqueueRequest(Process* client_process, IThread* client_thread,
-                        uptr ptr);
+                        uptr ptr, u64 size = MSG_BUFFER_MAX_SIZE,
+                        Event* reply_event = nullptr);
 
   private:
     Session* parent{nullptr};

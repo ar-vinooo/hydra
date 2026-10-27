@@ -11,6 +11,7 @@ struct GamePreviewContainer<T: GamePreview>: View {
 
     @State private var showAlert = false
     @State private var alertMessage = ""
+    @State private var showOnlineSettings = false
 
     var body: some View {
         ClickableListItem(onClick: {
@@ -39,9 +40,18 @@ struct GamePreviewContainer<T: GamePreview>: View {
                     alertMessage: self.$alertMessage)
             }
             .menuOrder(.fixed)
+
+            Button {
+                self.showOnlineSettings = true
+            } label: {
+                Label("Configure Online...", systemImage: "network")
+            }
         }
         .alert(self.alertMessage, isPresented: self.$showAlert) {
             Button("OK", role: .cancel) {}
+        }
+        .sheet(isPresented: self.$showOnlineSettings) {
+            GameOnlineSettingsView(game: self.game, isPresented: self.$showOnlineSettings)
         }
     }
 }

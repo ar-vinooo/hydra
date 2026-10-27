@@ -42,6 +42,22 @@ class LangEmitter : public Emitter {
     void emitFunction(const ir::Function& func) override;
     // void EmitNode(const ir::Function& func, const analyzer::CfgNode* node);
     void emitBlock(const ir::Function& func, const ir::Block& block);
+    // Geometry shader emulation (see geometry.hpp)
+    virtual std::string getGeometryInputStr(const AMem amem, ir::Type type) = 0;
+    virtual void emitGeometryEpilogue() = 0;
+    virtual void emitGeometryCapture() = 0;
+    // Tessellation emulation (see tessellation.hpp)
+    virtual std::string getPatchStr(const AMem amem, ir::Type type) = 0;
+    // Empty for inputs that are not control point attributes
+    virtual std::string getEvaluationInputStr(const AMem amem,
+                                              ir::Type type) = 0;
+    virtual void emitTessControlEpilogue() = 0;
+    // Runs a function's blocks from its entry until it exits
+    void emitDispatchLoop(const ir::Function& func, u32 guard_limit);
+    static std::string getBlockFunctionName(const ir::Function& func,
+                                            label_t label);
+    // Functions emitted before main that main runs first (VertexA)
+    std::vector<const ir::Function*> prior_functions;
 
     // Data
     void emitCopy(const ir::Value& dst, const ir::Value& src) override;
@@ -104,6 +120,8 @@ class LangEmitter : public Emitter {
     void emitBeginIf(const ir::Value& cond) override;
     void emitEndIf() override;
     void emitBranch(label_t target) override;
+    void emitPushReturn(label_t target) override;
+    void emitReturnBranch() override;
     void emitBranchConditional(const ir::Value& cond, label_t target_true,
                                label_t target_false) override;
 
@@ -160,6 +178,7 @@ class LangEmitter : public Emitter {
             exitScopeImpl("");
     }
 
+    std::string getBitwiseOperandStr(const ir::Value& value);
     std::string getTypeStr(const ir::Type& type) {
         switch (type.getKind()) {
         case ir::TypeKind::Scalar: {
@@ -198,15 +217,21 @@ class LangEmitter : public Emitter {
     }
 
     template <typename T>
-    std::string getConstantStr(const T imm) {
+    static std::string getConstantStr(const T imm) {
         if constexpr (std::is_same_v<T, bool>)
             return fmt::format("({})", imm);
         else if constexpr (std::is_same_v<T, u32>)
             return fmt::format("({:#x}u)", imm);
         else if constexpr (std::is_same_v<T, i32>)
             return fmt::format("({:#x})", imm);
-        else if constexpr (std::is_same_v<T, f32>)
+        else if constexpr (std::is_same_v<T, f32>) {
+            // Infinity and NaN cannot be written as decimal literals in MSL.
+            // Preserve their IEEE bits, including the sign and NaN payload.
+            const auto bits = std::bit_cast<u32>(imm);
+            if ((bits & 0x7f800000u) == 0x7f800000u)
+                return fmt::format("(as_type<float>({:#x}u))", bits);
             return fmt::format("({:#}f)", imm);
+        }
         else
             static_assert(always_false<T>::value, "Unsupported immediate type");
     }
@@ -238,12 +263,34 @@ class LangEmitter : public Emitter {
             case ir::ScalarType::F32:
                 return getConstantStr<f32>(std::bit_cast<f32>(imm));
             }
+            break;
+        }
+        case ir::TypeKind::Vector: {
+            // A register word: the elements of 2 x 16-bit vectors are its
+            // halves
+            const auto& vec_type = type.getVectorType();
+            const auto element = vec_type.getElementType();
+            const bool halves =
+                vec_type.getSize() == 2 &&
+                (element == ir::ScalarType::F16 ||
+                 element == ir::ScalarType::U16 || element == ir::ScalarType::I16);
+            std::string elements;
+            for (u32 i = 0; i < vec_type.getSize(); i++) {
+                if (i != 0)
+                    elements += ", ";
+                elements += getConstantStr(halves ? (imm >> (i * 16)) & 0xffff
+                                                  : imm,
+                                           element);
+            }
+            return fmt::format("{}({})", getTypeStr(type), elements);
         }
         default:
-            LOG_ERROR(ShaderDecompiler, "Unsupported type for immediate ({})",
-                      type);
-            return INVALID_VALUE;
+            break;
         }
+
+        LOG_ERROR(ShaderDecompiler, "Unsupported type for immediate ({})",
+                  type);
+        return INVALID_VALUE;
     }
 
     static std::string getLocalStr(local_t local) {
@@ -270,6 +317,15 @@ class LangEmitter : public Emitter {
 
     std::string getAttrMemoryStr(const AMem amem,
                                  ir::Type type = ir::ScalarType::U32) {
+        if (amem.patch && (context.tess_control || context.tess_eval))
+            return getPatchStr(amem, type);
+        if ((context.geometry || context.tess_control) && amem.is_input)
+            return getGeometryInputStr(amem, type);
+        if (context.tess_eval && amem.is_input) {
+            const auto str = getEvaluationInputStr(amem, type);
+            if (!str.empty())
+                return str;
+        }
         // TODO: what about unaligned access?
         return fmt::format("state.a_{}[({} + 0x{:08x}) >> 2].{}",
                            (amem.is_input ? "in" : "out"),
@@ -293,6 +349,8 @@ class LangEmitter : public Emitter {
             return getLocalStr(value.getLocal());
         case ir::ValueKind::Register:
             return getRegisterStr(value.getRegister(), value.getType());
+        case ir::ValueKind::ConditionFlag:
+            return fmt::format("state.cc[{}]", value.getConditionFlag());
         case ir::ValueKind::Predicate:
             return getPredicateStr(value.getPredicate());
         case ir::ValueKind::AttrMemory:
@@ -316,6 +374,9 @@ class LangEmitter : public Emitter {
             writeStatement(
                 "{} = {}",
                 getRegisterStr<false>(dst.getRegister(), dst.getType()), FMT);
+            break;
+        case ir::ValueKind::ConditionFlag:
+            writeStatement("state.cc[{}] = {}", dst.getConditionFlag(), FMT);
             break;
         case ir::ValueKind::Predicate:
             writeStatement("{} = {}",

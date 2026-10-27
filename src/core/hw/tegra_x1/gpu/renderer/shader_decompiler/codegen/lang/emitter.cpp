@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/helper.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::codegen::lang {
@@ -31,8 +32,14 @@ void LangEmitter::start() {
 
     // State
     enterScope("struct State");
+    write("float4 dbg;"); // DEBUG: captured register values
     write("Reg r[256];");
+    write("bool cc[4];");
     write("bool p[8];"); // TODO: is the size correct?
+    if (memory_analyzer.getUsesCallStack()) {
+        write("uint call_stack[8];");
+        write("uint call_depth = 0;");
+    }
     // TODO: move this to the backend
     for (auto index : memory_analyzer.getConstBuffers())
         write("constant Reg* c{};", index);
@@ -63,6 +70,19 @@ void LangEmitter::finish() {
 void LangEmitter::emitMainFunctionPrologue() {
     // State
     writeStatement("State state");
+    writeStatement("state.dbg = float4(0.0)");
+
+    // DEBUG: HYDRA_ZERO_REGS=1 initializes every register and attribute
+    static const bool zero_regs = std::getenv("HYDRA_ZERO_REGS") != nullptr;
+    if (zero_regs) {
+        writeStatement("for (uint zi = 0; zi < 256; zi++) state.r[zi]._u32 = 0u");
+        writeStatement("for (uint zi = 0; zi < 0x200; zi++) {{ state.a_in[zi]._u32 = 0u; state.a_out[zi]._u32 = 0u; }}");
+        writeStatement("for (uint zi = 0; zi < 4; zi++) state.cc[zi] = false");
+        writeStatement("for (uint zi = 0; zi < 8; zi++) state.p[zi] = false");
+    }
+
+    // Backend input conversions must precede the copy into guest attributes.
+    emitStateBindingAssignments();
 
     // Inputs
     // TODO: these are provided in the shader header, no need for analysis
@@ -85,14 +105,58 @@ void LangEmitter::emitMainFunctionPrologue() {
 
     switch (context.type) {
     case ShaderType::Vertex:
+        if (context.geometry || context.tess_control) {
+            // Outputs a vertex does not write: zero, and a position w of 1
+            writeStatement("for (uint i = {}u; i < {}u; i++) state.a_out[i]._u32 = 0u",
+                           geometry::RECORD_BASE / 4, geometry::RECORD_END / 4);
+            writeStatement("{} = 0x3f800000u",
+                           getAttrMemoryStr({RZ, SV_POSITION_BASE + 12u, false}));
+            break;
+        }
+        // The captured record holds every output word: start from zero
+        if (context.geometry_capture)
+            writeStatement("for (uint i = {}u; i < {}u; i++) state.a_out[i]._u32 = 0u",
+                           geometry::RECORD_BASE / 4, geometry::RECORD_END / 4);
+        // Guest shaders may only write XY (for fullscreen/offscreen passes).
+        // Supply the default homogeneous position before executing the shader;
+        // otherwise its unwritten Z/W components contain thread-stack garbage.
+        for (u8 c = 0; c < 4; ++c)
+            writeStatement(
+                "{} = {}",
+                getAttrMemoryStr({RZ, SV_POSITION_BASE + c * 4u, false}),
+                c == 3 ? "0x3f800000u" : "0u");
+        for (const auto output : memory_analyzer.getStageOutputs()) {
+            for (u8 c = 0; c < 4; ++c)
+                writeStatement(
+                    "{} = {}",
+                    getAttrMemoryStr(
+                        {RZ, SV_USER_IN_OUT_BASE + output * 16u + c * 4u,
+                         false}),
+                    c == 3 ? "0x3f800000u" : "0u");
+        }
+        // The evaluation shader reads control points, not vertex attributes
+        if (context.tess_eval)
+            break;
         for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
             const auto vertex_attrib_state = state.vertex_attrib_states[i];
-            if (vertex_attrib_state.type == engines::VertexAttribType::None)
-                continue;
 
-            // HACK: how are attributes disabled?
-            if (vertex_attrib_state.is_fixed)
+            // Attributes without a vertex buffer read as (0, 0, 0, 1)
+            if (vertex_attrib_state.type == engines::VertexAttribType::None ||
+                vertex_attrib_state.is_fixed) {
+                const bool is_int =
+                    vertex_attrib_state.type ==
+                        engines::VertexAttribType::Uint ||
+                    vertex_attrib_state.type == engines::VertexAttribType::Sint;
+                for (u8 c = 0; c < 4; c++) {
+                    const auto attr = getAttrMemoryStr(
+                        {RZ, 0x80u + i * 0x10u + c * 0x4u, true});
+                    writeStatement("{} = {}", attr,
+                                   c != 3     ? "0u"
+                                   : is_int   ? "1u"
+                                              : "0x3f800000u");
+                }
                 continue;
+            }
 
             // TODO: only set if the Rendered backend doesn't support scaled
             // attributes
@@ -114,6 +178,14 @@ void LangEmitter::emitMainFunctionPrologue() {
                     writeStatement("{} = as_type<uint>({})", attr,
                                    qualified_name);
             }
+
+            // Raw float attributes default to integer components
+            const auto raw_count =
+                getRawFloatVertexAttribComponentCount(vertex_attrib_state);
+            if (raw_count != 0 && raw_count < 4)
+                writeStatement(
+                    "{} = 0x3f800000u",
+                    getAttrMemoryStr({RZ, 0x80u + i * 0x10u + 3 * 0x4u, true}));
         }
 
         ADD_INPUT_1(SvSemantic::InstanceID, invalid<u8>(), SV_INSTANCE_ID_BASE);
@@ -139,8 +211,6 @@ void LangEmitter::emitMainFunctionPrologue() {
     for (auto index : memory_analyzer.getConstBuffers())
         writeStatement("state.c{} = c{}", index, index);
     writeNewline();
-
-    emitStateBindingAssignments();
 }
 
 void LangEmitter::emitFunction(const ir::Function& func) {
@@ -157,14 +227,12 @@ void LangEmitter::emitFunction(const ir::Function& func) {
     for (const auto& [_, block] : func.getBlocks())
         emitBlock(func, block);
 
-    // Function
-    // TODO: function name
-    std::string name = "main";
-    if (name == "main") {
-        emitMainPrototype();
-    } else
-        LOG_FATAL(ShaderDecompiler,
-                  "Custom functions not implemented (name: {})", name);
+    // Other functions are programs main runs first, in the same state
+    if (func.getName() != "main") {
+        prior_functions.push_back(&func);
+        return;
+    }
+    emitMainPrototype();
 
     // Structurize
     /*
@@ -173,25 +241,38 @@ void LangEmitter::emitFunction(const ir::Function& func) {
     auto entry_node = analyzer::Structurize(entry_block);
     */
 
-    // Caller loop
-    writeStatement("auto next = Block_{}::{}", func.getName(), label_t(0x0));
-    enterScope("while (next != Block_{}::None)", func.getName());
-    enterScope("switch (next)");
-    for (const auto& [label, block] : func.getBlocks()) {
-        indent--;
-        write("case Block_{}::{}:", func.getName(), label);
-        indent++;
-        writeStatement("next = func_{}(state)", label);
-        writeStatement("break");
-    }
-    exitScopeEmpty();
-    exitScopeEmpty();
-    writeNewline();
+    // Caller loop. Bound the number of block transitions: a loop that never
+    // ends (e.g. because of an unimplemented instruction) would otherwise hang
+    // the host GPU until the OS resets it and blocks further submissions.
+    // DEBUG: HYDRA_BLOCK_GUARD overrides the limit
+    static const u32 guard_limit = [] {
+        const char* env = std::getenv("HYDRA_BLOCK_GUARD");
+        return env != nullptr
+                   ? static_cast<u32>(std::strtoul(env, nullptr, 0))
+                   : 65536u;
+    }();
+    writeStatement("uint block_guard = 0");
+    // VertexA runs to its exit, then VertexB continues with its registers
+    for (const auto* prior : prior_functions)
+        emitDispatchLoop(*prior, guard_limit);
+    emitDispatchLoop(func, guard_limit);
 
     // Exit
     // Outputs
     switch (context.type) {
     case ShaderType::Vertex:
+        if (context.geometry) {
+            emitGeometryEpilogue();
+            break;
+        }
+        if (context.geometry_capture) {
+            emitGeometryCapture();
+            break;
+        }
+        if (context.tess_control) {
+            emitTessControlEpilogue();
+            break;
+        }
         // TODO: don't hardcode the bit cast type
 #define ADD_OUTPUT(sv_semantic, index, base, c)                                \
     {                                                                          \
@@ -216,21 +297,39 @@ void LangEmitter::emitFunction(const ir::Function& func) {
 
 #undef ADD_OUTPUT
         break;
-    case ShaderType::Fragment:
+    case ShaderType::Fragment: {
+        u8 source_register = 0;
         for (u8 i = 0; i < COLOR_TARGET_COUNT; i++) {
+            const auto mask = (context.fragment_output_mask >> (i * 4)) & 0xf;
+            if (mask == 0)
+                continue;
+            const auto base_register = source_register;
+            source_register += 4;
             const auto color_target_data_type =
                 state.color_target_data_types[i];
-            if (color_target_data_type == ColorDataType::Invalid)
+            if (color_target_data_type == MTL::DataTypeNone)
                 continue;
 
             for (u8 c = 0; c < 4; c++) {
+                if ((mask & (1u << c)) == 0)
+                    continue;
                 writeStatement(
                     "{} = as_type<{}>({})",
                     getSvAccessQualifiedStr(
                         SvAccess(Sv(SvSemantic::UserInOut, i), c), true),
-                    toType(color_target_data_type), getRegisterStr(i * 4 + c));
+                    toType(color_target_data_type), getRegisterStr(base_register + c));
             }
+
+            // DEBUG: show pixels whose shader hit the block guard
+            static const bool guard_magenta =
+                std::getenv("HYDRA_GUARD_MAGENTA") != nullptr;
+            if (guard_magenta)
+                writeStatement(
+                    "if (block_guard >= {}u) __out.user{} = vec<{}, 4>(1, 0, "
+                    "1, 1)",
+                    guard_limit, i, toType(color_target_data_type));
         }
+    }
         break;
     default:
         break;
@@ -303,21 +402,71 @@ void LangEmitter::EmitNode(const ir::Function& func,
 }
 */
 
+void LangEmitter::emitDispatchLoop(const ir::Function& func, u32 guard_limit) {
+    enterScopeEmpty();
+    writeStatement("auto next = Block_{}::{}", func.getName(), label_t(0x0));
+    writeStatement("block_guard = 0");
+    enterScope("while (next != Block_{}::None && block_guard++ < {}u)",
+               func.getName(), guard_limit);
+    enterScope("switch (next)");
+    for (const auto& [label, block] : func.getBlocks()) {
+        indent--;
+        write("case Block_{}::{}:", func.getName(), label);
+        indent++;
+        writeStatement("next = {}(state)", getBlockFunctionName(func, label));
+        writeStatement("break");
+    }
+    indent--;
+    write("default:");
+    indent++;
+    // A return to nowhere (or from a garbage stack) ends the program
+    writeStatement("next = Block_{}::None", func.getName());
+    writeStatement("break");
+    exitScopeEmpty();
+    exitScopeEmpty();
+    exitScopeEmpty();
+    writeNewline();
+}
+
+std::string LangEmitter::getBlockFunctionName(const ir::Function& func,
+                                              label_t label) {
+    if (func.getName() == "main")
+        return fmt::format("func_{}", label);
+    return fmt::format("func_{}_{}", func.getName(), label);
+}
+
 void LangEmitter::emitBlock(const ir::Function& func, const ir::Block& block) {
-    enterScope("Block_{} func_{}(thread State& state)", func.getName(),
-               block.getLabel());
+    enterScope("Block_{} {}(thread State& state)", func.getName(),
+               getBlockFunctionName(func, block.getLabel()));
 
     // Block enum alias
     writeStatement("using Block = Block_{}", func.getName());
     writeNewline();
 
-    // Temporary
-    enterScope("union");
-    write("int4 i;");
-    write("uint4 u;");
-    write("float4 f;");
-    exitScope("temp");
-    writeNewline();
+    // DEBUG: capture registers at the start of a block, set with
+    // HYDRA_DEBUG_CAPTURE="<block label>:<reg>,<reg>,<reg>"
+    if (context.type == ShaderType::Fragment && state.debug_highlight) {
+        static const std::string capture = [] {
+            const char* env = std::getenv("HYDRA_DEBUG_CAPTURE");
+            return std::string(env != nullptr ? env : "");
+        }();
+        const auto colon = capture.find(':');
+        if (colon != std::string::npos &&
+            std::strtoul(capture.substr(0, colon).c_str(), nullptr, 0) ==
+                static_cast<u32>(block.getLabel())) {
+            std::vector<std::string> regs;
+            std::string rest = capture.substr(colon + 1);
+            for (usize pos = 0; pos <= rest.size();) {
+                const auto next = rest.find(',', pos);
+                regs.push_back(rest.substr(pos, next - pos));
+                if (next == std::string::npos)
+                    break;
+                pos = next + 1;
+            }
+            for (usize i = 0; i < regs.size() && i < 4; i++)
+                writeStatement("state.dbg[{}] = state.r[{}]._f32", i, regs[i]);
+        }
+    }
 
     for (const auto& instruction : block.getInstructions())
         emitInstruction(instruction);
@@ -338,18 +487,40 @@ void LangEmitter::emitAbs(const ir::Value& dst, const ir::Value& src) {
     storeValue(dst, "abs({})", getValueStr(src));
 }
 
+namespace {
+
+// Signed overflow is undefined in C++ (and so MSL), the guest wraps around:
+// 32-bit signed arithmetic runs on the unsigned bits
+bool isWrappingSigned(const ir::Value& dst) {
+    return dst.getType() == ir::Type(ir::ScalarType::I32);
+}
+
+} // namespace
+
 void LangEmitter::emitNeg(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "(-{})", getValueStr(src));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(0u - as_type<uint>({}))",
+                   getValueStr(src));
+    else
+        storeValue(dst, "(-{})", getValueStr(src));
 }
 
 void LangEmitter::emitAdd(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "({} + {})", getValueStr(srcA), getValueStr(srcB));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(as_type<uint>({}) + as_type<uint>({}))",
+                   getValueStr(srcA), getValueStr(srcB));
+    else
+        storeValue(dst, "({} + {})", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitMultiply(const ir::Value& dst, const ir::Value& srcA,
                                const ir::Value& srcB) {
-    storeValue(dst, "({} * {})", getValueStr(srcA), getValueStr(srcB));
+    if (isWrappingSigned(dst))
+        storeValue(dst, "as_type<int>(as_type<uint>({}) * as_type<uint>({}))",
+                   getValueStr(srcA), getValueStr(srcB));
+    else
+        storeValue(dst, "({} * {})", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitFma(const ir::Value& dst, const ir::Value& srcA,
@@ -360,12 +531,12 @@ void LangEmitter::emitFma(const ir::Value& dst, const ir::Value& srcA,
 
 void LangEmitter::emitMin(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "min({}, {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "{}({}, {})", dst.getType().isFloatingPoint() ? "fmin" : "min", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitMax(const ir::Value& dst, const ir::Value& srcA,
                           const ir::Value& srcB) {
-    storeValue(dst, "max({}, {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "{}({}, {})", dst.getType().isFloatingPoint() ? "fmax" : "max", getValueStr(srcA), getValueStr(srcB));
 }
 
 void LangEmitter::emitClamp(const ir::Value& dst, const ir::Value& srcA,
@@ -397,22 +568,35 @@ void LangEmitter::emitNot(const ir::Value& dst, const ir::Value& src) {
 }
 
 void LangEmitter::emitBitwiseNot(const ir::Value& dst, const ir::Value& src) {
-    storeValue(dst, "(~{})", getValueStr(src));
+    // ~ on a bool promotes it to an always nonzero int
+    const bool is_bool = src.getType() == ir::Type(ir::ScalarType::Bool);
+    storeValue(dst, "({}{})", is_bool ? "!" : "~", getValueStr(src));
+}
+
+// Bitwise instructions operate on raw register bits. A register last written
+// as a float must be reinterpreted, as bitwise operators reject floats.
+std::string LangEmitter::getBitwiseOperandStr(const ir::Value& value) {
+    if (value.getType() == ir::ScalarType::F32)
+        return fmt::format("as_type<uint>({})", getValueStr(value));
+    return getValueStr(value);
 }
 
 void LangEmitter::emitBitwiseAnd(const ir::Value& dst, const ir::Value& srcA,
                                  const ir::Value& srcB) {
-    storeValue(dst, "({} & {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} & {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitBitwiseOr(const ir::Value& dst, const ir::Value& srcA,
                                 const ir::Value& srcB) {
-    storeValue(dst, "({} | {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} | {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitBitwiseXor(const ir::Value& dst, const ir::Value& srcA,
                                  const ir::Value& srcB) {
-    storeValue(dst, "({} ^ {})", getValueStr(srcA), getValueStr(srcB));
+    storeValue(dst, "({} ^ {})", getBitwiseOperandStr(srcA),
+               getBitwiseOperandStr(srcB));
 }
 
 void LangEmitter::emitShiftLeft(const ir::Value& dst, const ir::Value& src_a,
@@ -477,6 +661,23 @@ void LangEmitter::emitEndIf() { exitScopeEmpty(); }
 void LangEmitter::emitBranch(label_t target) {
     // LOG_FATAL(ShaderDecompiler, "Should not happen");
     writeStatement("return Block::{}", target);
+}
+
+void LangEmitter::emitPushReturn(label_t target) {
+    // Calls nest less than 8 deep; a deeper one overwrites the last entry
+    writeStatement("state.call_stack[min(state.call_depth, 7u)] = "
+                   "static_cast<uint>(Block::{})",
+                   target);
+    writeStatement("state.call_depth++");
+}
+
+void LangEmitter::emitReturnBranch() {
+    enterScope("if (state.call_depth == 0u)");
+    writeStatement("return Block::None");
+    exitScopeEmpty();
+    writeStatement("state.call_depth--");
+    writeStatement("return static_cast<Block>(state.call_stack[min("
+                   "state.call_depth, 7u)])");
 }
 
 void LangEmitter::emitBranchConditional(const ir::Value& cond,

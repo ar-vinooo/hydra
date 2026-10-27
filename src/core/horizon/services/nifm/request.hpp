@@ -24,14 +24,17 @@ enum class ConnectionConfirmationOption : u32 {
 
 class IRequest : public IService {
   public:
-    IRequest();
+    // online: the title plays online (online/<title ID>.toml), and its
+    // requests are accepted
+    explicit IRequest(bool online_ = false);
 
   protected:
     result_t requestImpl([[maybe_unused]] RequestContext& context,
                          u32 id) override;
 
   private:
-    std::array<std::unique_ptr<kernel::Event>, 2> events;
+    bool online;
+    std::array<kernel::AutoObjectPtr<kernel::Event>, 2> events;
 
     // Commands
     result_t getRequestState(RequestState* out_state);
@@ -41,7 +44,7 @@ class IRequest : public IService {
                                   OutHandle<HandleAttr::Copy> out_handle0,
                                   OutHandle<HandleAttr::Copy> out_handle1);
     STUB_REQUEST_COMMAND(cancel);
-    STUB_REQUEST_COMMAND(submit);
+    result_t submit();
     STUB_REQUEST_COMMAND(setRequirementPreset);
     result_t
     setConnectionConfirmationOption(ConnectionConfirmationOption option);

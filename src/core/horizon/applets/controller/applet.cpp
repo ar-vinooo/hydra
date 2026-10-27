@@ -7,7 +7,12 @@ result_t Applet::run(System& system) {
 
     // Mode
     if (arg_private.mode != Mode::ShowControllerSupport) {
-        LOG_WARN(Applets, "Unimplemented mode {}", arg_private.mode);
+        // The strap guide only explains how to attach Joy-Con straps; there is
+        // nothing to show or wait for, so it completes at once
+        if (arg_private.mode == Mode::ShowControllerStrapGuide)
+            LOG_DEBUG(Applets, "Controller strap guide skipped");
+        else
+            LOG_WARN(Applets, "Unimplemented mode {}", arg_private.mode);
 
         // Dummy response
         pushOutData(ResultInfoInternal{

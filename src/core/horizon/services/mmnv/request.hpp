@@ -22,15 +22,23 @@ class IRequest : public IService {
                          u32 id) override;
 
   private:
+    // Virtual clock requests do not change the host clock. Keep the requested
+    // effective frequency so clients can query a valid virtual engine rate.
+    std::mutex request_mutex;
+    u32 next_request_id{1};
+    std::unordered_map<u32, u32> request_frequencies;
+    std::unordered_map<u32, Module> request_modules;
+    std::unordered_map<u32, u32> legacy_frequencies;
+
     // Commands
     result_t initializeOld(Module module, u32 priority, u32 event_clear_mode);
     result_t finalizeOld(Module module);
-    result_t setAndWaitOld(Module module, u32 setting_min, u32 setting_max);
+    result_t setAndWaitOld(Module module, u32 frequency_hz, i32 timeout);
     result_t getOld(Module module, u32* out_setting_current);
     result_t initialize(Module module, u32 priority, u32 event_clear_mode,
                         u32* out_request_id);
     result_t finalize(u32 request_id);
-    result_t setAndWait(u32 request_id, u32 setting_min, u32 setting_max);
+    result_t setAndWait(u32 request_id, u32 frequency_hz, i32 timeout);
     result_t get(u32 request_id, u32* out_setting_current);
 };
 

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/horizon/kernel/auto_object.hpp"
+#include "core/horizon/kernel/resource_limit.hpp"
 
 namespace hydra::horizon::kernel {
 
@@ -14,7 +14,12 @@ class TransferMemory : public AutoObject {
         : AutoObject(TYPE_ID, debug_name), addr{addr_}, size{size_},
           perm{perm_} {}
 
+    void chargeTo(ResourceLimit* limit) {
+        charge.charge(limit, LimitableResource::TransferMemoryCountMax);
+    }
+
   private:
+    ResourceCharge charge;
     vaddr_t addr;
     u64 size;
     MemoryPermission perm;

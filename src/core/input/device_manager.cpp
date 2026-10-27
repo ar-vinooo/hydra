@@ -32,10 +32,19 @@ IDeviceList* createDeviceList() {
 
 } // namespace
 
+std::vector<std::string> DeviceManager::getAvailableControllerNames() {
+    std::unique_ptr<IDeviceList> list(createDeviceList());
+    list->pumpEvents();
+    return list->getControllerNames();
+}
+
 DeviceManager::DeviceManager() : device_list{createDeviceList()} {
     // Profiles
     for (u32 i = 0; i < horizon::services::hid::NPAD_COUNT; i++) {
-        const auto& name = CONFIG_INSTANCE.getInputProfiles()[i];
+        const auto& configured = CONFIG_INSTANCE.getInputProfiles();
+        if (i >= configured.size())
+            continue;
+        const auto& name = configured[i];
         if (name.empty())
             continue;
 

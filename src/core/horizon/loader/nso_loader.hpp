@@ -47,4 +47,11 @@ class NsoLoader : public ILoader {
     u32 main_thread_stack_size{0x40000};
 };
 
+// ExeFS code modules in the order the system loader maps them: rtld, main,
+// subsdk0-9, sdk, then anything else. rtld resolves symbols in that (address)
+// order, so a module that defines its own copy of an sdk symbol must come
+// before sdk.
+std::vector<std::pair<std::string, filesystem::IFile*>>
+getCodeModulesInLoadOrder(filesystem::Directory* exefs_dir);
+
 } // namespace hydra::horizon::loader

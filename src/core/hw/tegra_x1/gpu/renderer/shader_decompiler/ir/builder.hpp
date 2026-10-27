@@ -47,6 +47,21 @@ class Builder {
         return addInstruction(Opcode::Multiply, src_a.getType(),
                               {src_a, src_b});
     }
+    // Value of the neighbouring pixel in the 2x2 quad (lane ^ mask)
+    Value opQuadShuffleXor(const Value& src, const Value& mask) {
+        return addInstruction(Opcode::QuadShuffleXor, ScalarType::U32,
+                              {src, mask});
+    }
+    // Value of the pixel at quad lane `index` (x | (y << 1)) of the 2x2 quad
+    Value opQuadShuffle(const Value& src, const Value& index) {
+        return addInstruction(Opcode::QuadShuffle, ScalarType::U32,
+                              {src, index});
+    }
+    // a * LUT_A[mode] + b * LUT_B[mode], mode = swizzle >> (quad lane * 2)
+    Value opSwizzleAdd(const Value& src_a, const Value& src_b, u32 swizzle) {
+        return addInstruction(Opcode::SwizzleAdd, ScalarType::F32,
+                              {src_a, src_b, Value::createRawValue(swizzle)});
+    }
     Value opFma(const Value& src_a, const Value& src_b, const Value& src_c) {
         ASSERT_DEBUG(src_a.getType() == src_b.getType(), ShaderDecompiler,
                      "Type mismatch for fma ({} != {})", src_a.getType(),
@@ -84,7 +99,12 @@ class Builder {
     Value opIsNan(const Value& src) {
         ASSERT_DEBUG(src.getType().isFloatingPoint(), ShaderDecompiler,
                      "Cannot check for NaN with type {}", src.getType());
-        return addInstruction(Opcode::IsNan, src.getType(), {src});
+        const auto type =
+            src.getType().isScalar()
+                ? Type(ScalarType::Bool)
+                : Type(VectorType(ScalarType::Bool,
+                                  src.getType().getVectorType().getSize()));
+        return addInstruction(Opcode::IsNan, type, {src});
     }
     Value opRound(const Value& src) {
         ASSERT_DEBUG(src.getType().isFloatingPoint(), ShaderDecompiler,
@@ -303,6 +323,13 @@ class Builder {
         addInstructionWithDst(Opcode::Branch, std::nullopt,
                               {Value::createLabel(target)});
     }
+    void opPushReturn(label_t target) {
+        addInstructionWithDst(Opcode::PushReturn, std::nullopt,
+                              {Value::createLabel(target)});
+    }
+    void opReturnBranch() {
+        addInstructionWithDst(Opcode::ReturnBranch);
+    }
     void opBranchConditional(const Value& cond, label_t target_true,
                              label_t target_false) {
         ASSERT_DEBUG(
@@ -352,39 +379,239 @@ class Builder {
     Value opTextureSample(u32 const_buffer_index, TextureType type,
                           TextureSampleFlags flags, const Value& array_index,
                           const Value& coords, const Value& cmp_value,
-                          const Value& lod) {
+                          const Value& lod,
+                          const Value& ddx = Value::createUndefined(),
+                          const Value& ddy = Value::createUndefined(),
+                          const Value& offset = Value::createUndefined(),
+                          const Value& offsets = Value::createUndefined(),
+                          u8 component = 0) {
+        ASSERT(!(any(flags & TextureSampleFlags::Offset) &&
+                 any(flags & TextureSampleFlags::Offsets)),
+               ShaderDecompiler,
+               "Texture Offset and Offsets are mutually exclusive");
+        ASSERT(!any(flags & TextureSampleFlags::Offsets) ||
+                   any(flags & TextureSampleFlags::Gather),
+               ShaderDecompiler, "Per-texel offsets require a gather");
+        ASSERT(!any(flags & TextureSampleFlags::Derivatives) ||
+                   (!any(flags & (TextureSampleFlags::IntCoords |
+                                  TextureSampleFlags::Bias |
+                                  TextureSampleFlags::LodZero |
+                                  TextureSampleFlags::Gather)) &&
+                    ddx.getKind() != ValueKind::Undefined &&
+                    ddy.getKind() != ValueKind::Undefined),
+               ShaderDecompiler,
+               "Explicit texture derivatives require gradients and a filtered "
+               "sample");
+        ASSERT(!any(flags & TextureSampleFlags::Bias) ||
+                   !any(flags & (TextureSampleFlags::Lod |
+                                 TextureSampleFlags::LodZero)),
+               ShaderDecompiler,
+               "Texture bias and explicit LOD are mutually exclusive");
+        ASSERT(component < 4, ShaderDecompiler,
+               "Invalid texture gather component");
+        ASSERT(
+            !any(flags & TextureSampleFlags::Gather) ||
+                !any(flags &
+                     (TextureSampleFlags::IntCoords | TextureSampleFlags::Bias |
+                      TextureSampleFlags::Lod | TextureSampleFlags::LodZero)),
+            ShaderDecompiler,
+            "Gather does not accept texel-fetch, bias or explicit LOD modes");
+        ASSERT(!any(flags & TextureSampleFlags::Offset) ||
+                   offset.getKind() != ValueKind::Undefined,
+               ShaderDecompiler, "Texture Offset requires an offset operand");
+        ASSERT(!any(flags & TextureSampleFlags::Offsets) ||
+                   offsets.getKind() != ValueKind::Undefined,
+               ShaderDecompiler,
+               "Texture Offsets requires four packed offset pairs");
         ASSERT_DEBUG(coords.getType().isVector() &&
                          coords.getType().isFloatingPoint(),
                      ShaderDecompiler,
                      "Cannot perform texture sample with non-floating point "
                      "vector type {}",
                      coords.getType());
-        // TODO: texture type
+        if (renderer::isTrackedTextureIndex(const_buffer_index))
+            flags |= TextureSampleFlags::Bindless;
         return addInstruction(
             Opcode::TextureSample, Type::createVector(ScalarType::F32, 4),
             {Value::createRawValue(const_buffer_index),
              Value::createRawValue(type), Value::createRawValue(flags),
-             array_index, coords, cmp_value, lod});
+             array_index, coords, cmp_value, lod, ddx, ddy, offset, offsets,
+             Value::createRawValue(component)});
     }
     // TODO: more args
     Value opTextureGather(u32 const_buffer_index, const Value& coords,
-                          u8 component) {
+                          u8 component,
+                          const Value& cmp_value = Value::createUndefined(),
+                          TextureType type = TextureType::_2D,
+                          TextureSampleFlags flags = TextureSampleFlags::None,
+                          const Value& array_index = Value::createUndefined(),
+                          const Value& offset = Value::createUndefined(),
+                          const Value& offsets = Value::createUndefined()) {
         ASSERT_DEBUG(coords.getType().isVector() &&
                          coords.getType().isFloatingPoint(),
                      ShaderDecompiler,
                      "Cannot perform texture gather with non-floating point "
                      "vector type {}",
                      coords.getType());
-        // TODO: texture type
-        return addInstruction(Opcode::TextureGather,
-                              Type::createVector(ScalarType::F32, 4),
-                              {Value::createRawValue(const_buffer_index),
-                               coords, Value::createRawValue(component)});
+        flags |= TextureSampleFlags::Gather;
+        if (cmp_value.getKind() != ValueKind::Undefined)
+            flags |= TextureSampleFlags::DepthCompare;
+        return opTextureSample(
+            const_buffer_index, type, flags, array_index, coords, cmp_value,
+            Value::createUndefined(), Value::createUndefined(),
+            Value::createUndefined(), offset, offsets, component);
     }
-    Value opTextureQueryDimension(u32 const_buffer_index, u32 dimension) {
+    // Dimension 0-2 at the LOD (size, height, depth or array size), 3 is the
+    // number of mip levels
+    Value opTextureQueryDimension(u32 const_buffer_index, u32 dimension,
+                                  const Value& lod = Value::createConstantU(0)) {
         return addInstruction(Opcode::TextureQueryDimension, ScalarType::U32,
                               {Value::createRawValue(const_buffer_index),
-                               Value::createRawValue(dimension)});
+                               Value::createRawValue(dimension), lod});
+    }
+
+    // Mip level the texture is sampled at with the coordinates (float2 clamped
+    // to the texture's levels, unclamped), 0 where the host has none
+    Value opTextureQueryLod(u32 const_buffer_index, TextureType type,
+                            const Value& coords, bool unclamped) {
+        return addInstruction(
+            Opcode::TextureQueryLod, ScalarType::F32,
+            {Value::createRawValue(const_buffer_index),
+             Value::createRawValue(type), coords,
+             Value::createRawValue(static_cast<u32>(unclamped))});
+    }
+
+    // Bit counting
+    Value opPopCount(const Value& src) {
+        return addInstruction(Opcode::PopCount, ScalarType::U32, {src});
+    }
+    // Index of the most significant bit (sign bit excluded when signed), ~0
+    // when not found
+    Value opFindMsb(const Value& src, bool is_signed) {
+        return addInstruction(Opcode::FindMsb, ScalarType::U32,
+                              {src, Value::createRawValue(is_signed)});
+    }
+
+    // Compute
+    Value opReadSystemRegister(u32 sr) {
+        return addInstruction(Opcode::ReadSystemRegister, ScalarType::U32,
+                              {Value::createRawValue(sr)});
+    }
+    // Shared memory is addressed in bytes and accessed in words
+    Value opLoadShared(const Value& addr) {
+        return addInstruction(Opcode::LoadShared, ScalarType::U32, {addr});
+    }
+    void opStoreShared(const Value& addr, const Value& value) {
+        addInstructionWithDst(Opcode::StoreShared, std::nullopt,
+                              {addr, value});
+    }
+    Value opAtomicShared(const Value& addr, const Value& value, u32 op, bool is_signed) {
+        return addInstruction(Opcode::AtomicShared, ScalarType::U32,
+                              {addr, value, Value::createRawValue(op), Value::createRawValue(is_signed)});
+    }
+    // Compare and swap, returns the previous value
+    Value opAtomicSharedCas(const Value& addr, const Value& compare,
+                            const Value& value) {
+        return addInstruction(Opcode::AtomicSharedCas, ScalarType::U32,
+                              {addr, compare, value});
+    }
+    // Storage buffers (global memory). `binding` is the constant buffer word
+    // that holds the NVN descriptor (slot << 16 | word), offsets are in bytes
+    // from the buffer start and `size` is the descriptor's byte size. Access
+    // sizes: 0 U8, 1 S8, 2 U16, 3 S16, 4 B32
+    Value opLoadStorage(u32 binding, const Value& offset, const Value& size,
+                        u32 access) {
+        return addInstruction(Opcode::LoadStorage, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               Value::createRawValue(access)});
+    }
+    void opStoreStorage(u32 binding, const Value& offset, const Value& size,
+                        const Value& value, u32 access) {
+        addInstructionWithDst(Opcode::StoreStorage, std::nullopt,
+                              {Value::createRawValue(binding), offset, size,
+                               value, Value::createRawValue(access)});
+    }
+    // Returns the previous value. Operations as in ATOM (0 add ... 8 exchange)
+    // plus 9 for a floating point add
+    Value opAtomicStorage(u32 binding, const Value& offset, const Value& size,
+                          const Value& value, u32 op, bool is_signed) {
+        return addInstruction(Opcode::AtomicStorage, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               value, Value::createRawValue(op),
+                               Value::createRawValue(is_signed)});
+    }
+    // Compare and swap, returns the previous value
+    Value opAtomicStorageCas(u32 binding, const Value& offset,
+                             const Value& size, const Value& compare,
+                             const Value& value) {
+        return addInstruction(Opcode::AtomicStorageCas, ScalarType::U32,
+                              {Value::createRawValue(binding), offset, size,
+                               compare, value});
+    }
+    // Per-thread local memory, addressed in bytes and accessed in words
+    Value opLoadLocal(const Value& addr) {
+        return addInstruction(Opcode::LoadLocal, ScalarType::U32, {addr});
+    }
+    void opStoreLocal(const Value& addr, const Value& value) {
+        addInstructionWithDst(Opcode::StoreLocal, std::nullopt,
+                              {addr, value});
+    }
+    void opBarrier() { addInstructionWithDst(Opcode::Barrier); }
+    // Geometry shader output (OUT)
+    void opEmitVertex() { addInstructionWithDst(Opcode::EmitVertex); }
+    void opEndPrimitive() { addInstructionWithDst(Opcode::EndPrimitive); }
+    // Raw sizes of images accessed as raw words (SULD.D, SUST.D); formatted
+    // accesses convert the texel to or from channel values
+    // Store of 4 raw register values, formatted or as raw words of the given
+    // size (U8, S8, U16, S16, B32, B64, B128 as 0-6)
+    void opImageStore(u32 index, TextureType type, const Value& coords,
+                      const std::array<Value, 4>& values,
+                      u32 raw_size = IMAGE_FORMATTED) {
+        addInstructionWithDst(Opcode::ImageStore, std::nullopt,
+                              {Value::createRawValue(index),
+                               Value::createRawValue(type), coords, values[0],
+                               values[1], values[2], values[3],
+                               Value::createRawValue(raw_size)});
+    }
+    // Load of 4 raw words (channel bits, or the texel's words when raw)
+    Value opImageLoad(u32 index, TextureType type, const Value& coords,
+                      u32 raw_size = IMAGE_FORMATTED) {
+        return addInstruction(Opcode::ImageLoad,
+                              Type::createVector(ScalarType::U32, 4),
+                              {Value::createRawValue(index),
+                               Value::createRawValue(type), coords,
+                               Value::createRawValue(raw_size)});
+    }
+    // Returns the previous value
+    Value opImageAtomic(u32 index, TextureType type, u32 op,
+                        const Value& coords, const Value& value) {
+        return addInstruction(Opcode::ImageAtomic, ScalarType::U32,
+                              {Value::createRawValue(index),
+                               Value::createRawValue(type),
+                               Value::createRawValue(op), coords, value});
+    }
+
+    // Warp
+    // mode: 0 = all, 1 = any, 2 = equal
+    Value opVote(const Value& pred, u32 mode) {
+        return addInstruction(Opcode::Vote, ScalarType::Bool,
+                              {pred, Value::createRawValue(mode)});
+    }
+    Value opBallot(const Value& pred) {
+        return addInstruction(Opcode::Ballot, ScalarType::U32, {pred});
+    }
+    Value opShuffle(const Value& value, const Value& lane) {
+        return addInstruction(Opcode::Shuffle, ScalarType::U32, {value, lane});
+    }
+
+    // Intrinsic
+    Value opIntrinsic(Intrinsic intrinsic, Type dst_type,
+                      const std::vector<Value>& args) {
+        std::vector<Value> operands;
+        operands.reserve(args.size() + 1);
+        operands.push_back(Value::createRawValue(intrinsic));
+        operands.insert(operands.end(), args.begin(), args.end());
+        return addInstruction(Opcode::Intrinsic, dst_type, operands);
     }
 
     // Exit

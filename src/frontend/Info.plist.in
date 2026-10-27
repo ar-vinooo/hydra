@@ -30,6 +30,12 @@
 	<string>NSApplication</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<!-- Lets the Metal performance HUD be shown; the Graphics setting shows
+	     and hides it through the layer's developerHUDProperties -->
+	<key>MetalHudEnabled</key>
+	<true/>
 	<key>LSApplicationCategoryType</key>
 	<string>${MACOSX_BUNDLE_CATEGORY}</string>
 	 <key>LSMinimumSystemVersion</key>
@@ -86,6 +92,7 @@
                     <string>nro</string>
                     <string>nso</string>
                     <string>nca</string>
+                    <string>xci</string>
                 </array>
             </dict>
         </dict>

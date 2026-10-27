@@ -44,14 +44,23 @@ result_t IAudioOutManager::openAudioOutAuto(
                             out_device_name_buffer.stream);
 }
 
+namespace {
+
+// The console's only audio output (libnx audout's default name)
+constexpr std::string_view AUDIO_OUT_NAME = "DeviceOut";
+constexpr usize AUDIO_OUT_NAME_SIZE = 0x100;
+
+} // namespace
+
 result_t IAudioOutManager::listAudioOutsImpl(
     u32* out_count, std::optional<ztd::io::MemoryStream> out_stream) {
-    (void)out_stream;
-
-    LOG_FUNC_STUBBED(Services);
-
-    // HACK
     *out_count = 0;
+    if (!out_stream || out_stream->getSize() < AUDIO_OUT_NAME_SIZE)
+        return RESULT_SUCCESS;
+    std::array<char, AUDIO_OUT_NAME_SIZE> name{};
+    std::copy(AUDIO_OUT_NAME.begin(), AUDIO_OUT_NAME.end(), name.begin());
+    out_stream->write(name);
+    *out_count = 1;
     return RESULT_SUCCESS;
 }
 
@@ -83,9 +92,9 @@ result_t IAudioOutManager::openAudioOutImpl(
     *out_format = format;
     *out_state = AudioOutState::Stopped;
 
-    // TODO: is this somehow connected to device name in?
-    std::string device_name_out = "Hydra audio device";
-    out_device_name_stream->writeNullTerminatedString(device_name_out);
+    // Any name opens the one output, which reports its own name
+    out_device_name_stream->writeNullTerminatedString(
+        std::string(AUDIO_OUT_NAME));
 
     addService(*ctx,
                new IAudioOut(ctx->system, format, sample_rate, channel_count));

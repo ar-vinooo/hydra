@@ -48,6 +48,7 @@ struct HydraApp: App {
             Window("Hydra", id: "main") {
                 ContentView()
                     .environmentObject(globalState)
+                    .onAppear { appDelegate.globalState = globalState }
             }
             .defaultSize(width: 1280, height: 720)
             .windowResizability(.contentSize)
@@ -68,6 +69,7 @@ struct HydraApp: App {
 
             Settings {
                 SettingsView()
+                    .environmentObject(globalState)
                     .environmentObject(globalState)
             }
         #else

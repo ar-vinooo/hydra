@@ -1,5 +1,6 @@
 #include "core/horizon/display/layer.hpp"
 
+#include "common/config.hpp"
 #include "core/horizon/kernel/process.hpp"
 #include "core/horizon/os.hpp"
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
@@ -16,14 +17,45 @@ bool Layer::acquirePresentTexture(
     auto& binder = system.getOs().getDisplayDriver().getBinder(binder_handle);
 
     BqBufferInput input;
-    i32 slot = binder.consumeBuffer(input);
+    u64 gpu_fence;
+    i32 slot = binder.consumeBuffer(input, gpu_fence);
     if (slot == -1)
         return false;
-    const auto& buffer = binder.getBuffer(slot);
+
+    // Above the console's 60, only the newest frame is shown and the older
+    // ones go back to the title at once, so it renders on instead of waiting
+    // for the host display
+    if (CONFIG_INSTANCE.getFrameRateLimit() != 60) {
+        BqBufferInput newer_input;
+        u64 newer_gpu_fence;
+        for (i32 newer_slot;
+             (newer_slot = binder.consumeBuffer(newer_input,
+                                                newer_gpu_fence)) != -1;) {
+            binder.releaseCallback(slot)();
+            slot = newer_slot;
+            input = newer_input;
+            gpu_fence = newer_gpu_fence;
+        }
+    }
+
+    // Wait for the GPU to finish rendering the buffer
+    system.getGpu().getPfifo().waitForCompletion(gpu_fence);
+    const auto release = binder.releaseCallback(slot);
+    const auto buffer = binder.getBuffer(slot);
+    if (!buffer) {
+        release();
+        return false;
+    }
+    command_buffer->onCompleted(release);
 
     // Texture
-    present_texture = system.getGpu().getTexture(
-        command_buffer, process->getMmu(), buffer.nv_buffer);
+    auto* texture = system.getGpu().getTexture(
+        command_buffer, process->getMmu(), buffer->nv_buffer);
+    if (texture == nullptr) {
+        present_texture.reset();
+        return false;
+    }
+    present_texture = texture;
 
     // Rect
     src_rect = {};
@@ -33,17 +65,14 @@ bool Layer::acquirePresentTexture(
     src_rect.size.x() = input.rect.right - input.rect.left;
     src_rect.size.y() = input.rect.bottom - input.rect.top;
 
-    // HACK
-    if (src_rect.size.x() == 0) {
+    // An empty crop rectangle means "no crop" (the whole buffer), as in the
+    // Android BufferQueue this interface comes from
+    if (src_rect.size.x() == 0)
         src_rect.size.x() = static_cast<i32>(
             present_texture.value()->getBase()->getDescriptor().width);
-        ONCE(LOG_WARN(Other, "Invalid src width"));
-    }
-    if (src_rect.size.y() == 0) {
+    if (src_rect.size.y() == 0)
         src_rect.size.y() = static_cast<i32>(
             present_texture.value()->getBase()->getDescriptor().height);
-        ONCE(LOG_WARN(Other, "Invalid src height"));
-    }
 
     if (any(input.transform_flags & horizon::display::TransformFlags::FlipH)) {
         src_rect.origin.x() += src_rect.size.x();

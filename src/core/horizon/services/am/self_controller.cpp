@@ -13,8 +13,9 @@ DEFINE_SERVICE_COMMAND_TABLE(
     setRestartMessageEnabled, 16, setOutOfFocusSuspendingEnabled, 19,
     setAlbumImageOrientation, 40, createManagedDisplayLayer, 41,
     isSystemBufferSharingEnabled, 44, createManagedDisplaySeparableLayer, 50,
-    setHandlesRequestToDisplay, 62, setIdleTimeDetectionExtension, 80,
-    setWirelessPriorityMode, 91, getAccumulatedSuspendedTickChangedEvent)
+    setHandlesRequestToDisplay, 62, setIdleTimeDetectionExtension, 63,
+    getIdleTimeDetectionExtension, 80, setWirelessPriorityMode, 91,
+    getAccumulatedSuspendedTickChangedEvent)
 
 ISelfController::ISelfController()
     : library_applet_launchable_event{
@@ -71,17 +72,26 @@ result_t ISelfController::createManagedDisplaySeparableLayer(
                                 .getDisplayDriver()
                                 .createLayer(process, binder_handle)
                                 .getRaw();
-    // TODO: what is a recording layer?
-    *out_recording_layer_id = system->getOs()
-                                  .getDisplayDriver()
-                                  .createLayer(process, binder_handle)
-                                  .getRaw();
+    // The recording layer (screenshots and video capture) mirrors the
+    // display layer; it must not be shown or consume the display's buffers
+    auto& driver = system->getOs().getDisplayDriver();
+    const auto recording_layer = driver.createLayer(process, binder_handle);
+    driver.getLayer(recording_layer).setVisible(false);
+    *out_recording_layer_id = recording_layer.getRaw();
     return RESULT_SUCCESS;
 }
 
 result_t
 ISelfController::setIdleTimeDetectionExtension(IdleTimeDetectionExtension ext) {
-    LOG_FUNC_WITH_ARGS_STUBBED(Services, "extension: {}", ext);
+    if (ext > IdleTimeDetectionExtension::ExtendedUnsafe)
+        return MAKE_RESULT(Svc, kernel::Error::InvalidEnumValue);
+    idle_time_detection_extension = ext;
+    return RESULT_SUCCESS;
+}
+
+result_t ISelfController::getIdleTimeDetectionExtension(
+    IdleTimeDetectionExtension* out_ext) {
+    *out_ext = idle_time_detection_extension;
     return RESULT_SUCCESS;
 }
 

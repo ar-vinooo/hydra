@@ -40,6 +40,8 @@ class Layer {
     float2 position{0, 0};
     uint2 size{LAYER_SIZE_AUTO};
     i64 z{0};
+    // Recording layers share the display layer's binder but are never shown
+    bool visible{true};
 
     // Present
     std::optional<hw::tegra_x1::gpu::renderer::ITextureView*> present_texture;
@@ -51,6 +53,7 @@ class Layer {
     SETTER(position, setPosition);
     SETTER(size, setSize);
     GETTER_AND_SETTER(z, getZ, setZ);
+    GETTER_AND_SETTER(visible, isVisible, setVisible);
     GETTER(present_texture, getPresentTexture);
     CONST_REF_GETTER(src_rect, getSrcRect);
 };

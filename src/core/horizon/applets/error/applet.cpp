@@ -10,6 +10,7 @@ result_t Applet::run(System& system) {
     // TODO: PopInData
     auto param_reader = popInDataRaw();
     const auto param_common = param_reader.read<ParamCommon>();
+    LOG_INFO(Applets, "Error applet: type {}", param_common.type);
 
     // TODO: context (if present)
 
@@ -18,6 +19,11 @@ result_t Applet::run(System& system) {
     switch (param_common.type) {
     case ErrorType::ApplicationError: {
         const auto param = param_reader.read<ParamForApplicationError>();
+        LOG_INFO(Applets, "Error applet: code 0x{:x}, message \"{}\"",
+                 param.error_code_number,
+                 std::string_view(param.dialog_message,
+                                  strnlen(param.dialog_message,
+                                          sizeof(param.dialog_message))));
 
         // TODO: handle empty messages
         system.getUiHandler().showMessageDialog(

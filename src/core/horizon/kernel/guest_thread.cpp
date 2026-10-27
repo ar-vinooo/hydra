@@ -18,11 +18,43 @@ GuestThread::GuestThread(System& system_, Process* process,
     tls_mem = process->createTlsMemory(tls_addr);
 }
 
-GuestThread::~GuestThread() { delete tls_mem; }
+GuestThread::~GuestThread() {
+    stopAndJoin();
+    delete tls_mem;
+}
 
 uptr GuestThread::getTlsPtr() const { return tls_mem->getPtr(); }
 
+void GuestThread::captureContext(ThreadContext& out_context) {
+    out_context = {};
+    if (thread == nullptr)
+        return;
+    thread->completeState();
+    const auto& state = thread->getState();
+    for (u32 i = 0; i < out_context.cpu_gprs.size(); i++)
+        out_context.cpu_gprs[i].x = state.r[i];
+    out_context.fp = state.fp;
+    out_context.lr = state.lr;
+    out_context.sp = state.sp;
+    out_context.pc.x = state.pc;
+    out_context.psr = state.pstate;
+    for (u32 i = 0; i < out_context.fpu_gprs.size(); i++)
+        out_context.fpu_gprs[i].v = state.v[i];
+    out_context.fpcr = state.fpcr;
+    out_context.fpsr = state.fpsr;
+    out_context.tpidr = thread->getTpidr();
+}
+
+void GuestThread::prepareForDebugger() {
+    if (thread != nullptr)
+        thread->completeState();
+}
+
 void GuestThread::run() {
+    // The host QoS was set from the guest priority by IThread::start. Don't
+    // raise it here: low priority threads leave the performance cores to the
+    // game's main threads and the GPU thread.
+
     // Create
     ASSERT(entry_point != invalid<vaddr_t>(), Kernel, "Invalid entry point");
     thread = system.getCpu().createThread(
@@ -47,6 +79,11 @@ void GuestThread::run() {
              [this] {
                  DEBUGGER_MANAGER_INSTANCE.getDebugger(process).breakpointHit(
                      this);
+             },
+         .user_exception =
+             [this](hw::tegra_x1::cpu::IThread* hw_thread,
+                    const hw::tegra_x1::cpu::GuestException& info) {
+                 return process->enterUserException(this, *hw_thread, info);
              }},
         tls_mem, tls_addr);
 

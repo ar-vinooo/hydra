@@ -18,7 +18,10 @@ class IManagerForApplication : public IService {
 
     // Commands
     STUB_REQUEST_COMMAND(checkAvailability);
-    result_t getAccountId(u64* out_id);
+    result_t getAccountId(kernel::Process* process, u64* out_id);
+    result_t ensureIdTokenCacheAsync(RequestContext* ctx);
+    result_t loadIdTokenCache(kernel::Process* process, u32* out_size,
+                              OutBuffer<BufferAttr::MapAlias> out_buffer);
 };
 
 } // namespace hydra::horizon::services::account::baas

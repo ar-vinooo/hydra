@@ -23,6 +23,15 @@ union InstMov32I {
 
 void emitMov32I(DecoderContext& context, InstMov32I inst);
 
+union InstS2R {
+    BitField64<reg_t, 0, 8> dst;
+    BitField64<pred_t, 16, 3> pred;
+    BitField64<bool, 19, 1> pred_inv;
+    BitField64<u32, 20, 8> sr;
+};
+
+void emitS2R(DecoderContext& context, InstS2R inst);
+
 union InstSelBase {
     BitField64<reg_t, 0, 8> dst;
     BitField64<reg_t, 8, 8> src_a;

@@ -19,7 +19,27 @@ void Server::start() {
     thread->start();
 }
 
-void Server::stop() { thread = std::nullopt; }
+void Server::stop() {
+    if (thread) {
+        thread->stopAndJoin();
+        thread.reset();
+    }
+    while (!session_services.empty())
+        releaseSessionService(session_services.begin()->first);
+    for (auto session : sessions)
+        session->release();
+    sessions.clear();
+}
+
+void Server::releaseSessionService(kernel::hipc::ServerSession* session) {
+    auto* service = session_services.at(session);
+    session_services.erase(session);
+    if (std::none_of(
+            session_services.begin(), session_services.end(),
+            [service](const auto& entry) { return entry.second == service; }))
+        service->releaseDomainObjects();
+    service->release();
+}
 
 void Server::registerPort(kernel::hipc::ServerPort* port,
                           create_service_fn_t service_creator) {
@@ -29,6 +49,7 @@ void Server::registerPort(kernel::hipc::ServerPort* port,
 
 void Server::registerSession(kernel::hipc::ServerSession* session,
                              IService* service) {
+    service->setServer(this);
     sessions.push_back(session);
     session_services.insert({session, service});
 }
@@ -82,12 +103,6 @@ void Server::mainLoop(const kernel::should_stop_fn_t& should_stop) {
             auto session = sessions[session_index];
             auto service = session_services.at(session);
 
-            // Service
-            service->release();
-            session_services.erase(session);
-
-            // Session
-
             // Handle all requests
             while (session->hasRequests()) {
                 session->receive(&thread.value());
@@ -96,6 +111,9 @@ void Server::mainLoop(const kernel::should_stop_fn_t& should_stop) {
                                        thread->getTlsPtr());
                 session->reply(thread->getTlsPtr());
             }
+
+            // Keep the service alive until pending requests are drained.
+            releaseSessionService(session);
 
             // Release
             session->clear(); // TODO: is this necessary?

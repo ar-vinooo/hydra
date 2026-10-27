@@ -43,15 +43,23 @@ class IGeneralService : public IService {
 
   private:
     // Commands
+    result_t getClientId(OutBuffer<BufferAttr::HipcPointer> out_buffer);
     result_t createRequest(RequestContext* ctx, i32 requirement_preset);
     result_t
     getCurrentNetworkProfile(OutBuffer<BufferAttr::HipcPointer> out_buffer);
-    result_t getCurrentIpAddress(IpV4Address* out_ip);
+    result_t getCurrentIpAddress(kernel::Process* process,
+                                 IpV4Address* out_ip);
     result_t getCurrentIpConfigInfo(IpAddressSetting* out_ip_address_setting,
                                     DnsSetting* out_dns_setting);
     result_t getInternetConnectionStatus(InternetConnectionType* out_type,
                                          u32* out_wifi_strength,
                                          InternetConnectionStatus* out_status);
+    result_t isAnyInternetRequestAccepted(
+        kernel::Process* process,
+        InBuffer<BufferAttr::HipcPointer> client_id_buffer,
+        bool* out_accepted);
+    result_t isAnyForegroundRequestAccepted(kernel::Process* process,
+                                            bool* out_accepted);
 };
 
 } // namespace hydra::horizon::services::nifm

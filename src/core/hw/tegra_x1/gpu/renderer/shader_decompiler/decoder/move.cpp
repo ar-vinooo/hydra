@@ -1,5 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decoder/move.hpp"
 
+#include <bit>
+
 namespace hydra::hw::tegra_x1::gpu::renderer::shader_decomp::decoder {
 
 namespace {
@@ -46,12 +48,27 @@ void emitMovC(DecoderContext& context, InstMovC inst) {
 void emitMovI(DecoderContext& context, InstMovI inst) {
     emitMove(context, inst.base.pred, inst.base.pred_inv, inst.base.dst,
              ir::Value::createConstantU(
-                 getIntImm20(inst.imm20_0, inst.imm20_19, false)));
+                 getIntImm20(inst.imm20_0, inst.imm20_19, true)));
 }
 
 void emitMov32I(DecoderContext& context, InstMov32I inst) {
     emitMove(context, inst.pred, inst.pred_inv, inst.dst,
              ir::Value::createConstantU(inst.imm));
+}
+
+void emitS2R(DecoderContext& context, InstS2R inst) {
+    // Thread and block IDs only exist in compute shaders, other stages read
+    // zero
+    const auto sr = static_cast<u32>(inst.sr);
+    if (context.decomp_context.type != ShaderType::Compute &&
+        ((sr >= 0x20 && sr <= 0x23) || (sr >= 0x25 && sr <= 0x27))) {
+        emitMove(context, inst.pred, inst.pred_inv, inst.dst,
+                 ir::Value::createConstantU(0));
+        return;
+    }
+
+    emitMove(context, inst.pred, inst.pred_inv, inst.dst,
+             context.builder.opReadSystemRegister(sr));
 }
 
 void emitSelR(DecoderContext& context, InstSelR inst) {

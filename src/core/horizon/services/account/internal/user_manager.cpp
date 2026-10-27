@@ -204,7 +204,8 @@ void UserManager::serialize(uuid_t user_id) {
     const auto path = getUserPath(user_id);
     ZTD_ASSIGN_OR(
         auto file,
-        ztd::fs::openFileAbsolute(path, ztd::fs::File::OpenFlags::Write), {
+        ztd::fs::createFileAbsolute(path, ztd::fs::File::CreateFlags::Truncate),
+        {
             LOG_ERROR(Services, "Failed to write user at path {}", path);
             return;
         });

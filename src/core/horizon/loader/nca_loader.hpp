@@ -2,6 +2,7 @@
 
 #include "core/horizon/filesystem/content_archive.hpp"
 #include "core/horizon/loader/loader.hpp"
+#include "core/horizon/loader/npdm.hpp"
 
 namespace hydra {
 class System;
@@ -16,6 +17,11 @@ class NcaLoader : public ILoader {
     explicit NcaLoader(filesystem::ContentArchive content_archive_);
 
     u64 getTitleId() const override { return content_archive.getTitleId(); }
+    std::string_view getUnsupportedReason() const override {
+        return is_64_bit ? std::string_view{}
+                         : "This game uses 32-bit ARM instructions. Hydra "
+                           "currently supports only 64-bit games.";
+    }
 
     const std::string& getName() const { return name; }
 
@@ -25,8 +31,10 @@ class NcaLoader : public ILoader {
     filesystem::ContentArchive content_archive;
 
     std::string name;
+    bool is_64_bit{true};
     u8 main_thread_priority;
     u8 main_thread_core_number;
+    std::optional<NpdmThreadInfo> thread_info;
     u32 main_thread_stack_size;
     u32 system_resource_size;
 

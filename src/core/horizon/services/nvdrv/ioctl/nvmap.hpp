@@ -2,6 +2,8 @@
 
 #include "core/horizon/services/nvdrv/ioctl/fd_base.hpp"
 
+#include <map>
+
 namespace hydra::horizon::services::nvdrv::ioctl {
 
 enum class NvMapParamType : u32 {
@@ -15,18 +17,26 @@ enum class NvMapParamType : u32 {
 
 class NvMap : public FdBase {
   public:
+    ~NvMap() override;
     NvResult ioctl([[maybe_unused]] IoctlContext& context, u32 type,
                    u32 nr) override;
 
   private:
+    NvResult ioctlUnchecked(IoctlContext& context, u32 type, u32 nr);
+    std::mutex mutex;
+    System* bound_system{nullptr};
+    kernel::Process* bound_process{nullptr};
+    std::shared_ptr<const void> bound_identity;
+    std::map<u32, u32> references;
     // Ioctls
-    NvResult create(System* system, u32 size, Handle* out_handle);
-    NvResult fromId(u32 id, Handle* out_handle);
+    NvResult create(System* system, kernel::Process* process, u32 size,
+                    Handle* out_handle);
+    NvResult fromId(System* system, kernel::Process* process, u32 id, Handle* out_handle);
     NvResult alloc(System* system, Handle handle, u32 heap_mask, u32 flags,
                    InOutSingle<u32> inout_alignment, Aligned<u8, 8> kind,
                    gpu_vaddr_t addr);
     NvResult free(System* system, Aligned<Handle, 8> handle,
-                  gpu_vaddr_t* out_addr, u64* out_size, u32* out_flags);
+                     u64* out_addr, u32* out_size, u32* out_flags);
     NvResult param(System* system, Handle handle, NvMapParamType type,
                    u32* out_value);
     NvResult getId(u32* out_id, Handle handle);
