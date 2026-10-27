@@ -348,11 +348,11 @@ Pipeline::Pipeline(MTL::Device* device,
         pipeline_descriptor->setMaxTessellationFactor(64);
         if (capture_pipeline == nullptr || tess_control_pipeline == nullptr ||
             tess_factor_pipeline == nullptr) {
-            for (auto** state : {&capture_pipeline, &tess_control_pipeline,
+            for (auto** compute_state : {&capture_pipeline, &tess_control_pipeline,
                                  &tess_factor_pipeline}) {
-                if (*state != nullptr)
-                    (*state)->release();
-                *state = nullptr;
+                if (*compute_state != nullptr)
+                    (*compute_state)->release();
+                *compute_state = nullptr;
             }
             pipeline_descriptor->release();
             return;
