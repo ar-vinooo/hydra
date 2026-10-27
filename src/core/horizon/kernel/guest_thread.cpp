@@ -8,6 +8,8 @@
 #include "core/hw/tegra_x1/cpu/thread.hpp"
 #include "core/system.hpp"
 
+#include <pthread.h>
+
 namespace hydra::horizon::kernel {
 
 GuestThread::GuestThread(System& system_, Process* process,
@@ -26,6 +28,9 @@ GuestThread::~GuestThread() {
 uptr GuestThread::getTlsPtr() const { return tls_mem->getPtr(); }
 
 void GuestThread::run() {
+    // Guest CPU threads are latency critical; keep them on the P-cores
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
     // Create
     ASSERT(entry_point != invalid<vaddr_t>(), Kernel, "Invalid entry point");
     thread = system.getCpu().createThread(

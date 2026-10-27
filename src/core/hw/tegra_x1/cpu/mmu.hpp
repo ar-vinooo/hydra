@@ -67,6 +67,9 @@ class IMmu {
     // GPU thread before it uses the caches, so CPU threads never wait on
     // the cache locks a draw holds.
     void applyPendingInvalidations();
+    // Queues an invalidation of host memory changed outside the guest (e.g.
+    // cleared by the host), applied like those of trackWrite
+    void queueHostInvalidation(ztd::Range<uptr> range);
 
     // GPU-written memory: the GPU's contents are not in guest memory, so CPU
     // accesses must fault and have them written back first. Takes host
@@ -112,11 +115,16 @@ class IMmu {
                      va);
     }
 
+    // Stores only if memory still holds the value of the exclusive load
     template <typename T>
-    void writeExclusive(vaddr_t va, T value) const {
+    bool writeExclusive(vaddr_t va, T value, T expected) const {
         auto ptr = unmapAddr(va);
         ASSERT_DEBUG(ptr != 0x0, Cpu, "Failed to unmap va 0x{:08x}", va);
-        atomicStore(reinterpret_cast<T*>(ptr), value);
+        if (ptr == 0x0) [[unlikely]]
+            return false;
+
+        return atomicCompareExchangeStrong(reinterpret_cast<T*>(ptr), expected,
+                                           value);
     }
 
   protected:

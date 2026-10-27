@@ -649,7 +649,19 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     // Macros
     u32 readMacroRegister(u32 reg) override { return getReg(reg); }
     void callMacroMethod(u32 method, u32 arg) override {
+        if (!isConstBufferData(method))
+            flushConstBufferInvalidation();
         this->method(method, arg);
+    }
+
+    // LOAD_CONST_BUFFER words invalidate the buffer cache once per run of
+    // words: any other method may read the buffer, so it flushes them first
+    static constexpr bool isConstBufferData(u32 method) {
+        return method >= 0x8e4 && method < 0x8e4 + 16;
+    }
+    void flushConstBufferInvalidation() {
+        if (pending_const_buffer_invalidation.getSize() != 0)
+            flushConstBufferInvalidationImpl();
     }
 
     // Helpers (also used by the compute engine)
@@ -778,6 +790,9 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     void firmwareCall4(const u32 index, const u32 data);
 
     void loadConstBuffer(const u32 index, const u32 data);
+    // Host range written by LOAD_CONST_BUFFER and not invalidated yet
+    ztd::Range<uptr> pending_const_buffer_invalidation;
+    void flushConstBufferInvalidationImpl();
     void bindGroup(const u32 index, const u32 data);
 
     // Helpers

@@ -614,6 +614,7 @@ RenderEncoder* CommandBuffer::createRenderCommandEncoderHot2(
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Render;
+    writeMtl4PassTimestamp(false);
     has_commands = true;
     ++render_encoders;
     encoder_state.render_pass = render_pass_descriptor->retain();
@@ -624,16 +625,42 @@ RenderEncoder* CommandBuffer::createRenderCommandEncoderHot2(
 
 u32 CommandBuffer::reservePassSamples(GpuPassProfiler::Kind kind,
                                       std::string label) {
-    // TODO: Metal 4 samples timestamps through counter heaps
-    if (mtl4_context != nullptr)
-        return invalid<u32>();
-    auto* profiler = GpuPassProfiler::get(command_buffer->device());
-    if (!profiler)
+    auto* profiler = GpuPassProfiler::get(getDevice());
+    // Metal 4 writes timestamps into the counter heap
+    const bool mtl4 = mtl4_context != nullptr;
+    if (!profiler || (mtl4 && profiler->getCounterHeap() == nullptr))
         return invalid<u32>();
     const auto sample = profiler->reserve();
     if (sample != invalid<u32>())
-        profiled_passes.push_back({kind, sample, std::move(label)});
+        profiled_passes.push_back({kind, sample, std::move(label), mtl4});
     return sample;
+}
+
+void CommandBuffer::writeMtl4PassTimestamp(bool end) {
+    if (mtl4_pass_sample == invalid<u32>())
+        return;
+    auto* heap = GpuPassProfiler::get(getDevice())->getCounterHeap();
+    const NS::UInteger index = end ? mtl4_pass_sample + 1 : mtl4_pass_sample;
+    switch (encoder_type) {
+    case EncoderType::Render:
+        render_encoder.mtl4->writeTimestamp(
+            MTL4::TimestampGranularityPrecise,
+            end ? MTL::RenderStageFragment : MTL::RenderStageVertex, heap,
+            index);
+        break;
+    case EncoderType::Compute:
+        compute_encoder.mtl4->writeTimestamp(MTL4::TimestampGranularityPrecise,
+                                             heap, index);
+        break;
+    case EncoderType::Blit:
+        blit_encoder.mtl4->writeTimestamp(MTL4::TimestampGranularityPrecise,
+                                          heap, index);
+        break;
+    case EncoderType::None:
+        break;
+    }
+    if (end)
+        mtl4_pass_sample = invalid<u32>();
 }
 
 void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
@@ -766,6 +793,11 @@ void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
                     stores.empty() ? " -" : stores));
     if (sample == invalid<u32>())
         return;
+    // Metal 4: the encoder writes them, the descriptor is the caller's
+    if (mtl4_context != nullptr) {
+        mtl4_pass_sample = sample;
+        return;
+    }
     auto* attachment = descriptor->sampleBufferAttachments()->object(0);
     attachment->setSampleBuffer(
         GpuPassProfiler::get(command_buffer->device())->getSampleBuffer());
@@ -790,6 +822,8 @@ BlitEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
         mtl4_encoder = encoder->retain();
         blit_encoder.mtl4 = encoder;
         blit_encoder.encoded_any = false;
+        mtl4_pass_sample =
+            reservePassSamples(GpuPassProfiler::Kind::Blit, "blit");
     } else if (const auto sample =
                    reservePassSamples(GpuPassProfiler::Kind::Blit, "blit");
                sample != invalid<u32>()) {
@@ -810,6 +844,7 @@ BlitEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Blit;
+    writeMtl4PassTimestamp(false);
     render_pass_gap = 1;
     has_commands = true;
     ++blit_encoders;
@@ -833,6 +868,8 @@ ComputeEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
         compute_encoder.mtl4 = encoder;
         compute_encoder.table = compute_table;
         compute_encoder.encoded_any = false;
+        mtl4_pass_sample =
+            reservePassSamples(GpuPassProfiler::Kind::Compute, "compute");
     } else if (const auto sample =
                    reservePassSamples(GpuPassProfiler::Kind::Compute, "compute");
                sample != invalid<u32>()) {
@@ -855,6 +892,7 @@ ComputeEncoder* CommandBuffer::getComputeCommandEncoderHot4() {
     TMP_AUTORELEASE_POOL_END();
 
     encoder_type = EncoderType::Compute;
+    writeMtl4PassTimestamp(false);
     render_pass_gap = 2;
     has_commands = true;
 
@@ -959,6 +997,7 @@ void CommandBuffer::endEncodingHot6() {
         return;
 
     if (mtl4_encoder != nullptr) {
+        writeMtl4PassTimestamp(true);
         mtl4_encoder->endEncoding();
         mtl4_encoder->release();
         mtl4_encoder = nullptr;

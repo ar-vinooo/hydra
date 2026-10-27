@@ -22,6 +22,8 @@ class GpuPassProfiler {
         Kind kind;
         u32 sample; // Start sample, the end sample follows it
         std::string label;
+        // Written into the Metal 4 counter heap instead of the sample buffer
+        bool mtl4;
     };
 
     struct Total {
@@ -33,6 +35,9 @@ class GpuPassProfiler {
     static GpuPassProfiler* get(MTL::Device* device);
 
     MTL::CounterSampleBuffer* getSampleBuffer() const { return sample_buffer; }
+    // Timestamps of Metal 4 encoders, null if they cannot be written. Indices
+    // are those of the sample buffer.
+    MTL4::CounterHeap* getCounterHeap() const { return counter_heap; }
     // Reserves the start and end samples of a pass, invalid<u32>() if all are
     // in flight
     u32 reserve();
@@ -52,6 +57,9 @@ class GpuPassProfiler {
     static constexpr u32 SAMPLE_COUNT = 4096;
 
     MTL::CounterSampleBuffer* sample_buffer{nullptr};
+    MTL4::CounterHeap* counter_heap{nullptr};
+    // Counter heap timestamps are GPU ticks
+    f64 ns_per_tick{1.0};
     std::mutex mutex;
     std::vector<u32> free_pairs;
     Total kind_totals[3];

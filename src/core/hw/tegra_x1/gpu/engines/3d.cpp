@@ -498,18 +498,20 @@ void ThreeD::drawVertexArrayCompact(const u32 index, const u32 arg) {
     const auto start = regs.vertex_array_start;
     const auto primitive_type = regs.begin.primitive_type;
     regs.vertex_array_start = extractBits(arg, 0, 16);
+    // TOPOLOGY is 31:28: adjacency and patch topologies need bit 31
     regs.begin.primitive_type =
-        static_cast<PrimitiveType>(extractBits(arg, 28, 3));
+        static_cast<PrimitiveType>(extractBits(arg, 28, 4));
     drawVertexArray(0, extractBits(arg, 16, 12));
     regs.vertex_array_start = start;
     regs.begin.primitive_type = primitive_type;
 }
 
 void ThreeD::drawVertexElementsCompact(const u32 index, const u32 arg) {
-    // 32, 16 and 8-bit indices, first then subsequent instances
+    // 32, 16 and 8-bit indices, each with a first and then a subsequent
+    // instance method (DRAW_INDEX_BUFFER{32,16,8}_BEGIN_END_INSTANCE_*)
     constexpr IndexType formats[] = {IndexType::UInt32, IndexType::UInt16,
                                      IndexType::UInt8};
-    if (index < 3)
+    if (index % 2 == 0)
         instance_index = 0;
     else
         instance_index++;
@@ -518,7 +520,7 @@ void ThreeD::drawVertexElementsCompact(const u32 index, const u32 arg) {
     const auto index_type = regs.index_type;
     const auto primitive_type = regs.begin.primitive_type;
     regs.vertex_elements_start = extractBits(arg, 0, 16);
-    regs.index_type = formats[index % 3];
+    regs.index_type = formats[index / 2];
     regs.begin.primitive_type =
         static_cast<PrimitiveType>(extractBits(arg, 28, 4));
     drawVertexElements(0, extractBits(arg, 16, 12));
@@ -545,14 +547,6 @@ void ThreeD::drawAuto(const u32, const u32 byte_count) {
 void ThreeD::beginDraw(const u32 index, const u32 arg) {
     writeReg(0x586, arg);
     inline_indices.clear();
-
-    // DEBUG: log begin values while rendering to a 3D target
-    if (regs.color_targets[0].tile_mode.is_3d) {
-        static u32 logs = 0;
-        if (logs++ < 100)
-            LOG_INFO(Engines, "DEBUG begin {:#010x} base_instance {}", arg,
-                     regs.base_instance);
-    }
 
     // Instanced draws are submitted as one draw per instance
     switch (extractBits(arg, 26, 2)) {
@@ -1093,19 +1087,6 @@ void ThreeD::setReportSemaphore(const u32 index, const u32 data) {
     const u32 counter_type = extractBits(data, 23, 5);
     const bool short_query = extractBits(data, 28, 1) != 0;
 
-    // DEBUG: log the kinds of queries used
-    {
-        static std::mutex debug_mutex;
-        static std::set<u32> seen;
-        std::scoped_lock lock(debug_mutex);
-        if (seen.size() < 32 && seen.insert(data & 0xfffffff3u).second)
-            LOG_INFO(Engines,
-                     "DEBUG semaphore: data={:#010x} op={} counter={:#x} "
-                     "short={} payload={:#x}",
-                     data, operation, counter_type, short_query,
-                     regs.report_semaphore_payload);
-    }
-
     const u64 semaphore_address = (static_cast<u64>(regs_raw[0x6c0] & 0xff) << 32) |
                                   regs_raw[0x6c1];
     // Reduction (bits 3, 9-11 and 17-18) combines the payload into the word
@@ -1250,16 +1231,36 @@ void ThreeD::loadConstBuffer(const u32 index, const u32 data) {
     const uptr const_buffer_gpu_addr =
         static_cast<u64>(regs.const_buffer_selector);
     const uptr gpu_addr = const_buffer_gpu_addr + regs.load_const_buffer_offset;
-    const auto ptr = tls_crnt_gmmu->unmapAddr(gpu_addr);
+    regs.load_const_buffer_offset += sizeof(u32);
+    // unmapAddr does not detect unmapped memory: a stale or unset selector
+    // would write to an arbitrary host address
+    uptr base;
+    const auto as = tls_crnt_gmmu->findAddr(gpu_addr, base);
+    if (!as || as->ptr == 0 || gpu_addr - base + sizeof(u32) > as->size) {
+        ONCE(LOG_WARN(Engines, "Constant buffer update to unmapped {:#x}",
+                      gpu_addr));
+        return;
+    }
+    const uptr ptr = as->ptr + (gpu_addr - base);
 
     *reinterpret_cast<u32*>(ptr) = data;
-    regs.load_const_buffer_offset += sizeof(u32);
 
-    // Invalidate
-    // TODO: invalidate as a whole
+    // Consecutive words extend one range, invalidated once the run of words
+    // ends (see flushConstBufferInvalidation)
+    auto& pending = pending_const_buffer_invalidation;
+    if (pending.getSize() != 0 && pending.getEnd() != ptr)
+        flushConstBufferInvalidationImpl();
+    if (pending.getSize() == 0)
+        pending = ztd::Range<uptr>::fromSize(ptr, sizeof(u32));
+    else
+        pending.setEnd(ptr + sizeof(u32));
+}
+
+void ThreeD::flushConstBufferInvalidationImpl() {
+    const auto range = pending_const_buffer_invalidation;
+    pending_const_buffer_invalidation = {};
     gpu.getRenderer().invalidateMemory(
-        ztd::Range<uptr>::fromSize(ptr, sizeof(u32)),
-        renderer::MemoryInvalidationScope::BufferCache);
+        range, renderer::MemoryInvalidationScope::BufferCache);
 }
 
 void ThreeD::bindGroup(const u32 index, const u32 data) {

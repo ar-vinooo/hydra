@@ -5,10 +5,13 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -31,8 +34,15 @@ struct PipelineSources {
 // well, and the recorded pipelines are built in the background when the
 // title starts. A draw takes its pipeline from there, or waits for it if it
 // is being built.
+//
+// With HYDRA_ASYNC_PIPELINES=1, pipelines missing from the caches are compiled
+// on workers instead of on the thread that draws (see createPipelineAsync).
 class BinaryArchiveCache {
   public:
+    // Receives a pipeline compiled on a worker (null and an error on failure)
+    using PipelineCallback =
+        std::function<void(MTL::RenderPipelineState*, NS::Error*)>;
+
     explicit BinaryArchiveCache(MTL::Device* device,
                                 std::filesystem::path path = {});
     ~BinaryArchiveCache();
@@ -43,6 +53,14 @@ class BinaryArchiveCache {
     createPipeline(MTL::RenderPipelineDescriptor* descriptor, NS::Error** error,
                    std::string_view shader_key,
                    const PipelineSources* sources = nullptr);
+    // Like createPipeline, but in async mode a pipeline that is neither
+    // prewarmed nor archived is compiled on a worker and passed to done.
+    // Returns null in that case; done is not called otherwise.
+    MTL::RenderPipelineState*
+    createPipelineAsync(MTL::RenderPipelineDescriptor* descriptor,
+                        NS::Error** error, std::string_view shader_key,
+                        const PipelineSources* sources, PipelineCallback done);
+    bool isAsync() const { return async; }
     // Record pipelines in recipe_directory and build the recorded ones with
     // shaders from libraries. Only the first call has an effect.
     void startPrewarm(std::filesystem::path recipe_directory,
@@ -74,9 +92,22 @@ class BinaryArchiveCache {
     };
     struct Building {
         bool done{false};
+        // Pipeline built for a draw, shared with draws that waited for it
+        MTL::RenderPipelineState* pipeline{nullptr};
+        ~Building() {
+            if (pipeline)
+                pipeline->release();
+        }
+    };
+    struct AsyncJob {
+        MTL::RenderPipelineDescriptor* descriptor{nullptr}; // Retained
+        std::string shader_key;
+        std::optional<PipelineSources> sources;
+        PipelineCallback done;
     };
 
     void run();
+    void runAsync();
     void trimArchives();
     void prewarm(std::vector<std::filesystem::path> recipes,
                  ShaderLibraryCache& libraries);
@@ -87,6 +118,9 @@ class BinaryArchiveCache {
                                     NS::Error** error,
                                     const std::filesystem::path& entry,
                                     bool& archive_hit);
+    // Take a prewarmed pipeline, wait for one being built, or build it
+    MTL::RenderPipelineState* obtain(MTL::RenderPipelineDescriptor* descriptor,
+                                     NS::Error** error, const std::string& key);
     void queueRecipe(const std::string& key, std::string_view shader_key,
                      const PipelineSources* sources,
                      const std::vector<u64>& fields);
@@ -100,8 +134,15 @@ class BinaryArchiveCache {
     std::thread worker;
     bool stopping{false};
     bool busy{false};
-    u64 hits{0};
-    u64 misses{0};
+    std::atomic<u64> hits{0};
+    std::atomic<u64> misses{0};
+
+    // Async compilation
+    bool async{false};
+    bool async_stopping{false};
+    std::deque<AsyncJob> async_jobs;
+    std::condition_variable async_condition;
+    std::vector<std::thread> async_workers;
 
     // Prewarm
     std::filesystem::path recipe_directory;

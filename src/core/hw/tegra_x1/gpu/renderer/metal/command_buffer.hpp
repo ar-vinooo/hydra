@@ -250,6 +250,10 @@ class CommandBuffer final : public ICommandBuffer {
     // DEBUG: passes of the Metal command buffer whose GPU time is sampled,
     // and the attachments of the previous render pass (HYDRA_PERF_STATS)
     std::vector<GpuPassProfiler::Pass> profiled_passes;
+    // Metal 4: start sample of the open encoder's pass, written by the
+    // encoder itself
+    u32 mtl4_pass_sample{invalid<u32>()};
+    void writeMtl4PassTimestamp(bool end);
     std::array<MTL::Texture*, COLOR_TARGET_COUNT + 2> previous_attachments{};
     // DEBUG: the previous render pass, to show why a continuation of it was
     // not merged

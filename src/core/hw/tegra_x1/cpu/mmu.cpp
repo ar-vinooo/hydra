@@ -103,18 +103,39 @@ bool IMmu::trackWrite(ztd::Range<vaddr_t> range) {
         return false;
 
     // Notify the GPU. Queued: invalidating here would wait for the cache
-    // locks that the GPU thread holds for whole draws.
-    // TODO: what about non-contiguous regions?
-    const auto ptr = unmapAddr(aligned_range.getBegin());
+    // locks that the GPU thread holds for whole draws. Guest pages can be
+    // backed by separate host allocations, so queue each contiguous host run
+    std::vector<ztd::Range<uptr>> host_runs;
+    uptr run_begin = 0x0;
+    uptr run_end = 0x0;
+    for (vaddr_t va = aligned_range.getBegin(); va < aligned_range.getEnd();
+         va += GUEST_PAGE_SIZE) {
+        const uptr host = unmapAddr(va);
+        if (host == 0x0 || host != run_end) {
+            if (run_end != run_begin)
+                host_runs.push_back(ztd::Range<uptr>(run_begin, run_end));
+            run_begin = run_end = host;
+        }
+        if (host != 0x0)
+            run_end = host + GUEST_PAGE_SIZE;
+    }
+    if (run_end != run_begin)
+        host_runs.push_back(ztd::Range<uptr>(run_begin, run_end));
     {
         std::scoped_lock lock(write_tracking_mutex);
         tracked_pages.push_back(aligned_range);
-        pending_invalidations.push_back(
-            ztd::Range<uptr>::fromSize(ptr, aligned_range.getSize()));
+        pending_invalidations.insert(pending_invalidations.end(),
+                                     host_runs.begin(), host_runs.end());
         has_pending_invalidations.store(true, std::memory_order_release);
     }
 
     return true;
+}
+
+void IMmu::queueHostInvalidation(ztd::Range<uptr> range) {
+    std::scoped_lock lock(write_tracking_mutex);
+    pending_invalidations.push_back(range);
+    has_pending_invalidations.store(true, std::memory_order_release);
 }
 
 void IMmu::applyPendingInvalidations() {

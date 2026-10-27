@@ -140,9 +140,14 @@ void Process::resizeHeap(u64 size) {
 
     const u64 old_size = heap_size;
     if (size > old_size) {
-        // Grown memory reads as zero, even if the pages were used before
-        std::memset(reinterpret_cast<void*>(heap_host_base + old_size), 0,
-                    size - old_size);
+        // Grown memory reads as zero, even if the pages were used before.
+        // Only clear pages that were used: clearing untouched ones would
+        // commit the whole new heap at once
+        const u64 dirty_end = std::min(size, heap_dirty_size);
+        if (dirty_end > old_size)
+            std::memset(reinterpret_cast<void*>(heap_host_base + old_size), 0,
+                        dirty_end - old_size);
+        heap_dirty_size = std::max(heap_dirty_size, size);
 
         // A guest mapping may not cross a slab, as each slab is a separate CPU
         // memory object
@@ -187,6 +192,15 @@ void Process::resizeHeap(u64 size) {
             drop_tail(*space);
         drop_tail(gmmu);
         system.getGpu().getRenderer().invalidateMemory(tail);
+
+        // Give the pages back to the host; they are zeroed when grown again
+        const uptr host_begin =
+            align(tail_begin, static_cast<uptr>(getpagesize()));
+        const uptr host_end =
+            alignDown(tail_end, static_cast<uptr>(getpagesize()));
+        if (host_begin < host_end)
+            madvise(reinterpret_cast<void*>(host_begin), host_end - host_begin,
+                    MADV_FREE_REUSABLE);
     }
 }
 
@@ -239,6 +253,7 @@ void Process::releaseHeapMemory() {
         heap_host_base = 0x0;
     }
     heap_size = 0;
+    heap_dirty_size = 0;
 }
 
 void Process::releaseAliasMemory() {
@@ -353,6 +368,11 @@ result_t Process::unmapPhysicalMemory(vaddr_t addr, u64 size) {
 
     mmu->unmap(range);
     physical_mem_size -= unmapped_size;
+
+    // The host pages are reused when the range is mapped again, which neither
+    // goes through the guest nor keeps its write tracking: drop cached copies
+    system.getGpu().getRenderer().invalidateMemory(ztd::Range<uptr>(
+        getAliasHostPtr(range.getBegin()), getAliasHostPtr(range.getEnd())));
 
     // Give the pages back to the host; they are zeroed when mapped again
     const uptr host_begin = align(getAliasHostPtr(range.getBegin()),

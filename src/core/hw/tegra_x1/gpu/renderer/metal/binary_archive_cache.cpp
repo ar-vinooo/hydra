@@ -252,6 +252,20 @@ BinaryArchiveCache::BinaryArchiveCache(MTL::Device* device_,
                                        std::filesystem::path path_)
     : device(device_->retain()),
       path(path_.empty() ? defaultPath(device_) : std::move(path_)) {
+    // Draws whose pipeline is compiling are skipped, which can briefly drop
+    // geometry, so this is opt-in
+    if (const char* value = std::getenv("HYDRA_ASYNC_PIPELINES");
+        value && std::string_view(value) == "1") {
+        async = true;
+        // The compiler service runs compilations of different threads in
+        // parallel. Leave most cores to the guest.
+        const auto count =
+            std::clamp(std::thread::hardware_concurrency() / 4, 1u, 2u);
+        for (u32 i = 0; i < count; i++)
+            async_workers.emplace_back([this] { runAsync(); });
+        LOG_INFO(MetalRenderer, "Async pipeline compilation: {} workers",
+                 count);
+    }
     if (const char* disabled = std::getenv("HYDRA_DISABLE_SHADER_CACHE");
         disabled && std::string_view(disabled) == "1")
         return;
@@ -270,6 +284,17 @@ BinaryArchiveCache::BinaryArchiveCache(MTL::Device* device_,
 
 BinaryArchiveCache::~BinaryArchiveCache() {
     stopPrewarm();
+    // Workers finish their current compilation, which may queue a save
+    {
+        std::lock_guard lock(mutex);
+        async_stopping = true;
+    }
+    async_condition.notify_all();
+    for (auto& async_worker : async_workers)
+        async_worker.join();
+    for (auto& job : async_jobs)
+        job.descriptor->release();
+    async_jobs.clear();
     {
         std::lock_guard lock(mutex);
         stopping = true;
@@ -281,7 +306,8 @@ BinaryArchiveCache::~BinaryArchiveCache() {
         pipeline->release();
     logWorker("Shader binary cache: {} hits, {} misses, {} prewarmed "
               "pipelines used of {}",
-              hits, misses, prewarm_hits.load(), prewarmed.load());
+              hits.load(), misses.load(), prewarm_hits.load(),
+              prewarmed.load());
     device->release();
 }
 
@@ -365,8 +391,18 @@ BinaryArchiveCache::createPipeline(MTL::RenderPipelineDescriptor* descriptor,
     const auto fields = descriptorFields(descriptor);
     const auto key = pipelineKey(fields, shader_key);
     {
-        std::unique_lock lock(mutex);
+        std::lock_guard lock(mutex);
         queueRecipe(key, shader_key, sources, fields);
+    }
+    return obtain(descriptor, error, key);
+}
+
+MTL::RenderPipelineState*
+BinaryArchiveCache::obtain(MTL::RenderPipelineDescriptor* descriptor,
+                           NS::Error** error, const std::string& key) {
+    std::shared_ptr<Building> building_entry;
+    {
+        std::unique_lock lock(mutex);
         for (;;) {
             if (auto it = prewarmed_pipelines.find(key);
                 it != prewarmed_pipelines.end()) {
@@ -377,28 +413,102 @@ BinaryArchiveCache::createPipeline(MTL::RenderPipelineDescriptor* descriptor,
                     PerfStats::instance().pipeline_prewarm_hits++;
                 return pipeline;
             }
-            // Wait for a pipeline the prewarm is building
+            // Wait for a pipeline the prewarm or another draw is building
+            // instead of compiling it twice
             const auto it = building.find(key);
             if (it == building.end())
                 break;
             const auto other = it->second;
             built.wait(lock, [&] { return other->done; });
+            if (other->pipeline)
+                return other->pipeline->retain();
+            // A failed build is retried below to report its error
         }
         created.insert(key);
+        building_entry = std::make_shared<Building>();
+        building.emplace(key, building_entry);
     }
 
     bool archive_hit;
     auto* pipeline = build(descriptor, error,
                            path / (key + ".metallib"), archive_hit);
+    {
+        std::lock_guard lock(mutex);
+        building.erase(key);
+        building_entry->done = true;
+        if (pipeline)
+            building_entry->pipeline = pipeline->retain();
+    }
+    built.notify_all();
     if (archive_hit) {
-        hits++;
-        if (hits == 1 || hits % 128 == 0)
+        const auto count = ++hits;
+        if (count == 1 || count % 128 == 0)
             LOG_INFO(MetalRenderer, "Shader binary cache: {} hits, {} misses",
-                     hits, misses);
+                     count, misses.load());
     } else {
         misses++;
     }
     return pipeline;
+}
+
+MTL::RenderPipelineState* BinaryArchiveCache::createPipelineAsync(
+    MTL::RenderPipelineDescriptor* descriptor, NS::Error** error,
+    std::string_view shader_key, const PipelineSources* sources,
+    PipelineCallback done) {
+    if (!async)
+        return createPipeline(descriptor, error, shader_key, sources);
+    if (enabled) {
+        // Taking a prewarmed pipeline or loading an archived one is cheap
+        const auto key = pipelineKey(descriptorFields(descriptor), shader_key);
+        bool prewarmed_entry;
+        {
+            std::lock_guard lock(mutex);
+            prewarmed_entry = prewarmed_pipelines.contains(key);
+        }
+        std::error_code file_error;
+        if (prewarmed_entry ||
+            std::filesystem::is_regular_file(path / (key + ".metallib"),
+                                             file_error))
+            return createPipeline(descriptor, error, shader_key, sources);
+    }
+
+    *error = nullptr;
+    {
+        std::lock_guard lock(mutex);
+        async_jobs.push_back(
+            {descriptor->retain(), std::string(shader_key),
+             sources ? std::optional<PipelineSources>(*sources) : std::nullopt,
+             std::move(done)});
+    }
+    async_condition.notify_one();
+    return nullptr;
+}
+
+void BinaryArchiveCache::runAsync() {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess().registerThisThread(
+        "Pipeline compile");
+    for (;;) {
+        AsyncJob job;
+        {
+            std::unique_lock lock(mutex);
+            async_condition.wait(
+                lock, [this] { return async_stopping || !async_jobs.empty(); });
+            if (async_stopping)
+                break;
+            job = std::move(async_jobs.front());
+            async_jobs.pop_front();
+        }
+        NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+        NS::Error* error = nullptr;
+        auto* pipeline =
+            createPipeline(job.descriptor, &error, job.shader_key,
+                           job.sources ? &*job.sources : nullptr);
+        job.descriptor->release();
+        job.done(pipeline, error);
+    }
+    DEBUGGER_MANAGER_INSTANCE.getDebuggerForCurrentProcess()
+        .unregisterThisThread();
 }
 
 void BinaryArchiveCache::startPrewarm(std::filesystem::path directory,

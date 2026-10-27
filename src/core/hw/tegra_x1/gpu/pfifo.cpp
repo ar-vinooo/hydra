@@ -523,6 +523,9 @@ void Pfifo::threadFunc() {
                     ++entry_list.entry_index;
                     entry_list.word_offset = 0;
                 }
+                // Another channel may read what this one's constant buffer
+                // words wrote
+                gpu.channelContext().three_d.flushConstBufferInvalidation();
                 yielded = (decode.semaphore_wait || decode.syncpoint_wait) && !decode.failed;
                 if (yielded) {
                     const auto origin = capture::currentGuestEventOrigin();

@@ -190,6 +190,11 @@ void Thread::createVcpu() {
     // Enable FP and SIMD instructions
     setSysReg(HV_SYS_REG_CPACR_EL1, 0b11 << 20);
 
+    // Trap EL0 counter, frequency and timer accesses (EL0PCTEN, EL0VCTEN,
+    // EL0VTEN and EL0PTEN clear), so that both CNTPCT_EL0 and CNTVCT_EL0 are
+    // emulated at GUEST_CNTFRQ instead of exposing the host counter
+    setSysReg(HV_SYS_REG_CNTKCTL_EL1, 0x0);
+
     // Trampoline
     setSysReg(HV_SYS_REG_VBAR_EL1, KERNEL_REGION_BASE);
 
@@ -255,7 +260,10 @@ void Thread::run() {
         // Run
         deserializeState();
         HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
-        exception = (getReg(HV_REG_PC) >= cpu.getKernelPageTable().getBase());
+        // Exited from the exception vector (kernel region) rather than from
+        // guest code. Comparing against the kernel page table's physical
+        // base would misclassify guest code mapped above 4 GiB.
+        exception = (getReg(HV_REG_PC) >= KERNEL_REGION_BASE);
         serializeState();
 
         // Handle exit
@@ -336,6 +344,13 @@ void Thread::run() {
                     saved_pc = trampoline;
                 break;
             }
+            case ExceptionClass::TrappedWfeWfiWfetWfit:
+                // Guest spin loops wait with WFE/WFI, which get trapped.
+                // There is no event to wait for, so give the host core away
+                // and continue after the instruction.
+                std::this_thread::yield();
+                state.pc += 4;
+                break;
             case ExceptionClass::SmcAarch64:
                 LOG_FATAL(Hypervisor, "SMC");
                 break;
@@ -443,9 +458,14 @@ void Thread::run() {
 }
 
 void Thread::setupVTimer() {
+    // The vtimer only preempts the guest and runs in host ticks. It compares
+    // against the vCPU's virtual count (host count - vtimer offset), so the
+    // offset has to be taken into account.
+    u64 vtimer_offset;
+    HV_ASSERT_SUCCESS(hv_vcpu_get_vtimer_offset(vcpu, &vtimer_offset));
     setSysReg(HV_SYS_REG_CNTV_CTL_EL0, 1);
-    setSysReg(HV_SYS_REG_CNTV_CVAL_EL0,
-              mach_absolute_time() + interrupt_time_delta_ticks);
+    setSysReg(HV_SYS_REG_CNTV_CVAL_EL0, mach_absolute_time() - vtimer_offset +
+                                            interrupt_time_delta_ticks);
 }
 
 void Thread::updateVTimer() {
@@ -489,28 +509,49 @@ void Thread::deserializeState() {
         gpu::PerfStats::instance().register_writes += writes;
         gpu::PerfStats::instance().register_write_skips += 63 - writes;
     }
-    setSysReg(HV_SYS_REG_SP_EL0, state.sp);
+    // Like the register bank, skip registers the vCPU still holds from the
+    // last exit
+    const ThreadState* base =
+        !disable_filter && exit_register_state ? &*exit_register_state
+                                               : nullptr;
+    if (!base || state.sp != base->sp)
+        setSysReg(HV_SYS_REG_SP_EL0, state.sp);
     if (exception)
         setSysReg(HV_SYS_REG_ELR_EL1, state.pc);
     else
         setReg(HV_REG_PC, state.pc);
-    setReg(HV_REG_CPSR, state.pstate);
-    setReg(HV_REG_FPCR, state.fpcr);
-    setReg(HV_REG_FPSR, state.fpsr);
+    if (!base || state.pstate != base->pstate)
+        setReg(HV_REG_CPSR, state.pstate);
+    if (!base || state.fpcr != base->fpcr)
+        setReg(HV_REG_FPCR, state.fpcr);
+    if (!base || state.fpsr != base->fpsr)
+        setReg(HV_REG_FPSR, state.fpsr);
 }
 
 void Thread::instructionTrap(u32 esr) {
     bool read = (esr & 1) != 0;
     uint rt = (esr >> 5) & 0x1f;
 
+    // Rt 29/30 are FP/LR, which live outside `r`; 31 is XZR
+    const auto write_rt = [&](u64 value) {
+        if (rt < 29)
+            state.r[rt] = value;
+        else if (rt == 29)
+            state.fp = value;
+        else if (rt == 30)
+            state.lr = value;
+    };
+
     if (read) {
         // Op0 Op2 Op1 CRn 00000 CRm
         switch ((esr >> 1) & 0x1ffe0f) {
         case 0b11'000'011'1110'00000'0000: // CNTFRQ_EL0
-            state.r[rt] = GUEST_CNTFRQ;
+            write_rt(GUEST_CNTFRQ);
             break;
         case 0b11'001'011'1110'00000'0000: // CNTPCT_EL0
-            state.r[rt] = wall_clock.getCntpct();
+        case 0b11'010'011'1110'00000'0000: // CNTVCT_EL0
+            // The guest has no virtual offset, so both counters match
+            write_rt(wall_clock.getCntpct());
             break;
         default:
             LOG_FATAL(Hypervisor,

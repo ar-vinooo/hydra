@@ -6,6 +6,11 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <set>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace hydra::hw::tegra_x1::gpu {
 
@@ -43,18 +48,72 @@ GMmu::~GMmu() {
         std::scoped_lock lock(device_mappings->mutex);
         device_mappings->spaces.erase(this);
     }
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    for (const auto block : zero_blocks)
-        free(reinterpret_cast<void*>(block));
+    for (const auto& [ptr, block] : zero_blocks)
+        munmap(reinterpret_cast<void*>(ptr), block.size);
 }
 
 AddressSpace GMmu::allocateZeroBlock(u64 size) {
-    // NOLINTNEXTLINE(cppcoreguidelines-no-malloc)
-    void* ptr = calloc(1, size);
-    ASSERT(ptr != nullptr || size == 0, Gpu,
+    if (size == 0)
+        return {0x0, 0};
+
+    const u64 block_size = align(size, static_cast<u64>(getpagesize()));
+
+    // Reuse the smallest unmapped block that fits
+    auto it = free_zero_blocks.lower_bound(block_size);
+    if (it != free_zero_blocks.end()) {
+        const uptr ptr = it->second;
+        free_zero_blocks.erase(it);
+        auto& block = zero_blocks.at(ptr);
+        block.free = false;
+        // The pages may hold what the GPU wrote before they were returned.
+        // Cleared in place: Metal buffers may still wrap these addresses, so
+        // the mapping must stay the same.
+        madvise(reinterpret_cast<void*>(ptr), block.size, MADV_FREE_REUSE);
+        std::memset(reinterpret_cast<void*>(ptr), 0, block.size);
+        // Cached copies of the old contents are stale
+        if (mmu != nullptr)
+            mmu->queueHostInvalidation(
+                ztd::Range<uptr>::fromSize(ptr, block.size));
+        return {ptr, size};
+    }
+
+    // Anonymous pages read as zero and only take memory once written
+    void* ptr = mmap(nullptr, block_size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT(ptr != MAP_FAILED, Gpu,
            "Failed to allocate {:#x} bytes of sparse GPU memory", size);
-    zero_blocks.push_back(reinterpret_cast<uptr>(ptr));
+    zero_blocks[reinterpret_cast<uptr>(ptr)] = {block_size, false};
     return {reinterpret_cast<uptr>(ptr), size};
+}
+
+void GMmu::recycleZeroBlocks() {
+    if (zero_blocks.size() == free_zero_blocks.size())
+        return;
+
+    // Blocks still (partially) mapped
+    std::set<uptr> referenced;
+    for (const auto& [base, as] : mapped_ranges) {
+        if (as.guest != 0 || as.ptr == 0x0)
+            continue;
+        auto it = zero_blocks.upper_bound(as.ptr);
+        if (it == zero_blocks.begin())
+            continue;
+        --it;
+        if (as.ptr - it->first < it->second.size)
+            referenced.insert(it->first);
+    }
+
+    for (auto& [ptr, block] : zero_blocks) {
+        if (block.free || referenced.contains(ptr))
+            continue;
+
+        // Return the memory to the system. The mapping itself stays: Metal
+        // buffers wrapping these addresses would keep the old pages if it
+        // was replaced. Cleared when reused.
+        madvise(reinterpret_cast<void*>(ptr), block.size, MADV_FREE_REUSABLE);
+        block.free = true;
+        free_zero_blocks.emplace(block.size, ptr);
+    }
 }
 
 std::vector<u8> GMmu::readMappedBytes(uptr gpu_addr, usize max_size) {
@@ -229,6 +288,7 @@ void GMmu::carveOut(uptr begin, uptr end, bool host_only) {
                 other.guest != 0 ? other.guest + (end - other_begin) : 0};
     }
     generation.fetch_add(1, std::memory_order_release);
+    recycleZeroBlocks();
 }
 
 void GMmu::mapIntoGaps(uptr base, AddressSpace as) {

@@ -1701,7 +1701,9 @@ void Renderer::endCaptureHot51() {
 
 bool Renderer::canDrawHot52() const {
     if (state.pipeline->getPipeline() == nullptr) {
-        ONCE(LOG_WARN(MetalRenderer, "Pipeline not present, skipping draw"));
+        // A pipeline compiling in the background is expected to be missing
+        if (!state.pipeline->isCompiling())
+            ONCE(LOG_WARN(MetalRenderer, "Pipeline not present, skipping draw"));
         return false;
     }
 

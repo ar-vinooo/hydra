@@ -1,5 +1,7 @@
 #pragma once
 
+#include <map>
+
 #include "core/hw/generic_mmu.hpp"
 #include "core/hw/tegra_x1/gpu/resource/resource_lifetime.hpp"
 #include "core/hw/tegra_x1/gpu/resource/mapping_capture.hpp"
@@ -83,8 +85,11 @@ class GMmu : public GenericMmu<GMmu, AddressSpace>,
     void carveOut(uptr begin, uptr end, bool host_only = false);
     // Zero backing is owned by the GMMU until it is destroyed: queued or
     // in-flight GPU work may still hold pointers into blocks that were
-    // unmapped, so they are never freed earlier.
+    // unmapped, so they are never freed earlier. Blocks that are no longer
+    // mapped get fresh zero pages instead (the addresses stay valid) and are
+    // reused by later allocations.
     AddressSpace allocateZeroBlock(u64 size);
+    void recycleZeroBlocks();
     void mapIntoGaps(uptr base, AddressSpace as);
 
   public:
@@ -108,7 +113,13 @@ class GMmu : public GenericMmu<GMmu, AddressSpace>,
     std::shared_ptr<cpu::DeviceMappingState> device_mappings;
     void publishDeviceMappings(uptr excluded = invalid<uptr>());
     std::atomic<bool> gpu_cancelled{false};
-    std::vector<uptr> zero_blocks;
+    struct ZeroBlock {
+        u64 size;
+        bool free;
+    };
+    std::map<uptr, ZeroBlock> zero_blocks;
+    // Size -> base of the blocks that are not mapped
+    std::multimap<u64, uptr> free_zero_blocks;
 
     // TODO: use a better way to allocate new memory
     uptr address_space_base{GPU_PAGE_SIZE};

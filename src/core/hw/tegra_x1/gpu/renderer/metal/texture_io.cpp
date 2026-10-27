@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 
@@ -81,6 +82,14 @@ bool supported(const TextureDescriptor& descriptor) {
     return descriptor.level_count != 0 && descriptor.layer_count != 0;
 }
 
+// Commits the copies and waits for them, true if the GPU succeeded. The
+// renderer's command buffers are ordered with its rendering with either Metal
+// API.
+bool commitAndWait(CommandBuffer& commands) {
+    commands.debugCommitAndWait();
+    return commands.lastSubmissionSucceeded();
+}
+
 } // namespace
 
 // A buffer texture is its backing buffer: one blob of its bytes
@@ -94,13 +103,11 @@ bool Renderer::readTextureContents(ITexture* texture,
         const u64 bytes = std::min<u64>(descriptor.size, backing->length());
         out.assign(1, {});
         auto* staging = device->newBuffer(bytes, MTL::ResourceStorageModeShared);
-        auto* commands = command_queue->commandBuffer();
-        auto* blit = commands->blitCommandEncoder();
-        blit->copyFromBuffer(backing, 0, staging, 0, bytes);
-        blit->endEncoding();
-        commands->commit();
-        commands->waitUntilCompleted();
-        const bool ok = commands->status() == MTL::CommandBufferStatusCompleted;
+        std::unique_ptr<CommandBuffer> commands{
+            static_cast<CommandBuffer*>(createCommandBuffer())};
+        commands->getBlitCommandEncoder()->copyFromBuffer(backing, 0, staging, 0,
+                                                          bytes);
+        const bool ok = commitAndWait(*commands);
         if (ok)
             out[0].assign(static_cast<const u8*>(staging->contents()),
                           static_cast<const u8*>(staging->contents()) + bytes);
@@ -119,8 +126,9 @@ bool Renderer::readTextureContents(ITexture* texture,
         std::vector<u64> sizes;
     };
     std::vector<Pending> pending(subs.size());
-    auto* commands = command_queue->commandBuffer();
-    auto* blit = commands->blitCommandEncoder();
+    std::unique_ptr<CommandBuffer> commands{
+        static_cast<CommandBuffer*>(createCommandBuffer())};
+    auto* blit = commands->getBlitCommandEncoder();
     for (usize i = 0; i < subs.size(); i++) {
         const auto& sub = subs[i];
         for (usize p = 0; p < planes.size(); p++) {
@@ -137,10 +145,7 @@ bool Renderer::readTextureContents(ITexture* texture,
             pending[i].sizes.push_back(bytes);
         }
     }
-    blit->endEncoding();
-    commands->commit();
-    commands->waitUntilCompleted();
-    const bool ok = commands->status() == MTL::CommandBufferStatusCompleted;
+    const bool ok = commitAndWait(*commands);
     out.clear();
     for (auto& entry : pending) {
         std::vector<u8> blob;
@@ -171,13 +176,11 @@ bool Renderer::readBufferContents(const BufferView& view,
         return true;
     }
     auto* staging = device->newBuffer(size, MTL::ResourceStorageModeShared);
-    auto* commands = command_queue->commandBuffer();
-    auto* blit = commands->blitCommandEncoder();
-    blit->copyFromBuffer(native, offset, staging, 0, size);
-    blit->endEncoding();
-    commands->commit();
-    commands->waitUntilCompleted();
-    const bool ok = commands->status() == MTL::CommandBufferStatusCompleted;
+    std::unique_ptr<CommandBuffer> commands{
+        static_cast<CommandBuffer*>(createCommandBuffer())};
+    commands->getBlitCommandEncoder()->copyFromBuffer(native, offset, staging, 0,
+                                                      size);
+    const bool ok = commitAndWait(*commands);
     if (ok)
         std::memcpy(out.data(), staging->contents(), size);
     staging->release();
@@ -194,13 +197,11 @@ bool Renderer::writeTextureContents(
             return false;
         auto* staging = device->newBuffer(contents[0].data(), contents[0].size(),
                                           MTL::ResourceStorageModeShared);
-        auto* commands = command_queue->commandBuffer();
-        auto* blit = commands->blitCommandEncoder();
-        blit->copyFromBuffer(staging, 0, backing, 0, contents[0].size());
-        blit->endEncoding();
-        commands->commit();
-        commands->waitUntilCompleted();
-        const bool ok = commands->status() == MTL::CommandBufferStatusCompleted;
+        std::unique_ptr<CommandBuffer> commands{
+            static_cast<CommandBuffer*>(createCommandBuffer())};
+        commands->getBlitCommandEncoder()->copyFromBuffer(
+            staging, 0, backing, 0, contents[0].size());
+        const bool ok = commitAndWait(*commands);
         staging->release();
         return ok;
     }
@@ -214,8 +215,9 @@ bool Renderer::writeTextureContents(
         return false;
 
     std::vector<MTL::Buffer*> buffers;
-    auto* commands = command_queue->commandBuffer();
-    auto* blit = commands->blitCommandEncoder();
+    std::unique_ptr<CommandBuffer> commands{
+        static_cast<CommandBuffer*>(createCommandBuffer())};
+    auto* blit = commands->getBlitCommandEncoder();
     bool valid = true;
     for (usize i = 0; i < subs.size() && valid; i++) {
         const auto& sub = subs[i];
@@ -238,11 +240,7 @@ bool Renderer::writeTextureContents(
             offset += bytes;
         }
     }
-    blit->endEncoding();
-    commands->commit();
-    commands->waitUntilCompleted();
-    const bool ok = valid &&
-                    commands->status() == MTL::CommandBufferStatusCompleted;
+    const bool ok = commitAndWait(*commands) && valid;
     for (auto* buffer : buffers)
         buffer->release();
     return ok;

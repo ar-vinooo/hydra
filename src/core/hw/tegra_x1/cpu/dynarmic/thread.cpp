@@ -111,34 +111,28 @@ void Thread::MemoryWrite128(u64 addr, Dynarmic::A64::Vector value) {
     MMU->write(addr, value);
 }
 
-bool Thread::MemoryWriteExclusive8(u64 addr, u8 value, u8 /*unused*/) {
-    MMU->writeExclusive(addr, value);
-    return true;
+// The global monitor passes the value observed by the exclusive load as
+// expected; the store must fail if another thread changed it in between
+bool Thread::MemoryWriteExclusive8(u64 addr, u8 value, u8 expected) {
+    return MMU->writeExclusive(addr, value, expected);
 }
 
-bool Thread::MemoryWriteExclusive16(u64 addr, u16 value, u16 /*unused*/) {
-    MMU->writeExclusive(addr, value);
-    return true;
+bool Thread::MemoryWriteExclusive16(u64 addr, u16 value, u16 expected) {
+    return MMU->writeExclusive(addr, value, expected);
 }
 
-bool Thread::MemoryWriteExclusive32(u64 addr, u32 value, u32 /*unused*/) {
-    MMU->writeExclusive(addr, value);
-    return true;
+bool Thread::MemoryWriteExclusive32(u64 addr, u32 value, u32 expected) {
+    return MMU->writeExclusive(addr, value, expected);
 }
 
-// TODO: expected
 bool Thread::MemoryWriteExclusive64(u64 addr, u64 value, u64 expected) {
-    (void)expected;
-    MMU->writeExclusive(addr, value);
-    return true;
+    return MMU->writeExclusive(addr, value, expected);
 }
 
-// TODO: expected
 bool Thread::MemoryWriteExclusive128(u64 addr, Dynarmic::A64::Vector value,
                                      Dynarmic::A64::Vector expected) {
-    (void)expected;
-    MMU->writeExclusive(addr, std::bit_cast<u128>(value));
-    return true;
+    return MMU->writeExclusive(addr, std::bit_cast<u128>(value),
+                               std::bit_cast<u128>(expected));
 }
 
 void Thread::CallSVC(u32 svc) {

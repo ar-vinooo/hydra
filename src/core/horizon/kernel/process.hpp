@@ -207,6 +207,9 @@ class Process : public SynchronizationObject {
     mutable std::mutex heap_mutex;
     uptr heap_host_base{0};
     u64 heap_size{0};
+    // Highest heap size ever used: host pages past it were never touched and
+    // still read as zero
+    u64 heap_dirty_size{0};
     std::map<u64, std::unique_ptr<hw::tegra_x1::cpu::IMemory>> heap_slabs;
     void releaseHeapMemory();
     std::mutex shared_memory_mutex;
