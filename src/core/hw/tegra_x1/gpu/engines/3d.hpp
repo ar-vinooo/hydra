@@ -882,6 +882,8 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     renderer::RenderPassBase* resolveDrawTargets();
     bool prepareDraw(command_ir::DrawCommand& command);
     void executeDrawCommand(command_ir::DrawCommand& command);
+    // Whether the draw can be encoded on the draw queue's thread
+    bool canQueueDraw(const command_ir::DrawCommand& command, bool capturing);
     void selectVisualResources();
     // One line per texture the bound shaders sample, from the guest TIC/TSC
     std::vector<std::string> describeTextureBindings() const;

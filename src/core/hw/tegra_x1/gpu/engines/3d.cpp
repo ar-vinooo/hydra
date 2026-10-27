@@ -713,20 +713,13 @@ void ThreeD::executeDrawCommand(command_ir::DrawCommand& command) {
         if (capturing)
             live.draw(renderer, tls_crnt_command_buffer, command);
         labelCaptureDraw(command.count);
-        // Encode on the draw queue's thread. Diagnostics observe each draw
-        // right after it is encoded, and a draw writing storage synchronizes
-        // textures after it, so those stay on this thread.
-        if (auto queue = renderer.getDrawQueue();
-            queue && !capturing && command.storage_writes.empty() &&
-            !renderer.isCapturing() && !FrameTracer::instance().isActive() &&
-            !VisualDiagnostics::instance().active() &&
-            !capture::GuestEvents::instance().enabled() && !isProfilingDraws() &&
-            command_ir::canExecuteDraw(command, tls_crnt_command_buffer)) {
+        if (canQueueDraw(command, capturing)) {
             if (command.count == 0 || command.instance_count == 0)
                 return;
             command_ir::issueDrawWrites(renderer, tls_crnt_command_buffer,
                                         command);
-            queue->push(tls_crnt_command_buffer, std::move(command));
+            renderer.getDrawQueue()->push(tls_crnt_command_buffer,
+                                          std::move(command));
             return;
         }
         if (command_ir::executeDraw(renderer, tls_crnt_command_buffer, command,
@@ -743,6 +736,22 @@ void ThreeD::executeDrawCommand(command_ir::DrawCommand& command) {
     LOG_ERROR(Gpu, "Draw rejected: resource lifetime or GPU mapping changed");
     if (tls_crnt_decode_state)
         tls_crnt_decode_state->fail(25);
+}
+
+// Diagnostics observe each draw right after it is encoded, and a draw writing
+// storage synchronizes textures after it, so those stay on this thread
+bool ThreeD::canQueueDraw(const command_ir::DrawCommand& command,
+                          bool capturing) {
+    auto& renderer = gpu.getRenderer();
+    if (!renderer.getDrawQueue() || capturing || !command.storage_writes.empty())
+        return false;
+    const bool observed = renderer.isCapturing() ||
+                          FrameTracer::instance().isActive() ||
+                          VisualDiagnostics::instance().active() ||
+                          capture::GuestEvents::instance().enabled() ||
+                          isProfilingDraws();
+    return !observed &&
+           command_ir::canExecuteDraw(command, tls_crnt_command_buffer);
 }
 
 // Names each draw in a GPU capture after its guest shaders, so Metal draws can
