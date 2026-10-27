@@ -4,6 +4,9 @@
 #include "core/hw/tegra_x1/gpu/engines/3d.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/sampler.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
@@ -3971,6 +3974,46 @@ void runMaxwellTexelFetchCaseFile(MTL::Device* device, const char* in_path,
     };
     for (const auto& config : configs) {
         const auto format = MTL::PixelFormatRGBA32Float;
+        // A multisampled texture uploaded from guest memory (its samples as
+        // blocks of texels, DATA of the larger image), read by TLDS 2D.LZ.MS
+        if (config.kind == "2dms") {
+            using namespace hydra::hw::tegra_x1::gpu::renderer;
+            const u32 samples = config.depth;
+            const TextureDescriptor guest_descriptor(
+                0x10000, MTL::TextureType2D, TextureFormat::RGBA32Float, true,
+                config.width * 16, config.width, config.height, 1, 1, 1, 0, 0, 0, 0,
+                samples);
+            auto hydra_texture = std::make_unique<metal::Texture>(device, guest_descriptor);
+            const auto& words = config.data.at({0, 0});
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            {
+                metal::CommandBuffer commands(queue, std::make_shared<metal::CompletionQueue>());
+                metal::Buffer upload(device->newBuffer(words.data(), words.size() * 4,
+                                                       MTL::ResourceStorageModeShared));
+                static_cast<ITexture&>(*hydra_texture).copyFrom(&commands, &upload);
+            }
+            auto* fence = queue->commandBuffer();
+            fence->commit();
+            fence->waitUntilCompleted();
+            NS_STACK_SCOPED auto sampler_descriptor = MTL::SamplerDescriptor::alloc()->init();
+            NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_descriptor);
+            std::vector<AluState> inputs;
+            for (const auto& values : config.cases) {
+                AluState alu{};
+                for (u32 i = 0; i < 4; ++i)
+                    alu.regs[4 + i] = values[i];
+                inputs.push_back(alu);
+            }
+            const auto results = runTextureProgram(
+                device, {tlds(config.target, 10, 12, 4, 6, 4)}, inputs, {},
+                {{"texture2d_ms<float>", hydra_texture->getTexture(), sampler}},
+                "Maxwell multisample texel fetch reference");
+            for (const auto& result : results) {
+                for (u32 i = 10; i < 14; ++i) output << std::hex << result.regs[i] << ' ';
+                output << '\n';
+            }
+            continue;
+        }
         MTL::TextureDescriptor* descriptor = nullptr;
         bool owns_descriptor = false;
         std::string declaration;

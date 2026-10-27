@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <optional>
 #include <vector>
@@ -10,6 +11,9 @@
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
+
+// See draw_queue.hpp
+void syncDrawQueue();
 
 // Writes a report once the GPU produced it: with the counter, or with nothing
 // if the work failed (a failed report must not look like a result)
@@ -44,9 +48,12 @@ class ICommandBuffer {
         gpu_completion_callbacks.push_back(std::move(callback));
     }
 
+    // Any thread, also while the draw queue encodes
     void retainResource(const std::shared_ptr<void>& owner) {
-        if (owner)
-            retained_resources.try_emplace(owner.get(), owner);
+        if (!owner)
+            return;
+        std::scoped_lock lock(retained_mutex);
+        retained_resources.try_emplace(owner.get(), owner);
     }
 
     // Statistics only: what the next wait for the host GPU is for
@@ -67,6 +74,7 @@ class ICommandBuffer {
     }
     std::vector<std::function<void(bool)>> completion_callbacks;
     std::vector<std::function<void(bool)>> gpu_completion_callbacks;
+    std::mutex retained_mutex;
     std::unordered_map<const void*, std::shared_ptr<void>> retained_resources;
 };
 

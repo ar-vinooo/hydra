@@ -85,6 +85,7 @@ class CommandBuffer final : public ICommandBuffer {
     bool usesMetal4() const { return mtl4_context != nullptr; }
 
     RenderEncoder* getRenderCommandEncoderUnchecked() {
+        syncDrawQueue();
         ASSERT_DEBUG(encoder_type == EncoderType::Render, MetalRenderer,
                      "Render command encoder not active");
         return &render_encoder;
@@ -102,6 +103,7 @@ class CommandBuffer final : public ICommandBuffer {
         MTL::DepthStencilState* depth_stencil_disabled);
 
     BlitEncoder* getBlitCommandEncoderUnchecked() {
+        syncDrawQueue();
         ASSERT_DEBUG(encoder_type == EncoderType::Blit, MetalRenderer,
                      "Blit command encoder not active");
         return &blit_encoder;
@@ -123,6 +125,7 @@ class CommandBuffer final : public ICommandBuffer {
     MTL::Fence* beginExternalEncoding();
     // Null with Metal 3
     MTL4::CommandBuffer* getMtl4CommandBuffer() {
+        syncDrawQueue();
         has_commands = true;
         return mtl4_command_buffer;
     }
@@ -164,7 +167,14 @@ class CommandBuffer final : public ICommandBuffer {
     // to follow that work
     void noteQueuedCompletionWork() { queued_completion_work = true; }
     void setVisibilityResultBuffer(MTL::Buffer* buffer);
+    u64 getRenderEncoderCount() const { return render_encoders; }
     MTL::Buffer* getVisibilityResultBuffer() const { return visibility_buffer; }
+    // Gives each new render pass its visibility buffer, nullptr for none.
+    // Attaching one to an open pass would end it.
+    void setVisibilitySource(
+        std::function<MTL::Buffer*(CommandBuffer&)> source) {
+        visibility_source = std::move(source);
+    }
     bool hasRenderPass(MTL::RenderPassDescriptor* descriptor) const {
         return encoder_type == EncoderType::Render &&
                encoder_state.render_pass == descriptor;
@@ -193,6 +203,10 @@ class CommandBuffer final : public ICommandBuffer {
                     u32 index);
 
   private:
+    // Completion handlers until the native command buffer is committed
+    std::mutex pending_handlers_mutex;
+    std::vector<GpuCompletionHandler> pending_handlers;
+    void attachPendingHandlers();
     void commitSubmission();
     void attachGpuCompletionCallbacks();
     // Starts a new native command buffer
@@ -224,6 +238,7 @@ class CommandBuffer final : public ICommandBuffer {
 
     EncoderState encoder_state{};
     MTL::Buffer* visibility_buffer{nullptr};
+    std::function<MTL::Buffer*(CommandBuffer&)> visibility_source;
     bool last_submission_succeeded{true};
     // Anything was encoded on, or attached to, the current Metal command
     // buffer since it was created
@@ -269,6 +284,7 @@ class CommandBuffer final : public ICommandBuffer {
   public:
     // Handlers and drawables attached through this are part of the work
     MTL::CommandBuffer* getCommandBuffer() {
+        syncDrawQueue();
         has_commands = true;
         return command_buffer;
     }

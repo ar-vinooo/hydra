@@ -37,11 +37,12 @@ class StorageQueue {
 class LibraryAppletController {
   public:
     explicit LibraryAppletController(const LibraryAppletMode mode_) noexcept
-        : mode{mode_}, state_changed_event(std::make_unique<kernel::Event>(
-                           false, "Library applet state changed event")),
-          interactive_in_data_event(std::make_unique<kernel::Event>(
+        : mode{mode_},
+          state_changed_event(kernel::makeAutoObject<kernel::Event>(
+              false, "Library applet state changed event")),
+          interactive_in_data_event(kernel::makeAutoObject<kernel::Event>(
               false, "Library applet interactive in data event")),
-          interactive_out_data_event(std::make_unique<kernel::Event>(
+          interactive_out_data_event(kernel::makeAutoObject<kernel::Event>(
               false, "Library applet interactive out data event")) {}
 
     ZTD_MAKE_NON_COPYABLE(LibraryAppletController);
@@ -86,9 +87,9 @@ class LibraryAppletController {
     // TODO: use
     [[maybe_unused]] LibraryAppletMode mode;
 
-    std::unique_ptr<kernel::Event> state_changed_event;
-    std::unique_ptr<kernel::Event> interactive_in_data_event;
-    std::unique_ptr<kernel::Event> interactive_out_data_event;
+    kernel::AutoObjectPtr<kernel::Event> state_changed_event;
+    kernel::AutoObjectPtr<kernel::Event> interactive_in_data_event;
+    kernel::AutoObjectPtr<kernel::Event> interactive_out_data_event;
 
     StorageQueue in_data;
     StorageQueue out_data;

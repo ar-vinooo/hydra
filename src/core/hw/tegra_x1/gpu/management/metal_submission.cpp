@@ -67,6 +67,8 @@ void CommandBuffer::attachPassProfiling() {
 }
 
 void CommandBuffer::commitSubmission() {
+    // The draw queue may still encode and retain resources into this buffer
+    syncDrawQueue();
     attachGpuCompletionCallbacks();
     attachPassProfiling();
     render_pass_gap = 3;

@@ -12,7 +12,8 @@ DEFINE_SERVICE_COMMAND_TABLE(ILibraryAppletCreator, 0, createLibraryApplet, 10,
 result_t ILibraryAppletCreator::createLibraryApplet(RequestContext* ctx,
                                                     AppletId id,
                                                     LibraryAppletMode mode) {
-    LOG_DEBUG(Services, "ID: {}, mode: {}", id, mode);
+    // DEBUG: which applet a title shows (error messages go through one)
+    LOG_INFO(Services, "Library applet created: ID {}, mode {}", id, mode);
 
     addService(*ctx, new ILibraryAppletAccessor(id, mode));
     return RESULT_SUCCESS;

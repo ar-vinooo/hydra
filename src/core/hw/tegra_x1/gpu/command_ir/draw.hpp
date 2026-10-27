@@ -28,6 +28,16 @@ struct BufferBinding {
 
 using TextureBinding = renderer::TextureBinding;
 
+// Bindings of a draw: vertex, fragment, geometry and tessellation stages
+constexpr usize DRAW_STAGE_COUNT = 5;
+inline renderer::ShaderType getDrawStageShaderType(usize index) {
+    constexpr renderer::ShaderType TYPES[DRAW_STAGE_COUNT] = {
+        renderer::ShaderType::Vertex, renderer::ShaderType::Fragment,
+        renderer::ShaderType::Geometry, renderer::ShaderType::TessControl,
+        renderer::ShaderType::TessEvaluation};
+    return TYPES[index];
+}
+
 struct StageBindings {
     bool active{false};
     // Producer snapshots inherited slots when descriptor pools are absent.
@@ -47,7 +57,7 @@ struct DrawCommand {
     renderer::DrawState state{};
     bool occlusion_enabled{false};
     std::array<renderer::BufferView, VERTEX_ARRAY_COUNT> vertices{};
-    std::array<StageBindings, renderer::GRAPHICS_SHADER_TYPE_COUNT> stages{};
+    std::array<StageBindings, DRAW_STAGE_COUNT> stages{};
     std::vector<ztd::Range<uptr>> storage_writes;
     std::vector<ResourceReference> resource_refs;
     std::vector<std::shared_ptr<void>> resource_owners;
@@ -81,8 +91,29 @@ bool validateDrawResources(renderer::IRenderer& renderer,
 bool validateDrawContents(renderer::IRenderer& renderer,
                           const DrawCommand& command);
 
+enum class DrawExecution {
+    // Executed later than sealed: the resources are validated again
+    Validate,
+    // Sealed right before, with nothing in between that could retire its
+    // resources
+    Sealed,
+    // Sealed and its guest writes issued at sealing (DrawQueue), which
+    // syncs everything that could change its resources
+    Deferred,
+};
+
 bool executeDraw(renderer::IRenderer& renderer,
                  renderer::ICommandBuffer* command_buffer,
-                 const DrawCommand& command);
+                 const DrawCommand& command,
+                 DrawExecution execution = DrawExecution::Validate);
+// Whether executeDraw can encode a sealed command (not counting resource
+// validation)
+bool canExecuteDraw(const DrawCommand& command,
+                    const renderer::ICommandBuffer* command_buffer);
+// Records the guest memory the draw writes, in decode order. executeDraw does
+// it unless the draw is deferred.
+void issueDrawWrites(renderer::IRenderer& renderer,
+                     renderer::ICommandBuffer* command_buffer,
+                     const DrawCommand& command);
 
 } // namespace hydra::hw::tegra_x1::gpu::command_ir

@@ -62,13 +62,14 @@ enum class UpscalingFilter : u32 {
     MetalFx, // MetalFX spatial upscaling when the window is larger
 };
 
-// Frames generated between two guest frames, shown on display refreshes that
-// have no new guest frame
+// Frames generated between two guest frames
 enum class FrameGeneration : u32 {
     Off,
     Interpolate, // Optical flow interpolation
     MetalFx,     // As Interpolate, with MetalFX for the frames halfway
 };
+
+enum class FrameGenerationRateMode : u32 { Variable, Multiple };
 
 enum class AudioBackend : u32 {
     Null,
@@ -170,6 +171,11 @@ class Config {
     static FrameGeneration getDefaultFrameGeneration() {
         return FrameGeneration::Off;
     }
+    static FrameGenerationRateMode getDefaultFrameGenerationRateMode() {
+        return FrameGenerationRateMode::Variable;
+    }
+    static u32 getDefaultFrameGenerationTargetFps() { return 120; }
+    static u32 getDefaultFrameGenerationMultiplier() { return 2; }
     // Contrast adaptive sharpening of presented frames, 0 (off) to 100
     static u32 getDefaultSharpening() { return 0; }
     static bool getDefaultMetalHud() { return false; }
@@ -232,6 +238,9 @@ class Config {
     UpscalingFilter upscaling_filter;
     u32 frame_rate_limit;
     FrameGeneration frame_generation;
+    FrameGenerationRateMode frame_generation_rate_mode;
+    u32 frame_generation_target_fps;
+    u32 frame_generation_multiplier;
     u32 sharpening;
     bool metal_hud;
     AudioBackend audio_backend;
@@ -268,6 +277,9 @@ class Config {
     REF_GETTER(upscaling_filter, getUpscalingFilter);
     REF_GETTER(frame_rate_limit, getFrameRateLimit);
     REF_GETTER(frame_generation, getFrameGeneration);
+    REF_GETTER(frame_generation_rate_mode, getFrameGenerationRateMode);
+    REF_GETTER(frame_generation_target_fps, getFrameGenerationTargetFps);
+    REF_GETTER(frame_generation_multiplier, getFrameGenerationMultiplier);
     REF_GETTER(sharpening, getSharpening);
     REF_GETTER(metal_hud, getMetalHud);
     REF_GETTER(audio_backend, getAudioBackend);
@@ -312,6 +324,8 @@ ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, UpscalingFilter, Bilinear,
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, FrameGeneration, Off, "Off",
                                    Interpolate, "Interpolate", MetalFx,
                                    "MetalFX")
+ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, FrameGenerationRateMode, Variable,
+                                   "Variable", Multiple, "Multiple")
 ENABLE_ENUM_FORMATTING_AND_CASTING(hydra, AudioBackend, Null, "Null", Cubeb,
                                    "Cubeb")
 ENABLE_ENUM_FORMATTING_AND_CASTING(

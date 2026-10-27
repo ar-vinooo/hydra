@@ -20,7 +20,9 @@ void DriverBase::execute() {
 
     Call call;
     call.pc = start_address_ram[*pending_entry];
-    call.params = std::move(pending_params);
+    // Swapped rather than moved: the parameter storage goes back to
+    // collecting the next call, so steady state calls do not allocate
+    call.params.swap(pending_params);
     call.regs[1] = call.params[0];
     pending_entry.reset();
     pending_params.clear();
@@ -30,6 +32,11 @@ void DriverBase::execute() {
     if (call.next_param != call.params.size())
         LOG_WARN(Macro, "Macro used {} of {} parameters", call.next_param,
                  call.params.size());
+    // Nested calls executed already, nothing is being collected
+    if (!pending_entry && call.params.capacity() > pending_params.capacity()) {
+        call.params.clear();
+        pending_params.swap(call.params);
+    }
 }
 
 void DriverBase::loadInstructionRamPointer(u32 ptr) {

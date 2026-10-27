@@ -20,16 +20,32 @@ const u32 exception_handler[] = {
     0xd4200000u, // brk #0
 };
 
+// Return to the guest. This used to start with 0xd508831f, commented as
+// `msr spsel, xzr`, which is TLBI VMALLE1IS: every exception return
+// invalidated the TLBs of all cores. Only page table changes need that now.
 const u32 exception_trampoline[] = {
-    0xd508831fu, // msr spsel, xzr
-
-    // 0x910003e0,  // mov x0, sp
-    // 0xd5384241,  // TODO
-    // 0xd5384202,  // mrs x2, spsel
-    // 0xD4200000u, // brk #0
-
     0xd69f03e0u, // eret
     // Shouldn't happen
+    0xd4200000u, // brk #0
+};
+
+// After this thread relaxed a permission (a write tracking fault): its core
+// may still hold the read-only translation
+const u32 exception_trampoline_local_tlb[] = {
+    0xd508871fu, // tlbi vmalle1
+    0xd503379fu, // dsb nsh
+    0xd5033fdfu, // isb
+    0xd69f03e0u, // eret
+    0xd4200000u, // brk #0
+};
+
+// After page table changes by any thread (see notePageTableChange)
+const u32 exception_trampoline_shared_tlb[] = {
+    0xd5033a9fu, // dsb ishst
+    0xd508831fu, // tlbi vmalle1is
+    0xd5033b9fu, // dsb ish
+    0xd5033fdfu, // isb
+    0xd69f03e0u, // eret
     0xd4200000u, // brk #0
 };
 
@@ -77,6 +93,14 @@ Cpu::Cpu()
     memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
                                    EXCEPTION_TRAMPOLINE_OFFSET),
            exception_trampoline, sizeof(exception_trampoline));
+    memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
+                                   EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET),
+           exception_trampoline_local_tlb,
+           sizeof(exception_trampoline_local_tlb));
+    memcpy(reinterpret_cast<void*>(kernel_mem.getPtr() +
+                                   EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET),
+           exception_trampoline_shared_tlb,
+           sizeof(exception_trampoline_shared_tlb));
 
     // Symbols
     // TODO: this should be registered by the process

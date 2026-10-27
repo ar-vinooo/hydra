@@ -27,6 +27,26 @@ GuestThread::~GuestThread() {
 
 uptr GuestThread::getTlsPtr() const { return tls_mem->getPtr(); }
 
+void GuestThread::captureContext(ThreadContext& out_context) {
+    out_context = {};
+    if (thread == nullptr)
+        return;
+    thread->completeState();
+    const auto& state = thread->getState();
+    for (u32 i = 0; i < out_context.cpu_gprs.size(); i++)
+        out_context.cpu_gprs[i].x = state.r[i];
+    out_context.fp = state.fp;
+    out_context.lr = state.lr;
+    out_context.sp = state.sp;
+    out_context.pc.x = state.pc;
+    out_context.psr = state.pstate;
+    for (u32 i = 0; i < out_context.fpu_gprs.size(); i++)
+        out_context.fpu_gprs[i].v = state.v[i];
+    out_context.fpcr = state.fpcr;
+    out_context.fpsr = state.fpsr;
+    out_context.tpidr = thread->getTpidr();
+}
+
 void GuestThread::run() {
     // Guest CPU threads are latency critical; keep them on the P-cores
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -55,6 +75,11 @@ void GuestThread::run() {
              [this] {
                  DEBUGGER_MANAGER_INSTANCE.getDebugger(process).breakpointHit(
                      this);
+             },
+         .user_exception =
+             [this](hw::tegra_x1::cpu::IThread* hw_thread,
+                    const hw::tegra_x1::cpu::GuestException& info) {
+                 return process->enterUserException(this, *hw_thread, info);
              }},
         tls_mem, tls_addr);
 

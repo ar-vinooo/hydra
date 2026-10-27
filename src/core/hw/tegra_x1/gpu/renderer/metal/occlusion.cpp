@@ -57,6 +57,8 @@ OcclusionCounter::prepareDraw(CommandBuffer& command_buffer,
                               MTL::RenderPassDescriptor* render_pass) {
     if (!enabled)
         return std::nullopt;
+    passes_without_counting = 0;
+    counting_thread = std::this_thread::get_id();
     // Every page belongs to one encoder of one Metal command buffer. A pass
     // that continues the open encoder keeps its page: a new one would end the
     // encoder.
@@ -71,6 +73,21 @@ OcclusionCounter::prepareDraw(CommandBuffer& command_buffer,
     }
     command_buffer.setVisibilityResultBuffer(open.page->buffer);
     return static_cast<u64>(open.page->used++) * sizeof(u64);
+}
+
+MTL::Buffer* OcclusionCounter::pageForNewPass(CommandBuffer& command_buffer) {
+    // Called for the new passes of every command buffer, also those that
+    // other threads present or blit with: the counter belongs to the thread
+    // encoding the counted guest draws
+    if (std::this_thread::get_id() != counting_thread ||
+        (!enabled && passes_without_counting >= STICKY_PASSES))
+        return nullptr;
+    passes_without_counting++;
+    closeSegment();
+    open.page = pool->acquire();
+    open.token = command_buffer.shareCompletionToken();
+    open.begin = 0;
+    return open.page->buffer;
 }
 
 void OcclusionCounter::closeSegment() {

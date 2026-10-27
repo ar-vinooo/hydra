@@ -2,6 +2,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/depth_stencil_state_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/shader_library_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/emitter.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
@@ -841,9 +843,11 @@ void testVertexPositionDefaults(MTL::Device* device) {
                                                generated, mapping);
         emitter.emit(module);
         std::string source(generated.begin(), generated.end());
-        source += "\nfragment float4 check_position(float4 p [[position]], "
-                  "float4 value [[user(locn0)]]) { "
-                  "return float4(p.z,value.y+value.z,value.w,1); }\n";
+        // Fragment inputs only link through a stage_in struct
+        source += "\nstruct CheckIn { float4 p [[position]]; "
+                  "float4 value [[user(locn0)]]; };\n"
+                  "fragment float4 check_position(CheckIn in [[stage_in]]) { "
+                  "return float4(in.p.z,in.value.y+in.value.z,in.value.w,1); }\n";
         NS::Error* error = nullptr;
         NS_STACK_SCOPED auto library =
             device->newLibrary(toNsString(source), nullptr, &error);
@@ -898,6 +902,1058 @@ void testVertexPositionDefaults(MTL::Device* device) {
     }
     std::cout << "PASS: XY-only vertex positions rasterize; explicit Z/W "
                  "overrides survive\n";
+}
+
+// VertexA runs to its exit, then VertexB continues with its registers and
+// outputs: both are one Metal vertex function
+void testVertexA(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    DecompilerContext context{};
+    context.type = ShaderType::Vertex;
+    GuestShaderState guest{};
+    for (auto& attribute : guest.vertex_attrib_states)
+        attribute.is_fixed = true;
+    guest.depth_zero_to_one = true;
+    ir::Module module;
+    ir::Builder builder(module);
+    // VertexA: a register and an output, then exit
+    builder.setInsertFunction("vertex_a");
+    builder.setInsertBlock(0x0);
+    builder.opCopy(ir::Value::createRegister(4, ir::ScalarType::F32),
+                   ir::Value::createConstantF(0.25f));
+    builder.opCopy(ir::Value::createAttrMemory({RZ, SV_USER_IN_OUT_BASE, false},
+                                               ir::ScalarType::F32),
+                   ir::Value::createConstantF(0.75f));
+    builder.opExit();
+    // VertexB: a full screen triangle, and the register as output
+    builder.setInsertFunction("main");
+    builder.setInsertBlock(0x0);
+    const auto vid = ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true});
+    for (u32 component = 0; component < 2; ++component) {
+        const auto condition = builder.opCompareEqual(
+            vid, ir::Value::createConstant(component + 1));
+        builder.opCopy(ir::Value::createAttrMemory(
+                           {RZ, SV_POSITION_BASE + component * 4, false},
+                           ir::ScalarType::F32),
+                       builder.opSelect(condition, ir::Value::createConstantF(3.0f),
+                                        ir::Value::createConstantF(-1.0f)));
+    }
+    builder.opCopy(ir::Value::createAttrMemory({RZ, SV_USER_IN_OUT_BASE + 4, false},
+                                               ir::ScalarType::F32),
+                   ir::Value::createRegister(4, ir::ScalarType::F32));
+    builder.opExit();
+    analyzer::MemoryAnalyzer memory;
+    memory.analyze(module);
+    std::vector<u8> generated;
+    ResourceMapping mapping;
+    codegen::lang::msl::MslEmitter emitter(context, memory, guest, generated,
+                                           mapping);
+    emitter.emit(module);
+    std::string source(generated.begin(), generated.end());
+    // Fragment inputs only link through a stage_in struct
+    source += "\nstruct CheckIn { float4 value [[user(locn0)]]; };\n"
+              "fragment float4 check_vertex_a(CheckIn in [[stage_in]]) "
+              "{ return float4(in.value.x, in.value.y, 0, 1); }\n";
+    NS::Error* error = nullptr;
+    NS_STACK_SCOPED auto library =
+        device->newLibrary(toNsString(source), nullptr, &error);
+    if (!library && error)
+        std::cerr << error->localizedDescription()->utf8String() << std::endl;
+    check(library != nullptr, "VertexA and VertexB compile as one function");
+    NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("main_"));
+    NS_STACK_SCOPED auto fragment =
+        library->newFunction(toNsString("check_vertex_a"));
+    NS_STACK_SCOPED auto descriptor =
+        MTL::RenderPipelineDescriptor::alloc()->init();
+    descriptor->setVertexFunction(vertex);
+    descriptor->setFragmentFunction(fragment);
+    descriptor->colorAttachments()->object(0)->setPixelFormat(
+        MTL::PixelFormatRGBA8Unorm);
+    NS_STACK_SCOPED auto pipeline =
+        device->newRenderPipelineState(descriptor, &error);
+    check(pipeline != nullptr, "VertexA pipeline compiles");
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 4, 4, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 1, 1));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    encoder->setRenderPipelineState(pipeline);
+    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                            NS::UInteger(3));
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    check(commands->status() == MTL::CommandBufferStatusCompleted,
+          "VertexA draw completes");
+    std::array<u8, 64> pixels{};
+    texture->getBytes(pixels.data(), 16, MTL::Region::Make2D(0, 0, 4, 4), 0);
+    for (usize pixel = 0; pixel < 16; ++pixel)
+        check(pixels[pixel * 4] == 191 && pixels[pixel * 4 + 1] == 64 &&
+                  pixels[pixel * 4 + 2] == 0,
+              "VertexB draws after VertexA exits, with VertexA's register "
+              "and output");
+    std::cout << "PASS: VertexA runs before VertexB in one vertex function\n";
+}
+
+// Geometry shader emulation (geometry.hpp) on Metal, one render pass: a
+// capturing vertex shader, the geometry shader as a vertex function and the
+// passthrough draw. Two points become half screen quads with their colors.
+void testGeometryShader(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    namespace engines = hydra::hw::tegra_x1::gpu::engines;
+    const auto compile = [&](const std::string& source, const char* what) {
+        NS::Error* error = nullptr;
+        auto* library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << "\n"
+                      << source << std::endl;
+        check(library != nullptr, what);
+        return library;
+    };
+    const auto attr = [](u32 address, bool input) {
+        return ir::Value::createAttrMemory({RZ, address, input},
+                                           ir::ScalarType::F32);
+    };
+
+    // Vertex shader: point 0 at x = -0.5 with color A, point 1 at x = 0.5
+    // with color B
+    GuestShaderState vertex_state{};
+    for (auto& attribute : vertex_state.vertex_attrib_states)
+        attribute.is_fixed = true;
+    vertex_state.depth_zero_to_one = true;
+    vertex_state.geometry_capture = true;
+    std::vector<u8> vertex_code;
+    ResourceMapping vertex_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto second = b.opCompareEqual(
+            ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true}),
+            ir::Value::createConstant(1u));
+        const auto pick = [&](f32 a, f32 c) {
+            return b.opSelect(second, ir::Value::createConstantF(c),
+                              ir::Value::createConstantF(a));
+        };
+        b.opCopy(attr(SV_POSITION_BASE, false), pick(-0.5f, 0.5f));
+        b.opCopy(attr(SV_POSITION_BASE + 4, false), ir::Value::createConstantF(0.0f));
+        const f32 colors[2][4] = {{0.75f, 0.25f, 0.5f, 1.0f},
+                                  {0.25f, 0.5f, 1.0f, 1.0f}};
+        for (u32 c = 0; c < 4; c++)
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false),
+                     pick(colors[0][c], colors[1][c]));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter emitter(context, memory, vertex_state,
+                                               vertex_code, vertex_mapping);
+        emitter.emit(module);
+    }
+
+    // Geometry shader: points in, a 4 vertex strip out (limit 6, so index
+    // entries remain for the dead vertex)
+    constexpr u32 MAX_VERTICES = 6;
+    GuestShaderState geometry_state{};
+    std::vector<u8> geometry_code;
+    ResourceMapping geometry_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry = true;
+        context.geo.input_vertices = 1;
+        context.geo.input_primitive = engines::PrimitiveType::Points;
+        context.geo.output = static_cast<u32>(geometry::Output::TriangleStrip);
+        context.geo.max_output_vertices = MAX_VERTICES;
+        context.geo.invocations = 1;
+        geometry_state.geometry_input_vertices = 1;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto center = b.opCopy(attr(SV_POSITION_BASE, true));
+        std::array<ir::Value, 4> color = {
+            b.opCopy(attr(SV_USER_IN_OUT_BASE, true)),
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + 4, true)),
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + 8, true)),
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + 12, true))};
+        const f32 corners[4][2] = {{-0.5f, -1.0f}, {0.5f, -1.0f},
+                                   {-0.5f, 1.0f}, {0.5f, 1.0f}};
+        for (const auto& corner : corners) {
+            b.opCopy(attr(SV_POSITION_BASE, false),
+                     b.opAdd(center, ir::Value::createConstantF(corner[0])));
+            b.opCopy(attr(SV_POSITION_BASE + 4, false),
+                     ir::Value::createConstantF(corner[1]));
+            b.opCopy(attr(SV_POSITION_BASE + 8, false),
+                     ir::Value::createConstantF(0.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 12, false),
+                     ir::Value::createConstantF(1.0f));
+            for (u32 c = 0; c < 4; c++)
+                b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false), color[c]);
+            // Clip distance 0: the left quad (+1) is kept, the right (-1) clipped
+            b.opCopy(attr(SV_CLIP_DISTANCE_BASE, false),
+                     b.opMultiply(center, ir::Value::createConstantF(-2.0f)));
+            b.opEmitVertex();
+        }
+        b.opEndPrimitive();
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.setGeometry(true);
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter emitter(context, memory, geometry_state,
+                                               geometry_code, geometry_mapping);
+        emitter.emit(module);
+    }
+
+    GeometryPassthroughState passthrough_state{};
+    passthrough_state.output_mask = 1;
+    passthrough_state.depth_zero_to_one = true;
+    passthrough_state.clip_distance_mask = 1;
+    std::string passthrough = generateGeometryPassthrough(passthrough_state);
+    passthrough += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
+                   "fragment float4 check_geometry(CheckIn in [[stage_in]]) "
+                   "{ return in.color; }\n";
+
+    NS_STACK_SCOPED auto vertex_library = compile(
+        std::string(vertex_code.begin(), vertex_code.end()),
+        "Capturing vertex shader compiles");
+    NS_STACK_SCOPED auto geometry_library = compile(
+        std::string(geometry_code.begin(), geometry_code.end()),
+        "Geometry shader compiles as a vertex function");
+    NS_STACK_SCOPED auto passthrough_library =
+        compile(passthrough, "Geometry passthrough compiles");
+
+    const auto make_pipeline = [&](MTL::Library* library, const char* vertex,
+                                   MTL::Library* fragment_library,
+                                   const char* fragment) {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto vertex_function =
+            library->newFunction(toNsString(vertex));
+        descriptor->setVertexFunction(vertex_function);
+        if (fragment != nullptr) {
+            NS_STACK_SCOPED auto fragment_function =
+                fragment_library->newFunction(toNsString(fragment));
+            descriptor->setFragmentFunction(fragment_function);
+        } else {
+            descriptor->setRasterizationEnabled(false);
+        }
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        if (!pipeline && error)
+            std::cerr << error->localizedDescription()->utf8String() << std::endl;
+        check(pipeline != nullptr, "Geometry pipeline state compiles");
+        return pipeline;
+    };
+    NS_STACK_SCOPED auto capture_pipeline =
+        make_pipeline(vertex_library, "main_", nullptr, nullptr);
+    NS_STACK_SCOPED auto geometry_pipeline =
+        make_pipeline(geometry_library, "main_", nullptr, nullptr);
+    NS_STACK_SCOPED auto draw_pipeline = make_pipeline(
+        passthrough_library, "main_", passthrough_library, "check_geometry");
+
+    constexpr u32 POINTS = 2;
+    const u32 max_indices = geometry::getMaxOutputIndices(
+        geometry::Output::TriangleStrip, MAX_VERTICES);
+    NS_STACK_SCOPED auto records = device->newBuffer(
+        POINTS * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto output = device->newBuffer(
+        POINTS * (MAX_VERTICES + 1) * geometry::RECORD_SIZE,
+        MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto indices = device->newBuffer(
+        POINTS * max_indices * sizeof(u32), MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto index_data =
+        device->newBuffer(16, MTL::ResourceStorageModeShared);
+    const geometry::CaptureParams capture_params{0};
+    const geometry::Params params{POINTS,
+                                  static_cast<u32>(engines::IndexType::None),
+                                  0, 0, 0, POINTS};
+
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 8, 4, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    encoder->setRenderPipelineState(capture_pipeline);
+    encoder->setVertexBuffer(records, 0, vertex_mapping.capture_buffer_index);
+    encoder->setVertexBytes(&capture_params, sizeof(capture_params),
+                            vertex_mapping.capture_params_index);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(POINTS));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(geometry_pipeline);
+    encoder->setVertexBuffer(records, 0, geometry::INPUT_BUFFER);
+    encoder->setVertexBuffer(index_data, 0, geometry::INDEX_DATA_BUFFER);
+    encoder->setVertexBuffer(output, 0, geometry::OUTPUT_BUFFER);
+    encoder->setVertexBuffer(indices, 0, geometry::OUTPUT_INDEX_BUFFER);
+    encoder->setVertexBytes(&params, sizeof(params), geometry::PARAMS_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(POINTS));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(draw_pipeline);
+    encoder->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle,
+                                   NS::UInteger(POINTS * max_indices),
+                                   MTL::IndexTypeUInt32, indices, 0);
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    check(commands->status() == MTL::CommandBufferStatusCompleted,
+          "Geometry draws complete");
+    std::array<u8, 8 * 4 * 4> pixels{};
+    texture->getBytes(pixels.data(), 8 * 4, MTL::Region::Make2D(0, 0, 8, 4), 0);
+    for (u32 y = 0; y < 4; y++) {
+        for (u32 x = 0; x < 8; x++) {
+            const u8* p = &pixels[(y * 8 + x) * 4];
+            const bool left = x < 4;
+            check(left ? (p[0] == 191 && p[1] == 64 && p[2] == 128)
+                       : (p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0),
+                  "Each point becomes a half screen quad with its color, the "
+                  "right one clipped by its clip distance");
+        }
+    }
+    std::cout << "PASS: geometry shader emulation expands points into quads "
+                 "and passes clip distances\n";
+}
+
+// Geometry shader inputs of a triangle strip with adjacency follow OpenGL
+// 4.6 table 10.1: each input vertex is drawn as a point at (input, primitive)
+// colored with its vertex id
+void testGeometryStripAdjacency(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    namespace engines = hydra::hw::tegra_x1::gpu::engines;
+    const auto attr = [](u32 address, bool input, reg_t vertex = RZ) {
+        return ir::Value::createAttrMemory({RZ, address, input, vertex},
+                                           ir::ScalarType::F32);
+    };
+    // Vertex shader: user 0 x = vertex id / 255
+    GuestShaderState vertex_state{};
+    for (auto& attribute : vertex_state.vertex_attrib_states)
+        attribute.is_fixed = true;
+    vertex_state.geometry_capture = true;
+    std::vector<u8> vertex_code;
+    ResourceMapping vertex_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto id = b.opCast(
+            ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true}),
+            ir::ScalarType::F32);
+        b.opCopy(attr(SV_USER_IN_OUT_BASE, false),
+                 b.opMultiply(id, ir::Value::createConstantF(1.0f / 255.0f)));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter(context, memory, vertex_state,
+                                       vertex_code, vertex_mapping)
+            .emit(module);
+    }
+    // Geometry shader: points at pixel (k, primitive) of a 6x2 target
+    std::vector<u8> geometry_code;
+    ResourceMapping geometry_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry = true;
+        context.geo.input_vertices = 6;
+        context.geo.input_primitive = engines::PrimitiveType::TriangleStripAdjacency;
+        context.geo.output = static_cast<u32>(geometry::Output::Points);
+        context.geo.max_output_vertices = 6;
+        context.geo.invocations = 1;
+        GuestShaderState state{};
+        state.geometry_input_vertices = 6;
+        ir::Module module;
+        ir::Builder b(module);
+        // y of the primitive's row: 1 - (primitive + 0.5) (NDC, 2 rows)
+        const auto primitive = b.opCast(
+            ir::Value::createAttrMemory({RZ, SV_PRIMITIVE_ID_BASE, true}),
+            ir::ScalarType::F32);
+        const auto y = b.opAdd(ir::Value::createConstantF(0.5f), b.opNeg(primitive));
+        for (u32 k = 0; k < 6; k++) {
+            b.opCopy(ir::Value::createRegister(8), ir::Value::createConstantU(k));
+            b.opCopy(attr(SV_POSITION_BASE, false),
+                     ir::Value::createConstantF((static_cast<f32>(k) + 0.5f) / 3.0f - 1.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 4, false), y);
+            b.opCopy(attr(SV_POSITION_BASE + 8, false), ir::Value::createConstantF(0.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 12, false), ir::Value::createConstantF(1.0f));
+            b.opCopy(attr(SV_USER_IN_OUT_BASE, false),
+                     b.opCopy(attr(SV_USER_IN_OUT_BASE, true, 8)));
+            b.opEmitVertex();
+        }
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.setGeometry(true);
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter(context, memory, state, geometry_code,
+                                       geometry_mapping)
+            .emit(module);
+    }
+    GeometryPassthroughState passthrough_state{};
+    passthrough_state.output_mask = 1;
+    passthrough_state.depth_zero_to_one = true;
+    passthrough_state.point_list = true;
+    std::string passthrough = generateGeometryPassthrough(passthrough_state);
+    passthrough += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
+                   "fragment float4 check_adjacency(CheckIn in [[stage_in]]) "
+                   "{ return float4(in.color.x, 0, 0, 1); }\n";
+    const auto compile = [&](const std::string& source) {
+        NS::Error* error = nullptr;
+        auto* library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << "\n"
+                      << source << std::endl;
+        check(library != nullptr, "Strip adjacency shaders compile");
+        return library;
+    };
+    NS_STACK_SCOPED auto vertex_library =
+        compile(std::string(vertex_code.begin(), vertex_code.end()));
+    NS_STACK_SCOPED auto geometry_library =
+        compile(std::string(geometry_code.begin(), geometry_code.end()));
+    NS_STACK_SCOPED auto passthrough_library = compile(passthrough);
+    const auto make_pipeline = [&](MTL::Library* library, const char* fragment) {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto vertex_function =
+            library->newFunction(toNsString("main_"));
+        descriptor->setVertexFunction(vertex_function);
+        if (fragment != nullptr) {
+            NS_STACK_SCOPED auto fragment_function =
+                library->newFunction(toNsString(fragment));
+            descriptor->setFragmentFunction(fragment_function);
+        } else {
+            descriptor->setRasterizationEnabled(false);
+        }
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        check(pipeline != nullptr, "Strip adjacency pipeline compiles");
+        return pipeline;
+    };
+    NS_STACK_SCOPED auto capture_pipeline = make_pipeline(vertex_library, nullptr);
+    NS_STACK_SCOPED auto geometry_pipeline = make_pipeline(geometry_library, nullptr);
+    NS_STACK_SCOPED auto draw_pipeline =
+        make_pipeline(passthrough_library, "check_adjacency");
+
+    // 8 vertices: 2 triangles
+    constexpr u32 VERTICES = 8;
+    const u32 primitives = geometry::getPrimitiveCount(
+        engines::PrimitiveType::TriangleStripAdjacency, VERTICES);
+    check(primitives == 2, "A strip of 8 vertices with adjacency has 2 triangles");
+    const u32 max_indices = geometry::getMaxOutputIndices(geometry::Output::Points, 6);
+    NS_STACK_SCOPED auto records = device->newBuffer(
+        VERTICES * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto output = device->newBuffer(
+        primitives * 7 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto indices = device->newBuffer(
+        primitives * max_indices * sizeof(u32), MTL::ResourceStorageModePrivate);
+    const geometry::CaptureParams capture_params{0};
+    const geometry::Params params{primitives,
+                                  static_cast<u32>(engines::IndexType::None), 0, 0,
+                                  0, VERTICES};
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 6, 2, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    encoder->setRenderPipelineState(capture_pipeline);
+    encoder->setVertexBuffer(records, 0, vertex_mapping.capture_buffer_index);
+    encoder->setVertexBytes(&capture_params, sizeof(capture_params),
+                            vertex_mapping.capture_params_index);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(VERTICES));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(geometry_pipeline);
+    encoder->setVertexBuffer(records, 0, geometry::INPUT_BUFFER);
+    encoder->setVertexBuffer(records, 0, geometry::INDEX_DATA_BUFFER);
+    encoder->setVertexBuffer(output, 0, geometry::OUTPUT_BUFFER);
+    encoder->setVertexBuffer(indices, 0, geometry::OUTPUT_INDEX_BUFFER);
+    encoder->setVertexBytes(&params, sizeof(params), geometry::PARAMS_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(primitives));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(draw_pipeline);
+    encoder->drawIndexedPrimitives(MTL::PrimitiveTypePoint,
+                                   NS::UInteger(primitives * max_indices),
+                                   MTL::IndexTypeUInt32, indices, 0);
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    std::array<u8, 6 * 2 * 4> pixels{};
+    texture->getBytes(pixels.data(), 6 * 4, MTL::Region::Make2D(0, 0, 6, 2), 0);
+    // OpenGL 4.6 table 10.1: first (0, 1, 2, 6, 4, 3), last odd
+    // (2i+2, 2i-2, 2i, 2i+3, 2i+4, 2i+5) = (4, 0, 2, 5, 6, 7)
+    const u32 expected[2][6] = {{0, 1, 2, 6, 4, 3}, {4, 0, 2, 5, 6, 7}};
+    for (u32 primitive = 0; primitive < 2; primitive++) {
+        for (u32 k = 0; k < 6; k++) {
+            const u8* p = &pixels[(primitive * 6 + k) * 4];
+            if (p[0] != expected[primitive][k] || p[3] != 255)
+                std::cerr << "primitive " << primitive << " input " << k
+                          << ": vertex " << int(p[0]) << " (alpha " << int(p[3])
+                          << ")" << std::endl;
+            check(p[0] == expected[primitive][k] && p[3] == 255,
+                  "Strip adjacency inputs follow the OpenGL table");
+        }
+    }
+    std::cout << "PASS: geometry shader inputs of triangle strips with "
+                 "adjacency\n";
+}
+
+// A real geometry shader binary through the decoder: header (output
+// topology, vertex limit, invocations), ALD with a vertex register, AST and
+// OUT.EMIT pass a triangle through
+void testGeometryShaderBinary(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    namespace engines = hydra::hw::tegra_x1::gpu::engines;
+    constexpr u64 PRED_PT = 7ull << 16;
+    constexpr u64 RZ_A = 0xffull << 8;
+    const auto mov32i = [&](u32 dst, u32 value) {
+        return 0x0100000000000000ull | (u64(value) << 20) | (0xfull << 12) | PRED_PT |
+               dst;
+    };
+    // 128-bit attribute load of `vertex`, store of the vertex being built
+    const auto ald = [&](u32 dst, u32 address, u32 vertex) {
+        return 0xefd8000000000000ull | (3ull << 47) | (u64(vertex) << 39) |
+               (u64(address) << 20) | PRED_PT | RZ_A | dst;
+    };
+    const auto ast = [&](u32 address, u32 src) {
+        return 0xeff0000000000000ull | (3ull << 47) | (0xffull << 39) |
+               (u64(address) << 20) | PRED_PT | RZ_A | src;
+    };
+    const u64 out_emit = 0xfbe0000000000000ull | (1ull << 39) | (0xffull << 20) |
+                         PRED_PT | RZ_A | 11;
+    const u64 exit = 0xe30000000007000full;
+    std::vector<u64> instructions = {mov32i(8, 0), mov32i(9, 1), mov32i(10, 2)};
+    for (u32 v = 0; v < 3; v++) {
+        instructions.push_back(ald(0, 0x70, 8 + v));
+        instructions.push_back(ast(0x70, 0));
+        instructions.push_back(ald(4, 0x80, 8 + v));
+        instructions.push_back(ast(0x80, 4));
+        instructions.push_back(out_emit);
+    }
+    instructions.push_back(exit);
+    std::vector<u32> header(0x50 / 4, 0);
+    header[0] = 1 | (3u << 5) | (4u << 10); // VTG, version 3, geometry
+    header[2] = 1u << 24;                   // 1 invocation
+    header[3] = 7u << 24;                   // Triangle strip output
+    header[4] = 3;                          // 3 output vertices
+    std::vector<u8> binary(reinterpret_cast<const u8*>(header.data()),
+                           reinterpret_cast<const u8*>(header.data()) + 0x50);
+    for (usize i = 0; i < instructions.size(); i++) {
+        if (i % 3 == 0) {
+            const u64 sched = 0x001f8000fc0007e0ull;
+            binary.insert(binary.end(), reinterpret_cast<const u8*>(&sched),
+                          reinterpret_cast<const u8*>(&sched) + 8);
+        }
+        binary.insert(binary.end(), reinterpret_cast<const u8*>(&instructions[i]),
+                      reinterpret_cast<const u8*>(&instructions[i]) + 8);
+    }
+    binary.resize(binary.size() + 64, 0);
+
+    GuestShaderState geometry_state{};
+    geometry_state.geometry_input_vertices = 3;
+    geometry_state.geometry_input_primitive = engines::PrimitiveType::Triangles;
+    ShaderBackend backend;
+    std::vector<u8> geometry_code;
+    ResourceMapping geometry_mapping;
+    {
+        ztd::io::MemoryStream stream(binary);
+        decompile(stream, ShaderType::Geometry, geometry_state, backend,
+                  geometry_code, geometry_mapping);
+    }
+    check(geometry_mapping.geometry_output ==
+                  static_cast<u32>(geometry::Output::TriangleStrip) &&
+              geometry_mapping.geometry_max_output_vertices == 3 &&
+              geometry_mapping.geometry_invocations == 1,
+          "The geometry shader header gives the output topology and limits");
+    for (const auto& feature : geometry_mapping.unsupported)
+        std::cerr << "unsupported: " << feature << std::endl;
+    check(geometry_mapping.unsupported.empty(),
+          "ALD, AST and OUT of the geometry shader are supported");
+
+    // Vertex shader: a full screen triangle with one color
+    GuestShaderState vertex_state{};
+    for (auto& attribute : vertex_state.vertex_attrib_states)
+        attribute.is_fixed = true;
+    vertex_state.geometry_capture = true;
+    std::vector<u8> vertex_code;
+    ResourceMapping vertex_mapping;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto vid = ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true});
+        for (u32 component = 0; component < 2; ++component) {
+            const auto condition = b.opCompareEqual(
+                vid, ir::Value::createConstant(component + 1));
+            b.opCopy(ir::Value::createAttrMemory(
+                         {RZ, SV_POSITION_BASE + component * 4, false},
+                         ir::ScalarType::F32),
+                     b.opSelect(condition, ir::Value::createConstantF(3.0f),
+                                ir::Value::createConstantF(-1.0f)));
+        }
+        const f32 color[4] = {0.75f, 0.25f, 0.5f, 1.0f};
+        for (u32 c = 0; c < 4; c++)
+            b.opCopy(ir::Value::createAttrMemory({RZ, SV_USER_IN_OUT_BASE + c * 4, false},
+                                                 ir::ScalarType::F32),
+                     ir::Value::createConstantF(color[c]));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        codegen::lang::msl::MslEmitter(context, memory, vertex_state,
+                                       vertex_code, vertex_mapping)
+            .emit(module);
+    }
+    GeometryPassthroughState passthrough_state{};
+    passthrough_state.output_mask = 1;
+    passthrough_state.depth_zero_to_one = true;
+    std::string passthrough = generateGeometryPassthrough(passthrough_state);
+    passthrough += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
+                   "fragment float4 check_geometry(CheckIn in [[stage_in]]) "
+                   "{ return in.color; }\n";
+
+    const auto compile = [&](const std::string& source) {
+        NS::Error* error = nullptr;
+        auto* library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << "\n"
+                      << source << std::endl;
+        check(library != nullptr, "Geometry binary shaders compile");
+        return library;
+    };
+    NS_STACK_SCOPED auto vertex_library =
+        compile(std::string(vertex_code.begin(), vertex_code.end()));
+    NS_STACK_SCOPED auto geometry_library =
+        compile(std::string(geometry_code.begin(), geometry_code.end()));
+    NS_STACK_SCOPED auto passthrough_library = compile(passthrough);
+    const auto make_pipeline = [&](MTL::Library* library, const char* fragment) {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto vertex_function =
+            library->newFunction(toNsString("main_"));
+        descriptor->setVertexFunction(vertex_function);
+        if (fragment != nullptr) {
+            NS_STACK_SCOPED auto fragment_function =
+                library->newFunction(toNsString(fragment));
+            descriptor->setFragmentFunction(fragment_function);
+        } else {
+            descriptor->setRasterizationEnabled(false);
+        }
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        check(pipeline != nullptr, "Geometry binary pipeline compiles");
+        return pipeline;
+    };
+    NS_STACK_SCOPED auto capture_pipeline = make_pipeline(vertex_library, nullptr);
+    NS_STACK_SCOPED auto geometry_pipeline = make_pipeline(geometry_library, nullptr);
+    NS_STACK_SCOPED auto draw_pipeline =
+        make_pipeline(passthrough_library, "check_geometry");
+
+    const u32 max_indices =
+        geometry::getMaxOutputIndices(geometry::Output::TriangleStrip, 3);
+    NS_STACK_SCOPED auto records = device->newBuffer(
+        3 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto output = device->newBuffer(
+        4 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto indices = device->newBuffer(
+        max_indices * sizeof(u32), MTL::ResourceStorageModePrivate);
+    const geometry::CaptureParams capture_params{0};
+    const geometry::Params params{1, static_cast<u32>(engines::IndexType::None),
+                                  0, 0, 0, 3};
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 4, 4, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    encoder->setRenderPipelineState(capture_pipeline);
+    encoder->setVertexBuffer(records, 0, vertex_mapping.capture_buffer_index);
+    encoder->setVertexBytes(&capture_params, sizeof(capture_params),
+                            vertex_mapping.capture_params_index);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(3));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(geometry_pipeline);
+    encoder->setVertexBuffer(records, 0, geometry::INPUT_BUFFER);
+    encoder->setVertexBuffer(records, 0, geometry::INDEX_DATA_BUFFER);
+    encoder->setVertexBuffer(output, 0, geometry::OUTPUT_BUFFER);
+    encoder->setVertexBuffer(indices, 0, geometry::OUTPUT_INDEX_BUFFER);
+    encoder->setVertexBytes(&params, sizeof(params), geometry::PARAMS_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(1));
+    encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                           MTL::RenderStageVertex);
+    encoder->setRenderPipelineState(draw_pipeline);
+    encoder->drawIndexedPrimitives(MTL::PrimitiveTypeTriangle,
+                                   NS::UInteger(max_indices),
+                                   MTL::IndexTypeUInt32, indices, 0);
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    std::array<u8, 64> pixels{};
+    texture->getBytes(pixels.data(), 16, MTL::Region::Make2D(0, 0, 4, 4), 0);
+    for (usize pixel = 0; pixel < 16; ++pixel)
+        check(pixels[pixel * 4] == 191 && pixels[pixel * 4 + 1] == 64 &&
+                  pixels[pixel * 4 + 2] == 128 && pixels[pixel * 4 + 3] == 255,
+              "The geometry shader binary passes the triangle through");
+    std::cout << "PASS: geometry shader binaries decode ALD, AST and OUT\n";
+}
+
+// Tessellation emulation (tessellation.hpp) on Metal, one render pass: the
+// capturing vertex shader, the control shader as a vertex function writing
+// control points and patch levels, the factor function and drawPatches with
+// the evaluation shader
+void testTessellation(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    namespace engines = hydra::hw::tegra_x1::gpu::engines;
+    const auto attr = [](u32 address, bool input, reg_t vertex = RZ) {
+        return ir::Value::createAttrMemory({RZ, address, input, vertex},
+                                           ir::ScalarType::F32);
+    };
+    const auto emit = [](DecompilerContext& context, GuestShaderState& state,
+                         ir::Module& module, ResourceMapping& mapping) {
+        analyzer::MemoryAnalyzer memory;
+        memory.setGeometry(context.tess_control || context.tess_eval);
+        memory.analyze(module);
+        std::vector<u8> code;
+        codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+            .emit(module);
+        return std::string(code.begin(), code.end());
+    };
+
+    // Vertex shader: a full screen triangle, the color in user 0
+    ResourceMapping vertex_mapping;
+    std::string vertex_source;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        GuestShaderState state{};
+        for (auto& attribute : state.vertex_attrib_states)
+            attribute.is_fixed = true;
+        state.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto vid = ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true});
+        for (u32 component = 0; component < 2; ++component) {
+            const auto condition = b.opCompareEqual(
+                vid, ir::Value::createConstant(component + 1));
+            b.opCopy(attr(SV_POSITION_BASE + component * 4, false),
+                     b.opSelect(condition, ir::Value::createConstantF(3.0f),
+                                ir::Value::createConstantF(-1.0f)));
+        }
+        const f32 color[4] = {0.75f, 0.25f, 0.5f, 1.0f};
+        for (u32 c = 0; c < 4; c++)
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false),
+                     ir::Value::createConstantF(color[c]));
+        b.opExit();
+        vertex_source = emit(context, state, module, vertex_mapping);
+    }
+    // Control shader: each invocation copies its control point; the patch
+    // levels are 4
+    ResourceMapping control_mapping;
+    std::string control_source;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.tess_control = true;
+        context.tess.input_vertices = 3;
+        context.tess.output_vertices = 3;
+        GuestShaderState state{};
+        state.tessellation_patch_size = 3;
+        ir::Module module;
+        ir::Builder b(module);
+        b.opCopy(ir::Value::createRegister(8), b.opReadSystemRegister(0x11));
+        for (u32 c = 0; c < 4; c++) {
+            b.opCopy(attr(SV_POSITION_BASE + c * 4, false),
+                     b.opCopy(attr(SV_POSITION_BASE + c * 4, true, 8)));
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false),
+                     b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, true, 8)));
+        }
+        for (u32 level = 0; level < 6; level++)
+            b.opCopy(ir::Value::createAttrMemory({RZ, level * 4u, false, RZ, true},
+                                                 ir::ScalarType::F32),
+                     ir::Value::createConstantF(4.0f));
+        b.opExit();
+        control_source = emit(context, state, module, control_mapping);
+    }
+    check(control_mapping.tess_output_vertices == 3,
+          "The control shader reports its output control points");
+    // Evaluation shader: barycentric position, the first control point's
+    // color
+    ResourceMapping evaluation_mapping;
+    std::string evaluation_source;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.tess_eval = true;
+        context.tess.output_vertices = 3;
+        context.tess.domain = static_cast<u32>(tessellation::Domain::Triangle);
+        GuestShaderState state{};
+        state.depth_zero_to_one = true;
+        state.fragment_input_mask = 1;
+        state.tessellation_control_points = 3;
+        state.tessellation_domain = context.tess.domain;
+        ir::Module module;
+        ir::Builder b(module);
+        for (u32 point = 0; point < 3; point++)
+            b.opCopy(ir::Value::createRegister(static_cast<reg_t>(8 + point)),
+                     ir::Value::createConstantU(point));
+        const auto u = b.opCopy(attr(SV_TESS_COORD_BASE, true));
+        const auto v = b.opCopy(attr(SV_TESS_COORD_BASE + 4, true));
+        const auto w = b.opAdd(ir::Value::createConstantF(1.0f),
+                               b.opNeg(b.opAdd(u, v)));
+        const std::array<ir::Value, 3> weights = {u, v, w};
+        for (u32 c = 0; c < 4; c++) {
+            ir::Value sum = ir::Value::createConstantF(0.0f);
+            for (u32 point = 0; point < 3; point++)
+                sum = b.opAdd(sum, b.opMultiply(
+                                       weights[point],
+                                       b.opCopy(attr(SV_POSITION_BASE + c * 4,
+                                                     true,
+                                                     static_cast<reg_t>(8 + point)))));
+            b.opCopy(attr(SV_POSITION_BASE + c * 4, false), sum);
+            b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false),
+                     b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, true, 8)));
+        }
+        b.opExit();
+        evaluation_source = emit(context, state, module, evaluation_mapping);
+    }
+    for (const auto* mapping : {&control_mapping, &evaluation_mapping})
+        for (const auto& feature : mapping->unsupported)
+            std::cerr << "unsupported: " << feature << std::endl;
+    check(control_mapping.unsupported.empty() &&
+              evaluation_mapping.unsupported.empty(),
+          "Tessellation shaders use no unsupported features");
+    std::string factor_source = generateTessellationFactors(
+        static_cast<u32>(tessellation::Domain::Triangle), true, {});
+    evaluation_source += "\nstruct CheckIn { float4 color [[user(locn0)]]; };\n"
+                         "fragment float4 check_tessellation(CheckIn in "
+                         "[[stage_in]]) { return in.color; }\n";
+
+    const auto compile = [&](const std::string& source, const char* what) {
+        NS::Error* error = nullptr;
+        auto* library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << "\n"
+                      << source << std::endl;
+        check(library != nullptr, what);
+        return library;
+    };
+    NS_STACK_SCOPED auto vertex_library =
+        compile(vertex_source, "Capturing vertex shader compiles");
+    NS_STACK_SCOPED auto control_library =
+        compile(control_source, "Control shader compiles as a vertex function");
+    NS_STACK_SCOPED auto factor_library =
+        compile(factor_source, "Tessellation factor function compiles");
+    NS_STACK_SCOPED auto evaluation_library = compile(
+        evaluation_source, "Evaluation shader compiles post-tessellation");
+
+    const auto raster_off = [&](MTL::Library* library) {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto function = library->newFunction(toNsString("main_"));
+        descriptor->setVertexFunction(function);
+        descriptor->setRasterizationEnabled(false);
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        check(pipeline != nullptr, "Rasterization-off pipeline compiles");
+        return pipeline;
+    };
+    NS_STACK_SCOPED auto capture_pipeline = raster_off(vertex_library);
+    NS_STACK_SCOPED auto control_pipeline = raster_off(control_library);
+    NS_STACK_SCOPED auto factor_pipeline = raster_off(factor_library);
+    NS_STACK_SCOPED auto draw_pipeline = [&] {
+        NS_STACK_SCOPED auto descriptor =
+            MTL::RenderPipelineDescriptor::alloc()->init();
+        NS_STACK_SCOPED auto vertex_function =
+            evaluation_library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto fragment_function =
+            evaluation_library->newFunction(toNsString("check_tessellation"));
+        descriptor->setVertexFunction(vertex_function);
+        descriptor->setFragmentFunction(fragment_function);
+        descriptor->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA8Unorm);
+        descriptor->setTessellationPartitionMode(MTL::TessellationPartitionModeInteger);
+        descriptor->setTessellationFactorStepFunction(
+            MTL::TessellationFactorStepFunctionPerPatch);
+        descriptor->setTessellationOutputWindingOrder(MTL::WindingCounterClockwise);
+        descriptor->setTessellationControlPointIndexType(
+            MTL::TessellationControlPointIndexTypeNone);
+        descriptor->setMaxTessellationFactor(64);
+        NS::Error* error = nullptr;
+        auto* pipeline = device->newRenderPipelineState(descriptor, &error);
+        if (!pipeline && error)
+            std::cerr << error->localizedDescription()->utf8String() << std::endl;
+        check(pipeline != nullptr, "Tessellation draw pipeline compiles");
+        return pipeline;
+    }();
+
+    NS_STACK_SCOPED auto records = device->newBuffer(
+        3 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto control_points = device->newBuffer(
+        3 * geometry::RECORD_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto patches = device->newBuffer(
+        tessellation::PATCH_SIZE, MTL::ResourceStorageModePrivate);
+    NS_STACK_SCOPED auto factors = device->newBuffer(
+        tessellation::getFactorSize(tessellation::Domain::Triangle),
+        MTL::ResourceStorageModePrivate);
+    const geometry::CaptureParams capture_params{0};
+    const geometry::Params params{1, static_cast<u32>(engines::IndexType::None),
+                                  0, 0, 0, 3};
+    auto* texture_descriptor = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatRGBA8Unorm, 4, 4, false);
+    texture_descriptor->setStorageMode(MTL::StorageModeShared);
+    texture_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    NS_STACK_SCOPED auto texture = device->newTexture(texture_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* color = pass->colorAttachments()->object(0);
+    color->setTexture(texture);
+    color->setLoadAction(MTL::LoadActionClear);
+    color->setStoreAction(MTL::StoreActionStore);
+    color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+    NS_STACK_SCOPED auto queue = device->newCommandQueue();
+    auto* commands = queue->commandBuffer();
+    auto* encoder = commands->renderCommandEncoder(pass);
+    const auto barrier = [&] {
+        encoder->memoryBarrier(MTL::BarrierScopeBuffers, MTL::RenderStageVertex,
+                               MTL::RenderStageVertex);
+    };
+    encoder->setRenderPipelineState(capture_pipeline);
+    encoder->setVertexBuffer(records, 0, vertex_mapping.capture_buffer_index);
+    encoder->setVertexBytes(&capture_params, sizeof(capture_params),
+                            vertex_mapping.capture_params_index);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(3));
+    barrier();
+    encoder->setRenderPipelineState(control_pipeline);
+    encoder->setVertexBuffer(records, 0, geometry::INPUT_BUFFER);
+    encoder->setVertexBuffer(records, 0, geometry::INDEX_DATA_BUFFER);
+    encoder->setVertexBuffer(control_points, 0, tessellation::CONTROL_POINT_BUFFER);
+    encoder->setVertexBuffer(patches, 0, tessellation::PATCH_BUFFER);
+    encoder->setVertexBytes(&params, sizeof(params), geometry::PARAMS_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(3));
+    barrier();
+    encoder->setRenderPipelineState(factor_pipeline);
+    encoder->setVertexBuffer(factors, 0, tessellation::FACTOR_BUFFER);
+    encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                            NS::UInteger(1));
+    barrier();
+    encoder->setRenderPipelineState(draw_pipeline);
+    encoder->setVertexBuffer(control_points, 0,
+                             tessellation::EVALUATION_CONTROL_POINT_BUFFER);
+    encoder->setTessellationFactorBuffer(factors, 0, 0);
+    encoder->drawPatches(3, 0, 1, nullptr, 0, 1, 0);
+    encoder->endEncoding();
+    commands->commit();
+    commands->waitUntilCompleted();
+    check(commands->status() == MTL::CommandBufferStatusCompleted,
+          "Tessellation draws complete");
+    std::array<u8, 64> pixels{};
+    texture->getBytes(pixels.data(), 16, MTL::Region::Make2D(0, 0, 4, 4), 0);
+    for (usize pixel = 0; pixel < 16; ++pixel)
+        check(pixels[pixel * 4] == 191 && pixels[pixel * 4 + 1] == 64 &&
+                  pixels[pixel * 4 + 2] == 128 && pixels[pixel * 4 + 3] == 255,
+              "The tessellated patch covers the target with its control "
+              "points' color");
+    std::cout << "PASS: tessellation emulation draws the evaluated patch\n";
+}
+
+// SET_API_MANDATED_EARLY_Z: the fragment function tests early, unless it
+// writes the depth (Metal cannot combine the two)
+void testEarlyFragmentTests(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (const bool writes_depth : {false, true}) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        context.fragment_output_mask = 0xf;
+        if (writes_depth)
+            context.fragment_depth_register = 4;
+        GuestShaderState state{};
+        state.early_fragment_tests = true;
+        state.color_target_data_types[0] = MTL::DataTypeFloat;
+        ir::Module module;
+        ir::Builder b(module);
+        for (u32 c = 0; c < 5; c++)
+            b.opCopy(ir::Value::createRegister(static_cast<reg_t>(c),
+                                               ir::ScalarType::F32),
+                     ir::Value::createConstantF(0.5f));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> code;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+            .emit(module);
+        const std::string source(code.begin(), code.end());
+        const bool early = source.find("[[early_fragment_tests]]") != std::string::npos;
+        check(early == !writes_depth,
+              writes_depth ? "A depth writing fragment shader does not test early"
+                           : "The fragment shader tests early");
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << std::endl;
+        check(library != nullptr, "The early tested fragment shader compiles");
+    }
+    std::cout << "PASS: mandated early fragment tests\n";
 }
 
 // Maxwell's SHFL.BFLY + FSWZADD patterns implement positive X/Y derivatives.
@@ -990,6 +2046,206 @@ void testQuadDerivatives(MTL::Device* device) {
               "FSWZADD addition and move modes remain intact");
     }
     std::cout << "PASS: fragment quad derivatives and FSWZADD add/move modes\n";
+}
+
+// Maxwell SHFL.IDX with a quad segment (Jump Force: c = 0x1c03) reads one
+// lane of each 2x2 quad. Lanes are x | (y << 1), found by position on the host.
+void testQuadIndexedShuffle(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (u32 index = 0; index < 4; ++index) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        GuestShaderState guest{};
+        guest.color_target_data_types[0] = MTL::DataTypeFloat;
+        ir::Module module;
+        ir::Builder builder(module);
+        for (u32 axis = 0; axis < 2; ++axis) {
+            const auto position = ir::Value::createAttrMemory(
+                {RZ, SV_POSITION_BASE + axis * 4, true}, ir::ScalarType::F32);
+            const auto shuffled = builder.opBitCast(
+                builder.opQuadShuffle(
+                    builder.opBitCast(position, ir::ScalarType::U32),
+                    ir::Value::createConstantU(index)),
+                ir::ScalarType::F32);
+            builder.opCopy(ir::Value::createRegister(static_cast<u8>(axis),
+                                                     ir::ScalarType::F32),
+                           shuffled);
+        }
+        for (u32 component = 2; component < 4; ++component)
+            builder.opCopy(ir::Value::createRegister(static_cast<u8>(component),
+                                                     ir::ScalarType::F32),
+                           ir::Value::createConstantF(0));
+        builder.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter emitter(context, memory, guest,
+                                               generated, mapping);
+        emitter.emit(module);
+        std::string source(generated.begin(), generated.end());
+        source += "\nvertex float4 quad_vertex(uint id [[vertex_id]]) { return "
+                  "float4(id==1?3.0:-1.0,id==2?3.0:-1.0,0,1); }\n";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library =
+            device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << '\n';
+        check(library != nullptr, "Quad indexed shuffle shader compiles");
+        NS_STACK_SCOPED auto vertex =
+            library->newFunction(toNsString("quad_vertex"));
+        NS_STACK_SCOPED auto fragment =
+            library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vertex);
+        pd->setFragmentFunction(fragment);
+        pd->colorAttachments()->object(0)->setPixelFormat(
+            MTL::PixelFormatRGBA32Float);
+        NS_STACK_SCOPED auto pipeline =
+            device->newRenderPipelineState(pd, &error);
+        check(pipeline != nullptr, "Quad indexed shuffle pipeline compiles");
+        auto* td = MTL::TextureDescriptor::texture2DDescriptor(
+            MTL::PixelFormatRGBA32Float, 4, 4, false);
+        td->setStorageMode(MTL::StorageModeShared);
+        td->setUsage(MTL::TextureUsageRenderTarget);
+        NS_STACK_SCOPED auto texture = device->newTexture(td);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* color = pass->colorAttachments()->object(0);
+        color->setTexture(texture);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setStoreAction(MTL::StoreActionStore);
+        NS_STACK_SCOPED auto queue = device->newCommandQueue();
+        auto* commands = queue->commandBuffer();
+        auto* encoder = commands->renderCommandEncoder(pass);
+        encoder->setRenderPipelineState(pipeline);
+        encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                                NS::UInteger(3));
+        encoder->endEncoding();
+        commands->commit();
+        commands->waitUntilCompleted();
+        check(commands->status() == MTL::CommandBufferStatusCompleted,
+              "Quad indexed shuffle draw completes");
+        std::array<float, 64> pixels{};
+        texture->getBytes(pixels.data(), 64, MTL::Region::Make2D(0, 0, 4, 4),
+                          0);
+        for (u32 y = 0; y < 4; ++y) {
+            for (u32 x = 0; x < 4; ++x) {
+                const auto* pixel = &pixels[(y * 4 + x) * 4];
+                const float expected_x = float((x & ~1u) + (index & 1u)) + 0.5f;
+                const float expected_y = float((y & ~1u) + (index >> 1)) + 0.5f;
+                check(pixel[0] == expected_x && pixel[1] == expected_y,
+                      "Every quad lane reads the indexed lane of its quad");
+            }
+        }
+    }
+    std::cout << "PASS: fragment SHFL.IDX within quads reads lanes x | (y << 1)\n";
+}
+
+// PIXLD.MY_INDEX and PIXLD.COVMASK read the sample index and coverage, and
+// the header's sample mask output (the register after the colors) limits the
+// samples written. Rendered to a 4x target and every sample read back.
+void testFragmentSamples(MTL::Device* device) {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    for (const bool read_coverage : {false, true}) {
+        DecompilerContext context{};
+        context.type = ShaderType::Fragment;
+        if (!read_coverage)
+            context.fragment_sample_mask_register = 4;
+        GuestShaderState guest{};
+        guest.color_target_data_types[0] = MTL::DataTypeUInt;
+        ir::Module module;
+        ir::Builder builder(module);
+        const auto value =
+            read_coverage
+                ? builder.opReadSystemRegister(SR_PIXEL_COVERAGE_MASK)
+                : builder.opAdd(builder.opReadSystemRegister(SR_PIXEL_SAMPLE_INDEX),
+                                ir::Value::createConstantU(1));
+        builder.opCopy(ir::Value::createRegister(0, ir::ScalarType::U32), value);
+        for (u8 component = 1; component < 4; ++component)
+            builder.opCopy(ir::Value::createRegister(component, ir::ScalarType::U32),
+                           ir::Value::createConstantU(0));
+        builder.opCopy(ir::Value::createRegister(4, ir::ScalarType::U32),
+                       ir::Value::createConstantU(0b0101));
+        builder.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> generated;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter emitter(context, memory, guest, generated,
+                                               mapping);
+        emitter.emit(module);
+        std::string source(generated.begin(), generated.end());
+        source += R"(
+vertex float4 quad_vertex(uint id [[vertex_id]]) {
+    return float4(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0, 0, 1);
+}
+kernel void read_samples(texture2d_ms<uint> target [[texture(0)]],
+                         device uint* out [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+    for (uint s = 0; s < 4; s++)
+        out[(p.y * 2 + p.x) * 4 + s] = target.read(p, s).r;
+}
+)";
+        NS::Error* error = nullptr;
+        NS_STACK_SCOPED auto library = device->newLibrary(toNsString(source), nullptr, &error);
+        if (!library && error)
+            std::cerr << error->localizedDescription()->utf8String() << '\n';
+        check(library != nullptr, "Fragment sample shader compiles");
+        NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("quad_vertex"));
+        NS_STACK_SCOPED auto fragment = library->newFunction(toNsString("main_"));
+        NS_STACK_SCOPED auto reader = library->newFunction(toNsString("read_samples"));
+        NS_STACK_SCOPED auto pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vertex);
+        pd->setFragmentFunction(fragment);
+        pd->setRasterSampleCount(4);
+        pd->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatR32Uint);
+        NS_STACK_SCOPED auto pipeline = device->newRenderPipelineState(pd, &error);
+        check(pipeline != nullptr, "Fragment sample pipeline compiles");
+        NS_STACK_SCOPED auto read_pipeline = device->newComputePipelineState(reader, &error);
+        NS_STACK_SCOPED auto td = MTL::TextureDescriptor::alloc()->init();
+        td->setTextureType(MTL::TextureType2DMultisample);
+        td->setPixelFormat(MTL::PixelFormatR32Uint);
+        td->setWidth(2);
+        td->setHeight(2);
+        td->setSampleCount(4);
+        td->setStorageMode(MTL::StorageModePrivate);
+        td->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+        NS_STACK_SCOPED auto texture = device->newTexture(td);
+        NS_STACK_SCOPED auto out = device->newBuffer(16 * 4, MTL::ResourceStorageModeShared);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* color = pass->colorAttachments()->object(0);
+        color->setTexture(texture);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+        color->setStoreAction(MTL::StoreActionStore);
+        NS_STACK_SCOPED auto queue = device->newCommandQueue();
+        auto* commands = queue->commandBuffer();
+        auto* encoder = commands->renderCommandEncoder(pass);
+        encoder->setRenderPipelineState(pipeline);
+        encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+        encoder->endEncoding();
+        auto* compute = commands->computeCommandEncoder();
+        compute->setComputePipelineState(read_pipeline);
+        compute->setTexture(texture, 0);
+        compute->setBuffer(out, 0, 0);
+        compute->dispatchThreads(MTL::Size(2, 2, 1), MTL::Size(2, 2, 1));
+        compute->endEncoding();
+        commands->commit();
+        commands->waitUntilCompleted();
+        check(commands->status() == MTL::CommandBufferStatusCompleted,
+              "Fragment sample draw completes");
+        const auto* samples = static_cast<const u32*>(out->contents());
+        for (u32 i = 0; i < 16; i++) {
+            const u32 sample = i % 4;
+            if (read_coverage)
+                check(samples[i] == 0xf, "PIXLD.COVMASK reads the covered samples");
+            else
+                check(samples[i] == ((sample & 1) == 0 ? sample + 1 : 0u),
+                      "PIXLD.MY_INDEX is the sample, the mask output drops samples");
+        }
+    }
+    std::cout << "PASS: fragment sample index, coverage mask and sample mask output\n";
 }
 
 // Fragment depth follows packed color exports and a reserved sample-mask slot.
@@ -2442,8 +3698,16 @@ int main() {
         testCompareSelect(device, true);
         testSetRegisterResults(device);
         testVertexPositionDefaults(device);
+        testVertexA(device);
+        testGeometryShader(device);
+        testGeometryShaderBinary(device);
+        testGeometryStripAdjacency(device);
+        testTessellation(device);
+        testEarlyFragmentTests(device);
         testFragmentDepth(device);
         testQuadDerivatives(device);
+        testQuadIndexedShuffle(device);
+        testFragmentSamples(device);
         testTextureLodSelection();
         testTextureBorderEmulation();
         testTextureOffsetAndGather(device);

@@ -166,6 +166,9 @@ uptr GMmu::unmapAddr(uptr gpu_addr) const {
     const auto as = findAddrImpl(gpu_addr, base);
     ASSERT_DEBUG(as.ptr != 0x0, Gpu, "Address 0x{:08x} is not host mapped",
                  gpu_addr);
+    // `base` is not set for an unmapped address: no pointer into host memory
+    if (as.ptr == 0x0)
+        return 0x0;
 
     const uptr ptr = as.ptr + (gpu_addr - base);
     // DEBUG: the host pointer is resolved once at map time. Report mappings

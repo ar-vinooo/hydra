@@ -85,6 +85,8 @@ enum class MemoryInvalidationScope {
 };
 ZTD_ENABLE_ENUM_BITWISE_OPERATORS(MemoryInvalidationScope)
 
+class DrawQueue;
+
 class IRenderer {
   public:
     IRenderer()
@@ -209,13 +211,17 @@ class IRenderer {
 
     // Writes GPU-rendered textures in the range back to guest memory, from a
     // CPU thread that is about to access it (memory tracking faults)
-    void flushMemoryForCpu(ztd::Range<uptr> range) {
+    void flushMemoryForCpu(ztd::Range<uptr> range,
+                           const char* origin = __builtin_FUNCTION(),
+                           u32 line = __builtin_LINE()) {
         std::scoped_lock lock(texture_cache.getMutex());
         std::unique_ptr<ICommandBuffer> command_buffer(createCommandBuffer());
-        texture_cache.flushMemory(command_buffer.get(), range);
+        texture_cache.flushMemory(command_buffer.get(), range, origin, line);
     }
 
     virtual u64 getAllocatedResourceBytes() const { return 0; }
+    // Encodes draws on another thread, if the backend has one
+    virtual DrawQueue* getDrawQueue() { return nullptr; }
     // DEBUG: logs the GPU time per pass since the last call (HYDRA_PERF_STATS)
     virtual void logPassProfile([[maybe_unused]] f64 frames) {}
 
@@ -338,6 +344,8 @@ class IRenderer {
                               engines::Winding front_face) = 0;
     // Depth outside the clip range is clamped instead of clipped
     virtual void setDepthClamp(bool enabled) = 0;
+    // Triangles are drawn as their edges (polygon mode LINE)
+    virtual void setPolygonLines(bool enabled) = 0;
 
     // DEBUG: save the current contents of a texture to a PNG file
     virtual void

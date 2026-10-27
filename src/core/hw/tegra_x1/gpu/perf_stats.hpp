@@ -22,6 +22,13 @@ enum class CheckpointReason : u8 {
     StorageWrite,
     PullerSemaphore,
     ReportWrite,
+    // Puller methods that wait for idle, split out of PullerOther
+    PullerReference,
+    PullerMembar,
+    PullerWaitForIdle,
+    PullerRelease,
+    PullerReduction,
+    PullerSyncpoint,
     Count,
 };
 
@@ -35,6 +42,8 @@ constexpr const char* getCheckpointReasonName(CheckpointReason reason) {
         "acquire",        "puller acquire",    "puller other",
         "texture readback", "storage write",
         "puller semaphore", "report write",
+        "puller reference", "puller membar",   "puller wait for idle",
+        "puller release",   "puller reduction", "puller syncpoint",
     };
     return names[static_cast<usize>(reason)];
 }
@@ -70,6 +79,26 @@ constexpr const char* getGpuWorkName(GpuWork work) {
 
 constexpr bool isGpuWorkAsyncCapable(GpuWork work) {
     return work >= GpuWork::Encode && work < GpuWork::Wait;
+}
+
+// Why a guest thread left hv_vcpu_run
+enum class CpuExit : u8 {
+    Svc,
+    SystemRegister, // Trapped MSR/MRS, mostly CNTPCT_EL0 reads
+    DataAbort,      // Stage 1 write tracking or a guest fault
+    Stage2,         // Stage 2 memory tracking
+    VTimer,
+    Other,
+    Count,
+};
+
+constexpr usize CPU_EXIT_COUNT = static_cast<usize>(CpuExit::Count);
+
+constexpr const char* getCpuExitName(CpuExit exit) {
+    constexpr const char* names[CPU_EXIT_COUNT] = {
+        "svc", "sysreg", "data abort", "stage 2", "vtimer", "other",
+    };
+    return names[static_cast<usize>(exit)];
 }
 
 // DEBUG: frame timing statistics, logged when HYDRA_PERF_STATS is set
@@ -110,6 +139,17 @@ struct PerfStats {
     std::atomic<u64> register_writes{0};
     std::atomic<u64> register_write_skips{0};
     std::atomic<u64> render_encoders{0};
+    // Presentation (upscaling, sharpening, frame generation and the draw to
+    // the drawable): GPU time of its command buffers and CPU encoding time,
+    // per present, and the size it scaled from and to
+    std::atomic<u64> present_gpu_ns{0};
+    std::atomic<u64> present_gpu_count{0};
+    std::atomic<u64> present_encode_ns{0};
+    std::atomic<u64> presents{0};
+    std::atomic<u32> present_input_width{0};
+    std::atomic<u32> present_input_height{0};
+    std::atomic<u32> present_output_width{0};
+    std::atomic<u32> present_output_height{0};
     // Render passes and the attachment memory they read (load) and write
     // (store), from the attachment sizes. A continuation reopens the
     // attachments of the previous render pass and loads all of them; it is
@@ -138,6 +178,12 @@ struct PerfStats {
     std::atomic<u64> msaa_draws{0};
     std::atomic<u64> alpha_to_coverage_draws{0};
     std::atomic<u64> alpha_to_one_draws{0};
+    // Guest CPU: time inside hv_vcpu_run summed over all guest threads, VM
+    // exits by kind (see CpuExit) and wall time spent in each SVC
+    std::atomic<u64> guest_run_ns{0};
+    std::array<std::atomic<u64>, CPU_EXIT_COUNT> cpu_exits{};
+    std::array<std::atomic<u64>, 0x80> svc_count{};
+    std::array<std::atomic<u64>, 0x80> svc_ns{};
 
     static PerfStats& instance() {
         static PerfStats stats;
@@ -218,7 +264,10 @@ class ScopedGpuWorkRoot {
 
 class ScopedGpuWork {
   public:
-    explicit ScopedGpuWork(GpuWork work) : enabled{gpu_work_tracker.active} {
+    // The thread-local is only touched with the stats on: on macOS every
+    // access is a _tlv_get_addr call, and this runs several times per draw
+    explicit ScopedGpuWork(GpuWork work)
+        : enabled{PerfStats::isEnabled() && gpu_work_tracker.active} {
         if (!enabled)
             return;
         previous = gpu_work_tracker.work;

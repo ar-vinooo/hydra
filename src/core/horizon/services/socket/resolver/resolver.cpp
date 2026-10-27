@@ -1,4 +1,5 @@
 #include "core/horizon/services/socket/resolver/resolver.hpp"
+#include "core/horizon/services/socket/resolver/address_serialization.hpp"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -147,11 +148,8 @@ LookupResult getAddrInfo(kernel::Process* process, const std::string& host,
         appendBe32(entry, socket_type);
         appendBe32(entry, protocol);
         appendBe32(entry, 16); // ai_addrlen
-        appendBe16(entry, GUEST_AF_INET);
-        appendBe16(entry, port);
-        const auto* address_bytes = reinterpret_cast<const u8*>(&address);
-        entry.insert(entry.end(), address_bytes, address_bytes + 4);
-        entry.resize(entry.size() + 8, 0); // sin_zero
+        const auto sockaddr = serializeIpv4SockAddr(address, htons(port));
+        entry.insert(entry.end(), sockaddr.begin(), sockaddr.end());
         entry.push_back(0);                // ai_canonname
         if (data.size() + entry.size() + 4 > out.size())
             break;

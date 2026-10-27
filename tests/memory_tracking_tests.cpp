@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 using namespace hydra;
 using namespace hydra::hw::tegra_x1::cpu::hypervisor;
@@ -121,6 +122,45 @@ int main() {
         }
         check(invalidations == 2, "Rearmed pages fault on the next write");
         check(flushes == 1, "Written back pages don't flush again");
+
+        // Draws routinely rearm when no pages were written. Those empty
+        // checks must not lose the next write, including when a different
+        // host thread performs the rearm.
+        for (u32 iteration = 0; iteration < 32; ++iteration) {
+            std::thread rearm([&] {
+                tracker.rearmWriteTracking();
+                for (u32 idle = 0; idle < 64; ++idle)
+                    tracker.rearmWriteTracking();
+            });
+            rearm.join();
+            const auto before = invalidations;
+            const u64 value = 0x8000ull + iteration;
+            hv_vcpu_set_reg(vcpu, HV_REG_PC, code.getPhysicalAddress() + 4);
+            hv_vcpu_set_reg(vcpu, HV_REG_X2, value);
+            u32 rearmed_faults = 0;
+            while (true) {
+                check(hv_vcpu_run(vcpu) == HV_SUCCESS,
+                      "Run write after idle rearm checks");
+                check(exit->reason == HV_EXIT_REASON_EXCEPTION,
+                      "Rearmed vCPU exits with an exception");
+                const u64 syndrome = exit->exception.syndrome;
+                const u32 ec = static_cast<u32>((syndrome >> 26) & 0x3f);
+                if (ec == EC_HVC)
+                    break;
+                check(ec == EC_DATA_ABORT_LOWER_EL,
+                      "Rearmed write raises a data abort");
+                check(++rearmed_faults <= 2,
+                      "Rearmed write makes forward progress");
+                check(tracker.handleFault(exit->exception.physical_address,
+                                           (syndrome & (1ull << 6)) != 0),
+                      "Write after idle rearm is tracked");
+            }
+            check(rearmed_faults == 1 && invalidations == before + 1,
+                  "Empty rearm checks preserve subsequent invalidation");
+            check(data_words[0] == value,
+                  "Write after idle rearm reaches guest memory");
+        }
+        check(flushes == 1, "Idle rearm checks never repeat GPU write backs");
 
         hv_vcpu_destroy(vcpu);
         std::cout << "PASS: stage 2 tracking writes GPU contents back before "

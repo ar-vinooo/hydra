@@ -34,7 +34,7 @@ class IRequest : public IService {
 
   private:
     bool online;
-    std::array<std::unique_ptr<kernel::Event>, 2> events;
+    std::array<kernel::AutoObjectPtr<kernel::Event>, 2> events;
 
     // Commands
     result_t getRequestState(RequestState* out_state);

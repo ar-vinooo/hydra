@@ -1,5 +1,7 @@
 #include "core/horizon/filesystem/content_archive.hpp"
 
+#include "core/horizon/filesystem/compressed_storage.hpp"
+
 #include "core/horizon/filesystem/file_view.hpp"
 #include "core/horizon/filesystem/nca_file.hpp"
 #include "core/horizon/filesystem/partition_filesystem.hpp"
@@ -95,6 +97,7 @@ struct FsHeader {
     u8 reserved2[0x30];
 };
 #pragma pack(pop)
+static_assert(sizeof(FsHeader) == 0x200);
 
 enum class SectionType {
     Invalid,
@@ -251,8 +254,19 @@ ContentArchive::ContentArchive(IFile* file) {
         const auto& fs_header = header.fs_headers[i];
 
         const u64 entry_offset = entry.start_offset * FS_BLOCK_SIZE;
-        // const u64 entry_size = (entry.end_offset - entry.start_offset) *
-        // FS_BLOCK_SIZE;
+        const auto compression = readCompressionInfo(std::span(
+            reinterpret_cast<const u8*>(&fs_header), sizeof(fs_header)));
+        // The file of a filesystem region of the section. A compressed
+        // section decompresses the region, and its filesystem is all of it.
+        const auto open_region = [&](u64 offset, u64 size) -> IFile* {
+            if (!compression)
+                return new FileView(decoded_file, entry_offset + offset, size);
+            auto data = openCompressedSection(
+                std::make_shared<FileView>(decoded_file, entry_offset + offset,
+                                           size),
+                *compression);
+            return new FileView(data, 0, data->getSize());
+        };
 
         switch (type) {
         case SectionType::Code:
@@ -264,8 +278,7 @@ ContentArchive::ContentArchive(IFile* file) {
                 fs_header.hierarchical_sha_256_data.pfs0_region;
 
             auto partition_file =
-                new FileView(decoded_file, entry_offset + layer_region.offset,
-                             layer_region.size); // TODO: free
+                open_region(layer_region.offset, layer_region.size); // TODO: free
             auto pfs = new PartitionFilesystem();
             pfs->initialize<false>(partition_file);
             entries.insert(
@@ -284,8 +297,7 @@ ContentArchive::ContentArchive(IFile* file) {
 
             entries.insert(
                 {"data",
-                 new FileView(decoded_file, entry_offset + level.logical_offset,
-                              level.hash_data_size)});
+                 open_region(level.logical_offset, level.hash_data_size)});
             break;
         }
         default:

@@ -287,16 +287,11 @@ void emitFlo(DecoderContext& context, instruction_t inst, ir::Value src) {
 } // namespace
 
 void emitCsetp(DecoderContext& context, instruction_t inst) {
-    const auto test = extractBits(inst, 8, 5);
-    if (test != 13 && test != 0 && test != 15) {
-        SHADER_UNSUPPORTED("CSETP flow test {}", test);
-        return;
-    }
+    const auto test = static_cast<u32>(extractBits(inst, 8, 5));
     auto& b = context.builder;
     const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
-    const auto condition = test == 13
-        ? b.opBitwiseOr(ir::Value::createConditionFlag(1), b.opNot(ir::Value::createConditionFlag(0)))
-        : ir::Value::createConstantB(test == 15);
+    // The same condition code tests as branches
+    const auto condition = b.opCopy(getFlowTest(b, test));
     const auto other = notIf(b, ir::Value::createPredicate(static_cast<pred_t>(extractBits(inst, 39, 3))), extractBits(inst, 42, 1));
     const u32 bop = static_cast<u32>(extractBits(inst, 45, 2));
     const auto combine = [&](ir::Value x) {
@@ -310,6 +305,28 @@ void emitCsetp(DecoderContext& context, instruction_t inst) {
     const auto pb = static_cast<pred_t>(extractBits(inst, 0, 3));
     if (pa != PT) b.opCopy(ir::Value::createPredicate(pa), result_a);
     if (pb != PT) b.opCopy(ir::Value::createPredicate(pb), result_b);
+    if (conditional) b.opEndIf();
+}
+
+// CSET Rd, CC.test, Pc: the condition code test combined with a predicate,
+// as all ones (or 1.0 with .BF) when true
+void emitCset(DecoderContext& context, instruction_t inst) {
+    auto& b = context.builder;
+    const auto conditional = handlePredCond(b, getPred(inst), getPredInv(inst));
+    const auto condition =
+        b.opCopy(getFlowTest(b, static_cast<u32>(extractBits(inst, 8, 5))));
+    const auto other = notIf(
+        b, ir::Value::createPredicate(static_cast<pred_t>(extractBits(inst, 39, 3))),
+        extractBits(inst, 42, 1));
+    const u32 bop = static_cast<u32>(extractBits(inst, 45, 2));
+    const auto result = bop == 0   ? b.opBitwiseAnd(condition, other)
+                        : bop == 1 ? b.opBitwiseOr(condition, other)
+                                   : b.opBitwiseXor(condition, other);
+    const bool bf = extractBits(inst, 44, 1) != 0;
+    b.opCopy(ir::Value::createRegister(getReg(inst, 0), ir::ScalarType::U32),
+             b.opSelect(result,
+                        ir::Value::createConstantU(bf ? 0x3f800000u : 0xffffffffu),
+                        ir::Value::createConstantU(0)));
     if (conditional) b.opEndIf();
 }
 

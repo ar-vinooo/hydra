@@ -3,6 +3,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 #include "core/hw/tegra_x1/gpu/renderer/command_buffer.hpp"
@@ -57,6 +58,12 @@ class OcclusionCounter {
 
     void setEnabled(bool value) { enabled = value; }
 
+    // The visibility buffer of a new render pass. While the game counts,
+    // every pass gets a page up front: attaching one to an open pass at its
+    // first counted draw would end the pass, storing and reloading all of
+    // its attachments.
+    MTL::Buffer* pageForNewPass(CommandBuffer& command_buffer);
+
     // Called before a draw of the render pass. Returns the offset in the
     // visibility result buffer that counts the draw, none if counting is off.
     std::optional<u64> prepareDraw(CommandBuffer& command_buffer,
@@ -90,6 +97,12 @@ class OcclusionCounter {
     std::shared_ptr<Totals> totals{std::make_shared<Totals>()};
     OpenSegment open;
     bool enabled{false};
+    // Passes keep getting pages for a while after the last counted draw:
+    // games toggle counting around their occlusion draws
+    static constexpr u32 STICKY_PASSES = 256;
+    u32 passes_without_counting{STICKY_PASSES};
+    // The thread of the counted draws, see pageForNewPass
+    std::thread::id counting_thread;
 };
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

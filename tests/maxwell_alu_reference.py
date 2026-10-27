@@ -1070,6 +1070,141 @@ def make_iadd_carry_cases(rng):
     return cases
 
 
+# Constant buffer c2 of every case (the runner binds it at slot 2)
+CBUF_SLOT = 2
+CBUF = [0x00000000, 0x00000001, 0xffffffff, 0x80000000, 0x7fffffff, 0x12345678,
+        0x9abcdef0, 0x0000ffff, 0xffff0000, 0x00010001, 0xdeadbeef, 0x00000003,
+        0xfffffffd, 0x40000000, 0xc0000000, 0x55aa55aa]
+
+
+def enc_imad(form, dst, a, b, c, a_signed=0, b_signed=0, hi=0, x=0, cc=0, sat=0):
+    """IMAD (envytools gm107): form R (b=R20, c=R39), RC (b=R39, c=cbuf),
+    C (b=cbuf, c=R39) or I (b=imm20, c=R39). For the cbuf forms b or c is the
+    word index into c2."""
+    flags = (cc << 47) | (a_signed << 48) | (x << 49) | (sat << 50) | (b_signed << 53) | (hi << 54)
+    if form == 'R':
+        return base(0x5a00, dst, a) | (b << 20) | (c << 39) | flags
+    if form == 'RC':
+        return base(0x5200, dst, a) | (b << 39) | (CBUF_SLOT << 34) | (c << 20) | flags
+    if form == 'C':
+        return base(0x4a00, dst, a) | (CBUF_SLOT << 34) | (b << 20) | (c << 39) | flags
+    imm = b & 0xfffff
+    return base(0x3400, dst, a) | ((imm & 0x7ffff) << 20) | ((imm >> 19) << 56) | (c << 39) | flags
+
+
+def imad_model(a, b, c, a_signed, b_signed, hi, cin=0, sat=0):
+    """PTX mad.lo / mad.hi with the carry-in of .X; .SAT clamps the signed sum
+    (mad.hi.sat.s32). Returns the result and the IADD-style flags of the add."""
+    M = 0xffffffff
+    product = (s32(a) if a_signed else a) * (s32(b) if b_signed else b)
+    part = (product >> 32) & M if hi else product & M
+    total = part + c + cin
+    result = total & M
+    if sat:
+        result = max(-(1 << 31), min((1 << 31) - 1, s32(part) + s32(c))) & M
+    overflow = ((~(part ^ c)) & (part ^ (total & M))) >> 31 & 1
+    flags = ((total & M) == 0) | (((total & M) >> 31) << 1) | ((total > M) << 2) | (overflow << 3)
+    return result, flags
+
+
+def make_imad_cases(rng):
+    cases = []
+    M = 0xffffffff
+    triples = int_triples(rng, 12)
+    for hi in (0, 1):
+        for a_signed in (0, 1):
+            for b_signed in (0, 1):
+                inst = enc_imad('R', 3, 0, 1, 2, a_signed, b_signed, hi)
+                for a, b, c in triples:
+                    cases.append(Case('imad' + ('_hi' if hi else ''), inst, (a, b, c),
+                                      imad_model(a, b, c, a_signed, b_signed, hi)[0], None))
+                # operands from the constant buffer and the immediate
+                for word in range(len(CBUF)):
+                    for a, _, c in triples[:2]:
+                        cases.append(Case('imad_cbuf', enc_imad('C', 3, 0, word, 2, a_signed, b_signed, hi),
+                                          (a, 0, c), imad_model(a, CBUF[word], c, a_signed, b_signed, hi)[0], None))
+                        cases.append(Case('imad_rc', enc_imad('RC', 3, 0, 1, word, a_signed, b_signed, hi),
+                                          (a, c, 0), imad_model(a, c, CBUF[word], a_signed, b_signed, hi)[0], None))
+                for imm in (0, 1, 0x7ffff, 0x80000, 0xfffff, 0x12345):
+                    value = imm | (0xfff00000 if imm & 0x80000 else 0)
+                    for a, _, c in triples[:4]:
+                        cases.append(Case('imad_imm', enc_imad('I', 3, 0, imm, 2, a_signed, b_signed, hi),
+                                          (a, 0, c), imad_model(a, value, c, a_signed, b_signed, hi)[0], None))
+    # .SAT on the signed high word, with sums that overflow both ways
+    inst = enc_imad('R', 3, 0, 1, 2, 1, 1, 1, sat=1)
+    for a, b, c in triples + [(0x7fffffff, 0x7fffffff, 0x7fffffff), (0x80000000, 0x7fffffff, 0x80000000),
+                              (0x80000000, 0x80000000, 0x7fffffff), (M, 1, 0x80000000)]:
+        cases.append(Case('imad_hi_sat', inst, (a, b, c), imad_model(a, b, c, 1, 1, 1, sat=1)[0], None))
+
+    def chain(group, insts, regs, out, cc_in, cc_out):
+        cases.append(Case(group, ','.join('%016x' % i for i in insts), tuple(regs),
+                          {'out': out, 'cc_in': cc_in, 'cc_out': cc_out, 'cc_all': True}, 'chain'))
+    # .CC flags and .X carry
+    for x in (0, 1):
+        for hi in (0, 1):
+            inst = enc_imad('R', 3, 0, 1, 2, 0, 0, hi, x=x, cc=1)
+            for cc_in in (0, CC_C):
+                for a, b, c in triples:
+                    cin = x and bool(cc_in & CC_C)
+                    result, flags = imad_model(a, b, c, 0, 0, hi, cin)
+                    chain('imad_cc' + ('_x' if x else ''), [inst], (a, b, c, 0, 0, 0, 0, 0),
+                          {3: result}, cc_in, flags)
+    # a 64-bit multiply-add: lo = IMAD.CC, hi = IMAD.HI.X (a * b + c64)
+    lo = enc_imad('R', 4, 0, 1, 2, cc=1)
+    hi = enc_imad('R', 5, 0, 1, 3, hi=1, x=1)
+    for a, b, c_lo in triples:
+        c_hi = rng.getrandbits(32)
+        total = (a * b + ((c_hi << 32) | c_lo)) & ((1 << 64) - 1)
+        chain('imad_chain64', [lo, hi], (a, b, c_lo, c_hi, 0, 0, 0, 0),
+              {4: total & M, 5: total >> 32}, 0, imad_model(a, b, c_lo, 0, 0, 0)[1])
+    return cases
+
+
+def make_cset_cases(rng):
+    """CSET against the meaning of each condition code test: the flags come from
+    a real subtraction a - b (IADD.CC with a negated operand), so every test is a
+    comparison of a and b (or a property of the difference)."""
+    cases = []
+    M = 0xffffffff
+    values = [0, 1, 2, M, 0x7fffffff, 0x80000000, 0x80000001, 0x12345678]
+    tests = {
+        0: lambda sa, sb, a, b, d, o: False,
+        1: lambda sa, sb, a, b, d, o: sa < sb, 2: lambda sa, sb, a, b, d, o: a == b,
+        3: lambda sa, sb, a, b, d, o: sa <= sb, 4: lambda sa, sb, a, b, d, o: sa > sb,
+        5: lambda sa, sb, a, b, d, o: a != b, 6: lambda sa, sb, a, b, d, o: sa >= sb,
+        # Integer differences are never unordered
+        7: lambda sa, sb, a, b, d, o: True, 8: lambda sa, sb, a, b, d, o: False,
+        9: lambda sa, sb, a, b, d, o: sa < sb, 10: lambda sa, sb, a, b, d, o: a == b,
+        11: lambda sa, sb, a, b, d, o: sa <= sb, 12: lambda sa, sb, a, b, d, o: sa > sb,
+        13: lambda sa, sb, a, b, d, o: a != b, 14: lambda sa, sb, a, b, d, o: sa >= sb,
+        15: lambda sa, sb, a, b, d, o: True,
+        16: lambda sa, sb, a, b, d, o: not o, 17: lambda sa, sb, a, b, d, o: a < b,
+        18: lambda sa, sb, a, b, d, o: not d >> 31, 19: lambda sa, sb, a, b, d, o: a <= b,
+        20: lambda sa, sb, a, b, d, o: a > b, 21: lambda sa, sb, a, b, d, o: bool(d >> 31),
+        22: lambda sa, sb, a, b, d, o: a >= b, 23: lambda sa, sb, a, b, d, o: bool(o),
+        30: lambda sa, sb, a, b, d, o: d >> 31 or d == 0,
+        31: lambda sa, sb, a, b, d, o: not d >> 31 and d != 0,
+    }
+    sub = enc_iadd(4, 0, 1, 1) | (1 << 47)
+    for test, fn in tests.items():
+        for bf in (0, 1):
+            for bop, combine in ((0, lambda t, p: t and p), (1, lambda t, p: t or p), (2, lambda t, p: t != p)):
+                for pred, inv, p_value in ((PT, 0, True), (0, 0, False), (0, 1, True)):
+                    cset = (base(0x5098, 3, 0) | (test << 8) | (pred << 39) | (inv << 42) |
+                            (bf << 44) | (bop << 45))
+                    for a in values:
+                        for b in values[::3]:
+                            d = (a - b) & M
+                            overflow = ((a ^ b) & (a ^ d)) >> 31 & 1
+                            flags = (d == 0) | ((d >> 31) << 1) | ((a >= b) << 2) | (overflow << 3)
+                            want = combine(fn(s32(a), s32(b), a, b, d, overflow), p_value)
+                            cases.append(Case('cset', ','.join('%016x' % i for i in (sub, cset)),
+                                              (a, b, 0, 0, 0, 0, 0, 0),
+                                              {'out': {4: d, 3: (0x3f800000 if bf else M) if want else 0},
+                                               'cc_in': 0, 'cc_out': flags, 'cc_all': True}, 'chain'))
+    return cases
+
+
 def is_denormal(b):
     return (b & 0x7f800000) == 0 and (b & 0x7fffff) != 0
 
@@ -1091,6 +1226,7 @@ def run(binary, cases):
         cases_path = Path(tmp) / 'cases.txt'
         out_path = Path(tmp) / 'out.txt'
         with cases_path.open('w') as f_:
+            f_.write('CBUF %s\n' % ' '.join('%x' % w for w in CBUF))
             for c in cases:
                 inst = c.inst if isinstance(c.inst, str) else '%016x' % c.inst
                 if c.tolerance == 'chain':
@@ -1157,7 +1293,7 @@ def main():
     parser.add_argument('--show', type=int, default=3)
     args = parser.parse_args()
     rng = random.Random(args.seed)
-    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng) + make_arith_cases(rng) + make_carry_cases(rng) + make_iadd_carry_cases(rng)
+    cases = make_float_cases(rng) + make_mufu_cases(rng) + make_int_cases(rng) + make_xmad_cases(rng) + make_bit_cases(rng) + make_half_cases(rng) + make_arith_cases(rng) + make_carry_cases(rng) + make_iadd_carry_cases(rng) + make_imad_cases(rng) + make_cset_cases(rng)
     cases = split_denormals(cases)
     if args.group:
         cases = [c for c in cases if c.group == args.group]

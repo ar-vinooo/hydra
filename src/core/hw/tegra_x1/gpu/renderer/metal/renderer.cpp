@@ -1,4 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/compute_limits.hpp"
 #include "core/hw/tegra_x1/gpu/management/metal_submission.hpp"
@@ -124,9 +127,15 @@ Renderer::Renderer()
     info = {
         .supports_quads_primitive = false,
     };
+
+    if (DrawQueue::isEnabled())
+        draw_queue = std::make_unique<DrawQueue>(*this);
 }
 
 Renderer::~Renderer() {
+    // Encodes what is left, before the objects the draws use go away
+    draw_queue.reset();
+
     for (auto& [function, pipeline] : compute_pipelines) {
         if (pipeline != nullptr)
             pipeline->release();
@@ -167,6 +176,11 @@ ISurfaceCompositor* Renderer::acquireNextSurfaceHot1() {
     if (ca_layer == nullptr)
         return nullptr;
 
+#ifdef ZTD_PLATFORM_MACOS
+    // FG presentation has its own clock, independent of guest vsync/render FPS.
+    ca_layer->setDisplaySyncEnabled(
+        CONFIG_INSTANCE.getFrameGeneration() == FrameGeneration::Off);
+#endif
     ca_drawable = ca_layer->nextDrawable();
     if (ca_drawable == nullptr)
         return nullptr;
@@ -195,7 +209,7 @@ std::shared_ptr<UploadBufferPool> snapshotBufferPool(MTL::Device* device) {
 BufferBase* Renderer::createCpuBufferSnapshotHot3(ztd::Range<uptr> range) {
     static const bool disabled =
         std::getenv("HYDRA_DISABLE_BUFFER_SNAPSHOTS") != nullptr;
-    if (disabled || range.getSize() > 64 * 1024)
+    if (disabled || range.getSize() > BUFFER_SNAPSHOT_MAX_SIZE)
         return nullptr;
     ScopedGpuWork work(GpuWork::Buffer);
     BufferBase* snapshot =
@@ -442,9 +456,14 @@ SamplerBase* Renderer::createSamplerHot10(const SamplerDescriptor& descriptor) {
 }
 
 ICommandBuffer* Renderer::createCommandBufferHot11() {
-    if (mtl4_context)
-        return new CommandBuffer(mtl4_context, completions);
-    return new CommandBuffer(command_queue, completions);
+    auto* command_buffer = mtl4_context
+                               ? new CommandBuffer(mtl4_context, completions)
+                               : new CommandBuffer(command_queue, completions);
+    command_buffer->setVisibilitySource(
+        [counter = occlusion.get()](CommandBuffer& buffer) {
+            return counter->pageForNewPass(buffer);
+        });
+    return command_buffer;
 }
 
 RenderPassBase*
@@ -485,7 +504,7 @@ void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target
                                       .color_targets[render_target_id]
                                       .texture);
 
-    // HACK
+    // Nothing is bound to clear at this index
     if (texture == nullptr) {
         ONCE(LOG_WARN(MetalRenderer, "Invalid color target at index {}",
                       render_target_id));
@@ -499,7 +518,10 @@ void Renderer::clearColorHot14(ICommandBuffer* command_buffer, u32 render_target
     ClearColorPipelineDescriptor pipeline_descriptor{
         .render_target_id = render_target_id,
         .mask = mask,
-        .depth_stencil_pixel_format = getDepthStencilPixelFormat()};
+        .depth_stencil_pixel_format = getDepthStencilPixelFormat(),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_color_pipeline_cache.find(pipeline_descriptor));
@@ -518,7 +540,7 @@ void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
     auto texture = static_cast<TextureView*>(
         state.render_pass->getDescriptor().depth_stencil_target.texture);
 
-    // HACK
+    // No depth target is bound to clear
     if (texture == nullptr) {
         ONCE(LOG_WARN(MetalRenderer, "Invalid depth target"));
         return;
@@ -538,7 +560,10 @@ void Renderer::clearDepthHot15(ICommandBuffer* command_buffer, u32 layer,
 
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
-            toMtlPixelFormat(texture->getDescriptor().format)};
+            toMtlPixelFormat(texture->getDescriptor().format),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));
@@ -571,7 +596,10 @@ void Renderer::clearStencilHot16(ICommandBuffer* command_buffer, u32 layer,
     // the write mask, while keeping depth intact
     ClearDepthPipelineDescriptor pipeline_descriptor{
         .depth_stencil_pixel_format =
-            toMtlPixelFormat(texture->getDescriptor().format)};
+            toMtlPixelFormat(texture->getDescriptor().format),
+        .sample_count = state.render_pass != nullptr
+                            ? state.render_pass->getSampleCount()
+                            : 1u};
     getColorPixelFormats(pipeline_descriptor.color_pixel_formats);
     command_buffer_impl->setRenderPipelineState(
         clear_depth_pipeline_cache.find(pipeline_descriptor));
@@ -1076,7 +1104,8 @@ void Renderer::bindIndexBufferHot33(const BufferView& index_buffer,
 
 void Renderer::bindUniformBufferHot34(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1118,6 +1147,7 @@ BufferView Renderer::getGuestMemoryBuffer(ztd::Range<uptr> range) {
 
 void Renderer::bindStorageBuffer(const BufferView& buffer,
                                  ShaderType shader_type, u32 index) {
+    syncDrawQueue();
     if (shader_type == ShaderType::Count)
         return;
     state.storage_buffers[static_cast<u32>(shader_type)][index] = buffer;
@@ -1125,7 +1155,8 @@ void Renderer::bindStorageBuffer(const BufferView& buffer,
 
 void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
                            ShaderType shader_type, u32 index) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1136,6 +1167,7 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
             MTL::SamplerMinMagFilterNearest;
         descriptor.mip_filter = MTL::SamplerMipFilterNearest;
         descriptor.max_anisotropy = 1;
+        std::scoped_lock lock(getSamplerCache().getMutex());
         sampler = getSamplerCache().find(descriptor);
     }
     state.textures[static_cast<u32>(shader_type)][index] = {
@@ -1147,6 +1179,7 @@ void Renderer::bindTextureHot35(ITextureView* texture, SamplerBase* sampler,
 
 std::vector<TextureBinding>
 Renderer::getTextureBindings(ShaderType shader_type) const {
+    syncDrawQueue();
     std::vector<TextureBinding> result;
     if (shader_type == ShaderType::Count)
         return result;
@@ -1161,7 +1194,8 @@ Renderer::getTextureBindings(ShaderType shader_type) const {
 }
 
 void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1169,13 +1203,15 @@ void Renderer::unbindUniformBuffersHot36(ShaderType shader_type) {
 }
 
 void Renderer::unbindStorageBuffers(ShaderType shader_type) {
+    syncDrawQueue();
     if (shader_type == ShaderType::Count)
         return;
     state.storage_buffers[static_cast<u32>(shader_type)] = {};
 }
 
 void Renderer::unbindTexturesHot37(ShaderType shader_type) {
-    // HACK
+    // Stages without a host shader type (compute and others) have no
+    // graphics bindings
     if (shader_type == ShaderType::Count)
         return;
 
@@ -1183,12 +1219,14 @@ void Renderer::unbindTexturesHot37(ShaderType shader_type) {
 }
 
 bool Renderer::synchronize(ICommandBuffer* command_buffer) {
+    syncDrawQueue();
     auto* commands = static_cast<CommandBuffer*>(command_buffer);
     commands->debugCommitAndWait();
     return commands->lastSubmissionSucceeded();
 }
 
 bool Renderer::synchronizeGuestWrites(ICommandBuffer* command_buffer) {
+    syncDrawQueue();
     if (!CommandBuffer::hasUnsynchronizedGuestWrites())
         return true;
     return synchronize(command_buffer);
@@ -1197,6 +1235,7 @@ bool Renderer::synchronizeGuestWrites(ICommandBuffer* command_buffer) {
 void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
                                     ReportPublisher publish,
                                     std::vector<ztd::Range<uptr>> writes) {
+    syncDrawQueue();
     if (PerfStats::isEnabled())
         PerfStats::instance().reports_queued++;
     const auto trace = capture::GuestEvents::instance().beginReport(
@@ -1217,6 +1256,7 @@ void Renderer::queueOcclusionReport(ICommandBuffer* command_buffer,
 void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
                                std::function<void(bool succeeded)> write,
                                std::vector<ztd::Range<uptr>> writes) {
+    syncDrawQueue();
     auto* impl = static_cast<CommandBuffer*>(command_buffer);
     const auto trace = capture::GuestEvents::instance().beginReport(
         capture::currentGuestEventOrigin());
@@ -1235,6 +1275,7 @@ void Renderer::queueGuestWrite(ICommandBuffer* command_buffer,
 
 void Renderer::flushReports(ICommandBuffer* command_buffer,
                             ztd::Range<uptr> range) {
+    syncDrawQueue();
     if (!completions->hasPendingWrites())
         return;
     const auto sequence = completions->lastWriteTo(range);
@@ -1259,6 +1300,7 @@ void Renderer::flushReports(ICommandBuffer* command_buffer,
 }
 
 void Renderer::drainReports() {
+    syncDrawQueue();
     if (!completions->hasPendingOrdered())
         return;
     // A marker behind everything queued so far
@@ -1286,6 +1328,17 @@ void Renderer::drawHot38(ICommandBuffer* command_buffer,
         return;
     }
 
+    if (state.pipeline->hasTessellation()) {
+        drawTessellation(command_buffer_impl, start, count, false, 0,
+                         base_instance, instance_count);
+        return;
+    }
+    if (state.pipeline->hasGeometry()) {
+        drawGeometry(command_buffer_impl, primitive_type, start, count, false,
+                     0, base_instance, instance_count);
+        return;
+    }
+
     const auto visibility_offset = prepareOcclusionQuery(command_buffer_impl);
     bindDrawState(command_buffer_impl);
 
@@ -1305,6 +1358,8 @@ void Renderer::drawHot38(ICommandBuffer* command_buffer,
     // Draw
     encoder->drawPrimitives(toMtlPrimitiveType(primitive_type), start, count,
                             instance_count, base_instance);
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        encoder->setTriangleFillMode(MTL::TriangleFillModeFill);
     if (visibility_offset)
         encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
@@ -1325,6 +1380,16 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
     if (!canDraw()) {
         if (auto& visual = VisualDiagnostics::instance(); visual.selected())
             visual.event("metal_draw_rejected", {{"reason", "pipeline or render pass unavailable"}});
+        return;
+    }
+    if (state.pipeline->hasTessellation()) {
+        drawTessellation(command_buffer_impl, start, count, true, base_vertex,
+                         base_instance, instance_count);
+        return;
+    }
+    if (state.pipeline->hasGeometry()) {
+        drawGeometry(command_buffer_impl, primitive_type, start, count, true,
+                     base_vertex, base_instance, instance_count);
         return;
     }
 
@@ -1355,12 +1420,395 @@ void Renderer::drawIndexedHot39(ICommandBuffer* command_buffer,
                                    toMtlIndexType(state.index_type),
                                    index_buffer_mtl, index_buffer_offset,
                                    instance_count, base_vertex, base_instance);
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        encoder->setTriangleFillMode(MTL::TriangleFillModeFill);
     if (visibility_offset)
         encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled, 0);
     if (capture_group) {
         encoder->popDebugGroup();
         capture_draw_label.clear();
     }
+}
+
+void Renderer::bindStageResources(CommandBuffer* command_buffer,
+                                  const Shader* shader, ShaderType state_type,
+                                  ShaderType host_type) {
+    const auto& mapping = shader->getDescriptor().resource_mapping;
+    const auto type = static_cast<u32>(state_type);
+    for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
+        const auto& buffer = state.uniform_buffers[type][i];
+        if (mapping.uniform_buffers[i] == invalid<u32>() ||
+            buffer.getBase() == nullptr)
+            continue;
+        command_buffer->setBuffer(
+            static_cast<Buffer*>(buffer.getBase())->getBuffer(),
+            buffer.getOffset(), host_type, i);
+    }
+    for (const auto& storage : mapping.storage_buffers) {
+        const auto& buffer = state.storage_buffers[type][storage.host_index];
+        if (buffer.getBase() == nullptr)
+            continue;
+        if (storage.written)
+            command_buffer->noteGuestMemoryWrites();
+        command_buffer->setBuffer(
+            static_cast<Buffer*>(buffer.getBase())->getBuffer(),
+            buffer.getOffset(), host_type, storage.host_index);
+    }
+    const auto sampler_encoder = shader->getSamplerEncoder();
+    for (const auto& [binding, index] : mapping.textures) {
+        (void)binding;
+        const auto& texture = state.textures[type][index];
+        command_buffer->setTexture(texture.texture_view != nullptr
+                                       ? texture.texture_view->getTexture()
+                                       : nullptr,
+                                   host_type, index);
+        if (texture.sampler != nullptr && index < SAMPLER_COUNT &&
+            sampler_encoder == nullptr)
+            command_buffer->setSampler(texture.sampler->getSampler(), host_type,
+                                       index);
+    }
+    if (sampler_encoder == nullptr)
+        return;
+    auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
+    const auto native = static_cast<Buffer*>(buffer)->getBuffer();
+    sampler_encoder->setArgumentBuffer(native, 0);
+    for (const auto& [binding, index] : mapping.textures) {
+        (void)binding;
+        const auto sampler = state.textures[type][index].sampler;
+        sampler_encoder->setSamplerState(
+            sampler != nullptr ? sampler->getSampler() : nullptr, index);
+    }
+    command_buffer->setBuffer(native, 0, host_type, mapping.sampler_buffer_index);
+    retireTextureUploadBuffer(command_buffer, buffer);
+}
+
+std::optional<Renderer::VertexRange>
+Renderer::getDrawVertexRange(bool indexed, u32 start, u32 count,
+                             u32 base_vertex) {
+    if (!indexed)
+        return VertexRange{start, count, nullptr, 0};
+    auto* index_buffer =
+        static_cast<Buffer*>(state.index_buffer.getBase())->getBuffer();
+    const u64 index_offset = state.index_buffer.getOffset();
+    const auto* data = static_cast<const u8*>(index_buffer->contents());
+    if (data == nullptr) {
+        ONCE(LOG_WARN(MetalRenderer, "Geometry or tessellation draw with an "
+                                     "index buffer the CPU cannot read"));
+        return std::nullopt;
+    }
+    data += index_offset;
+    u32 lowest = invalid<u32>();
+    u32 highest = 0;
+    for (u32 i = start; i < start + count; i++) {
+        u32 index = 0;
+        switch (state.index_type) {
+        case engines::IndexType::UInt8:
+            index = data[i];
+            break;
+        case engines::IndexType::UInt16:
+            index = reinterpret_cast<const u16*>(data)[i];
+            break;
+        default:
+            index = reinterpret_cast<const u32*>(data)[i];
+            break;
+        }
+        lowest = std::min(lowest, index);
+        highest = std::max(highest, index);
+    }
+    return VertexRange{lowest + base_vertex, highest - lowest + 1, index_buffer,
+                       index_offset};
+}
+
+void Renderer::encodeVertexCapture(CommandBuffer* command_buffer,
+                                   const VertexRange& range,
+                                   MTL::Buffer* records, MTL::Buffer* params,
+                                   bool indexed, u32 start, u32 count,
+                                   u32 base_vertex, u32 base_instance) {
+    const auto& vertex_mapping =
+        static_cast<const Shader*>(
+            state.pipeline->getDescriptor()
+                .shaders[static_cast<u32>(ShaderType::Vertex)])
+            ->getDescriptor()
+            .resource_mapping;
+    auto encoder = command_buffer->getRenderCommandEncoderUnchecked();
+    command_buffer->setRenderPipelineState(state.pipeline->getCapturePipeline());
+    command_buffer->setBuffer(records, 0, ShaderType::Vertex,
+                              vertex_mapping.capture_buffer_index);
+    command_buffer->setBuffer(params, 0, ShaderType::Vertex,
+                              vertex_mapping.capture_params_index);
+    if (indexed)
+        encoder->drawIndexedPrimitives(
+            MTL::PrimitiveTypePoint, count, toMtlIndexType(state.index_type),
+            range.index_buffer,
+            range.index_offset +
+                u64(start) * engines::getIndexTypeSize(state.index_type),
+            1, base_vertex, base_instance);
+    else
+        encoder->drawPrimitives(MTL::PrimitiveTypePoint, start, count, 1,
+                                base_instance);
+    encoder->vertexBufferBarrier();
+}
+
+void Renderer::drawTessellation(CommandBuffer* command_buffer, u32 start,
+                                u32 count, bool indexed, u32 base_vertex,
+                                u32 base_instance, u32 instance_count) {
+    const auto* pipeline = state.pipeline;
+    const auto& descriptor = pipeline->getDescriptor();
+    const auto* vertex_shader = static_cast<const Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::Vertex)]);
+    const auto* control_shader = static_cast<const Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::TessControl)]);
+    const auto* evaluation_shader = static_cast<const Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::TessEvaluation)]);
+    const u32 patch_size = std::max(descriptor.tessellation_patch_size, 1u);
+    const u32 patches = count / patch_size;
+    const u32 control_points =
+        control_shader->getDescriptor().resource_mapping.tess_output_vertices;
+    const auto domain = tessellation::getDomain(descriptor.tessellation_parameters);
+    if (patches == 0 || control_points == 0 ||
+        vertex_shader->getDescriptor().resource_mapping.capture_buffer_index ==
+            invalid<u32>())
+        return;
+    auto encoder = command_buffer->getRenderCommandEncoderUnchecked();
+    if (!encoder->supportsTessellation()) {
+        ONCE(LOG_WARN(MetalRenderer, "Tessellation needs the Metal 3 encoder, "
+                                     "tessellated draws are skipped"));
+        return;
+    }
+    const auto range = getDrawVertexRange(indexed, start, count, base_vertex);
+    if (!range)
+        return;
+
+    const u64 record_bytes = u64(range->slots) * geometry::RECORD_SIZE;
+    const u64 control_point_bytes =
+        u64(patches) * control_points * geometry::RECORD_SIZE;
+    const u64 patch_bytes = u64(patches) * tessellation::PATCH_SIZE;
+    const u64 factor_bytes = u64(patches) * tessellation::getFactorSize(domain);
+    constexpr u64 MAX_BYTES = 512ull << 20;
+    if (record_bytes + control_point_bytes + patch_bytes + factor_bytes >
+        MAX_BYTES) {
+        ONCE(LOG_WARN(MetalRenderer,
+                      "Tessellated draw needs {} MiB of buffers, skipped",
+                      (record_bytes + control_point_bytes + patch_bytes +
+                       factor_bytes) >>
+                          20));
+        return;
+    }
+    auto* records = allocateTextureUploadBuffer(record_bytes);
+    auto* control = allocateTextureUploadBuffer(control_point_bytes);
+    auto* patch_data = allocateTextureUploadBuffer(patch_bytes);
+    auto* factors = allocateTextureUploadBuffer(factor_bytes);
+    constexpr u64 PARAMS_OFFSET = 256;
+    auto* params = allocateTextureUploadBuffer(PARAMS_OFFSET +
+                                               sizeof(geometry::Params));
+    const auto native = [](BufferBase* buffer) {
+        return static_cast<Buffer*>(buffer)->getBuffer();
+    };
+    auto* params_data = static_cast<u8*>(native(params)->contents());
+    const geometry::CaptureParams capture_params{range->min_vertex};
+    std::memcpy(params_data, &capture_params, sizeof(capture_params));
+    const geometry::Params patch_params{
+        patches,
+        static_cast<u32>(indexed ? state.index_type : engines::IndexType::None),
+        start,
+        static_cast<i32>(base_vertex),
+        range->min_vertex,
+        count};
+    std::memcpy(params_data + PARAMS_OFFSET, &patch_params,
+                sizeof(patch_params));
+
+    const auto visibility_offset = prepareOcclusionQuery(command_buffer);
+    for (u32 instance = 0; instance < instance_count; instance++) {
+        // The vertex shader's resources again: the other stages of the
+        // previous instance replaced them
+        bindDrawState(command_buffer);
+        encoder = command_buffer->getRenderCommandEncoderUnchecked();
+        if (instance != 0)
+            encoder->vertexBufferBarrier();
+
+        // 1. The vertex shader writes the input control points' records
+        encodeVertexCapture(command_buffer, *range, native(records),
+                            native(params), indexed, start, count, base_vertex,
+                            base_instance + instance);
+
+        // 2. The control shader writes control points and patch attributes
+        command_buffer->setRenderPipelineState(
+            pipeline->getTessControlPipeline());
+        bindStageResources(command_buffer, control_shader,
+                           ShaderType::TessControl, ShaderType::Vertex);
+        command_buffer->setBuffer(native(records), 0, ShaderType::Vertex,
+                                  geometry::INPUT_BUFFER);
+        command_buffer->setBuffer(indexed ? range->index_buffer : native(records),
+                                  indexed ? range->index_offset : 0,
+                                  ShaderType::Vertex,
+                                  geometry::INDEX_DATA_BUFFER);
+        command_buffer->setBuffer(native(control), 0, ShaderType::Vertex,
+                                  tessellation::CONTROL_POINT_BUFFER);
+        command_buffer->setBuffer(native(patch_data), 0, ShaderType::Vertex,
+                                  tessellation::PATCH_BUFFER);
+        command_buffer->setBuffer(native(params), PARAMS_OFFSET,
+                                  ShaderType::Vertex, geometry::PARAMS_BUFFER);
+        encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                                NS::UInteger(u64(patches) * control_points));
+        encoder->vertexBufferBarrier();
+
+        // 3. The patch levels become Metal tessellation factors
+        command_buffer->setRenderPipelineState(pipeline->getTessFactorPipeline());
+        command_buffer->setBuffer(native(factors), 0, ShaderType::Vertex,
+                                  tessellation::FACTOR_BUFFER);
+        encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                                NS::UInteger(patches));
+        encoder->vertexBufferBarrier();
+
+        // 4. The evaluation shader runs per tessellated vertex
+        command_buffer->setRenderPipelineState(pipeline->getPipeline());
+        bindStageResources(command_buffer, evaluation_shader,
+                           ShaderType::TessEvaluation, ShaderType::Vertex);
+        command_buffer->setBuffer(native(control), 0, ShaderType::Vertex,
+                                  tessellation::EVALUATION_CONTROL_POINT_BUFFER);
+        command_buffer->setBuffer(native(patch_data), 0, ShaderType::Vertex,
+                                  tessellation::PATCH_BUFFER);
+        encoder->setTessellationFactorBuffer(native(factors), 0, 0);
+        if (visibility_offset)
+            encoder->setVisibilityResultMode(MTL::VisibilityResultModeCounting,
+                                             *visibility_offset);
+        encoder->drawPatches(control_points, 0, patches, 1,
+                             base_instance + instance);
+        if (visibility_offset)
+            encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled,
+                                             0);
+    }
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            MTL::TriangleFillModeFill);
+    for (auto* buffer : {records, control, patch_data, factors, params})
+        retireTextureUploadBuffer(command_buffer, buffer);
+}
+
+void Renderer::drawGeometry(CommandBuffer* command_buffer,
+                            engines::PrimitiveType primitive_type, u32 start,
+                            u32 count, bool indexed, u32 base_vertex,
+                            u32 base_instance, u32 instance_count) {
+    const auto* pipeline = state.pipeline;
+    const auto& descriptor = pipeline->getDescriptor();
+    const auto* vertex_shader = static_cast<const Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::Vertex)]);
+    const auto* geometry_shader = static_cast<const Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::Geometry)]);
+    const auto& vertex_mapping = vertex_shader->getDescriptor().resource_mapping;
+    const auto& geometry_mapping =
+        geometry_shader->getDescriptor().resource_mapping;
+    const auto output =
+        static_cast<geometry::Output>(geometry_mapping.geometry_output);
+    const u32 max_vertices = geometry_mapping.geometry_max_output_vertices;
+    const u32 invocations = std::max(geometry_mapping.geometry_invocations, 1u);
+    const u32 max_indices = geometry::getMaxOutputIndices(output, max_vertices);
+    const u32 primitives = geometry::getPrimitiveCount(primitive_type, count);
+    if (primitives == 0 || max_indices == 0 ||
+        vertex_mapping.capture_buffer_index == invalid<u32>())
+        return;
+
+    const auto range = getDrawVertexRange(indexed, start, count, base_vertex);
+    if (!range)
+        return;
+    const u32 min_vertex = range->min_vertex;
+    const u32 vertex_slots = range->slots;
+    MTL::Buffer* index_buffer = range->index_buffer;
+    const u64 index_offset = range->index_offset;
+
+    const u64 threads = u64(primitives) * invocations;
+    const u64 record_bytes = u64(vertex_slots) * geometry::RECORD_SIZE;
+    const u64 output_bytes =
+        threads * (max_vertices + 1) * geometry::RECORD_SIZE;
+    const u64 index_bytes = threads * max_indices * sizeof(u32);
+    constexpr u64 MAX_BYTES = 512ull << 20;
+    if (record_bytes + output_bytes + index_bytes > MAX_BYTES) {
+        ONCE(LOG_WARN(MetalRenderer,
+                      "Geometry shader draw needs {} MiB of buffers, skipped",
+                      (record_bytes + output_bytes + index_bytes) >> 20));
+        return;
+    }
+    auto* records = allocateTextureUploadBuffer(record_bytes);
+    auto* emitted = allocateTextureUploadBuffer(output_bytes);
+    auto* indices = allocateTextureUploadBuffer(index_bytes);
+    // The capture parameters, then the geometry parameters at 256 bytes
+    constexpr u64 PARAMS_OFFSET = 256;
+    auto* params = allocateTextureUploadBuffer(PARAMS_OFFSET +
+                                               sizeof(geometry::Params));
+    const auto native = [](BufferBase* buffer) {
+        return static_cast<Buffer*>(buffer)->getBuffer();
+    };
+    auto* params_data = static_cast<u8*>(native(params)->contents());
+    const geometry::CaptureParams capture_params{min_vertex};
+    std::memcpy(params_data, &capture_params, sizeof(capture_params));
+    const geometry::Params geometry_params{
+        static_cast<u32>(primitives),
+        static_cast<u32>(indexed ? state.index_type : engines::IndexType::None),
+        start,
+        static_cast<i32>(base_vertex),
+        min_vertex,
+        count};
+    std::memcpy(params_data + PARAMS_OFFSET, &geometry_params,
+                sizeof(geometry_params));
+
+    MTL::PrimitiveType list_type = MTL::PrimitiveTypeTriangle;
+    if (output == geometry::Output::Points)
+        list_type = MTL::PrimitiveTypePoint;
+    else if (output == geometry::Output::LineStrip)
+        list_type = MTL::PrimitiveTypeLine;
+
+    const auto visibility_offset = prepareOcclusionQuery(command_buffer);
+    for (u32 instance = 0; instance < instance_count; instance++) {
+        // The vertex shader's resources (and vertex buffers) again: the
+        // geometry shader of the previous instance replaced them
+        bindDrawState(command_buffer);
+        auto encoder = command_buffer->getRenderCommandEncoderUnchecked();
+        // The previous instance's draw reads the buffers rewritten below
+        if (instance != 0)
+            encoder->vertexBufferBarrier();
+
+        // 1. The vertex shader writes its output records
+        encodeVertexCapture(command_buffer, *range, native(records),
+                            native(params), indexed, start, count, base_vertex,
+                            base_instance + instance);
+
+        // 2. The geometry shader emits vertices and list indices
+        command_buffer->setRenderPipelineState(pipeline->getGeometryPipeline());
+        bindStageResources(command_buffer, geometry_shader, ShaderType::Geometry,
+                           ShaderType::Vertex);
+        command_buffer->setBuffer(native(records), 0, ShaderType::Vertex,
+                                  geometry::INPUT_BUFFER);
+        command_buffer->setBuffer(indexed ? index_buffer : native(records),
+                                  indexed ? index_offset : 0,
+                                  ShaderType::Vertex,
+                                  geometry::INDEX_DATA_BUFFER);
+        command_buffer->setBuffer(native(emitted), 0, ShaderType::Vertex,
+                                  geometry::OUTPUT_BUFFER);
+        command_buffer->setBuffer(native(indices), 0, ShaderType::Vertex,
+                                  geometry::OUTPUT_INDEX_BUFFER);
+        command_buffer->setBuffer(native(params), PARAMS_OFFSET,
+                                  ShaderType::Vertex, geometry::PARAMS_BUFFER);
+        encoder->drawPrimitives(MTL::PrimitiveTypePoint, NS::UInteger(0),
+                                NS::UInteger(threads));
+        encoder->vertexBufferBarrier();
+
+        // 3. The passthrough draws them with the fragment shader
+        command_buffer->setRenderPipelineState(pipeline->getPipeline());
+        if (visibility_offset)
+            encoder->setVisibilityResultMode(MTL::VisibilityResultModeCounting,
+                                             *visibility_offset);
+        encoder->drawIndexedPrimitives(list_type,
+                                       NS::UInteger(threads * max_indices),
+                                       MTL::IndexTypeUInt32, native(indices), 0);
+        if (visibility_offset)
+            encoder->setVisibilityResultMode(MTL::VisibilityResultModeDisabled,
+                                             0);
+    }
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            MTL::TriangleFillModeFill);
+    for (auto* buffer : {records, emitted, indices, params})
+        retireTextureUploadBuffer(command_buffer, buffer);
 }
 
 f64 Renderer::debugSyncCommandBufferHot40(ICommandBuffer* command_buffer) {
@@ -1726,6 +2174,10 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
     command_buffer->setFrontFaceWinding(state.front_face_winding);
     command_buffer->getRenderCommandEncoderUnchecked()->setDepthClipMode(
         state.depth_clip_mode);
+    // Reset after the draw (see endPolygonLines): internal draws fill
+    if (state.triangle_fill_mode != MTL::TriangleFillModeFill)
+        command_buffer->getRenderCommandEncoderUnchecked()->setTriangleFillMode(
+            state.triangle_fill_mode);
 
     // Stencil reference
     command_buffer->setStencilReferences(state.stencil.front.ref & 0xff,

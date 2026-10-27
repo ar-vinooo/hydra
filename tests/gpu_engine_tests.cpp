@@ -15,11 +15,19 @@
 #include "core/hw/tegra_x1/gpu/optimization_policy.hpp"
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/draw_state.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/analyzer/memory_analyzer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/decompiler.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/ir/builder.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/index_cache.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/completion_queue.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
@@ -32,6 +40,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <random>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -62,6 +71,45 @@ struct ThreeDTestAccess {
         target.tile_mode.is_linear = 1;
         target.array_mode.layers = 1;
         engine.regs.depth_target_enabled = 0;
+    }
+    static renderer::PipelineBase* pipeline(ThreeD& engine) {
+        return engine.getPipeline();
+    }
+    static void program(ThreeD& engine, ShaderStage stage, u64 region,
+                        u32 offset, bool enable = true) {
+        engine.regs.shader_program_region = {static_cast<u32>(region >> 32),
+                                             static_cast<u32>(region)};
+        auto& program = engine.regs.shader_programs[static_cast<u32>(stage)];
+        program.config.enable = enable;
+        program.offset = offset;
+    }
+    static void primitive(ThreeD& engine, PrimitiveType type) {
+        engine.regs.begin.primitive_type = type;
+    }
+    static void raw(ThreeD& engine, u32 reg, u32 value) {
+        engine.regs_raw[reg] = value;
+    }
+    static renderer::DrawState drawState(ThreeD& engine) {
+        return engine.prepareDrawState();
+    }
+    static MTL::ScissorRect scissor(ThreeD& engine, u32 index) {
+        return engine.getScissor(index);
+    }
+    static MTL::ScissorRect clearRect(ThreeD& engine) {
+        return engine.getClearRect();
+    }
+    static void fixedAttributes(ThreeD& engine) {
+        for (auto& attribute : engine.regs.vertex_attrib_states)
+            attribute.is_fixed = true;
+    }
+    static u32 samplerIndex(const ThreeD& engine, u32 handle) {
+        return engine.getSamplerIndex(handle);
+    }
+    static void setColorWriteMask(ThreeD& engine, u32 index, ColorWriteMask mask) {
+        engine.regs.color_write_masks[index] = mask;
+    }
+    static ColorWriteMask colorWriteMask(const ThreeD& engine, u32 index) {
+        return engine.getColorWriteMask(index);
     }
     static renderer::RenderPassBase* targets(ThreeD& engine) {
         auto* pass = engine.resolveDrawTargets();
@@ -666,12 +714,10 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
     };
     encode(scattered_before, 0);
     encode(scattered_after, 32);
-    auto* native = metal_commands->getCommandBuffer()->retain();
+    metal_commands->debugCommitAndWait();
+    const bool completed = metal_commands->lastSubmissionSucceeded();
     tls_crnt_command_buffer = nullptr;
     commands.reset();
-    native->waitUntilCompleted();
-    const bool completed = native->status() == MTL::CommandBufferStatusCompleted;
-    native->release();
     expect(completed, "GPU reads gathered uniform snapshots successfully");
     const auto* words = static_cast<const u32*>(output->contents());
     for (u32 i = 0; i < 16; ++i)
@@ -701,14 +747,13 @@ kernel void copy_words(constant uint* input [[buffer(0)]],
         prefix_upload.getOffset(), 0);
     prefix_encoder->setBuffer(output, 0, 1);
     prefix_encoder->dispatchThreads(MTL::Size(4, 1, 1), MTL::Size(4, 1, 1));
-    auto* prefix_native = prefix_commands->getCommandBuffer()->retain();
+    prefix_commands->debugCommitAndWait();
+    const bool prefix_completed = prefix_commands->lastSubmissionSucceeded();
     tls_crnt_command_buffer = nullptr;
     commands.reset();
-    prefix_native->waitUntilCompleted();
-    expect(prefix_native->status() == MTL::CommandBufferStatusCompleted &&
+    expect(prefix_completed &&
                std::memcmp(output->contents(), replacement.data() + 4, 16) == 0,
            "Metal reads the complete required prefix despite an unmapped selector tail");
-    prefix_native->release();
     commands.reset(renderer.createCommandBuffer());
     tls_crnt_command_buffer = commands.get();
     expect(engine.getConstBuffer(STAGE, SLOT, 0x10001).getSize() == 0 &&
@@ -1284,6 +1329,73 @@ void testDrawContentVersions() {
                  "from resource identity\n";
 }
 
+// Draws encoded on the draw queue's thread land in order, also past the
+// queue's bound, and code reading the results on the GPU thread sees every
+// draw queued before it
+void testDrawQueueOrder() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    const auto shader = [&](ShaderType type, const std::string& code) {
+        ShaderDescriptor descriptor{};
+        descriptor.type = type;
+        descriptor.backend = ShaderBackend::Msl;
+        descriptor.code.assign(code.begin(), code.end());
+        return std::unique_ptr<ShaderBase>(rig.renderer.createShader(descriptor));
+    };
+    const auto solid = [&](const char* color) {
+        return shader(ShaderType::Fragment,
+                      std::string("#include <metal_stdlib>\nusing namespace metal;\n"
+                                  "fragment float4 main_() { return float4(") +
+                          color + "); }\n");
+    };
+    auto red = solid("1, 0, 0, 1");
+    auto green = solid("0, 1, 0, 1");
+    const auto pipeline = [&](ShaderBase* fragment) {
+        auto descriptor = rig.pipeline->getDescriptor();
+        descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment;
+        return std::unique_ptr<PipelineBase>(rig.renderer.createPipeline(descriptor));
+    };
+    auto red_pipeline = pipeline(red.get());
+    auto green_pipeline = pipeline(green.get());
+    auto* color = rig.pass->getDescriptor().color_targets[0].texture->getBase();
+    const auto pixel = [&] {
+        rig.renderer.debugSyncCommandBuffer(rig.commands.get());
+        std::vector<std::vector<u8>> contents;
+        expect(rig.renderer.readTextureContents(color, contents) &&
+                   !contents.empty() && contents[0].size() >= 4,
+               "Read the color target back");
+        return std::array<u8, 4>{contents[0][0], contents[0][1], contents[0][2],
+                                 contents[0][3]};
+    };
+    constexpr std::array<u8, 4> RED{255, 0, 0, 255};
+    constexpr std::array<u8, 4> GREEN{0, 255, 0, 255};
+    auto* queue = rig.renderer.getDrawQueue();
+    const u64 encoded_before = queue ? queue->getEncodedCount() : 0;
+    constexpr u32 DRAWS = 2001;
+    constexpr u32 CHECKED = 777;
+    for (u32 i = 0; i < DRAWS; i++) {
+        command_ir::DrawCommand command;
+        command.pipeline = (i % 2 == 0 ? red_pipeline : green_pipeline).get();
+        command.render_pass = rig.pass.get();
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        engines::ThreeDTestAccess::execute(rig.engine, command);
+        if (i == CHECKED)
+            expect(pixel() == GREEN,
+                   "A readback on the GPU thread sees the draw queued before it");
+    }
+    expect(pixel() == RED, "The last queued draw wins");
+    if (queue)
+        expect(queue->getEncodedCount() - encoded_before == DRAWS,
+               "Every draw went through the draw queue");
+    rig.renderer.bindPipeline(rig.pipeline.get());
+    std::cout << "PASS: queued draws encode in order past the queue bound and "
+                 "sync before readback (" << (queue ? "queue" : "sync encode")
+              << ")\n";
+}
+
 void testClearAndCopyCommands() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
@@ -1715,6 +1827,191 @@ void benchmarkCommands() {
         submit_ns);
 }
 
+// A multisampled texture uploaded from and read back to guest memory, where
+// its pixels are blocks of samples, gives back the same bytes (every sample
+// goes through the host multisampled texture)
+void testMultisampleGuestRoundTrip() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = gpu.getRenderer();
+    std::mt19937 rng(7);
+    for (const auto format : {TextureFormat::RGBA8Unorm, TextureFormat::R32Uint,
+                              TextureFormat::Z32Float, TextureFormat::Z24Unorm_S8Uint}) {
+        for (const u32 samples : {1u, 2u, 4u, 8u}) {
+            const auto layout = getMsaaLayoutForSamples(samples);
+            const u32 width = 8u << layout.samples_x_log2;
+            const u32 height = 4u << layout.samples_y_log2;
+            const u32 bpp = getTextureFormatBpp(format);
+            const TextureDescriptor descriptor(
+                0x10000, MTL::TextureType2D, format, true, width * bpp, width,
+                height, 1, 1, 1, 0, 0, 0, 0, samples);
+            std::unique_ptr<ITexture> texture(renderer.createTexture(descriptor));
+            const u64 bytes = static_cast<u64>(width) * height * bpp;
+            std::unique_ptr<BufferBase> upload(renderer.allocateTemporaryBuffer(bytes));
+            std::unique_ptr<BufferBase> readback(renderer.allocateTemporaryBuffer(bytes));
+            auto* data = reinterpret_cast<u8*>(upload->getPtr());
+            for (u64 i = 0; i < bytes / 4; i++) {
+                u32 word = static_cast<u32>(rng());
+                if (format == TextureFormat::Z32Float)
+                    // Depth outputs are clamped to [0, 1]
+                    word = std::bit_cast<u32>(static_cast<f32>(word % 1000) / 999.0f);
+                std::memcpy(data + i * 4, &word, 4);
+            }
+            std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+            texture->copyFrom(commands.get(), upload.get());
+            std::unique_ptr<ITextureView> view(texture->createView(TextureViewDescriptor(
+                MTL::TextureType2D, format, ztd::Range<u32>(0, 1), ztd::Range<u32>(0, 1))));
+            readback->copyFrom(commands.get(), view.get(), MTL::Origin(0, 0, 0),
+                               MTL::Size(width, height, 1), ztd::Range<u32>(0, 1),
+                               ztd::Range<u32>(0, 1), 0);
+            renderer.synchronize(commands.get());
+            // A device with fewer samples keeps the first ones: guest sample
+            // i comes back from host sample i % host samples
+            auto* device = static_cast<metal::Renderer&>(renderer).getDevice();
+            u32 host_samples = samples;
+            while (!device->supportsTextureSampleCount(host_samples))
+                host_samples >>= 1;
+            std::vector<u8> expected(data, data + bytes);
+            const u32 block_width = 1u << layout.samples_x_log2;
+            const u32 block_height = 1u << layout.samples_y_log2;
+            for (u32 y = 0; y < height; y++) {
+                for (u32 x = 0; x < width; x++) {
+                    const u32 local_x = x % block_width;
+                    const u32 local_y = y % block_height;
+                    u32 sample = 0;
+                    for (u32 i = 0; i < samples; i++)
+                        if (getMsaaSampleTexel(samples, i) == std::pair{local_x, local_y})
+                            sample = i;
+                    const auto [kept_x, kept_y] =
+                        getMsaaSampleTexel(samples, sample % host_samples);
+                    const u32 source_x = x - local_x + kept_x;
+                    const u32 source_y = y - local_y + kept_y;
+                    std::memcpy(expected.data() + (static_cast<u64>(y) * width + x) * bpp,
+                                data + (static_cast<u64>(source_y) * width + source_x) * bpp,
+                                bpp);
+                }
+            }
+            expect(std::memcmp(expected.data(),
+                               reinterpret_cast<const u8*>(readback->getPtr()),
+                               bytes) == 0,
+                   fmt::format("{} with {} samples survives guest memory", format,
+                               samples).c_str());
+        }
+    }
+    std::cout << "PASS: textures (multisampled or not, Z24 included) round trip "
+                 "through guest memory\n";
+}
+
+// Rendering to a multisampled target: guest sample i is host sample i (at
+// the texel nouveau places it), and the samples are at the Maxwell positions
+void testMultisampleRendering() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = gpu.getRenderer();
+    const auto run = [&](u32 samples, u32 msaa_mode, const char* fragment_code,
+                         const char* vertex_code, u32 vertex_count) {
+        const auto layout = getMsaaLayoutForSamples(samples);
+        const u32 width = 2u << layout.samples_x_log2;
+        const u32 height = 2u << layout.samples_y_log2;
+        const TextureDescriptor descriptor(
+            0x20000, MTL::TextureType2D, TextureFormat::R32Uint, true, width * 4,
+            width, height, 1, 1, 1, 0, 0, 0, 0, samples);
+        std::unique_ptr<ITexture> texture(renderer.createTexture(descriptor));
+        std::unique_ptr<ITextureView> view(texture->createView(TextureViewDescriptor(
+            MTL::TextureType2D, TextureFormat::R32Uint, ztd::Range<u32>(0, 1),
+            ztd::Range<u32>(0, 1))));
+        std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+        // Start from zero in every sample
+        std::unique_ptr<BufferBase> zero(renderer.allocateTemporaryBuffer(width * height * 4));
+        std::memset(reinterpret_cast<void*>(zero->getPtr()), 0, width * height * 4);
+        texture->copyFrom(commands.get(), zero.get());
+        RenderPassDescriptor pass_descriptor{};
+        pass_descriptor.color_targets[0].texture = view.get();
+        pass_descriptor.msaa_mode = msaa_mode;
+        std::unique_ptr<RenderPassBase> pass(renderer.createRenderPass(pass_descriptor));
+        const auto shader = [&](ShaderType type, const char* code) {
+            ShaderDescriptor shader_descriptor{};
+            shader_descriptor.type = type;
+            shader_descriptor.backend = ShaderBackend::Msl;
+            shader_descriptor.code.assign(code, code + std::strlen(code));
+            return std::unique_ptr<ShaderBase>(renderer.createShader(shader_descriptor));
+        };
+        auto vertex = shader(ShaderType::Vertex, vertex_code);
+        auto fragment = shader(ShaderType::Fragment, fragment_code);
+        PipelineDescriptor pipeline_descriptor{};
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        pipeline_descriptor.color_target_states[0].format = TextureFormat::R32Uint;
+        pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        pipeline_descriptor.sample_count = samples;
+        std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+        renderer.bindRenderPass(pass.get());
+        renderer.bindPipeline(pipeline.get());
+        for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
+            renderer.setScissor(i, MTL::ScissorRect{0, 0, 2, 2});
+            renderer.setViewport(i, MTL::Viewport{0, 0, 2, 2, 0, 1});
+        }
+        renderer.setCullState(false, engines::CullFaceMode::Back, engines::Winding::CounterClockwise);
+        renderer.setDepthTestEnabled(false);
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, vertex_count, 0, 1);
+        std::unique_ptr<BufferBase> readback(renderer.allocateTemporaryBuffer(width * height * 4));
+        readback->copyFrom(commands.get(), view.get(), MTL::Origin(0, 0, 0),
+                           MTL::Size(width, height, 1), ztd::Range<u32>(0, 1),
+                           ztd::Range<u32>(0, 1), 0);
+        renderer.synchronize(commands.get());
+        std::vector<u32> texels(width * height);
+        std::memcpy(texels.data(), reinterpret_cast<const void*>(readback->getPtr()),
+                    texels.size() * 4);
+        return texels;
+    };
+    constexpr const char* FULL_SCREEN = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    float2 p[] = {float2(-1,-1), float2(3,-1), float2(-1,3)};
+    return float4(p[id], 0.5, 1);
+})";
+    // Each sample writes its index + 1
+    const auto by_sample = run(4, 0x2, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment uint4 main_(uint sample_id [[sample_id]]) { return uint4(sample_id + 1); }
+)", FULL_SCREEN, 3);
+    for (u32 y = 0; y < 4; y++)
+        for (u32 x = 0; x < 4; x++) {
+            u32 sample = 0;
+            for (u32 i = 0; i < 4; i++)
+                if (getMsaaSampleTexel(4, i) == std::pair{x & 1, y & 1})
+                    sample = i;
+            expect(by_sample[y * 4 + x] == sample + 1,
+                   "Each sample is stored at its texel of the pixel's block");
+        }
+    // The left half of each pixel covers only the sample at x = 4/16 of the
+    // Maxwell 2x pattern, sample 0 (Metal's own pattern has it at index 1)
+    const auto left_half = run(2, 0x1, R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment uint4 main_() { return uint4(1); }
+)", R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 main_(uint id [[vertex_id]]) {
+    // Two pixels wide: the left halves of both pixel columns
+    float2 p[] = {float2(-1,-1), float2(-0.5,-1), float2(-1,1),
+                  float2(-0.5,-1), float2(-0.5,1), float2(-1,1),
+                  float2(0,-1), float2(0.5,-1), float2(0,1),
+                  float2(0.5,-1), float2(0.5,1), float2(0,1)};
+    return float4(p[id], 0.5, 1);
+})", 12);
+    for (u32 y = 0; y < 2; y++)
+        for (u32 x = 0; x < 4; x++)
+            expect(left_half[y * 4 + x] == ((x & 1) == 0 ? 1u : 0u),
+                   "Samples are at the Maxwell positions");
+    std::cout << "PASS: multisampled rendering places samples like Maxwell\n";
+}
+
 // Buffer textures are their backing buffer: capture reads and restores its bytes
 void testBufferTextureContents() {
     using namespace hydra::hw::tegra_x1::gpu::renderer;
@@ -1846,6 +2143,119 @@ void testDrawResourceValidation() {
                "Retired GMMU is rejected without dereferencing its old address");
     }
     std::cout << "PASS: command registry rejects retired resources and used mappings before encoding\n";
+}
+
+// While a game counts samples, render passes start with their visibility
+// buffer: the first counted draw of an open pass does not end it (storing and
+// reloading its attachments)
+void testOcclusionKeepsRenderPass() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto& commands = rig.commands;
+    const auto draw = [&] {
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+    };
+    const auto report = [&] {
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(OcclusionRig::REPORT));
+        engine.method(0x6c3, 2 | (0x15u << 23));
+        renderer.flushReports(
+            commands.get(),
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(rig.report_memory.data()),
+                                       rig.report_memory.size()));
+        u64 value = 0;
+        std::memcpy(&value, rig.report_memory.data(), sizeof(value));
+        return value;
+    };
+
+    // The game counts once, then draws without counting in a new submission
+    renderer.setOcclusionCounterEnabled(true);
+    draw();
+    renderer.setOcclusionCounterEnabled(false);
+    commands.reset(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    renderer.clearDepth(commands.get(), 0, 0.75f);
+    draw();
+    auto* metal_commands = static_cast<metal::CommandBuffer*>(commands.get());
+    const auto encoders = metal_commands->getRenderEncoderCount();
+    expect(metal_commands->getVisibilityResultBuffer() != nullptr,
+           "A pass started while the game counts has a visibility buffer");
+
+    // Passes of other threads (presentation) leave the counter alone: it is
+    // not synchronized with the thread counting the guest draws
+    bool other_has_visibility = true;
+    std::thread([&] {
+        std::unique_ptr<ICommandBuffer> other(renderer.createCommandBuffer());
+        renderer.clearDepth(other.get(), 0, 0.5f);
+        other_has_visibility = static_cast<metal::CommandBuffer*>(other.get())
+                                   ->getVisibilityResultBuffer() != nullptr;
+    }).join();
+    expect(!other_has_visibility,
+           "A pass of another thread has no visibility buffer");
+
+    // Counting starts in the open pass
+    renderer.setOcclusionCounterEnabled(true);
+    engine.method(0x54c, 1);
+    draw();
+    draw();
+    expect(metal_commands->getRenderEncoderCount() == encoders,
+           "Counted draws continue the open render pass");
+    expect(report() == 32, "Draws counted in the open pass report their samples");
+    std::cout << "PASS: counted draws keep the open render pass\n";
+}
+
+// SET_ANTI_ALIAS_ALPHA_CONTROL alpha-to-coverage: with one sample a pixel is
+// kept or dropped by the alpha of output 0
+void testAlphaToCoverage() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    auto& commands = rig.commands;
+    const auto count = [&](f32 alpha, bool coverage) {
+        ShaderDescriptor fragment_descriptor{};
+        fragment_descriptor.type = ShaderType::Fragment;
+        fragment_descriptor.backend = ShaderBackend::Msl;
+        const auto code = fmt::format(R"(
+#include <metal_stdlib>
+using namespace metal;
+fragment float4 main_() {{ return float4(1, 1, 1, {}); }}
+)", alpha);
+        fragment_descriptor.code.assign(code.begin(), code.end());
+        std::unique_ptr<ShaderBase> fragment(renderer.createShader(fragment_descriptor));
+        PipelineDescriptor descriptor{};
+        descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = rig.vertex.get();
+        descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+        descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        descriptor.depth_stencil_format = TextureFormat::Z32Float;
+        descriptor.alpha_to_coverage = coverage;
+        std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(descriptor));
+        renderer.bindPipeline(pipeline.get());
+        renderer.clearDepth(commands.get(), 0, 0.75f);
+        renderer.setOcclusionCounterEnabled(true);
+        engine.method(0x54c, 1);
+        renderer.draw(commands.get(), engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+        engine.method(0x6c0, 0);
+        engine.method(0x6c1, static_cast<u32>(OcclusionRig::REPORT));
+        engine.method(0x6c3, 2 | (0x15u << 23));
+        renderer.flushReports(
+            commands.get(),
+            ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(rig.report_memory.data()),
+                                       rig.report_memory.size()));
+        u64 value = 0;
+        std::memcpy(&value, rig.report_memory.data(), sizeof(value));
+        renderer.bindPipeline(rig.pipeline.get());
+        return value;
+    };
+    expect(count(0.25f, false) == 16, "Without alpha-to-coverage alpha does not drop pixels");
+    expect(count(0.25f, true) == 0, "Alpha-to-coverage drops pixels with a low alpha");
+    expect(count(0.75f, true) == 16, "Alpha-to-coverage keeps pixels with a high alpha");
+    std::cout << "PASS: alpha-to-coverage keeps or drops single-sample pixels by alpha\n";
 }
 
 void testOcclusionReports() {
@@ -2843,6 +3253,638 @@ void testReportSemaphoreReductionAndAcquire() {
     std::cout << "PASS: report semaphore reduction and acquire\n";
 }
 
+// A draw command with an emulated geometry shader (geometry.hpp): the
+// renderer captures the vertex shader's outputs, runs the geometry shader with
+// its own constant buffer and draws what it emits, in the open render pass
+void testGeometryDrawCommand() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    const auto attr = [](u32 address, bool input) {
+        return ir::Value::createAttrMemory({RZ, address, input},
+                                           ir::ScalarType::F32);
+    };
+    const auto make_shader = [&](ShaderType type, std::vector<u8> code,
+                                 const ResourceMapping& mapping) {
+        ShaderDescriptor descriptor{};
+        descriptor.type = type;
+        descriptor.backend = ShaderBackend::Msl;
+        descriptor.code = std::move(code);
+        descriptor.resource_mapping = mapping;
+        return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+    };
+
+    // Vertex shader: two points, at x = -0.5 and 0.5
+    std::unique_ptr<ShaderBase> vertex;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry_capture = true;
+        GuestShaderState state{};
+        for (auto& attribute : state.vertex_attrib_states)
+            attribute.is_fixed = true;
+        state.geometry_capture = true;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto second = b.opCompareEqual(
+            ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true}),
+            ir::Value::createConstant(1u));
+        b.opCopy(attr(SV_POSITION_BASE, false),
+                 b.opSelect(second, ir::Value::createConstantF(0.5f),
+                            ir::Value::createConstantF(-0.5f)));
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.analyze(module);
+        std::vector<u8> code;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+            .emit(module);
+        vertex = make_shader(ShaderType::Vertex, std::move(code), mapping);
+    }
+    // Geometry shader: each point becomes a half screen quad colored from
+    // its constant buffer 0
+    std::unique_ptr<ShaderBase> geometry;
+    {
+        DecompilerContext context{};
+        context.type = ShaderType::Vertex;
+        context.geometry = true;
+        context.geo.input_vertices = 1;
+        context.geo.input_primitive = engines::PrimitiveType::Points;
+        context.geo.output = static_cast<u32>(geometry::Output::TriangleStrip);
+        context.geo.max_output_vertices = 4;
+        context.geo.invocations = 1;
+        GuestShaderState state{};
+        state.geometry_input_vertices = 1;
+        ir::Module module;
+        ir::Builder b(module);
+        const auto center = b.opCopy(attr(SV_POSITION_BASE, true));
+        std::array<ir::Value, 4> color = {
+            b.opCopy(ir::Value::createConstMemory(CMem(0, RZ, 0), ir::ScalarType::F32)),
+            b.opCopy(ir::Value::createConstMemory(CMem(0, RZ, 4), ir::ScalarType::F32)),
+            b.opCopy(ir::Value::createConstMemory(CMem(0, RZ, 8), ir::ScalarType::F32)),
+            b.opCopy(ir::Value::createConstMemory(CMem(0, RZ, 12), ir::ScalarType::F32))};
+        const f32 corners[4][2] = {{-0.5f, -1.0f}, {0.5f, -1.0f},
+                                   {-0.5f, 1.0f}, {0.5f, 1.0f}};
+        for (const auto& corner : corners) {
+            b.opCopy(attr(SV_POSITION_BASE, false),
+                     b.opAdd(center, ir::Value::createConstantF(corner[0])));
+            b.opCopy(attr(SV_POSITION_BASE + 4, false),
+                     ir::Value::createConstantF(corner[1]));
+            b.opCopy(attr(SV_POSITION_BASE + 8, false),
+                     ir::Value::createConstantF(0.0f));
+            b.opCopy(attr(SV_POSITION_BASE + 12, false),
+                     ir::Value::createConstantF(1.0f));
+            for (u32 c = 0; c < 4; c++)
+                b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false), color[c]);
+            b.opEmitVertex();
+        }
+        b.opExit();
+        analyzer::MemoryAnalyzer memory;
+        memory.setGeometry(true);
+        memory.analyze(module);
+        std::vector<u8> code;
+        ResourceMapping mapping;
+        codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+            .emit(module);
+        geometry = make_shader(ShaderType::Geometry, std::move(code), mapping);
+    }
+    GeometryPassthroughState passthrough_state{};
+    passthrough_state.output_mask = 1;
+    passthrough_state.depth_zero_to_one = true;
+    const auto passthrough_code = generateGeometryPassthrough(passthrough_state);
+    auto passthrough = make_shader(
+        ShaderType::Vertex,
+        std::vector<u8>(passthrough_code.begin(), passthrough_code.end()), {});
+    const std::string fragment_code = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct In { float4 color [[user(locn0)]]; };
+fragment float4 main_(In in [[stage_in]]) { return in.color; }
+)";
+    auto fragment = make_shader(
+        ShaderType::Fragment,
+        std::vector<u8>(fragment_code.begin(), fragment_code.end()), {});
+
+    PipelineDescriptor pipeline_descriptor{};
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+    pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Geometry)] = geometry.get();
+    pipeline_descriptor.geometry_passthrough = passthrough.get();
+    pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+    pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+    pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
+    std::unique_ptr<PipelineBase> pipeline(renderer.createPipeline(pipeline_descriptor));
+
+    const std::array<float, 4> color{0.25f, 0.75f, 0.5f, 1.0f};
+    std::unique_ptr<BufferBase> color_buffer(renderer.allocateTemporaryBuffer(16));
+    color_buffer->copyFrom(reinterpret_cast<uptr>(color.data()));
+
+    auto* cb = rig.commands.get();
+    command_ir::DrawCommand command;
+    command.pipeline = pipeline.get();
+    command.render_pass = rig.pass.get();
+    command.primitive = engines::PrimitiveType::Points;
+    command.count = 2;
+    command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+    command.state.scissors.fill(rig.full);
+    command.stages[0].active = true;
+    command.stages[1].active = true;
+    command.stages[2].active = true;
+    command.stages[2].uniforms.push_back({0, BufferView(color_buffer.get())});
+    command_ir::captureDrawAddressSpace(renderer, command, nullptr);
+    expect(command_ir::sealDrawResources(renderer, command) &&
+               command_ir::executeDraw(renderer, cb, command),
+           "A geometry shader draw executes");
+    expect(renderer.synchronize(cb), "The geometry shader draw completes");
+    auto* target = static_cast<metal::TextureView*>(
+        rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+    const auto pixels = readTexture(renderer.getDevice(), target, 4);
+    for (usize i = 0; i < 16; i++)
+        expect(pixels[i * 4] == 64 && pixels[i * 4 + 1] == 191 &&
+                   pixels[i * 4 + 2] == 128,
+               "The quads the geometry shader emits cover the target with "
+               "its constant buffer's color");
+    std::cout << "PASS: geometry shader draw commands render what the "
+                 "geometry shader emits\n";
+}
+
+// Tessellated draw commands (tessellation.hpp): with a control shader, and
+// with the copy function and fixed function levels in its place. The
+// evaluation shader takes its color from its constant buffer 0.
+void testTessellationDrawCommand() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    using namespace shader_decomp;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    const auto attr = [](u32 address, bool input, reg_t vertex = RZ) {
+        return ir::Value::createAttrMemory({RZ, address, input, vertex},
+                                           ir::ScalarType::F32);
+    };
+    for (const bool with_control : {true, false}) {
+        OcclusionRig rig(32);
+        auto& renderer = rig.renderer;
+        const auto make_shader = [&](ShaderType type, std::vector<u8> code,
+                                     const ResourceMapping& mapping) {
+            ShaderDescriptor descriptor{};
+            descriptor.type = type;
+            descriptor.backend = ShaderBackend::Msl;
+            descriptor.code = std::move(code);
+            descriptor.resource_mapping = mapping;
+            return std::unique_ptr<ShaderBase>(renderer.createShader(descriptor));
+        };
+        const auto emit = [&](ShaderType type, DecompilerContext& context,
+                              GuestShaderState& state, ir::Module& module) {
+            analyzer::MemoryAnalyzer memory;
+            memory.setGeometry(context.tess_control || context.tess_eval);
+            memory.analyze(module);
+            std::vector<u8> code;
+            ResourceMapping mapping;
+            codegen::lang::msl::MslEmitter(context, memory, state, code, mapping)
+                .emit(module);
+            return make_shader(type, std::move(code), mapping);
+        };
+
+        // Vertex shader: a full screen triangle
+        std::unique_ptr<ShaderBase> vertex;
+        {
+            DecompilerContext context{};
+            context.type = ShaderType::Vertex;
+            context.geometry_capture = true;
+            GuestShaderState state{};
+            for (auto& attribute : state.vertex_attrib_states)
+                attribute.is_fixed = true;
+            state.geometry_capture = true;
+            ir::Module module;
+            ir::Builder b(module);
+            const auto vid =
+                ir::Value::createAttrMemory({RZ, SV_VERTEX_ID_BASE, true});
+            for (u32 component = 0; component < 2; ++component) {
+                const auto condition = b.opCompareEqual(
+                    vid, ir::Value::createConstant(component + 1));
+                b.opCopy(attr(SV_POSITION_BASE + component * 4, false),
+                         b.opSelect(condition, ir::Value::createConstantF(3.0f),
+                                    ir::Value::createConstantF(-1.0f)));
+            }
+            b.opExit();
+            vertex = emit(ShaderType::Vertex, context, state, module);
+        }
+        // Control shader (copies its control point, levels 4) or the copy
+        // function
+        std::unique_ptr<ShaderBase> control;
+        if (with_control) {
+            DecompilerContext context{};
+            context.type = ShaderType::Vertex;
+            context.tess_control = true;
+            context.tess.input_vertices = 3;
+            context.tess.output_vertices = 3;
+            GuestShaderState state{};
+            state.tessellation_patch_size = 3;
+            ir::Module module;
+            ir::Builder b(module);
+            b.opCopy(ir::Value::createRegister(8), b.opReadSystemRegister(0x11));
+            for (u32 c = 0; c < 4; c++)
+                b.opCopy(attr(SV_POSITION_BASE + c * 4, false),
+                         b.opCopy(attr(SV_POSITION_BASE + c * 4, true, 8)));
+            for (u32 level = 0; level < 6; level++)
+                b.opCopy(ir::Value::createAttrMemory(
+                             {RZ, level * 4u, false, RZ, true},
+                             ir::ScalarType::F32),
+                         ir::Value::createConstantF(4.0f));
+            b.opExit();
+            control = emit(ShaderType::TessControl, context, state, module);
+        } else {
+            const auto code = generateTessellationCopy(3);
+            ResourceMapping mapping;
+            mapping.tess_output_vertices = 3;
+            control = make_shader(ShaderType::TessControl,
+                                  std::vector<u8>(code.begin(), code.end()),
+                                  mapping);
+        }
+        // Evaluation shader: barycentric position, color from c0
+        std::unique_ptr<ShaderBase> evaluation;
+        {
+            DecompilerContext context{};
+            context.type = ShaderType::Vertex;
+            context.tess_eval = true;
+            context.tess.output_vertices = 3;
+            context.tess.domain = static_cast<u32>(tessellation::Domain::Triangle);
+            GuestShaderState state{};
+            state.depth_zero_to_one = true;
+            state.fragment_input_mask = 1;
+            ir::Module module;
+            ir::Builder b(module);
+            for (u32 point = 0; point < 3; point++)
+                b.opCopy(ir::Value::createRegister(static_cast<reg_t>(8 + point)),
+                         ir::Value::createConstantU(point));
+            const auto u = b.opCopy(attr(SV_TESS_COORD_BASE, true));
+            const auto v = b.opCopy(attr(SV_TESS_COORD_BASE + 4, true));
+            const auto w = b.opAdd(ir::Value::createConstantF(1.0f),
+                                   b.opNeg(b.opAdd(u, v)));
+            const std::array<ir::Value, 3> weights = {u, v, w};
+            for (u32 c = 0; c < 4; c++) {
+                ir::Value sum = ir::Value::createConstantF(0.0f);
+                for (u32 point = 0; point < 3; point++)
+                    sum = b.opAdd(sum,
+                                  b.opMultiply(weights[point],
+                                               b.opCopy(attr(
+                                                   SV_POSITION_BASE + c * 4, true,
+                                                   static_cast<reg_t>(8 + point)))));
+                b.opCopy(attr(SV_POSITION_BASE + c * 4, false), sum);
+                b.opCopy(attr(SV_USER_IN_OUT_BASE + c * 4, false),
+                         b.opCopy(ir::Value::createConstMemory(
+                             CMem(0, RZ, c * 4), ir::ScalarType::F32)));
+            }
+            b.opExit();
+            evaluation = emit(ShaderType::TessEvaluation, context, state, module);
+        }
+        const auto factor_code = generateTessellationFactors(
+            static_cast<u32>(tessellation::Domain::Triangle), with_control,
+            {4.0f, 4.0f, 4.0f, 4.0f, 4.0f, 4.0f});
+        auto factors = make_shader(
+            ShaderType::Vertex,
+            std::vector<u8>(factor_code.begin(), factor_code.end()), {});
+        const std::string fragment_code = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct In { float4 color [[user(locn0)]]; };
+fragment float4 main_(In in [[stage_in]]) { return in.color; }
+)";
+        auto fragment = make_shader(
+            ShaderType::Fragment,
+            std::vector<u8>(fragment_code.begin(), fragment_code.end()), {});
+
+        PipelineDescriptor pipeline_descriptor{};
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Vertex)] = vertex.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::Fragment)] = fragment.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::TessControl)] = control.get();
+        pipeline_descriptor.shaders[static_cast<u32>(ShaderType::TessEvaluation)] =
+            evaluation.get();
+        pipeline_descriptor.tessellation_factors = factors.get();
+        // Triangles, integer spacing, counterclockwise triangles
+        pipeline_descriptor.tessellation_parameters = 1 | (3u << 8);
+        pipeline_descriptor.tessellation_patch_size = 3;
+        pipeline_descriptor.color_target_states[0].format = TextureFormat::RGBA8Unorm;
+        pipeline_descriptor.color_target_states[0].write_mask = engines::ColorWriteMask::All;
+        pipeline_descriptor.depth_stencil_format = TextureFormat::Z32Float;
+        std::unique_ptr<PipelineBase> pipeline(
+            renderer.createPipeline(pipeline_descriptor));
+
+        const std::array<float, 4> color{0.25f, 0.75f, 0.5f, 1.0f};
+        std::unique_ptr<BufferBase> color_buffer(renderer.allocateTemporaryBuffer(16));
+        color_buffer->copyFrom(reinterpret_cast<uptr>(color.data()));
+
+        auto* cb = rig.commands.get();
+        command_ir::DrawCommand command;
+        command.pipeline = pipeline.get();
+        command.render_pass = rig.pass.get();
+        command.primitive = engines::PrimitiveType::Patches;
+        command.count = 3;
+        command.state.viewports.fill({0, 0, 4, 4, 0, 1});
+        command.state.scissors.fill(rig.full);
+        for (const u32 stage : {0u, 1u, 3u, 4u})
+            command.stages[stage].active = true;
+        command.stages[4].uniforms.push_back({0, BufferView(color_buffer.get())});
+        command_ir::captureDrawAddressSpace(renderer, command, nullptr);
+        expect(command_ir::sealDrawResources(renderer, command) &&
+                   command_ir::executeDraw(renderer, cb, command),
+               "A tessellated draw executes");
+        expect(renderer.synchronize(cb), "The tessellated draw completes");
+        auto* target = static_cast<metal::TextureView*>(
+            rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+        const auto pixels = readTexture(renderer.getDevice(), target, 4);
+        for (usize i = 0; i < 16; i++)
+            expect(pixels[i * 4] == 64 && pixels[i * 4 + 1] == 191 &&
+                       pixels[i * 4 + 2] == 128,
+                   with_control
+                       ? "The tessellated patch covers the target"
+                       : "Without a control shader the copied patch covers the "
+                         "target");
+    }
+    std::cout << "PASS: tessellated draw commands with and without a control "
+                 "shader\n";
+}
+
+// Guest Maxwell programs through the 3D engine: a geometry shader pipeline,
+// and tessellation with a control shader and with the copy function in its
+// place. Checks the engine selects the stages, captures the vertex shader and
+// that Metal builds the pipelines.
+void testEnginePipelineStages() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& engine = rig.engine;
+    constexpr u64 PRED_PT = 7ull << 16;
+    constexpr u64 RZ_A = 0xffull << 8;
+    const auto mov32i = [](u32 dst, u32 value) {
+        return 0x0100000000000000ull | (u64(value) << 20) | (0xfull << 12) |
+               PRED_PT | dst;
+    };
+    const auto ald = [](u32 dst, u32 address, u32 vertex) {
+        return 0xefd8000000000000ull | (3ull << 47) | (u64(vertex) << 39) |
+               (u64(address) << 20) | PRED_PT | RZ_A | dst;
+    };
+    const auto ast = [](u32 address, u32 src, bool patch = false,
+                        u64 size = 3) {
+        return 0xeff0000000000000ull | (size << 47) | (0xffull << 39) |
+               (patch ? 1ull << 31 : 0) | (u64(address) << 20) | PRED_PT |
+               RZ_A | src;
+    };
+    const u64 s2r_invocation = 0xf0c8000000000000ull | (0x11ull << 20) |
+                               PRED_PT | 8;
+    const u64 out_emit = 0xfbe0000000000000ull | (1ull << 39) |
+                         (0xffull << 20) | PRED_PT | RZ_A | 11;
+    const u64 exit = 0xe30000000007000full;
+    // Program header type (1 VS, 2 TCS, 3 TES, 4 GS, 5 PS) and fields
+    const auto binary = [&](u32 type, std::map<u32, u32> header_words,
+                            std::vector<u64> instructions) {
+        std::vector<u32> header(0x50 / 4, 0);
+        header[0] = 1 | (3u << 5) | (type << 10);
+        for (const auto& [index, value] : header_words)
+            header[index] |= value;
+        std::vector<u8> bytes(reinterpret_cast<const u8*>(header.data()),
+                              reinterpret_cast<const u8*>(header.data()) + 0x50);
+        for (usize i = 0; i < instructions.size(); i++) {
+            if (i % 3 == 0) {
+                const u64 sched = 0x001f8000fc0007e0ull;
+                bytes.insert(bytes.end(), reinterpret_cast<const u8*>(&sched),
+                             reinterpret_cast<const u8*>(&sched) + 8);
+            }
+            bytes.insert(bytes.end(),
+                         reinterpret_cast<const u8*>(&instructions[i]),
+                         reinterpret_cast<const u8*>(&instructions[i]) + 8);
+        }
+        bytes.resize(0x1000, 0);
+        return bytes;
+    };
+    const u32 one = std::bit_cast<u32>(1.0f);
+    const u32 four = std::bit_cast<u32>(4.0f);
+    std::vector<u8> code;
+    const auto append = [&](std::vector<u8> program) {
+        code.insert(code.end(), program.begin(), program.end());
+    };
+    // 0x0000 vertex shader: a constant position
+    append(binary(1, {}, {mov32i(0, 0), mov32i(1, 0), mov32i(2, 0),
+                          mov32i(3, one), ast(0x70, 0), exit}));
+    // 0x1000 geometry shader: passes the triangle through
+    {
+        std::vector<u64> instructions = {mov32i(8, 0), mov32i(9, 1), mov32i(10, 2)};
+        for (u32 v = 0; v < 3; v++) {
+            instructions.push_back(ald(0, 0x70, 8 + v));
+            instructions.push_back(ast(0x70, 0));
+            instructions.push_back(out_emit);
+        }
+        instructions.push_back(exit);
+        append(binary(4, {{2, 1u << 24}, {3, 7u << 24}, {4, 3}}, instructions));
+    }
+    // 0x2000 control shader: copies its control point, levels 4
+    {
+        std::vector<u64> instructions = {s2r_invocation, ald(0, 0x70, 8),
+                                         ast(0x70, 0), mov32i(4, four)};
+        for (u32 level = 0; level < 6; level++)
+            instructions.push_back(ast(level * 4, 4, true, 0));
+        instructions.push_back(exit);
+        append(binary(2, {{2, 3u << 24}}, instructions));
+    }
+    // 0x3000 evaluation shader: the first control point's position
+    append(binary(3, {}, {mov32i(8, 0), ald(0, 0x70, 8), ast(0x70, 0), exit}));
+    // 0x4000 fragment shader: a constant color to render target 0
+    append(binary(5, {{0x48 / 4, 0xf}},
+                  {mov32i(0, one), mov32i(1, 0), mov32i(2, 0), mov32i(3, one),
+                   exit}));
+
+    constexpr u64 REGION = 0x40000000;
+    rig.gmmu.map(REGION, {reinterpret_cast<uptr>(code.data()), code.size()});
+    engines::ThreeDTestAccess::colorTarget(
+        engine, reinterpret_cast<uptr>(rig.image_memory.data()));
+    engines::ThreeDTestAccess::fixedAttributes(engine);
+    using engines::ShaderStage;
+    const auto program = [&](ShaderStage stage, u32 offset, bool enable = true) {
+        engines::ThreeDTestAccess::program(engine, stage, REGION, offset, enable);
+    };
+    program(ShaderStage::VertexB, 0x0);
+    program(ShaderStage::Fragment, 0x4000);
+    const auto vertex_capture = [](const PipelineDescriptor& descriptor) {
+        const auto* vertex =
+            descriptor.shaders[static_cast<u32>(ShaderType::Vertex)];
+        return vertex != nullptr &&
+               vertex->getDescriptor().resource_mapping.capture_buffer_index !=
+                   invalid<u32>();
+    };
+
+    // VertexA: the vertex shader continues the program at 0x0
+    engines::ThreeDTestAccess::primitive(engine, engines::PrimitiveType::Triangles);
+    program(ShaderStage::VertexA, 0x0);
+    {
+        auto* pipeline = engines::ThreeDTestAccess::pipeline(engine);
+        expect(pipeline != nullptr, "The VertexA pipeline is created");
+        const auto& vertex_code = pipeline->getDescriptor()
+                                      .shaders[static_cast<u32>(ShaderType::Vertex)]
+                                      ->getDescriptor()
+                                      .code;
+        const std::string source(vertex_code.begin(), vertex_code.end());
+        expect(source.find("Block_vertex_a") != std::string::npos,
+               "The vertex shader runs the VertexA program first");
+    }
+    program(ShaderStage::VertexA, 0x0, false);
+    {
+        auto* pipeline = engines::ThreeDTestAccess::pipeline(engine);
+        const auto& vertex_code = pipeline->getDescriptor()
+                                      .shaders[static_cast<u32>(ShaderType::Vertex)]
+                                      ->getDescriptor()
+                                      .code;
+        expect(std::string(vertex_code.begin(), vertex_code.end())
+                       .find("Block_vertex_a") ==
+                   std::string::npos,
+               "Without VertexA the vertex shader is the program alone");
+    }
+
+    // Geometry shader
+    program(ShaderStage::Geometry, 0x1000);
+    {
+        auto* pipeline = engines::ThreeDTestAccess::pipeline(engine);
+        expect(pipeline != nullptr, "The geometry pipeline is created");
+        const auto& descriptor = pipeline->getDescriptor();
+        const auto* geometry =
+            descriptor.shaders[static_cast<u32>(ShaderType::Geometry)];
+        expect(geometry != nullptr && descriptor.geometry_passthrough != nullptr &&
+                   vertex_capture(descriptor),
+               "The engine runs the geometry shader with a capturing vertex "
+               "shader and a passthrough");
+        expect(geometry->getDescriptor().resource_mapping.unsupported.empty() &&
+                   geometry->getDescriptor().resource_mapping.geometry_output == 7,
+               "The guest geometry shader decompiles completely");
+        expect(static_cast<metal::Pipeline*>(pipeline)->hasGeometry(),
+               "Metal builds the geometry pipeline states");
+    }
+    program(ShaderStage::Geometry, 0x1000, false);
+
+    // Tessellation: triangles, integer spacing, counterclockwise, 3 points
+    engines::ThreeDTestAccess::primitive(engine, engines::PrimitiveType::Patches);
+    engines::ThreeDTestAccess::raw(engine, 0x320 / 4, 1 | (3u << 8));
+    engines::ThreeDTestAccess::raw(engine, 0xdcc / 4, 3);
+    for (u32 i = 0; i < 6; i++)
+        engines::ThreeDTestAccess::raw(engine, 0x324 / 4 + i, four);
+    program(ShaderStage::TessEval, 0x3000);
+    for (const bool with_control : {true, false}) {
+        program(ShaderStage::TessCtrl, 0x2000, with_control);
+        auto* pipeline = engines::ThreeDTestAccess::pipeline(engine);
+        expect(pipeline != nullptr, "The tessellation pipeline is created");
+        const auto& descriptor = pipeline->getDescriptor();
+        const auto* control =
+            descriptor.shaders[static_cast<u32>(ShaderType::TessControl)];
+        const auto* evaluation =
+            descriptor.shaders[static_cast<u32>(ShaderType::TessEvaluation)];
+        expect(control != nullptr && evaluation != nullptr &&
+                   descriptor.tessellation_factors != nullptr &&
+                   descriptor.tessellation_patch_size == 3 &&
+                   vertex_capture(descriptor),
+               "The engine tessellates patches with a capturing vertex shader");
+        expect(control->getDescriptor().resource_mapping.tess_output_vertices == 3,
+               with_control ? "The control shader outputs 3 control points"
+                            : "The copy function stands in for the control "
+                              "shader");
+        expect(evaluation->getDescriptor().resource_mapping.unsupported.empty() &&
+                   control->getDescriptor().resource_mapping.unsupported.empty(),
+               "The guest tessellation shaders decompile completely");
+        expect(static_cast<metal::Pipeline*>(pipeline)->hasTessellation(),
+               "Metal builds the tessellation pipeline states");
+    }
+    std::cout << "PASS: the engine builds VertexA, geometry and tessellation "
+                 "pipelines from guest programs\n";
+}
+
+// SET_FRONT_POLYGON_MODE LINE draws triangle edges only (Metal fill mode)
+void testPolygonLines() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& renderer = rig.renderer;
+    auto& engine = rig.engine;
+    expect(!engines::ThreeDTestAccess::drawState(engine).polygon_lines,
+           "Polygons fill at power on");
+    engine.method(0xdac / 4, 0x1b01);
+    expect(engines::ThreeDTestAccess::drawState(engine).polygon_lines,
+           "FRONT_POLYGON_MODE LINE selects line fill");
+    engine.method(0xdac / 4, 0x1b02);
+
+    // A full screen triangle drawn as lines leaves the inside empty
+    auto* commands = static_cast<metal::CommandBuffer*>(rig.commands.get());
+    renderer.setClearState({.rect = rig.full});
+    renderer.clearColor(commands, 0, 0, 0xf, simd::uint4{});
+    renderer.setDepthTestEnabled(false);
+    renderer.setPolygonLines(true);
+    renderer.draw(commands, engines::PrimitiveType::Triangles, 0, 3, 0, 1);
+    renderer.setPolygonLines(false);
+    expect(renderer.synchronize(commands), "The line draw completes");
+    auto* color = static_cast<metal::TextureView*>(
+        rig.pass->getDescriptor().color_targets[0].texture)->getTexture();
+    const auto pixels = readTexture(renderer.getDevice(), color, 4);
+    // The rig's triangle is (-1,-1) (3,-1) (-1,3): pixel (1,1) is inside,
+    // away from every edge
+    const u8* inside = &pixels[(1 * 4 + 1) * 4];
+    expect(inside[0] == 0 && inside[3] == 0,
+           "Line fill leaves the inside of the triangle untouched");
+    std::cout << "PASS: polygon mode LINE draws triangle edges\n";
+}
+
+// SET_SURFACE_CLIP (0xff4/0xff8) clips draws and clears with the scissor
+void testSurfaceClip() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    const auto same = [](MTL::ScissorRect a, MTL::ScissorRect b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width &&
+               a.height == b.height;
+    };
+    // Unset (zero size): no clip
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(0, 0, 0xffff, 0xffff)),
+           "Without a surface clip the disabled scissor covers everything");
+    engine.method(0x3fd, 0u | (64u << 16)); // x 0, width 64
+    engine.method(0x3fe, 0u | (32u << 16)); // y 0, height 32
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(0, 0, 64, 32)),
+           "The surface clip bounds draws without a scissor");
+    expect(same(engines::ThreeDTestAccess::clearRect(engine),
+                MTL::ScissorRect(0, 0, 64, 32)),
+           "The surface clip bounds clears");
+    // Scissor 0: enable, x 48..96, y 8..16
+    engine.method(0x380, 1);
+    engine.method(0x381, 48u | (96u << 16));
+    engine.method(0x382, 8u | (16u << 16));
+    expect(same(engines::ThreeDTestAccess::scissor(engine, 0),
+                MTL::ScissorRect(48, 8, 16, 8)),
+           "Draws use the intersection of the scissor and the surface clip");
+    std::cout << "PASS: surface clip bounds draws and clears\n";
+}
+
+// SET_SAMPLER_BINDING (0x48d) and SET_SINGLE_CT_WRITE_CONTROL (0x3e4)
+void testSamplerBindingAndCommonWriteMask() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& engine = gpu.get3DEngine();
+    // TIC 0x123, TSC 0x45
+    constexpr u32 HANDLE = 0x123 | (0x45u << 20);
+    engine.method(0x48d, 0);
+    expect(engines::ThreeDTestAccess::samplerIndex(engine, HANDLE) == 0x45,
+           "Independent sampler binding takes the handle's sampler index");
+    engine.method(0x48d, 1);
+    expect(engines::ThreeDTestAccess::samplerIndex(engine, HANDLE) == 0x123,
+           "Sampler binding via the header uses the texture header index");
+    engine.method(0x48d, 0);
+
+    engines::ThreeDTestAccess::setColorWriteMask(engine, 0, engines::ColorWriteMask::Red);
+    engines::ThreeDTestAccess::setColorWriteMask(engine, 2, engines::ColorWriteMask::None);
+    engine.method(0x3e4, 0);
+    expect(engines::ThreeDTestAccess::colorWriteMask(engine, 2) == engines::ColorWriteMask::None,
+           "Per-target write masks apply without the common control");
+    engine.method(0x3e4, 1);
+    expect(engines::ThreeDTestAccess::colorWriteMask(engine, 2) == engines::ColorWriteMask::Red,
+           "The common write control applies mask 0 to every target");
+    std::cout << "PASS: sampler binding via header and common color write mask\n";
+}
+
 void testConditionalRendering() {
     NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
     Gpu gpu;
@@ -2861,14 +3903,18 @@ void testConditionalRendering() {
     expect(!engine.shouldExecute(), "FALSE rendering mode disables execution");
     engine.method(0x556, 1);
     expect(engine.shouldExecute(), "TRUE rendering mode enables execution");
+    // Conditional (RES_NON_ZERO) tests the 64-bit report value: an occlusion
+    // count has a zero high word
     engine.method(0x556, 2);
-    expect(engine.shouldExecute(), "Conditional mode requires both initial words nonzero");
-    compare[0] = 0;
-    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial sequence");
-    compare[0] = 5;
+    expect(engine.shouldExecute(), "Conditional mode renders for a nonzero value");
     compare[1] = 0;
-    expect(!engine.shouldExecute(), "Conditional mode rejects a zero initial mode");
+    expect(engine.shouldExecute(),
+           "Conditional mode renders for a count below 2^32 (high word zero)");
+    compare[0] = 0;
+    expect(!engine.shouldExecute(), "Conditional mode rejects a zero value");
     compare[1] = 1;
+    expect(engine.shouldExecute(), "Conditional mode renders for a count of 2^32");
+    compare[0] = 5;
     engine.method(0x556, 3);
     expect(engine.shouldExecute(), "RENDER_IF_EQUAL compares both report words");
     compare[5] = 2;
@@ -2885,6 +3931,21 @@ void testConditionalRendering() {
     engine.method(0x651, 1);
     expect(engine.shouldExecute(), "ALWAYS override wins over FALSE mode");
     engine.method(0x651, 0);
+    // SET_GLOBAL_RENDER_ENABLE_C (0x138): on at power on, both conditions
+    // have to pass
+    engine.method(0x556, 1);
+    expect(engine.shouldExecute(), "The global render enable is on at power on");
+    engine.method(0x4e, 0);
+    expect(!engine.shouldExecute(), "Global FALSE disables execution");
+    engine.method(0x4c, static_cast<u32>(ADDRESS >> 32));
+    engine.method(0x4d, static_cast<u32>(ADDRESS));
+    engine.method(0x4e, 2);
+    expect(engine.shouldExecute(), "Global conditional mode reads its report");
+    compare[0] = compare[1] = 0;
+    expect(!engine.shouldExecute(), "Global conditional mode rejects a zero value");
+    compare[0] = 5;
+    compare[1] = 1;
+    engine.method(0x4e, 1);
     engine.method(0x556, 3);
     gmmu.unmap(ADDRESS + 12);
     expect(!engine.shouldExecute(), "Incomplete comparison data safely disables execution");
@@ -3087,6 +4148,25 @@ void checkPrimitiveRestart(engines::IndexType input_type) {
         expect(primitive == P::TriangleStrip && count == source.size() &&
                    read(native_restart) == std::vector<u32>({1, 2, maximum, 3, 4}),
                "Fixed U16/U32 restart uses the native Metal strip path");
+    // Geometry shaders and tessellation read the indices themselves: no
+    // restart index may reach them
+    descriptor.expand_restart = true;
+    expect(!decode().isValid() && count == 0,
+           "Expanded restart decodes the strips, dropping those too short "
+           "around the cut");
+    source = {1, 2, 3, static_cast<T>(~T{0}), 4, 5, 6};
+    descriptor.mem_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T));
+    descriptor.count = static_cast<u32>(source.size());
+    if (sizeof(T) > 1)
+        expect(read(decode()) == std::vector<u32>({1, 2, 3, 4, 5, 6}) &&
+                   primitive == P::Triangles,
+               "Expanded restart gives the triangles of each strip as a list");
+    descriptor.expand_restart = false;
+    source = {1, 2, static_cast<T>(~T{0}), 3, 4};
+    descriptor.mem_range = ztd::Range<uptr>::fromSize(
+        reinterpret_cast<uptr>(source.data()), source.size() * sizeof(T));
+    descriptor.count = static_cast<u32>(source.size());
     descriptor.restart_index = 0xffffffff;
     if (sizeof(T) < sizeof(u32))
         expect(read(decode()).size() == 9,
@@ -3141,7 +4221,18 @@ void testInlineIndices() {
     expect(PerfStats::instance().draws.load() == before + 2 &&
                engine.getRegs().vertex_array_start == 7,
            "DRAW_AUTO submits byte count divided by stride from vertex zero");
-    std::cout << "PASS: inline indices, restart registers and DRAW_AUTO fallback\n";
+    // DRAW_ZERO_INDEX (0x304): one draw of count vertices
+    engine.method(0xc1, 5);
+    expect(PerfStats::instance().draws.load() == before + 3,
+           "DRAW_ZERO_INDEX submits one draw");
+    // DRAW_VERTEX_ARRAY_BEGIN_END_INSTANCE topology is 4 bits (31:28)
+    const auto primitive_before = engine.getRegs().begin.primitive_type;
+    engine.method(0x485, 3u | (4u << 16) | (8u << 28));
+    expect(PerfStats::instance().draws.load() == before + 4 &&
+               engine.getRegs().begin.primitive_type == primitive_before,
+           "Compact array draws decode QUAD_STRIP and restore the topology");
+    std::cout << "PASS: inline indices, restart registers, DRAW_AUTO fallback "
+                 "and DRAW_ZERO_INDEX\n";
 }
 
 void testClippedBlitRegions() {
@@ -3513,6 +4604,97 @@ void testDmaCopies() {
     tls_crnt_gmmu = nullptr;
     std::cout << "PASS: DMA block linear copies, semaphores and launches "
                  "without transfers\n";
+}
+
+// A DMA copy out of a render target (UE4 reads its exposure back this way)
+// runs on the GPU in stream order: nothing waits for the GPU and the texture
+// is not read back, the bytes and the semaphore land once the GPU copied
+void testDmaCopyOfRenderedTexture() {
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    // Page aligned: the copy writes guest memory through a Metal buffer
+    constexpr usize SIZE = 0x10000;
+    auto* memory = static_cast<u8*>(std::aligned_alloc(0x4000, SIZE));
+    std::memset(memory, 0xee, SIZE);
+    GMmu gmmu(nullptr);
+    constexpr uptr BASE = 0x200000;
+    gmmu.map(BASE, {reinterpret_cast<uptr>(memory), SIZE});
+    tls_crnt_gmmu = &gmmu;
+    auto& renderer = gpu.getRenderer();
+    std::unique_ptr<renderer::ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+
+    // A 1x1 RGBA32F render target the GPU cleared
+    constexpr uptr SOURCE = 0x0, TARGET = 0x4000, SEMAPHORE = 0x8000;
+    const auto source_ptr = reinterpret_cast<uptr>(memory + SOURCE);
+    auto* target_view = renderer.getTextureCache().find(
+        commands.get(),
+        renderer::TextureDescriptor(source_ptr, MTL::TextureType2D,
+                                    renderer::TextureFormat::RGBA32Float, false,
+                                    0, 1, 1, 1, 1, 1, 0, 0, 0),
+        renderer::TextureUsage::Write);
+    expect(target_view != nullptr, "The render target is cached");
+    {
+        auto* texture = static_cast<renderer::metal::Texture*>(target_view->getBase())
+                            ->getTexture();
+        NS_STACK_SCOPED auto pass = MTL::RenderPassDescriptor::alloc()->init();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(texture);
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setClearColor(MTL::ClearColor::Make(0.25, 0.5, 0.75, 1.0));
+        attachment->setStoreAction(MTL::StoreActionStore);
+        auto* metal_commands = static_cast<renderer::metal::CommandBuffer*>(commands.get());
+        metal_commands->getRenderCommandEncoder(pass);
+        metal_commands->endEncoding();
+    }
+
+    gpu.subchannelMethod(0, 0, 0xb0b5);
+    const auto method = [&](u32 index, u32 arg) {
+        gpu.subchannelMethod(0, index, arg);
+    };
+    method(0x100, 0);
+    method(0x101, static_cast<u32>(BASE + SOURCE));
+    method(0x102, 0);
+    method(0x103, static_cast<u32>(BASE + TARGET));
+    method(0x104, 16); // pitch in
+    method(0x105, 16); // pitch out
+    method(0x106, 16); // line length (bytes)
+    method(0x107, 1);
+    // Source: one GOB block, 16 bytes x 1 row
+    method(0x1ca, 0);
+    method(0x1cb, 16);
+    method(0x1cc, 1);
+    method(0x1cd, 1);
+    method(0x1ce, 0);
+    method(0x1cf, 0);
+    method(0x90, 0);
+    method(0x91, static_cast<u32>(BASE + SEMAPHORE));
+    method(0x92, 0x600du);
+    // Pipelined, block linear to pitch (DST_MEMORY_LAYOUT bit 8), one word
+    // semaphore release
+    method(0xc0, 1u | (1u << 3) | (1u << 8));
+
+    // Nothing was submitted yet: a copy on the CPU would have read the
+    // texture back and written both already
+    u32 word;
+    std::memcpy(&word, memory + SEMAPHORE, sizeof(word));
+    expect(memory[TARGET] == 0xee && word == 0xeeeeeeeeu,
+           "The copy and its semaphore wait for the GPU");
+    expect(memory[SOURCE] == 0xee, "The render target is not read back");
+
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    renderer.drainReports();
+    std::array<f32, 4> texel{};
+    std::memcpy(texel.data(), memory + TARGET, sizeof(texel));
+    std::memcpy(&word, memory + SEMAPHORE, sizeof(word));
+    expect(texel == std::array<f32, 4>{0.25f, 0.5f, 0.75f, 1.0f},
+           "The GPU copies the rendered texel to guest memory");
+    expect(memory[TARGET + 16] == 0xee, "The copy writes only its line");
+    expect(word == 0x600du, "The semaphore is released after the copy");
+    tls_crnt_gmmu = nullptr;
+    std::free(memory);
+    std::cout << "PASS: DMA copies of rendered textures run on the GPU\n";
 }
 
 // 2D fixed point coordinates are signed 32.32
@@ -4088,11 +5270,23 @@ void testChannelMethodsAndFences() {
         static_cast<renderer::metal::CommandBuffer*>(reference_commands.get())
             ->getBlitCommandEncoder()->fillBuffer(reference_buffer, NS::Range(0, 16), 0x7b);
         tls_crnt_command_buffer = reference_commands.get();
+        // dev_pbdma SET_REF: Host waits for idle before the reference. Nothing
+        // reads it, so the wait moves to the next guest memory write.
         method(0x14, 0x12345678);
-        tls_crnt_command_buffer = nullptr;
         expect(gpu.channelContext().puller_regs[0x14] == 0x12345678 &&
-                   static_cast<const u8*>(reference_buffer->contents())[15] == 0x7b,
-               "SET_REFERENCE publishes its value after preceding GPU work completes");
+                   gpu.channelContext().idle_pending,
+               "SET_REFERENCE records its value and defers the idle wait");
+        set_address(0x40);
+        method(0x6, 0x5151u);
+        // Four byte release without RELEASE_WFI
+        method(0x7, 0x2u | (1u << 20) | (1u << 24));
+        tls_crnt_command_buffer = nullptr;
+        u32 released;
+        std::memcpy(&released, memory.data() + 0x40, sizeof(released));
+        expect(released == 0x5151u &&
+                   static_cast<const u8*>(reference_buffer->contents())[15] == 0x7b &&
+                   !gpu.channelContext().idle_pending,
+               "A release after SET_REFERENCE lands after preceding GPU work completes");
     }
 
     set_address(0x80);
@@ -4757,6 +5951,10 @@ void testGpuWorkTracker() {
 }
 
 int main(int argc, char** argv) {
+    // Exercise the draw queue (opt-in in production) unless the run asks
+    // for synchronous encoding
+    if (std::getenv("HYDRA_SYNC_ENCODE") == nullptr)
+        setenv("HYDRA_ASYNC_ENCODE", "1", 0);
     if (argc == 2 && std::string_view(argv[1]) == "--gpu-work-tracker") {
         // Statistics are only collected with HYDRA_PERF_STATS
         expect(hydra::hw::tegra_x1::gpu::PerfStats::isEnabled(),
@@ -4826,15 +6024,20 @@ int main(int argc, char** argv) {
         testDrawCommands();
         testDrawResourceValidation();
         testDrawContentVersions();
+        testDrawQueueOrder();
         testClearAndCopyCommands();
         testComputeCommandsAndCapture();
         testCaptureAndReplay();
         testBufferTextureContents();
+        testMultisampleGuestRoundTrip();
+        testMultisampleRendering();
         if (std::getenv("HYDRA_GPU_BENCH"))
             benchmarkCommands();
         testDrawResourceLeases();
         testRenderTargetMappingMemo();
         testOcclusionReports();
+        testOcclusionKeepsRenderPass();
+        testAlphaToCoverage();
         testCompletionQueueOrder();
         testSubmissionSaturation();
         testManagedMetalSubmissions();
@@ -4844,6 +6047,12 @@ int main(int argc, char** argv) {
         testShaderInvalidationWaitsOnlyForGuestWrites();
         testReportSemaphoreReductionAndAcquire();
         testConditionalRendering();
+        testSamplerBindingAndCommonWriteMask();
+        testSurfaceClip();
+        testPolygonLines();
+        testGeometryDrawCommand();
+        testTessellationDrawCommand();
+        testEnginePipelineStages();
         testIndexDecoding();
         testPrimitiveRestart();
         testInlineIndices();
@@ -4853,6 +6062,7 @@ int main(int argc, char** argv) {
         testStorageWritesRefreshTextures();
         testInlineToMemory();
         testDmaCopies();
+        testDmaCopyOfRenderedTexture();
         testChannelMethodsAndFences();
         testTwoDFixedPoint();
         testExplicitAlphaBlendEquation();

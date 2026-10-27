@@ -181,6 +181,14 @@ struct TextureMem {
 };
 
 // TODO: destroy textures
+// DEBUG: the caller of the flush in progress on this thread, for readback
+// tracing
+struct TextureFlushOrigin {
+    const char* function{nullptr};
+    u32 line{0};
+};
+inline thread_local TextureFlushOrigin tls_texture_flush_origin{};
+
 class TextureCache {
   public:
     explicit TextureCache(IRenderer& renderer_) : renderer{renderer_} {}
@@ -204,7 +212,34 @@ class TextureCache {
     // Copies textures rendered by the GPU in the range back to guest memory,
     // waiting for the GPU. Engines that read guest memory directly (DMA
     // copies used for readbacks) would otherwise see stale data.
-    void flushMemory(ICommandBuffer* command_buffer, ztd::Range<uptr> range);
+    // `origin` and `line` name the caller for readback tracing
+    // (HYDRA_TRACE_TEXTURE_READBACK)
+    void flushMemory(ICommandBuffer* command_buffer, ztd::Range<uptr> range,
+                     const char* origin = __builtin_FUNCTION(),
+                     u32 line = __builtin_LINE());
+    // A DMA copy out of a block linear surface the GPU rendered: the copied
+    // texels of its texture are blitted to pitch rows of guest memory on the
+    // GPU, in stream order, instead of reading the texture back and copying
+    // on the CPU. False when the source is not exactly one such texture (the
+    // CPU path handles it then). The caller orders what the guest sees after
+    // the copy behind the GPU (queued writes).
+    struct RenderedCopySource {
+        uptr ptr;
+        // Row length (bytes) and height of the DMA surface
+        u32 stride;
+        u32 height;
+        u32 block_height_log2;
+        u32 block_depth_log2;
+        // The copied rectangle, horizontally in bytes
+        u32 x_bytes;
+        u32 y;
+        u32 line_bytes;
+        u32 rows;
+    };
+    bool copyRenderedToGuest(ICommandBuffer* command_buffer,
+                             const RenderedCopySource& src,
+                             ztd::Range<uptr> src_range, uptr dst_ptr,
+                             u64 dst_stride);
     // The range is about to be overwritten entirely by guest memory writes:
     // GPU writes to textures inside it are dropped instead of waiting for a
     // readback, textures only partially inside it are still flushed
@@ -252,7 +287,19 @@ class TextureCache {
     IRenderer& renderer;
 
     std::mutex mutex;
+    // Disjoint intervals, by their begin
     std::map<uptr, TextureMem> entries;
+
+    // The entries that intersect `range`, without visiting the others
+    template <typename F>
+    void forEachIntersecting(ztd::Range<uptr> range, F&& f) {
+        auto it = entries.upper_bound(range.getBegin());
+        if (it != entries.begin())
+            it--;
+        for (; it != entries.end() && it->first < range.getEnd(); it++)
+            if (it->second.range.intersects(range))
+                f(it->second);
+    }
     u64 epoch{0};
     // DEBUG: set around the first decode of a new render target, which then
     // uploads zeros instead of the guest memory contents (HYDRA_RT_ZERO_INIT)

@@ -83,6 +83,11 @@ typedef enum : uint32_t {
 } HydraFrameGeneration;
 
 typedef enum : uint32_t {
+    HYDRA_FRAME_GENERATION_RATE_VARIABLE,
+    HYDRA_FRAME_GENERATION_RATE_MULTIPLE,
+} HydraFrameGenerationRateMode;
+
+typedef enum : uint32_t {
     HYDRA_AUDIO_BACKEND_NULL,
     HYDRA_AUDIO_BACKEND_CUBEB,
 } HydraAudioBackend;
@@ -218,6 +223,9 @@ uint32_t* hydraConfigGetMetalApi();
 uint32_t* hydraConfigGetUpscalingFilter();
 uint32_t* hydraConfigGetFrameRateLimit();
 uint32_t* hydraConfigGetFrameGeneration();
+uint32_t* hydraConfigGetFrameGenerationRateMode();
+uint32_t* hydraConfigGetFrameGenerationTargetFps();
+uint32_t* hydraConfigGetFrameGenerationMultiplier();
 uint32_t* hydraConfigGetSharpening();
 bool* hydraConfigGetMetalHud();
 uint32_t* hydraConfigGetAudioBackend();
@@ -377,6 +385,9 @@ void hydraSystemProgressFrame(void* system, uint32_t width, uint32_t height,
 
 bool hydraSystemIsRunning(void* system);
 float hydraSystemGetLastDeltaTimeAverage(void* system);
+double hydraSystemGetPresentationFrameRate(void* system);
+float hydraSystemGetLastShownFps(void* system);
+float hydraSystemGetLastGeneratedFps(void* system);
 
 void hydraSystemTakeScreenshot(void* system);
 void hydraSystemCaptureGpuFrame(void* system);

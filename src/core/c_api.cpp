@@ -246,6 +246,19 @@ HYDRA_EXPORT uint32_t* hydraConfigGetFrameGeneration() {
         &hydra::CONFIG_INSTANCE.getFrameGeneration());
 }
 
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationRateMode() {
+    return reinterpret_cast<uint32_t*>(
+        &hydra::CONFIG_INSTANCE.getFrameGenerationRateMode());
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationTargetFps() {
+    return &hydra::CONFIG_INSTANCE.getFrameGenerationTargetFps();
+}
+
+HYDRA_EXPORT uint32_t* hydraConfigGetFrameGenerationMultiplier() {
+    return &hydra::CONFIG_INSTANCE.getFrameGenerationMultiplier();
+}
+
 HYDRA_EXPORT uint32_t* hydraConfigGetSharpening() {
     return &hydra::CONFIG_INSTANCE.getSharpening();
 }
@@ -942,6 +955,18 @@ HYDRA_EXPORT void hydraSystemProgressFrame(void* system, uint32_t width,
 
 HYDRA_EXPORT bool hydraSystemIsRunning(void* system) {
     return reinterpret_cast<hydra::System*>(system)->isRunning();
+}
+
+HYDRA_EXPORT double hydraSystemGetPresentationFrameRate(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getPresentationFrameRate();
+}
+
+HYDRA_EXPORT float hydraSystemGetLastShownFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastShownFps();
+}
+
+HYDRA_EXPORT float hydraSystemGetLastGeneratedFps(void* system) {
+    return reinterpret_cast<hydra::System*>(system)->getLastGeneratedFps();
 }
 
 HYDRA_EXPORT float hydraSystemGetLastDeltaTimeAverage(void* system) {

@@ -5,6 +5,33 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
+namespace {
+
+// DEBUG: HYDRA_EXPERIMENT_DONTCARE=color_load,depth_load,depth_store drops
+// those memory transfers to measure the bandwidth they cost. The picture is
+// wrong, it is not meant for playing.
+struct DontCareExperiment {
+    bool color_load{false};
+    bool depth_load{false};
+    bool depth_store{false};
+};
+
+const DontCareExperiment& getDontCareExperiment() {
+    static const DontCareExperiment experiment = [] {
+        DontCareExperiment result;
+        if (const char* env = std::getenv("HYDRA_EXPERIMENT_DONTCARE")) {
+            const std::string_view list(env);
+            result.color_load = list.contains("color_load");
+            result.depth_load = list.contains("depth_load");
+            result.depth_store = list.contains("depth_store");
+        }
+        return result;
+    }();
+    return experiment;
+}
+
+} // namespace
+
 RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
     : RenderPassBase(descriptor) {
     render_pass_descriptor = MTL::RenderPassDescriptor::alloc()->init();
@@ -13,11 +40,14 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
     // be set. Use the smallest layer count among all attachments.
     u32 array_length = invalid<u32>();
     const auto add_attachment = [&](MTL::Texture* texture) {
+        sample_count = static_cast<u32>(texture->sampleCount());
         array_length =
             std::min(array_length, getRenderTargetArrayLength(texture));
         width = std::min(width, static_cast<u32>(texture->width()));
         height = std::min(height, static_cast<u32>(texture->height()));
     };
+
+    const auto& experiment = getDontCareExperiment();
 
     // Color targets
     for (u32 i = 0; i < COLOR_TARGET_COUNT; i++) {
@@ -39,7 +69,9 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
                 static_cast<f64>(color_target.clear_data.color[2]),
                 static_cast<f64>(color_target.clear_data.color[3])));
         } else {
-            color_attachment->setLoadAction(MTL::LoadActionLoad);
+            color_attachment->setLoadAction(experiment.color_load
+                                                ? MTL::LoadActionDontCare
+                                                : MTL::LoadActionLoad);
         }
         color_attachment->setStoreAction(MTL::StoreActionStore);
     }
@@ -63,9 +95,13 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
                 depth_attachment->setClearDepth(
                     static_cast<f64>(depth_stencil_target.clear_data.depth));
             } else {
-                depth_attachment->setLoadAction(MTL::LoadActionLoad);
+                depth_attachment->setLoadAction(experiment.depth_load
+                                                    ? MTL::LoadActionDontCare
+                                                    : MTL::LoadActionLoad);
             }
-            depth_attachment->setStoreAction(MTL::StoreActionStore);
+            depth_attachment->setStoreAction(experiment.depth_store
+                                                 ? MTL::StoreActionDontCare
+                                                 : MTL::StoreActionStore);
         }
 
         // Stencil
@@ -82,14 +118,43 @@ RenderPass::RenderPass(const RenderPassDescriptor& descriptor)
                 stencil_attachment->setClearStencil(
                     depth_stencil_target.clear_data.stencil);
             } else {
-                stencil_attachment->setLoadAction(MTL::LoadActionLoad);
+                stencil_attachment->setLoadAction(experiment.depth_load
+                                                      ? MTL::LoadActionDontCare
+                                                      : MTL::LoadActionLoad);
             }
-            stencil_attachment->setStoreAction(MTL::StoreActionStore);
+            stencil_attachment->setStoreAction(experiment.depth_store
+                                                   ? MTL::StoreActionDontCare
+                                                   : MTL::StoreActionStore);
         }
     }
 
     if (array_length != invalid<u32>())
         render_pass_descriptor->setRenderTargetArrayLength(array_length);
+
+    // The sample positions of the guest pattern. With fewer samples on the
+    // host than the guest uses, the host count's standard pattern covers the
+    // pixel (the first samples of a larger pattern do not).
+    if (sample_count > 1) {
+        MTL::Device* mtl_device = nullptr;
+        for (u32 i = 0; i < COLOR_TARGET_COUNT && mtl_device == nullptr; i++)
+            if (auto* texture =
+                    render_pass_descriptor->colorAttachments()->object(i)->texture())
+                mtl_device = texture->device();
+        if (mtl_device == nullptr && render_pass_descriptor->depthAttachment()->texture())
+            mtl_device = render_pass_descriptor->depthAttachment()->texture()->device();
+        if (mtl_device != nullptr && mtl_device->areProgrammableSamplePositionsSupported()) {
+            auto layout = getMsaaLayout(descriptor.msaa_mode);
+            if (layout.samples != sample_count)
+                layout = getMsaaLayoutForSamples(sample_count);
+            std::array<MTL::SamplePosition, 16> positions{};
+            for (u32 i = 0; i < sample_count; i++) {
+                const auto [x, y] = getMsaaSamplePosition(layout, i);
+                positions[i] = MTL::SamplePosition(static_cast<f32>(x) / 16.0f,
+                                                   static_cast<f32>(y) / 16.0f);
+            }
+            render_pass_descriptor->setSamplePositions(positions.data(), sample_count);
+        }
+    }
 }
 
 RenderPass::~RenderPass() { render_pass_descriptor->release(); }

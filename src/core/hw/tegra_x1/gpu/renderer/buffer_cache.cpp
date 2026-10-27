@@ -150,7 +150,7 @@ void BufferCache::updateRangeHot2(ICommandBuffer* command_buffer,
     // constant buffers whose bytes did not change. Host-visible snapshots are
     // immutable: compare the invalidated bytes before allocating a replacement.
     // Bound the comparison to the small-buffer snapshot path.
-    if (entry.range.getSize() <= 64 * 1024) {
+    if (entry.range.getSize() <= BUFFER_SNAPSHOT_MAX_SIZE) {
         const auto previous = entry.buffer->getPtr();
         if (previous != 0 &&
             std::memcmp(reinterpret_cast<const void*>(range.getBegin()),

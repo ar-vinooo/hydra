@@ -112,7 +112,7 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                     // a later write back
                     if (storage.base->getDescriptor().getRange().intersects(
                             range))
-                        logTextureEvent(
+                        LOG_TEXTURE_EVENT(
                             "guest_overwrote_unflushed_gpu_data",
                             storage.base->getDescriptor(),
                             fmt::format("range={:#x}+{:#x}", range.getBegin(),
@@ -142,7 +142,7 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                             storage.base->getDescriptor().getRange().clampedTo(
                                 range));
                     storage.cpu_modified_timestamp = now;
-                    logTextureEvent("guest_modified",
+                    LOG_TEXTURE_EVENT("guest_modified",
                                     storage.base->getDescriptor(),
                                     fmt::format("range={:#x}+{:#x}",
                                                 range.getBegin(),
@@ -188,7 +188,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         bool fresh = false;
         storage.forEachFresh(storage_range,
                              [&](ztd::Range<uptr>) { fresh = true; });
-        logTextureEvent("reconcile_stale_render_target",
+        LOG_TEXTURE_EVENT("reconcile_stale_render_target",
                         storage.base->getDescriptor(),
                         fmt::format("fresh_parts_written_back={}", fresh));
         if (fresh)
@@ -256,7 +256,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                          storage.gpu_written_timestamp !=
                              TextureCacheTimePoint{});
         }
-        logTextureEvent(
+        LOG_TEXTURE_EVENT(
             "reload_from_guest", storage.base->getDescriptor(),
             fmt::format("forced={} mem_modified={} cpu_modified={} first={}",
                         force_reload,
@@ -326,7 +326,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                 for (const auto& previous : flushed)
                     candidate->markFlushed(previous);
             }
-            logTextureEvent("alias_via_guest", descriptor,
+            LOG_TEXTURE_EVENT("alias_via_guest", descriptor,
                             fmt::format("source={:#x} {} {}",
                                         source.base->getDescriptor().ptr,
                                         source.base->getDescriptor().type,
@@ -385,7 +385,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                                 candidate.base->getDescriptor().getRange()),
                             [&](ztd::Range<uptr>) { fresh = true; });
                         if (!fresh) {
-                            logTextureEvent(
+                            LOG_TEXTURE_EVENT(
                                 "alias_sync_skipped_stale_source",
                                 storage.base->getDescriptor(),
                                 fmt::format(
@@ -415,7 +415,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                 const auto other_range = other_descriptor.getRange();
 
                 if (range.intersects(other_range)) {
-                    logTextureEvent(
+                    LOG_TEXTURE_EVENT(
                         "alias_sync", descriptor,
                         fmt::format("source={:#x} {} {} written_ms_after_update={}",
                                     other_descriptor.ptr, other_descriptor.type,
@@ -623,7 +623,7 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                                  ztd::Range<uptr> range) {
     ScopedGpuWork work(GpuWork::Texture);
     const auto& descriptor = storage.base->getDescriptor();
-    logTextureEvent("writeback_to_guest", descriptor,
+    LOG_TEXTURE_EVENT("writeback_to_guest", descriptor,
                     fmt::format("range={:#x}+{:#x}", range.getBegin(),
                                 range.getSize()));
     // A partial readback does not make the rest of the GPU storage coherent.
@@ -660,11 +660,17 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
                       getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
         }
     }
-    // DEBUG: which textures are read back each frame (synchronous waits)
-    {
+    // Descriptor formatting and aggregation are diagnostics, not part of
+    // readback/coherence. Keep them off the normal CPU render path.
+    static const bool trace_readbacks =
+        std::getenv("HYDRA_TRACE_TEXTURE_READBACK") != nullptr;
+    if (trace_readbacks) {
         static std::map<std::string, u32> seen;
         static auto last = std::chrono::steady_clock::now();
-        seen[fmt::format("ptr={:#x} {} {}x{} lin={} lv={} ly={} range={:#x}+{:#x}", descriptor.ptr, descriptor.format,
+        const auto origin = tls_texture_flush_origin;
+        seen[fmt::format("from {}:{} ptr={:#x} {} {}x{} lin={} lv={} ly={} range={:#x}+{:#x}",
+                         origin.function ? origin.function : "?", origin.line,
+                         descriptor.ptr, descriptor.format,
                          descriptor.width, descriptor.height, descriptor.is_linear,
                          descriptor.level_count, descriptor.layer_count,
                          range.getBegin() - descriptor.ptr, range.getSize())]++;

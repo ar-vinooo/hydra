@@ -22,38 +22,6 @@ namespace hydra::hw::tegra_x1::cpu::hypervisor {
 
 namespace {
 
-inline ApFlags toApFlags(horizon::kernel::MemoryPermission perm) {
-    if (any(perm & horizon::kernel::MemoryPermission::Read)) {
-        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadWriteExecuteKernelReadWrite;
-            } else {
-                return ApFlags::UserReadWriteKernelReadWrite;
-            }
-        } else {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadExecuteKernelRead;
-            } else {
-                return ApFlags::UserReadKernelRead;
-            }
-        }
-    } else {
-        if (any(perm & horizon::kernel::MemoryPermission::Write)) {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserReadWriteExecuteKernelReadWrite; // TODO
-            } else {
-                return ApFlags::UserReadWriteKernelReadWrite; // TODO
-            }
-        } else {
-            if (any(perm & horizon::kernel::MemoryPermission::Execute)) {
-                return ApFlags::UserExecuteKernelRead; // TODO
-            } else {
-                return ApFlags::UserNoneKernelRead; // TODO
-            }
-        }
-    }
-}
-
 // TODO: this is a horrible way to handle this
 bool page_table_regions[16] = {false};
 
@@ -246,10 +214,9 @@ bool Mmu::trackWrite(ztd::Range<vaddr_t> range) {
 }
 
 void Mmu::flushTrackedPages() {
-    if (useStage1Tracking()) {
-        IMmu::flushTrackedPages();
+    // Stage 1 pages are rearmed with their invalidations, once per entry
+    if (useStage1Tracking())
         return;
-    }
     Stage2Tracker::instance().rearmWriteTracking();
 }
 

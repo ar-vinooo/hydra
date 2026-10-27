@@ -4,6 +4,7 @@
 #include "core/hw/tegra_x1/gpu/macro/driver_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_view.hpp"
 #include "core/hw/tegra_x1/gpu/command_ir/draw.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/shader_base.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer {
@@ -240,6 +241,12 @@ inline renderer::ShaderType toRendererShaderType(ShaderStage stage) {
         return renderer::ShaderType::Fragment;
     case ShaderStage::Compute:
         return renderer::ShaderType::Compute;
+    case ShaderStage::Geometry:
+        return renderer::ShaderType::Geometry;
+    case ShaderStage::TessCtrl:
+        return renderer::ShaderType::TessControl;
+    case ShaderStage::TessEval:
+        return renderer::ShaderType::TessEvaluation;
     default:
         ONCE(LOG_NOT_IMPLEMENTED(Engines, "Shader stage {}", stage));
         return renderer::ShaderType::Count;
@@ -400,7 +407,11 @@ struct Regs3D {
         bool volume;
     } depth_target_array_mode;
 
-    u32 padding_0x48d[0x26];
+    // 0x48d SET_SAMPLER_BINDING: bit 0 set means the sampler index is the
+    // texture header index (the handle's sampler bits are ignored)
+    u32 sampler_binding;
+
+    u32 padding_0x48e[0x25];
 
     // 0x4b3
     bool32 depth_test_enabled;
@@ -757,6 +768,16 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     void drawVertexElementsImpl(u32 count,
                                std::optional<ztd::Range<uptr>> inline_range);
     void drawAuto(const u32 index, const u32 byte_count);
+    void drawZeroIndex(const u32 index, const u32 count);
+    // DRAW_ZERO_INDEX's indices
+    std::shared_ptr<renderer::BufferBase> zero_indices;
+    // SET_CT_SELECT's target count, at most the 8 targets
+    u32 getColorTargetCount() const {
+        return std::min<u32>(regs.color_target_control.count,
+                             COLOR_TARGET_COUNT);
+    }
+    // A render enable condition (SET_RENDER_ENABLE_A, or the global one)
+    bool evaluateRenderEnable(u32 base_reg) const;
     void drawVertexArray(const u32 index, u32 count);
     void drawVertexElements(const u32 index, u32 count);
     // Draws with their topology, first vertex or index and count in the
@@ -799,6 +820,10 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     renderer::ITextureView*
     getColorTargetTexture(u32 render_target_index) const;
     renderer::ITextureView* getDepthStencilTargetTexture() const;
+    renderer::MsaaLayout getRenderTargetMsaaLayout() const;
+    // The TSC index of a texture handle (see SET_SAMPLER_BINDING)
+    u32 getSamplerIndex(u32 handle) const;
+    ColorWriteMask getColorWriteMask(u32 render_target_index) const;
 
     // Reads the handle a shader texture binding refers to
     std::optional<u32> readTextureHandle(u32 stage_index,
@@ -807,17 +832,42 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
     // DEBUG: frame tracer
     void traceDraw(const char* kind, u32 count, u32 first, u32 base_vertex);
     bool isHighlightedDraw() const;
+    static bool isProfilingDraws();
     void profileDraw(u32 count);
     void labelCaptureDraw(u32 count);
     u32 capture_draw_index{0};
 
     MTL::Viewport getViewport(u32 index);
     MTL::ScissorRect getScissor(u32 index);
+    // The scissor alone, without the surface clip
+    MTL::ScissorRect getScissorRect(u32 index);
     renderer::ShaderBase* getShaderUnchecked(ShaderStage stage) const;
     renderer::ShaderBase* getShader(ShaderStage stage,
                                     u32 fragment_input_mask = 0,
                                     u32 layer_output_addr = 0);
     u32 getGeometryLayerSource();
+    // Geometry shader emulation (see renderer/geometry.hpp)
+    bool useGeometryShader() const;
+    renderer::ShaderBase*
+    getGeometryPassthrough(const renderer::ShaderBase& geometry_shader,
+                           u32 fragment_input_mask);
+    // The current pipeline has an emulated geometry shader
+    bool geometry_active{false};
+    // Tessellation emulation (see renderer/tessellation.hpp)
+    bool useTessellation() const;
+    renderer::ShaderBase* getTessellationCopy(u32 patch_size);
+    renderer::ShaderBase* getTessellationFactors(u32 domain, bool from_patches,
+                                                 const std::array<f32, 6>& levels);
+    bool tessellation_active{false};
+    // Control points the control shader of the current pipeline outputs
+    u32 tessellation_control_points{0};
+    std::map<u32, std::unique_ptr<renderer::ShaderBase>> tessellation_copies;
+    std::map<std::tuple<u32, bool, std::array<u32, 6>>,
+             std::unique_ptr<renderer::ShaderBase>>
+        tessellation_factor_shaders;
+    std::map<std::tuple<u32, bool, bool, bool, u32, u32, u32, bool, bool, u32>,
+             std::unique_ptr<renderer::ShaderBase>>
+        geometry_passthroughs;
     renderer::PipelineBase* getPipeline();
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
     bool isVertexArrayInstanced(u32 vertex_array_index) const;

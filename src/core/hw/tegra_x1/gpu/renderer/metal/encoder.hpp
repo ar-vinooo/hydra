@@ -51,6 +51,17 @@ class RenderEncoder {
 
     void setVisibilityResultMode(MTL::VisibilityResultMode mode,
                                  NS::UInteger offset);
+    // Buffers vertex functions wrote are visible to the vertex functions of
+    // the following draws
+    void vertexBufferBarrier();
+    // Tessellation (Metal 3 only: Metal 4 encoders do not tessellate)
+    bool supportsTessellation() const { return mtl3 != nullptr; }
+    void setTessellationFactorBuffer(const MTL::Buffer* buffer,
+                                     NS::UInteger offset,
+                                     NS::UInteger instance_stride);
+    void drawPatches(NS::UInteger control_points, NS::UInteger patch_start,
+                     NS::UInteger patch_count, NS::UInteger instance_count,
+                     NS::UInteger base_instance);
 
     void drawPrimitives(MTL::PrimitiveType type, NS::UInteger vertex_start,
                         NS::UInteger vertex_count);

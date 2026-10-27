@@ -3,6 +3,8 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/blit_pipeline_cache.hpp"
 #include "common/config.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
+#include "core/hw/tegra_x1/gpu/display_stats.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
@@ -37,6 +39,13 @@ SurfaceCompositor::SurfaceCompositor(Renderer& renderer_,
 
 SurfaceCompositor::~SurfaceCompositor() { render_pass_descriptor->release(); }
 
+bool SurfaceCompositor::reusesPresentedFrame(bool new_frame) const {
+    // Frame generation shows the frames it holds until a new one arrives, the
+    // canvas is only read for new frames
+    return !new_frame && target != drawable->texture() &&
+           renderer.getFramePresenter().holdsFrames();
+}
+
 RenderEncoder*
 SurfaceCompositor::getEncoder(CommandBuffer* command_buffer) {
     auto* encoder = command_buffer->getRenderCommandEncoder(render_pass_descriptor);
@@ -58,6 +67,21 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
     auto texture_impl = static_cast<const TextureView*>(texture);
     const auto& descriptor = texture->getBase()->getDescriptor();
     const auto filter = CONFIG_INSTANCE.getUpscalingFilter();
+    ScopedPerfTimer encode_timer(PerfStats::instance().present_encode_ns,
+                                 PerfStats::isEnabled());
+    // Frame generation searches motion at the size the game rendered at
+    if (target != drawable->texture() && dst_rect.size.x() > 0.0f &&
+        dst_rect.size.y() > 0.0f)
+        renderer.getFramePresenter().setInputScale(
+            std::abs(src_rect.size.x()) / dst_rect.size.x(),
+            std::abs(src_rect.size.y()) / dst_rect.size.y());
+    if (PerfStats::isEnabled()) {
+        auto& stats = PerfStats::instance();
+        stats.present_input_width = static_cast<u32>(std::abs(src_rect.size.x()));
+        stats.present_input_height = static_cast<u32>(std::abs(src_rect.size.y()));
+        stats.present_output_width = static_cast<u32>(dst_rect.size.x());
+        stats.present_output_height = static_cast<u32>(dst_rect.size.y());
+    }
 
     // MetalFX scales the whole texture so that the source rectangle becomes
     // the size of the destination. The blit below then samples it 1:1 with the
@@ -121,12 +145,51 @@ void SurfaceCompositor::drawTexture(ICommandBuffer* command_buffer,
 void SurfaceCompositor::present(ICommandBuffer* command_buffer,
                                 bool new_frame) {
     auto command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
+    ScopedPerfTimer encode_timer(PerfStats::instance().present_encode_ns,
+                                 PerfStats::isEnabled());
+    if (PerfStats::isEnabled()) {
+        PerfStats::instance().presents++;
+        // Everything this command buffer holds is presentation work
+        command_buffer_impl->addCompletedHandler([](const GpuCompletion& done) {
+            if (!done.succeeded || done.gpu_end_time <= done.gpu_start_time)
+                return;
+            auto& stats = PerfStats::instance();
+            stats.present_gpu_ns += static_cast<u64>(
+                (done.gpu_end_time - done.gpu_start_time) * 1e9);
+            stats.present_gpu_count++;
+        });
+    }
 
-    getEncoder(command_buffer_impl);
-    command_buffer_impl->endEncoding();
-    if (target != drawable->texture())
-        renderer.getFramePresenter().present(
-            command_buffer_impl, drawable->texture(), new_frame);
+    // The canvas is cleared even when no layer drew, unless the presenter
+    // does not read it
+    if (!reusesPresentedFrame(new_frame)) {
+        getEncoder(command_buffer_impl);
+        command_buffer_impl->endEncoding();
+    }
+    // 0: a game frame shown for the first time, 1: generated, 2: repeated
+    int kind = new_frame ? 0 : 2;
+    if (target != drawable->texture()) {
+        auto& presenter = renderer.getFramePresenter();
+        presenter.present(command_buffer_impl, drawable->texture(), new_frame);
+        switch (presenter.lastShown()) {
+        case FramePresenter::Shown::GameFrame: kind = 0; break;
+        case FramePresenter::Shown::Generated: kind = 1; break;
+        case FramePresenter::Shown::Repeated: kind = 2; break;
+        }
+    }
+    // What the display really shows, from the drawable's presentation (the
+    // frame rate in the window title)
+    drawable->addPresentedHandler([kind](MTL::Drawable* shown) {
+        auto& stats = DisplayStats::instance();
+        if (shown->presentedTime() <= 0.0)
+            stats.dropped++;
+        else if (kind == 0)
+            stats.game_frames++;
+        else if (kind == 1)
+            stats.generated_frames++;
+        else
+            stats.repeated_frames++;
+    });
     command_buffer_impl->presentDrawable(drawable);
 }
 

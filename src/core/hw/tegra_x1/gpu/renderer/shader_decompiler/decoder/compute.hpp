@@ -28,6 +28,7 @@ void emitSuatom(DecoderContext& context, instruction_t inst);
 
 // Integer
 void emitCsetp(DecoderContext& context, instruction_t inst);
+void emitCset(DecoderContext& context, instruction_t inst);
 void emitR2p(DecoderContext& context, instruction_t inst, u32 variant);
 void emitLop3R(DecoderContext& context, instruction_t inst);
 void emitLop3C(DecoderContext& context, instruction_t inst);

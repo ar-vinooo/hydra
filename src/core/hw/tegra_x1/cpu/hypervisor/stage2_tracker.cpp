@@ -51,6 +51,10 @@ void Stage2Tracker::protectGpuWritten(ztd::Range<uptr> range) {
 }
 
 void Stage2Tracker::rearmWriteTracking() {
+    // Every draw checks this. Most draws have no new CPU writes and need not
+    // contend with fault handlers for the tracker mutex.
+    if (!has_written_pages.load(std::memory_order_acquire))
+        return;
     std::scoped_lock lock(mutex);
     for (const auto page : written_pages) {
         auto& state = pages[page];
@@ -60,6 +64,9 @@ void Stage2Tracker::rearmWriteTracking() {
         applyProtection(page, state);
     }
     written_pages.clear();
+    // Publish the empty state under the same lock used by fault handlers, so
+    // a concurrent write cannot have its pending notification cleared.
+    has_written_pages.store(false, std::memory_order_relaxed);
 }
 
 bool Stage2Tracker::handleFault(paddr_t address, bool is_write) {
@@ -99,6 +106,7 @@ bool Stage2Tracker::handleFault(paddr_t address, bool is_write) {
     if (is_write && state.write_tracked) {
         state.write_armed = false;
         written_pages.push_back(page);
+        has_written_pages.store(true, std::memory_order_release);
     }
     applyProtection(page, state);
     return true;

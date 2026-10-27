@@ -37,7 +37,7 @@ AppletResource::AppletResource(System& system)
 
 #undef NPAD_INTERNAL_STATE
 
-AppletResource::~AppletResource() { delete shared_mem; }
+AppletResource::~AppletResource() { shared_mem->release(); }
 
 void AppletResource::activateNpads(NpadRevision revision) {
     active = true;

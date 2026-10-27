@@ -166,6 +166,16 @@ void writeGuestAddr(const sockaddr_in& host, std::span<u8> out,
     out_size = static_cast<u32>(sizeof(addr));
 }
 
+// DEBUG: the first bytes of a datagram, for the online protocol
+std::string hexPrefix(std::span<const u8> data) {
+    std::string text;
+    for (usize i = 0; i < std::min<usize>(data.size(), 48); i++)
+        text += fmt::format("{:02x}", data[i]);
+    if (data.size() > 48)
+        text += "..";
+    return text;
+}
+
 std::string toString(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {};
     inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
@@ -537,6 +547,24 @@ CallResult HostSockets::recv(i32 fd, std::span<u8> buffer, i32 flags,
                                     &addr_size);
                             });
 
+    // DEBUG: datagram contents
+    if (!socket->is_stream && result.ret >= 0 &&
+        socket->logged_datagrams < 40) {
+        socket->logged_datagrams++;
+        LOG_INFO(Services, "Online: socket {} UDP recv {} bytes from {}: {}",
+                 fd, result.ret, toString(addr),
+                 hexPrefix(std::span<const u8>(buffer.data(),
+                                               static_cast<usize>(result.ret))));
+    }
+    if (result.ret > 0 && !socket->logged_receive) {
+        socket->logged_receive = true;
+        LOG_INFO(Services, "Online: socket {} ({}) received {} bytes from {}", fd,
+                 socket->is_stream ? "TCP" : "UDP", result.ret, toString(addr));
+    } else if (result.ret < 0 && result.error != E_AGAIN && result.error != E_INTR) {
+        LOG_WARN(Services, "Online: socket {} receive failed, errno {}", fd,
+                 result.error);
+    }
+
     // The server's answers to the title's HTTP requests
     if (socket->http && result.ret > 5 &&
         std::memcmp(buffer.data(), "HTTP/", 5) == 0) {
@@ -589,7 +617,7 @@ CallResult HostSockets::send(i32 fd, std::span<const u8> buffer, i32 flags,
     const int host_flags = ((flags & GUEST_MSG_OOB) ? MSG_OOB : 0) | SEND_FLAGS;
     const bool may_wait = (flags & GUEST_MSG_DONTWAIT) == 0 &&
                           (!socket->non_blocking || force_wait);
-    return run(*socket, POLLOUT, may_wait, socket->send_timeout_ms, [&] {
+    const auto result = run(*socket, POLLOUT, may_wait, socket->send_timeout_ms, [&] {
                    return host_addr
                               ? ::sendto(socket->host_fd, buffer.data(),
                                          buffer.size(), host_flags,
@@ -599,6 +627,18 @@ CallResult HostSockets::send(i32 fd, std::span<const u8> buffer, i32 flags,
                               : ::send(socket->host_fd, buffer.data(),
                                        buffer.size(), host_flags);
                });
+    if (result.ret < 0 && result.error != E_AGAIN && result.error != E_INTR)
+        LOG_WARN(Services, "Online: socket {} send failed, errno {}", fd,
+                 result.error);
+    // DEBUG: datagram contents
+    if (!socket->is_stream && socket->logged_datagrams < 40) {
+        socket->logged_datagrams++;
+        LOG_INFO(Services, "Online: socket {} UDP send {} bytes to {} -> {}: {}",
+                 fd, buffer.size(),
+                 host_addr ? toString(*host_addr) : std::string("connected peer"),
+                 result.ret, hexPrefix(buffer));
+    }
+    return result;
 }
 
 CallResult HostSockets::getSockName(i32 fd, std::span<u8> out_addr,
@@ -767,7 +807,7 @@ CallResult HostSockets::poll(std::span<u8> fds, i32 timeout_ms) {
     }
     host_fds[count] = pollfd{wake_pipe[0], POLLIN, 0};
 
-    const int ret = ::poll(host_fds.data(), host_fds.size(),
+    const int ret = ::poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()),
                            any_invalid ? 0 : timeout_ms);
     if (interrupted || host_fds[count].revents != 0)
         return {-1, E_INTR};
@@ -794,14 +834,14 @@ CallResult HostSockets::select(i32 nfds, std::span<u8> read_fds,
                                std::span<u8> except_fds, i64 timeout_ms) {
     const auto is_set = [](std::span<u8> set, i32 fd) {
         return static_cast<usize>(fd / 8) < set.size() &&
-               ((set[fd / 8] >> (fd % 8)) & 1) != 0;
+               ((set[static_cast<usize>(fd / 8)] >> (fd % 8)) & 1) != 0;
     };
     const auto set_bit = [](std::span<u8> set, i32 fd) {
-        set[fd / 8] |= static_cast<u8>(1 << (fd % 8));
+        set[static_cast<usize>(fd / 8)] |= static_cast<u8>(1 << (fd % 8));
     };
 
     const auto max_fd = static_cast<i32>(std::min<usize>(
-        std::max(nfds, 0),
+        static_cast<usize>(std::max(nfds, 0)),
         std::max({read_fds.size(), write_fds.size(), except_fds.size()}) * 8));
     std::vector<i32> guest_fds;
     std::vector<pollfd> host_fds;
@@ -823,7 +863,7 @@ CallResult HostSockets::select(i32 nfds, std::span<u8> read_fds,
     }
     host_fds.push_back(pollfd{wake_pipe[0], POLLIN, 0});
 
-    const int ret = ::poll(host_fds.data(), host_fds.size(),
+    const int ret = ::poll(host_fds.data(), static_cast<nfds_t>(host_fds.size()),
                            toPollTimeout(timeout_ms));
     if (interrupted || host_fds.back().revents != 0)
         return {-1, E_INTR};

@@ -34,6 +34,10 @@ TextureView::TextureView(Texture* base, const TextureViewDescriptor& descriptor)
         to_host_swizzle(descriptor.swizzle_channels.a));
 
     auto type = descriptor.type;
+    // Views of a multisampled texture are multisampled
+    if (base->getTexture()->sampleCount() > 1)
+        type = type == MTL::TextureType2DArray ? MTL::TextureType2DMultisampleArray
+                                               : MTL::TextureType2DMultisample;
 
     // Stencil views of combined depth stencil textures
     auto pixel_format = pixel_format_info.pixel_format;

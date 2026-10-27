@@ -18,6 +18,7 @@ class SurfaceCompositor final : public ISurfaceCompositor {
                      const ITextureView* texture, const FloatRect2D src_rect,
                      const FloatRect2D dst_rect, bool transparent,
                      f32 opacity) override;
+    bool reusesPresentedFrame(bool new_frame) const override;
     void present(ICommandBuffer* command_buffer, bool new_frame) override;
 
   private:

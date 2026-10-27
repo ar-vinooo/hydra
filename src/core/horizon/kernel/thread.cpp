@@ -3,7 +3,59 @@
 #include "core/debugger/debugger_manager.hpp"
 #include "core/horizon/kernel/process.hpp"
 
+#include <bit>
+
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 namespace hydra::horizon::kernel {
+
+namespace {
+
+#ifdef __APPLE__
+// Guest threads at this priority or lower (numerically higher) prefer the
+// efficiency cores, leaving the performance cores to the game's main threads
+// and the GPU thread. An M1 efficiency core is about as fast as a Tegra X1
+// core, so these threads still run at least at Switch speed. nn::os maps its
+// default priority 16 to 44 and its lowest, 31, to 59.
+// HYDRA_EFFICIENCY_CORE_PRIORITY overrides it (64 keeps every thread on the
+// performance cores).
+i32 getEfficiencyCorePriority() {
+    static const i32 threshold = [] {
+        if (const char* env = std::getenv("HYDRA_EFFICIENCY_CORE_PRIORITY"))
+            return static_cast<i32>(std::atoi(env));
+        return 52;
+    }();
+    return threshold;
+}
+
+qos_class_t getHostQos(i32 priority) {
+    if (priority <= 28)
+        return QOS_CLASS_USER_INTERACTIVE;
+    if (priority < getEfficiencyCorePriority())
+        return QOS_CLASS_USER_INITIATED;
+    return QOS_CLASS_UTILITY;
+}
+#endif
+
+} // namespace
+
+void IThread::applyHostScheduling() {
+#ifdef __APPLE__
+    // macOS only allows a thread to change its own QoS. Apple silicon has no
+    // core affinity, so the guest core mask stays a guest-visible property.
+    pthread_set_qos_class_self_np(getHostQos(getPriority()), 0);
+#endif
+}
+
+u32 IThread::getCurrentCore() const {
+    const auto mask = getAffinityMask();
+    const auto core = getIdealCore();
+    if (core >= 0 && core < CPU_CORE_COUNT && (mask & (1ull << core)) != 0)
+        return static_cast<u32>(core);
+    return mask != 0 ? static_cast<u32>(std::countr_zero(mask)) : 0;
+}
 
 IThread::~IThread() noexcept { stopAndJoin(); }
 
@@ -24,6 +76,8 @@ void IThread::start() {
         process->registerThread(this);
     thread = std::jthread([&] {
         tls_current_thread = this;
+        host_scheduling_dirty.store(false, std::memory_order_relaxed);
+        applyHostScheduling();
 
         GET_CURRENT_PROCESS_DEBUGGER().registerThisThread(getDebugName());
 
@@ -42,6 +96,11 @@ void IThread::start() {
 bool IThread::processMessages(i64 pause_timeout_ns) {
     if (state == ThreadState::Stopping)
         return true;
+    // Called on every VM exit: skip the lock while nothing is queued and the
+    // thread is not paused
+    if (!has_messages.load(std::memory_order_acquire) &&
+        state != ThreadState::Paused)
+        return true;
 
     const auto timeout_time = std::chrono::steady_clock::now() +
                               std::chrono::nanoseconds(pause_timeout_ns);
@@ -53,7 +112,10 @@ bool IThread::processMessages(i64 pause_timeout_ns) {
         if (state != ThreadState::Paused)
             return true;
 
-        if (supervisor_pause || pause_timeout_ns == INFINITE_TIMEOUT) {
+        // A suspended thread stays stopped past its wait timeout; the wait
+        // times out once it is resumed
+        if (supervisor_pause || activity_suspended ||
+            pause_timeout_ns == INFINITE_TIMEOUT) {
             msg_cv.wait(lock, [&] { return !msg_queue.empty(); });
         } else if (!msg_cv.wait_until(lock, timeout_time,
                                       [&] { return !msg_queue.empty(); })) {
@@ -82,6 +144,7 @@ void IThread::sendMessage(ThreadMessage msg) {
         }
     }
     msg_queue.push(msg);
+    has_messages.store(true, std::memory_order_release);
     msg_cv.notify_all(); // TODO: notify one?
 }
 
@@ -91,7 +154,36 @@ void IThread::pushCancelResumeLocked() {
     msg_queue.push({.type = ThreadMessageType::Resume,
                     .supervisor = false,
                     .payload = {.resume = {.signalled = false}}});
+    has_messages.store(true, std::memory_order_release);
     msg_cv.notify_all();
+}
+
+bool IThread::waitForSuspendedContext(ThreadContext& out_context,
+                                      std::chrono::nanoseconds timeout) {
+    std::unique_lock lock(msg_mutex);
+    if (!suspended_cv.wait_for(lock, timeout, [&] {
+            return suspended_context_valid || !isSuspendRequested() ||
+                   isStoppingOrStopped();
+        }) ||
+        !suspended_context_valid)
+        return false;
+    out_context = suspended_context;
+    return true;
+}
+
+void IThread::sleep(i64 duration_ns) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(duration_ns);
+    std::unique_lock lock(msg_mutex);
+    while (true) {
+        // Only stop and suspension messages can be queued here: signals are
+        // dropped while no wait is armed
+        if (!msg_queue.empty() && !processMessagesImpl())
+            return;
+        if (!msg_cv.wait_until(lock, deadline,
+                               [&] { return !msg_queue.empty(); }))
+            return;
+    }
 }
 
 void IThread::cancelSync() {
@@ -119,6 +211,7 @@ void IThread::endSyncWait() {
 }
 
 bool IThread::processMessagesImpl() {
+    has_messages.store(false, std::memory_order_relaxed);
     while (!msg_queue.empty()) {
         auto msg = msg_queue.front();
         msg_queue.pop();
@@ -145,11 +238,29 @@ bool IThread::processMessagesImpl() {
                 supervisor_pause = false;
             else
                 guest_pause = false;
-            if (!supervisor_pause && !guest_pause)
+            if (!supervisor_pause && !guest_pause && !activity_suspended)
                 state = ThreadState::Running;
 
             if (!msg.supervisor && !sync_info)
                 sync_info = payload;
+            break;
+        }
+        case ThreadMessageType::Suspend: {
+            if (activity_suspended)
+                break;
+            activity_suspended = true;
+            state = ThreadState::Paused;
+            // Only this thread can read its registers
+            captureContext(suspended_context);
+            suspended_context_valid = true;
+            suspended_cv.notify_all();
+            break;
+        }
+        case ThreadMessageType::Unsuspend: {
+            activity_suspended = false;
+            suspended_context_valid = false;
+            if (!supervisor_pause && !guest_pause)
+                state = ThreadState::Running;
             break;
         }
         }

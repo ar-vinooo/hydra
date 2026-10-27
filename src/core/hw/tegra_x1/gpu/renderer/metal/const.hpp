@@ -106,6 +106,15 @@ inline MTL::Library* createLibraryFromSource(MTL::Device* device,
     return library;
 }
 
+// The most samples the device supports up to the guest's count (Apple M1
+// has no 8 sample targets)
+inline u32 getHostSampleCount(MTL::Device* device, u32 samples) {
+    for (u32 count = samples; count > 1; count >>= 1)
+        if (device->supportsTextureSampleCount(count))
+            return count;
+    return 1;
+}
+
 inline MTL::Function* createFunctionFromSource(MTL::Device* device,
                                                const std::string_view source,
                                                const std::string_view name) {

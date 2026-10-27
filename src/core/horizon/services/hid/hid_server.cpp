@@ -162,16 +162,30 @@ result_t IHidServer::getNpadJoyHoldType(System* system,
 
 result_t IHidServer::getVibrationDeviceInfo(VibrationDeviceHandle handle,
                                             VibrationDeviceInfo* out_info) {
-    (void)handle;
+    // The motor depends on the controller style (NpadStyleIndex) and the side
+    // on the device index, as in yuzu's IHidServer::GetVibrationDeviceInfo
+    constexpr u8 STYLE_FULL_KEY = 3;
+    constexpr u8 STYLE_JOYCON_RIGHT = 7;
+    constexpr u8 STYLE_GAMECUBE = 8;
+    constexpr u8 STYLE_N64 = 13;
+    auto type = VibrationDeviceType::Unknown;
+    if (handle.npad_style_index >= STYLE_FULL_KEY &&
+        handle.npad_style_index <= STYLE_JOYCON_RIGHT)
+        type = VibrationDeviceType::LinearResonantActuator;
+    else if (handle.npad_style_index == STYLE_GAMECUBE)
+        type = VibrationDeviceType::GcErm;
+    else if (handle.npad_style_index == STYLE_N64)
+        type = VibrationDeviceType::Erm;
 
-    LOG_FUNC_STUBBED(Services);
+    auto position = VibrationDevicePosition::None;
+    if (type == VibrationDeviceType::LinearResonantActuator) {
+        if (handle.device_index == 0)
+            position = VibrationDevicePosition::Left;
+        else if (handle.device_index == 1)
+            position = VibrationDevicePosition::Right;
+    }
 
-    // HACK
-    *out_info = {
-        .device_type = VibrationDeviceType::LinearResonantActuator,
-        .position = VibrationDevicePosition::Left,
-    };
-
+    *out_info = {.device_type = type, .position = position};
     return RESULT_SUCCESS;
 }
 

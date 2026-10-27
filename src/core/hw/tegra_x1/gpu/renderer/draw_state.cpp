@@ -18,6 +18,7 @@ void applyDrawState(IRenderer& renderer, const DrawState& state) {
     renderer.setDepthBias(state.depth_bias_constant, state.depth_bias_slope,
                           state.depth_bias_clamp);
     renderer.setDepthClamp(state.depth_clamp);
+    renderer.setPolygonLines(state.polygon_lines);
     for (u32 i = 0; i < VIEWPORT_COUNT; i++) {
         renderer.setViewport(i, state.viewports[i]);
         renderer.setScissor(i, state.scissors[i]);

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "core/horizon/filesystem/bktr.hpp"
+#include "core/horizon/filesystem/compressed_storage.hpp"
 #include "core/horizon/filesystem/file_view.hpp"
 #include "core/horizon/loader/content_package.hpp"
 #include "core/system.hpp"
@@ -146,8 +147,37 @@ Region sectionRegion(const NcaFile::Header& header, usize index, bool romfs) {
     return {start + offset, size};
 }
 
-void validateProgram(IFile& file, const NcaFile::Header& header) {
-    const auto code = sectionRegion(header, 0, false);
+// A section region together with the storage its offsets refer to: the NCA,
+// or the decompressed section of a compressed one
+struct SectionData {
+    std::shared_ptr<IFile> storage;
+    u64 offset;
+    u64 size;
+};
+
+SectionData sectionData(std::shared_ptr<IFile> nca,
+                        const NcaFile::Header& header, usize index,
+                        bool romfs) {
+    const auto region = sectionRegion(header, index, romfs);
+    const auto fs = 0x400 + index * 0x200;
+    const auto compression = filesystem::readCompressionInfo(
+        std::span<const u8>(header).subspan(fs, 0x200));
+    if (!compression)
+        return {std::move(nca), region.offset, region.size};
+    // The region is the hashed data the compressed storage sits on; the
+    // filesystem is all of its decompressed storage
+    auto data = filesystem::openCompressedSection(
+        std::make_shared<filesystem::FileView>(std::move(nca), region.offset,
+                                               region.size),
+        *compression);
+    const auto size = data->getSize();
+    return {std::move(data), 0, size};
+}
+
+void validateProgram(const std::shared_ptr<IFile>& nca,
+                     const NcaFile::Header& header) {
+    const auto code = sectionData(nca, header, 0, false);
+    auto& file = *code.storage;
     const auto entries = partition(file, code.offset, code.size, false);
     const auto npdm = std::ranges::find(entries, "main.npdm", &Entry::name);
     if (npdm == entries.end() || npdm->size < sizeof(NpdmMeta))
@@ -172,21 +202,25 @@ void validateProgram(IFile& file, const NcaFile::Header& header) {
     if (!has_main)
         throw std::runtime_error(
             "Package program is missing its main executable.");
-    const auto data = sectionRegion(header, 1, true);
-    const auto romfs = read(file, data.offset, 0x50);
+    const auto data = sectionData(nca, header, 1, true);
+    const auto romfs = read(*data.storage, data.offset, 0x50);
     if (valueAt<u64>(romfs, 0) != 0x50)
         throw std::runtime_error(
             "Cannot decrypt Package RomFS. Check prod.keys.");
     // Validate the logo PFS before the existing NCA loader reads it.
     if (valueAt<u32>(header, 0x260) != 0) {
-        const auto logo = sectionRegion(header, 2, false);
-        (void)partition(file, logo.offset, logo.size, false);
+        const auto logo = sectionData(nca, header, 2, false);
+        (void)partition(*logo.storage, logo.offset, logo.size, false);
     }
 }
 
-std::vector<Entry> controlEntries(NcaFile& file,
-                                  const NcaFile::Header& header) {
-    const auto data = sectionRegion(header, 0, true);
+// The files of a control NCA's RomFS; their offsets are in `out_storage`
+std::vector<Entry> controlEntries(const std::shared_ptr<IFile>& nca,
+                                  const NcaFile::Header& header,
+                                  std::shared_ptr<IFile>& out_storage) {
+    const auto data = sectionData(nca, header, 0, true);
+    out_storage = data.storage;
+    auto& file = *data.storage;
     const auto romfs = read(file, data.offset, 0x50);
     if (valueAt<u64>(romfs, 0) != 0x50)
         throw std::runtime_error("Invalid Package control RomFS.");
@@ -415,7 +449,7 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp,
     }
     // The final virtual NCA must be valid before NcaLoader parses its
     // filesystems. Base validation uses the same checks as updated programs.
-    validateProgram(*program_file, effective_header);
+    validateProgram(program_file, effective_header);
     auto loader =
         std::unique_ptr<XciLoader>(new XciLoader(std::move(program_file)));
     loader->content_version = update ? update->version : 0;
@@ -436,14 +470,14 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp,
         if (record == meta.records.end())
             throw std::runtime_error("DLC has no Data NCA.");
         const auto& item = installed[index].content[record->content];
-        auto data = item.open(installed[index].keys);
-        const auto region = sectionRegion(item.header, 0, true);
-        const auto magic = read(*data, region.offset, 8);
+        const auto region = sectionData(item.open(installed[index].keys),
+                                        item.header, 0, true);
+        const auto magic = read(*region.storage, region.offset, 8);
         if (valueAt<u64>(magic, 0) != 0x50)
             throw std::runtime_error("Cannot read DLC RomFS. Check prod.keys.");
         loader->add_on_content.emplace(
-            dlc_id, std::make_shared<filesystem::FileView>(data, region.offset,
-                                                           region.size));
+            dlc_id, std::make_shared<filesystem::FileView>(
+                        region.storage, region.offset, region.size));
     }
     // Prefer the selected update's Control NCA (display version and metadata).
     std::vector<std::pair<const PackageContent*, const NcaFile::Keys*>>
@@ -461,8 +495,9 @@ XciLoader* XciLoader::createPackage(std::string_view path, bool nsp,
         const auto& item = *ptr;
 
         try {
-            auto control = item.open(*control_keys);
-            const auto files = controlEntries(*control, item.header);
+            std::shared_ptr<IFile> control;
+            const auto files =
+                controlEntries(item.open(*control_keys), item.header, control);
             for (const auto& file : files) {
                 if (file.name == "control.nacp" &&
                     file.size ==
@@ -527,8 +562,8 @@ std::vector<ContentMeta> ContentPackage::metadata(bool verify_hashes) const {
     for (const auto& item : content) {
         if (item.header[0x205] != 1)
             continue;
-        auto file = item.open(keys);
-        const auto region = sectionRegion(item.header, 0, false);
+        const auto region = sectionData(item.open(keys), item.header, 0, false);
+        const auto& file = region.storage;
         const auto entries =
             partition(*file, region.offset, region.size, false);
         for (const auto& entry : entries) {
@@ -643,9 +678,10 @@ std::vector<ContentMeta> ContentPackage::metadata(bool verify_hashes) const {
                     // installation.
                     auto decoded = found->open(keys);
                     if (record_type == 2) {
-                        const auto data = sectionRegion(found->header, 0, true);
-                        if (valueAt<u64>(read(*decoded, data.offset, 8), 0) !=
-                            0x50)
+                        const auto data =
+                            sectionData(decoded, found->header, 0, true);
+                        if (valueAt<u64>(read(*data.storage, data.offset, 8),
+                                         0) != 0x50)
                             throw std::runtime_error(
                                 "Cannot decrypt DLC RomFS. Check prod.keys.");
                     }

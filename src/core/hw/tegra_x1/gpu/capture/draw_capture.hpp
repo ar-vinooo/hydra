@@ -27,7 +27,7 @@
 namespace hydra::hw::tegra_x1::gpu::capture {
 
 constexpr char MAGIC[8] = {'H', 'Y', 'D', 'R', 'A', 'C', 'A', 'P'};
-constexpr u32 VERSION = 4;
+constexpr u32 VERSION = 5;
 
 using Contents = std::vector<std::vector<u8>>;
 
@@ -70,12 +70,19 @@ struct ShaderRecord {
     renderer::ShaderDescriptor descriptor;
 };
 
+// Vertex, fragment and compute: the capture format predates geometry shaders,
+// whose pipelines are not captured
+constexpr usize CAPTURED_SHADER_TYPE_COUNT = 3;
+
 struct PipelineRecord {
-    i32 shaders[static_cast<usize>(renderer::ShaderType::Count)];
+    i32 shaders[CAPTURED_SHADER_TYPE_COUNT];
     std::vector<u8> vertex_state;
     std::vector<u8> color_targets;
     u32 depth_stencil_format;
     u32 topology_class;
+    // Version 5: bit 0 alpha-to-coverage, bit 1 alpha-to-one
+    u32 alpha_flags{0};
+    u32 sample_count{1};
 };
 
 struct TargetRecord {

@@ -95,6 +95,7 @@ bool commitAndWait(CommandBuffer& commands) {
 // A buffer texture is its backing buffer: one blob of its bytes
 bool Renderer::readTextureContents(ITexture* texture,
                                    std::vector<std::vector<u8>>& out) {
+    syncDrawQueue();
     const auto& descriptor = texture->getDescriptor();
     if (descriptor.type == MTL::TextureTypeTextureBuffer) {
         auto* backing = static_cast<Texture*>(texture)->getBufferBacking();
@@ -162,6 +163,7 @@ bool Renderer::readTextureContents(ITexture* texture,
 
 bool Renderer::readBufferContents(const BufferView& view,
                                   std::vector<u8>& out) {
+    syncDrawQueue();
     if (!view.isValid())
         return false;
     auto* native = static_cast<Buffer*>(view.getBase())->getBuffer();
@@ -189,6 +191,7 @@ bool Renderer::readBufferContents(const BufferView& view,
 
 bool Renderer::writeTextureContents(
     ITexture* texture, const std::vector<std::vector<u8>>& contents) {
+    syncDrawQueue();
     const auto& descriptor = texture->getDescriptor();
     if (descriptor.type == MTL::TextureTypeTextureBuffer) {
         auto* backing = static_cast<Texture*>(texture)->getBufferBacking();

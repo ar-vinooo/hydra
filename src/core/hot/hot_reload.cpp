@@ -18,14 +18,17 @@
 // modules stay loaded, threads may still be running their code.
 namespace hydra::hot {
 
+namespace detail {
+std::atomic<bool> pinning{false};
+std::atomic<const Table*> latest_table{nullptr};
+} // namespace detail
+
 namespace {
+
+auto& crnt_table = detail::latest_table;
 
 using register_fn_t = bool (*)(Table*, std::uint64_t, const char*);
 
-std::atomic<const Table*> crnt_table{nullptr};
-// HYDRA_HOT_RELOAD=0: no module is ever loaded, the built-in functions are the
-// only image and scopes need no thread-local pinning
-std::atomic<bool> hot_disabled{false};
 thread_local const Table* pinned_table = nullptr;
 
 // The watcher thread isn't a guest or debugger thread, the logger can't be
@@ -91,6 +94,8 @@ bool loadModule(const std::filesystem::path& path, u64 generation) {
         return false;
     }
     table->revision = generation;
+    // From now on there are several images: scopes pin theirs
+    detail::pinning.store(true, std::memory_order_release);
     crnt_table.store(table, std::memory_order_release);
     report("Hot reload: loaded module #{} ({})", generation, path.string());
     return true;
@@ -157,10 +162,9 @@ const Table& getLatestTable() {
         const Table* expected = nullptr;
         crnt_table.compare_exchange_strong(expected, builtin);
         const char* disabled = std::getenv("HYDRA_HOT_RELOAD");
-        if (disabled != nullptr && std::strcmp(disabled, "0") == 0) {
-            hot_disabled.store(true, std::memory_order_release);
+        // HYDRA_HOT_RELOAD=0: no module is ever loaded
+        if (disabled != nullptr && std::strcmp(disabled, "0") == 0)
             return;
-        }
         const char* path = std::getenv("HYDRA_HOT_MODULE");
 #ifdef HYDRA_DEFAULT_HOT_MODULE
         // Unit tests also link hydra-core. They must not watch the app's
@@ -186,14 +190,11 @@ const Table& getTable() {
     return getLatestTable();
 }
 
-Scope::Scope() {
-    // Hot reload disabled: the built-in functions are the only image
-    if (hot_disabled.load(std::memory_order_acquire)) [[likely]] {
-        slot = nullptr;
-        previous = nullptr;
-        current = crnt_table.load(std::memory_order_acquire);
-        return;
-    }
+namespace detail {
+const Table& initialTable() { return getLatestTable(); }
+} // namespace detail
+
+void Scope::pin() {
     slot = &pinned_table;
     previous = *slot;
     current = previous != nullptr ? previous : &getLatestTable();

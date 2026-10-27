@@ -359,11 +359,11 @@ NcaFile::NcaFile(std::shared_ptr<IFile> container, u64 offset, u64 size,
         // BKTR tables use ordinary CTR; data subsections are split below.
         if (encryption == 4)
             encryption = 3;
+        // SparseInfo (0x148). Compressed sections (CompressionInfo, 0x178)
+        // are decompressed above this physical view, see ContentArchive.
         if (valueAt<u32>(header, fs + 0x148) != 0 ||
-            valueAt<u64>(header, fs + 0x160) != 0 ||
-            valueAt<u64>(header, fs + 0x178) != 0)
-            throw std::runtime_error(
-                "Sparse or compressed NCA sections are not supported.");
+            valueAt<u64>(header, fs + 0x160) != 0)
+            throw std::runtime_error("Sparse NCA sections are not supported.");
         if (decrypted_body)
             encryption = 1;
         State::Section section{start, end - start, encryption, {}};

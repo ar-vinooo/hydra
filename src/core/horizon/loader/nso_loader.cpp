@@ -239,9 +239,14 @@ void NsoLoader::loadProcess(System& system, kernel::Process* process) {
             system, process,
             kernel::STACK_REGION.getBegin() + main_thread_stack_size - 0x10,
             main_thread_priority);
+        if (main_thread_core_number < kernel::CPU_CORE_COUNT)
+            main_thread->setCoreAffinity(main_thread_core_number,
+                                         1ull << main_thread_core_number);
         const auto main_thread_handle = process->setMainThread(main_thread);
 
         main_thread->setEntryPoint(base + text_offset);
+        // User exceptions enter the process here too
+        process->setEntryPoint(base + text_offset);
         main_thread->setArg(0, 0x0);
         main_thread->setArg(1, main_thread_handle.getRaw());
     }

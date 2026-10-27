@@ -12,11 +12,23 @@ class IMemory;
 class IMmu;
 class IThread;
 
+// A synchronous exception of guest (EL0) code the kernel did not handle
+// itself, with its syndrome as Horizon would see it
+struct GuestException {
+    u32 esr;
+    u64 far;
+    u32 afsr0;
+    u32 afsr1;
+};
+
 struct ThreadCallbacks {
     std::function<void(IThread*, u64)> svc_handler;
     std::function<bool()> stop_requested;
     std::function<void()> supervisor_pause;
     std::function<void()> breakpoint_hit;
+    // Hands the exception to the process (user exception handling). True if
+    // the thread's state now enters the process's handler.
+    std::function<bool(IThread*, const GuestException&)> user_exception;
 };
 
 using stack_frame_callback_fn_t = std::function<void(vaddr_t)>;
@@ -52,6 +64,16 @@ class IThread {
     virtual void insertBreakpoint(vaddr_t addr) = 0;
     virtual void removeBreakpoint(vaddr_t addr) = 0;
     virtual void singleStep() = 0;
+
+    // Makes `state` complete, for another thread to read while this one is
+    // suspended. Must be called from the thread itself.
+    virtual void completeState() {}
+    // TPIDR_EL0, the user read/write thread pointer. Same caveat.
+    virtual u64 getTpidr() = 0;
+    // PSTATE the guest code returns to (NZCV and the mode), also while the
+    // thread is in an exception. Same caveat.
+    virtual u32 getUserPstate() { return state.pstate; }
+    virtual void setUserPstate(u32 pstate) { state.pstate = pstate; }
 
     // Getters
     IMemory* getTlsMemory() const { return tls_mem; }

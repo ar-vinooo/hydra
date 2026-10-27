@@ -1,4 +1,9 @@
 #include "core/system.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/draw_queue.hpp"
+
+#include "common/frame_generation_timing.hpp"
+
+#include "core/hw/tegra_x1/gpu/display_stats.hpp"
 
 #include "core/hw/tegra_x1/gpu/capture/draw_capture.hpp"
 #include "core/hw/tegra_x1/gpu/frame_tracer.hpp"
@@ -172,6 +177,10 @@ void System::loadAndStart(horizon::loader::ILoader* loader) {
     main_process =
         os.getKernel().getProcessManager().createProcess("Guest process");
     loader->loadProcess(*this, main_process);
+    // Services read the version and save data sizes from it
+    main_process->setApplicationControlProperty(
+        std::unique_ptr<horizon::services::ns::ApplicationControlProperty>(
+            loader->loadNacp()));
 
     // Check for firmware applets
     horizon::services::am::internal::LibraryAppletController controller(
@@ -535,6 +544,8 @@ void System::resume() {
 
 void System::progressFrame(u32 width, u32 height,
                            bool& out_dt_average_updated) {
+    out_dt_average_updated = false;
+
     // DEBUG: dump guest threads when the trigger file appears
     static const char* thread_dump_trigger = std::getenv("HYDRA_THREAD_DUMP");
     if (thread_dump_trigger != nullptr && main_process != nullptr) {
@@ -696,6 +707,44 @@ void System::progressFrame(u32 width, u32 height,
                          per_frame(waits),
                          static_cast<f64>(wait_ns) / 1e6 / std::max(frames, 1.0),
                          reasons, per_frame(stats.checkpoint_skips.exchange(0)));
+                // Guest CPU: how long the guest threads executed, why they
+                // left the vCPU and which SVCs took the most wall time
+                std::string exits;
+                u64 exit_total = 0;
+                for (usize i = 0; i < hw::tegra_x1::gpu::CPU_EXIT_COUNT; i++) {
+                    const auto count = stats.cpu_exits[i].exchange(0);
+                    exit_total += count;
+                    exits += fmt::format(
+                        " | {} {:.0f}",
+                        hw::tegra_x1::gpu::getCpuExitName(
+                            static_cast<hw::tegra_x1::gpu::CpuExit>(i)),
+                        per_frame(count));
+                }
+                std::array<std::pair<u64, u32>, 0x80> svcs;
+                for (u32 i = 0; i < svcs.size(); i++)
+                    svcs[i] = {stats.svc_ns[i].exchange(0), i};
+                std::sort(svcs.begin(), svcs.end(), std::greater<>());
+                std::string top_svcs;
+                for (usize i = 0; i < 8 && svcs[i].first != 0; i++) {
+                    const auto id = svcs[i].second;
+                    top_svcs += fmt::format(
+                        " | {:#x} {:.0f}x {:.2f} ms", id,
+                        per_frame(stats.svc_count[id].load()),
+                        static_cast<f64>(svcs[i].first) / 1e6 /
+                            std::max(frames, 1.0));
+                }
+                for (auto& count : stats.svc_count)
+                    count = 0;
+                LOG_INFO(Other,
+                         "GUEST CPU: run {:.2f} ms/frame (all threads), "
+                         "{:.0f} exits/frame{}",
+                         static_cast<f64>(stats.guest_run_ns.exchange(0)) /
+                             1e6 / std::max(frames, 1.0),
+                         per_frame(exit_total), exits);
+                LOG_INFO(Other, "GUEST SVC wall time per frame:{}", top_svcs);
+                LOG_INFO(Other, "DRAW QUEUE waits: {}",
+                         hw::tegra_x1::gpu::renderer::takeDrawQueueReport(
+                             frames));
                 LOG_INFO(Other,
                          "REPORTS: {:.1f} queued/frame, {} forced a wait",
                          per_frame(stats.reports_queued.exchange(0)),
@@ -737,6 +786,48 @@ void System::progressFrame(u32 width, u32 height,
                      static_cast<f64>(stats.render_pass_merges.exchange(0)) /
                          std::max(frames, 1.0));
             gpu.getRenderer().logPassProfile(frames);
+            {
+                const auto presents = stats.presents.exchange(0);
+                const auto gpu_count = stats.present_gpu_count.exchange(0);
+                LOG_INFO(Other,
+                         "PRESENT: filter {}, sharpening {}, frame generation "
+                         "{} | {}x{} -> {}x{} | GPU {:.3f} ms, CPU encode "
+                         "{:.3f} ms per present | {:.1f} presents/s",
+                         CONFIG_INSTANCE.getUpscalingFilter(),
+                         CONFIG_INSTANCE.getSharpening(),
+                         CONFIG_INSTANCE.getFrameGeneration(),
+                         stats.present_input_width.load(),
+                         stats.present_input_height.load(),
+                         stats.present_output_width.load(),
+                         stats.present_output_height.load(),
+                         static_cast<f64>(stats.present_gpu_ns.exchange(0)) /
+                             1e6 / std::max<f64>(static_cast<f64>(gpu_count), 1.0),
+                         static_cast<f64>(stats.present_encode_ns.exchange(0)) /
+                             1e6 / std::max<f64>(static_cast<f64>(presents), 1.0),
+                         static_cast<f64>(presents) / elapsed);
+            }
+            {
+                // Displayed since the last statistics
+                const auto& display = hw::tegra_x1::gpu::DisplayStats::instance();
+                static u64 last_counts[4] = {};
+                const u64 now_counts[4] = {display.game_frames.load(),
+                                           display.generated_frames.load(),
+                                           display.repeated_frames.load(),
+                                           display.dropped.load()};
+                f64 per_second[4];
+                for (usize i = 0; i < 4; i++) {
+                    per_second[i] =
+                        static_cast<f64>(now_counts[i] - last_counts[i]) / elapsed;
+                    last_counts[i] = now_counts[i];
+                }
+                LOG_INFO(Other,
+                         "DISPLAYED: {:.1f} images/s on screen ({:.1f} new "
+                         "game frames, {:.1f} generated, {:.1f} repeated) | "
+                         "{:.1f} dropped/s",
+                         per_second[0] + per_second[1] + per_second[2],
+                         per_second[0], per_second[1], per_second[2],
+                         per_second[3]);
+            }
             LOG_INFO(Other, "COMPUTE: {:.1f} dispatches, {:.0f} threads/frame",
                      static_cast<f64>(stats.compute_dispatches.exchange(0)) /
                          std::max(frames, 1.0),
@@ -808,7 +899,8 @@ void System::progressFrame(u32 width, u32 height,
     }
 
     // Render pass
-    os.getDisplayDriver().present(command_buffer, compositor, width, height);
+    if (!compositor->reusesPresentedFrame(acquired))
+        os.getDisplayDriver().present(command_buffer, compositor, width, height);
 
     if (loading) {
         if (acquired) {
@@ -883,6 +975,20 @@ void System::progressFrame(u32 width, u32 height,
             else
                 last_dt_average = 0.f;
             accumulated_dt = {};
+            // New images the display showed: game frames and generated ones
+            const auto& display = hw::tegra_x1::gpu::DisplayStats::instance();
+            const u64 game = display.game_frames.load();
+            const u64 generated = display.generated_frames.load();
+            const auto seconds =
+                std::chrono::duration<f32>(time_since_last_dt_averaging).count();
+            last_shown_fps =
+                static_cast<f32>((game - last_display_game) +
+                                 (generated - last_display_generated)) /
+                seconds;
+            last_generated_fps =
+                static_cast<f32>(generated - last_display_generated) / seconds;
+            last_display_game = game;
+            last_display_generated = generated;
             last_dt_averaging_time = now;
 
             out_dt_average_updated = true;
@@ -896,6 +1002,13 @@ void System::progressFrame(u32 width, u32 height,
     delete command_buffer;
     delete compositor;
 
+}
+
+f64 System::getPresentationFrameRate() const {
+    return frameGenerationOutputRate(
+        CONFIG_INSTANCE.getFrameGenerationRateMode() == FrameGenerationRateMode::Multiple,
+        CONFIG_INSTANCE.getFrameGenerationTargetFps(),
+        CONFIG_INSTANCE.getFrameGenerationMultiplier(), static_cast<f64>(last_dt_average));
 }
 
 bool System::isRunning() const {
@@ -966,6 +1079,14 @@ void System::takeScreenshot() {
 }
 
 void System::captureGpuFrame() {
+    // With HYDRA_GPU_CAPTURE, a replayable capture of what follows (more than
+    // a frame, see LiveCapture) instead of a Metal GPU trace
+    if (const char* directory = std::getenv("HYDRA_GPU_CAPTURE")) {
+        std::ofstream(std::filesystem::path(directory) / "trigger")
+            << "commands=3000 limit_mb=1500";
+        LOG_INFO(Gpu, "GPU capture requested");
+        return;
+    }
     // TODO: allow multiple frames
     gpu.getRenderer().captureFrames(1);
 }

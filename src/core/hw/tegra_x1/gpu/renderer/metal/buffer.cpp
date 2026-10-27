@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/msaa_converter.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/texture.hpp"
 #include "core/hot/table.hpp"
 
 #include <map>
@@ -62,6 +64,20 @@ MTL::ComputePipelineState* depthStencilReadbackPipeline(MTL::Device* device) {
     const char* source = R"(
         #include <metal_stdlib>
         using namespace metal;
+        // round(d * (2^24 - 1)) from the exact value of d: for the float
+        // nearest to u / (2^24 - 1) the error stays below half a unit, so u
+        // comes back exactly (float arithmetic is off by one at times)
+        uint unorm24(float d) {
+            const uint bits = as_type<uint>(clamp(d, 0.0f, 1.0f));
+            const uint exponent = bits >> 23;
+            if (exponent == 0)
+                return 0;
+            const ulong product = ulong((bits & 0x7fffffu) | 0x800000u) * 16777215ul;
+            const uint shift = 150u - exponent;
+            if (shift >= 63u)
+                return 0;
+            return uint((product + (1ul << (shift - 1u))) >> shift);
+        }
         kernel void pack_depth_stencil(
                 device const float* depth [[buffer(0)]],
                 device const uchar* stencil [[buffer(1)]],
@@ -70,9 +86,7 @@ MTL::ComputePipelineState* depthStencilReadbackPipeline(MTL::Device* device) {
                 uint tid [[thread_position_in_grid]]) {
             const ulong i = tid;
             if (i >= p[0]) return;
-            const uint depth24 = min(
-                uint(clamp(depth[i], 0.0f, 1.0f) * 16777215.0f + 0.5f),
-                0xffffffu);
+            const uint depth24 = min(unorm24(depth[i]), 0xffffffu);
             uint words[2] = {0, 0};
             ulong bytes = 4;
             switch (p[2]) {
@@ -124,6 +138,22 @@ void Buffer::copyFromHot0(ICommandBuffer* command_buffer, ITextureView* src,
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
     auto src_impl = static_cast<TextureView*>(src);
+
+    // Guest memory holds the samples as a larger image: read back that form
+    if (auto* base = static_cast<Texture*>(src_impl->getBase());
+        base->getDescriptor().isMultisampled()) {
+        auto scaled = base->createScaledTexture();
+        MsaaConverter::get(buffer->device())
+            .expand(command_buffer_impl, base->getTexture(), scaled->getTexture(),
+                    base->getDescriptor().sample_count);
+        auto view = std::shared_ptr<ITextureView>(
+            scaled->createView(src_impl->getDescriptor()));
+        command_buffer->retainResource(scaled);
+        command_buffer->retainResource(view);
+        copyFromHot0(command_buffer, view.get(), src_origin, src_size,
+                     src_levels, src_layers, dst_offset);
+        return;
+    }
 
     const auto format = src_impl->getDescriptor().format;
     const auto host_format = getHostTextureFormat(format);

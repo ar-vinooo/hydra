@@ -104,7 +104,7 @@ bool toRgba8(const std::string& format, const std::vector<unsigned char>& in,
         if (in.size() < pixels * 8)
             return false;
         for (size_t p = 0; p < pixels; p++)
-            for (int c = 0; c < 3; c++) {
+            for (size_t c = 0; c < 3; c++) {
                 uint16_t h;
                 std::memcpy(&h, in.data() + p * 8 + c * 2, 2);
                 out[p * 4 + c] = display(halfToFloat(h));
@@ -123,7 +123,7 @@ bool toRgba8(const std::string& format, const std::vector<unsigned char>& in,
             return false;
         for (size_t p = 0; p < pixels; p++) {
             const auto v = word(p, 4);
-            for (int c = 0; c < 3; c++)
+            for (size_t c = 0; c < 3; c++)
                 out[p * 4 + c] = static_cast<unsigned char>(((v >> (c * 10)) & 1023) * 255 / 1023);
         }
     } else if (format == "r8unorm") {

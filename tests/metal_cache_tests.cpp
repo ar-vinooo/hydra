@@ -481,6 +481,103 @@ fragment float4 red() { return float4(1, 0, 0, 1); }
                       << "\n";
             return 0;
         }
+        if (mode == "upscale-bench") {
+            // GPU time of presenting a 1280x720 frame on a 3175x1786
+            // drawable: a bilinear draw alone, or MetalFX and then the draw.
+            // Each variant runs alone on the GPU, one command buffer per frame.
+            constexpr hydra::u32 in_w = 1280, in_h = 720, out_w = 3175, out_h = 1786;
+            constexpr int frames = 200;
+            const std::string source = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct V { float4 position [[position]]; float2 uv; };
+vertex V v(uint id [[vertex_id]]) {
+    const float2 p[] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
+    V out;
+    out.position = float4(p[id], 0, 1);
+    out.uv = float2(p[id].x * 0.5 + 0.5, 0.5 - p[id].y * 0.5);
+    return out;
+}
+fragment float4 f(V in [[stage_in]], texture2d<float> t [[texture(0)]],
+                  sampler s [[sampler(0)]]) { return t.sample(s, in.uv); }
+)";
+            NS::Error* error = nullptr;
+            NS_STACK_SCOPED auto library =
+                device->newLibrary(toNsString(source), nullptr, &error);
+            check(library != nullptr, "Blit shader compilation failed");
+            NS_STACK_SCOPED auto vertex = library->newFunction(toNsString("v"));
+            NS_STACK_SCOPED auto fragment = library->newFunction(toNsString("f"));
+            NS_STACK_SCOPED auto pipeline_descriptor =
+                MTL::RenderPipelineDescriptor::alloc()->init();
+            pipeline_descriptor->setVertexFunction(vertex);
+            pipeline_descriptor->setFragmentFunction(fragment);
+            pipeline_descriptor->colorAttachments()->object(0)->setPixelFormat(
+                MTL::PixelFormatBGRA8Unorm);
+            NS_STACK_SCOPED auto pipeline =
+                device->newRenderPipelineState(pipeline_descriptor, &error);
+            check(pipeline != nullptr, "Blit pipeline creation failed");
+            NS_STACK_SCOPED auto sampler_descriptor = MTL::SamplerDescriptor::alloc()->init();
+            sampler_descriptor->setMinFilter(MTL::SamplerMinMagFilterLinear);
+            sampler_descriptor->setMagFilter(MTL::SamplerMinMagFilterLinear);
+            NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_descriptor);
+
+            NS_STACK_SCOPED auto input_descriptor = MTL::TextureDescriptor::alloc()->init();
+            input_descriptor->setPixelFormat(MTL::PixelFormatRGBA8Unorm);
+            input_descriptor->setWidth(in_w);
+            input_descriptor->setHeight(in_h);
+            input_descriptor->setStorageMode(MTL::StorageModePrivate);
+            input_descriptor->setUsage(MTL::TextureUsageShaderRead |
+                                       MTL::TextureUsageRenderTarget);
+            NS_STACK_SCOPED auto input = device->newTexture(input_descriptor);
+            NS_STACK_SCOPED auto drawable_descriptor = MTL::TextureDescriptor::alloc()->init();
+            drawable_descriptor->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+            drawable_descriptor->setWidth(out_w);
+            drawable_descriptor->setHeight(out_h);
+            drawable_descriptor->setStorageMode(MTL::StorageModePrivate);
+            drawable_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+            NS_STACK_SCOPED auto drawable = device->newTexture(drawable_descriptor);
+
+            SpatialUpscaler upscaler(device);
+            NS_STACK_SCOPED auto queue = device->newCommandQueue();
+            const auto run = [&](bool metalfx, double& gpu_ms) {
+                double total = 0;
+                for (int i = 0; i < frames + 10; i++) {
+                    auto* command = queue->commandBuffer();
+                    MTL::Texture* source_texture = input;
+                    if (metalfx) {
+                        auto* upscaled = upscaler.upscale(command, input, out_w, out_h);
+                        check(upscaled != nullptr, "MetalFX could not upscale");
+                        source_texture = upscaled;
+                    }
+                    auto pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+                    pass->colorAttachments()->object(0)->setTexture(drawable);
+                    pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionClear);
+                    pass->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+                    auto* encoder = command->renderCommandEncoder(pass);
+                    encoder->setRenderPipelineState(pipeline);
+                    encoder->setFragmentTexture(source_texture, NS::UInteger(0));
+                    encoder->setFragmentSamplerState(sampler, NS::UInteger(0));
+                    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
+                                            NS::UInteger(3));
+                    encoder->endEncoding();
+                    command->commit();
+                    command->waitUntilCompleted();
+                    check(command->status() == MTL::CommandBufferStatusCompleted,
+                          "Benchmark command buffer failed");
+                    if (i >= 10) // Warm-up excluded
+                        total += (command->GPUEndTime() - command->GPUStartTime()) * 1000.0;
+                }
+                gpu_ms = total / frames;
+            };
+            double bilinear_ms = 0, metalfx_ms = 0;
+            run(false, bilinear_ms);
+            run(true, metalfx_ms);
+            std::cout << "PASS upscale-bench " << in_w << "x" << in_h << " -> " << out_w
+                      << "x" << out_h << ": bilinear " << bilinear_ms
+                      << " ms, MetalFX + draw " << metalfx_ms << " ms, MetalFX alone ~"
+                      << (metalfx_ms - bilinear_ms) << " ms per frame (GPU)\n";
+            return 0;
+        }
         if (mode == "upscale") {
             // Left half red, right half blue: the upscaled image keeps both
             // halves and their colours

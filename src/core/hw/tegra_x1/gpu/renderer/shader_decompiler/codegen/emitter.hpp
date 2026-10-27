@@ -65,6 +65,8 @@ class Emitter {
                          const ir::Value& srcB, const ir::Value& srcC) = 0;
     virtual void emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
                                     const ir::Value& mask) = 0;
+    virtual void emitQuadShuffle(const ir::Value& dst, const ir::Value& src,
+                                 const ir::Value& index) = 0;
     virtual void emitSwizzleAdd(const ir::Value& dst, const ir::Value& src_a,
                                 const ir::Value& src_b, u32 swizzle) = 0;
     virtual void emitMin(const ir::Value& dst, const ir::Value& srcA,
@@ -206,6 +208,8 @@ class Emitter {
                                       const ir::Value& compare,
                                       const ir::Value& value) = 0;
     virtual void emitBarrier() = 0;
+    virtual void emitEmitVertex() = 0;
+    virtual void emitEndPrimitive() = 0;
     virtual void emitImageStore(u32 index, TextureType type,
                                 const ir::Value& coords,
                                 const std::array<ir::Value, 4>& values,

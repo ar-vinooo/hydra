@@ -78,6 +78,90 @@ ir::Value addWithCarry(DecoderContext& context, ir::Value lhs, ir::Value rhs,
     return result;
 }
 
+} // namespace
+
+// IMAD Rd, Ra, b, c: the low (or with .HI the high) word of the 32x32-bit
+// product plus c, with the carry (.X) and flags (.CC) of IADD. .SAT clamps the
+// signed sum, which PTX defines for mad.hi.sat.s32.
+void emitImad(DecoderContext& context, instruction_t inst, ImadForm form) {
+    auto& b = context.builder;
+    const bool write_cc = extractBits(inst, 47, 1) != 0;
+    const bool a_signed = extractBits(inst, 48, 1) != 0;
+    const bool extended = extractBits(inst, 49, 1) != 0;
+    const bool saturate = extractBits(inst, 50, 1) != 0;
+    const bool b_signed = extractBits(inst, 53, 1) != 0;
+    const bool high = extractBits(inst, 54, 1) != 0;
+    if (saturate && (!high || !a_signed || !b_signed || write_cc || extended)) {
+        SHADER_UNSUPPORTED("IMAD.SAT without .HI.S32.S32 or with .X/.CC");
+        return;
+    }
+    const auto reg = [&](u32 offset) {
+        return b.opCopy(ir::Value::createRegister(
+            static_cast<reg_t>(extractBits(inst, offset, 8)), ir::ScalarType::U32));
+    };
+    const auto cbuf = [&] {
+        return b.opBitCast(
+            b.opCopy(ir::Value::createConstMemory(
+                CMem(static_cast<u32>(extractBits(inst, 34, 5)), RZ,
+                     extractBits(inst, 20, 14) * 4))),
+            ir::ScalarType::U32);
+    };
+    const auto conditional =
+        handlePredCond(b, static_cast<pred_t>(extractBits(inst, 16, 3)),
+                       extractBits(inst, 19, 1) != 0);
+    const auto a = reg(8);
+    ir::Value src_b = ir::Value::createConstantU(0);
+    ir::Value src_c = ir::Value::createConstantU(0);
+    switch (form) {
+    case ImadForm::Register:
+        src_b = reg(20);
+        src_c = reg(39);
+        break;
+    case ImadForm::RegisterConstBuffer:
+        src_b = reg(39);
+        src_c = cbuf();
+        break;
+    case ImadForm::ConstBuffer:
+        src_b = cbuf();
+        src_c = reg(39);
+        break;
+    case ImadForm::Immediate:
+        src_b = ir::Value::createConstantU(
+            getIntImm20(static_cast<u32>(extractBits(inst, 20, 19)),
+                        static_cast<u32>(extractBits(inst, 56, 1)), true));
+        src_c = reg(39);
+        break;
+    }
+    const auto product =
+        high ? b.opIntrinsic(ir::Intrinsic::IMulHi, ir::ScalarType::U32,
+                             {a, src_b,
+                              ir::Value::createConstantU(
+                                  (a_signed ? 1u : 0u) | (b_signed ? 2u : 0u))})
+             : b.opMultiply(a, src_b);
+    auto result = addWithCarry(context, product, src_c, extended, write_cc);
+    if (saturate) {
+        const auto zero = ir::Value::createConstantU(0);
+        const auto sign = [&](ir::Value v) {
+            return b.opCompareNotEqual(
+                b.opBitwiseAnd(v, ir::Value::createConstantU(0x80000000u)), zero);
+        };
+        const auto overflow = sign(b.opBitwiseAnd(
+            b.opBitwiseNot(b.opBitwiseXor(product, src_c)),
+            b.opBitwiseXor(product, result)));
+        const auto clamp = b.opSelect(sign(product),
+                                      ir::Value::createConstantU(0x80000000u),
+                                      ir::Value::createConstantU(0x7fffffffu));
+        result = b.opSelect(overflow, clamp, result);
+    }
+    b.opCopy(ir::Value::createRegister(static_cast<reg_t>(extractBits(inst, 0, 8)),
+                                       ir::ScalarType::U32),
+             result);
+    if (conditional)
+        b.opEndIf();
+}
+
+namespace {
+
 void emitIscadd(DecoderContext& context, pred_t pred, bool pred_inv,
                 AvgMode avg_mode, reg_t dst, reg_t src_a, u32 shift,
                 ir::Value src_b, bool write_cc = false) {

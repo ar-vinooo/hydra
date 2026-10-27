@@ -3,7 +3,7 @@ import SwiftUI
 struct EmulationView: View {
     @EnvironmentObject var globalState: GlobalState
 
-    @Binding var fps: Int
+    @Binding var fps: FrameRate
     @State private var showingStartupError = false
     @State private var startupError = ""
 
@@ -22,7 +22,7 @@ struct EmulationView: View {
                     }
                 }
                 .onDisappear {
-                    fps = 0
+                    fps = FrameRate()
                 }
 
             #if os(macOS)

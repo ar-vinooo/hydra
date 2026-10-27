@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/pipeline.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/gpu/perf_stats.hpp"
@@ -9,7 +11,7 @@
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
-Pipeline::Pipeline(MTL::Device* /*device*/,
+Pipeline::Pipeline(MTL::Device* device,
                    const PipelineDescriptor& descriptor,
                    BinaryArchiveCache& binary_archive_cache)
     : PipelineBase(descriptor) {
@@ -22,6 +24,40 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         descriptor.shaders[static_cast<u32>(ShaderType::Vertex)]);
     const auto fragment_shader = static_cast<Shader*>(
         descriptor.shaders[static_cast<u32>(ShaderType::Fragment)]);
+    // Geometry pipelines (geometry.hpp): the vertex shader captures, the
+    // passthrough draws
+    const auto geometry_shader = static_cast<Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::Geometry)]);
+    const auto passthrough_shader =
+        static_cast<Shader*>(descriptor.geometry_passthrough);
+    const bool geometry =
+        geometry_shader != nullptr && passthrough_shader != nullptr;
+    // Tessellation pipelines (tessellation.hpp): the vertex shader captures,
+    // the evaluation shader draws
+    const auto control_shader = static_cast<Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::TessControl)]);
+    const auto evaluation_shader = static_cast<Shader*>(
+        descriptor.shaders[static_cast<u32>(ShaderType::TessEvaluation)]);
+    const auto factor_shader =
+        static_cast<Shader*>(descriptor.tessellation_factors);
+    const bool tessellation = control_shader != nullptr &&
+                              evaluation_shader != nullptr &&
+                              factor_shader != nullptr;
+    if (tessellation && (control_shader->getFunction() == nullptr ||
+                         evaluation_shader->getFunction() == nullptr ||
+                         factor_shader->getFunction() == nullptr)) {
+        LOG_ERROR(MetalRenderer, "Skipping pipeline with a tessellation "
+                                 "shader that failed to compile");
+        pipeline_descriptor->release();
+        return;
+    }
+    if (geometry && (geometry_shader->getFunction() == nullptr ||
+                     passthrough_shader->getFunction() == nullptr)) {
+        LOG_ERROR(MetalRenderer, "Skipping pipeline with a geometry shader "
+                                 "that failed to compile");
+        pipeline_descriptor->release();
+        return;
+    }
     // A shader that failed to compile has no function; Metal asserts on such
     // a descriptor, so leave the pipeline null and let draws using it be
     // skipped
@@ -34,8 +70,20 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     }
     pipeline_descriptor->setVertexFunction(vertex_shader->getFunction());
     // Layered rendering and viewport selection require the primitive class
-    if (vertex_shader->getDescriptor().writes_layer) {
-        switch (descriptor.topology_class) {
+    // (the drawn one, which a geometry shader decides)
+    if (geometry       ? passthrough_shader->getDescriptor().writes_layer
+        : tessellation ? evaluation_shader->getDescriptor().writes_layer
+                       : vertex_shader->getDescriptor().writes_layer) {
+        const auto output = static_cast<geometry::Output>(
+            geometry_shader != nullptr ? geometry_shader->getDescriptor()
+                                             .resource_mapping.geometry_output
+                                       : 0);
+        switch (geometry ? (output == geometry::Output::Points
+                                ? MTL::PrimitiveTopologyClassPoint
+                            : output == geometry::Output::LineStrip
+                                ? MTL::PrimitiveTopologyClassLine
+                                : MTL::PrimitiveTopologyClassTriangle)
+                         : descriptor.topology_class) {
         case MTL::PrimitiveTopologyClassPoint:
         case MTL::PrimitiveTopologyClassLine:
             pipeline_descriptor->setInputPrimitiveTopology(
@@ -50,6 +98,12 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     // Depth-only passes can intentionally disable the fragment stage.
     if (fragment_shader != nullptr)
         pipeline_descriptor->setFragmentFunction(fragment_shader->getFunction());
+    // With one sample, alpha-to-coverage keeps or drops the whole pixel
+    pipeline_descriptor->setAlphaToCoverageEnabled(descriptor.alpha_to_coverage);
+    pipeline_descriptor->setAlphaToOneEnabled(descriptor.alpha_to_one);
+    // As many samples as the render targets have on the host
+    pipeline_descriptor->setRasterSampleCount(
+        getHostSampleCount(device, descriptor.sample_count));
 
     // Vertex state
 
@@ -183,6 +237,128 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         }
     }
 
+    // Geometry pipelines: the capture keeps the vertex fetch, the others
+    // read buffers
+    if (geometry) {
+        const auto create = [&](MTL::RenderPipelineDescriptor* state_descriptor,
+                                const char* what) -> MTL::RenderPipelineState* {
+            NS::Error* state_error = nullptr;
+            auto* state = device->newRenderPipelineState(state_descriptor,
+                                                         &state_error);
+            if (state == nullptr)
+                LOG_ERROR(MetalRenderer, "Failed to create the {} pipeline: {}",
+                          what,
+                          state_error != nullptr
+                              ? state_error->localizedDescription()->utf8String()
+                              : "unknown error");
+            return state;
+        };
+        auto* capture = static_cast<MTL::RenderPipelineDescriptor*>(
+            pipeline_descriptor->copy());
+        capture->setFragmentFunction(nullptr);
+        capture->setRasterizationEnabled(false);
+        capture->setInputPrimitiveTopology(
+            MTL::PrimitiveTopologyClassUnspecified);
+        capture_pipeline = create(capture, "vertex capture");
+        capture->release();
+
+        pipeline_descriptor->setVertexDescriptor(nullptr);
+        auto* emit = static_cast<MTL::RenderPipelineDescriptor*>(
+            pipeline_descriptor->copy());
+        emit->setVertexFunction(geometry_shader->getFunction());
+        emit->setFragmentFunction(nullptr);
+        emit->setRasterizationEnabled(false);
+        emit->setInputPrimitiveTopology(MTL::PrimitiveTopologyClassUnspecified);
+        geometry_pipeline = create(emit, "geometry shader");
+        emit->release();
+
+        pipeline_descriptor->setVertexFunction(passthrough_shader->getFunction());
+        if (capture_pipeline == nullptr || geometry_pipeline == nullptr) {
+            if (capture_pipeline != nullptr)
+                capture_pipeline->release();
+            if (geometry_pipeline != nullptr)
+                geometry_pipeline->release();
+            capture_pipeline = nullptr;
+            geometry_pipeline = nullptr;
+            pipeline_descriptor->release();
+            return;
+        }
+    }
+
+    if (tessellation) {
+        const auto create = [&](MTL::RenderPipelineDescriptor* state_descriptor,
+                                const char* what) -> MTL::RenderPipelineState* {
+            NS::Error* state_error = nullptr;
+            auto* state = device->newRenderPipelineState(state_descriptor,
+                                                         &state_error);
+            if (state == nullptr)
+                LOG_ERROR(MetalRenderer, "Failed to create the {} pipeline: {}",
+                          what,
+                          state_error != nullptr
+                              ? state_error->localizedDescription()->utf8String()
+                              : "unknown error");
+            return state;
+        };
+        const auto raster_off = [&](Shader* shader, const char* what) {
+            auto* state_descriptor = static_cast<MTL::RenderPipelineDescriptor*>(
+                pipeline_descriptor->copy());
+            state_descriptor->setVertexFunction(shader->getFunction());
+            state_descriptor->setFragmentFunction(nullptr);
+            state_descriptor->setRasterizationEnabled(false);
+            state_descriptor->setInputPrimitiveTopology(
+                MTL::PrimitiveTopologyClassUnspecified);
+            auto* state = create(state_descriptor, what);
+            state_descriptor->release();
+            return state;
+        };
+        capture_pipeline = raster_off(vertex_shader, "vertex capture");
+        pipeline_descriptor->setVertexDescriptor(nullptr);
+        tess_control_pipeline =
+            raster_off(control_shader, "tessellation control shader");
+        tess_factor_pipeline =
+            raster_off(factor_shader, "tessellation factor");
+
+        // The evaluation shader runs per tessellated vertex
+        pipeline_descriptor->setVertexFunction(evaluation_shader->getFunction());
+        switch (tessellation::getSpacing(descriptor.tessellation_parameters)) {
+        case tessellation::Spacing::FractionalOdd:
+            pipeline_descriptor->setTessellationPartitionMode(
+                MTL::TessellationPartitionModeFractionalOdd);
+            break;
+        case tessellation::Spacing::FractionalEven:
+            pipeline_descriptor->setTessellationPartitionMode(
+                MTL::TessellationPartitionModeFractionalEven);
+            break;
+        default:
+            pipeline_descriptor->setTessellationPartitionMode(
+                MTL::TessellationPartitionModeInteger);
+            break;
+        }
+        pipeline_descriptor->setTessellationOutputWindingOrder(
+            tessellation::getOutputPrimitives(descriptor.tessellation_parameters) ==
+                    tessellation::OutputPrimitives::TrianglesCw
+                ? MTL::WindingClockwise
+                : MTL::WindingCounterClockwise);
+        pipeline_descriptor->setTessellationFactorStepFunction(
+            MTL::TessellationFactorStepFunctionPerPatch);
+        pipeline_descriptor->setTessellationFactorFormat(
+            MTL::TessellationFactorFormatHalf);
+        pipeline_descriptor->setTessellationControlPointIndexType(
+            MTL::TessellationControlPointIndexTypeNone);
+        pipeline_descriptor->setMaxTessellationFactor(64);
+        if (capture_pipeline == nullptr || tess_control_pipeline == nullptr ||
+            tess_factor_pipeline == nullptr) {
+            for (auto** state : {&capture_pipeline, &tess_control_pipeline,
+                                 &tess_factor_pipeline}) {
+                if (*state != nullptr)
+                    (*state)->release();
+                *state = nullptr;
+            }
+            pipeline_descriptor->release();
+            return;
+        }
+    }
+
     // Pipeline
     std::optional<ScopedPerfTimer> compile_timer;
     if (PerfStats::isEnabled()) {
@@ -190,47 +366,21 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
         PerfStats::instance().pipeline_compiles++;
     }
     NS::Error* error = nullptr;
+    const auto* drawing_shader = geometry       ? passthrough_shader
+                                 : tessellation ? evaluation_shader
+                                                : vertex_shader;
     const PipelineSources sources{
-        vertex_shader->getLibraryKey(),
+        drawing_shader->getLibraryKey(),
         fragment_shader != nullptr ? fragment_shader->getLibraryKey() : ""};
     // A fragment shader without a stored source cannot be rebuilt
     const bool rebuildable =
         fragment_shader == nullptr || !sources.fragment.empty();
-    const auto shader_key = fmt::format(
-        "{}:{}", vertex_shader->getCacheKey(),
-        fragment_shader != nullptr ? fragment_shader->getCacheKey()
-                                   : "no-fragment");
-    MTL::RenderPipelineState* pipeline;
-    if (binary_archive_cache.isAsync()) {
-        // Draws are skipped until the worker publishes the pipeline
-        state->compiling.store(true, std::memory_order_release);
-        pipeline = binary_archive_cache.createPipelineAsync(
-            pipeline_descriptor, &error, shader_key,
-            rebuildable ? &sources : nullptr,
-            [state = state](MTL::RenderPipelineState* compiled,
-                            NS::Error* compile_error) {
-                // The error belongs to the worker's autorelease pool
-                if (compiled == nullptr)
-                    LOG_ERROR(MetalRenderer, "Failed to create pipeline: {}",
-                              compile_error ? compile_error
-                                                  ->localizedDescription()
-                                                  ->utf8String()
-                                            : "unknown error");
-                state->pipeline.store(compiled, std::memory_order_release);
-                state->compiling.store(false, std::memory_order_release);
-            });
-        // Not queued: done is never called. Otherwise the worker may already
-        // have published the pipeline, so leave the state to it.
-        if (pipeline != nullptr || error != nullptr) {
-            state->pipeline.store(pipeline, std::memory_order_release);
-            state->compiling.store(false, std::memory_order_release);
-        }
-    } else {
-        pipeline = binary_archive_cache.createPipeline(
-            pipeline_descriptor, &error, shader_key,
-            rebuildable ? &sources : nullptr);
-        state->pipeline.store(pipeline, std::memory_order_release);
-    }
+    pipeline = binary_archive_cache.createPipeline(
+        pipeline_descriptor, &error,
+        fmt::format("{}:{}", drawing_shader->getCacheKey(),
+                    fragment_shader != nullptr ? fragment_shader->getCacheKey()
+                                               : "no-fragment"),
+        rebuildable ? &sources : nullptr);
     if (auto& visual = VisualDiagnostics::instance(); visual.selected())
         visual.event("metal_pipeline_result", {{"available", pipeline ? "1" : "0"},
             {"vertex_key", vertex_shader->getCacheKey()},
@@ -245,6 +395,17 @@ Pipeline::Pipeline(MTL::Device* /*device*/,
     }
 }
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    if (pipeline != nullptr)
+        pipeline->release();
+    if (capture_pipeline != nullptr)
+        capture_pipeline->release();
+    if (geometry_pipeline != nullptr)
+        geometry_pipeline->release();
+    if (tess_control_pipeline != nullptr)
+        tess_control_pipeline->release();
+    if (tess_factor_pipeline != nullptr)
+        tess_factor_pipeline->release();
+}
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

@@ -21,6 +21,8 @@ struct DrawState {
     f32 depth_bias_slope{0.0f};
     f32 depth_bias_clamp{0.0f};
     bool depth_clamp{false};
+    // SET_FRONT_POLYGON_MODE: triangles drawn as lines
+    bool polygon_lines{false};
     std::array<MTL::Viewport, VIEWPORT_COUNT> viewports{};
     std::array<MTL::ScissorRect, VIEWPORT_COUNT> scissors{};
 };

@@ -2,6 +2,7 @@
 
 #include "core/horizon/filesystem/content_archive.hpp"
 #include "core/horizon/loader/loader.hpp"
+#include "core/horizon/loader/npdm.hpp"
 
 namespace hydra {
 class System;
@@ -33,6 +34,7 @@ class NcaLoader : public ILoader {
     bool is_64_bit{true};
     u8 main_thread_priority;
     u8 main_thread_core_number;
+    std::optional<NpdmThreadInfo> thread_info;
     u32 main_thread_stack_size;
     u32 system_resource_size;
 

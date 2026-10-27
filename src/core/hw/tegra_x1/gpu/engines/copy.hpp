@@ -150,8 +150,10 @@ class Copy : public EngineWithRegsBase<RegsCopy> {
 
     void launchDma(const u32 index, const LaunchDMAData data);
     // Copies the data of a launch (not its semaphore)
-    void executeCopy(const LaunchDMAData data);
-    void releaseSemaphore(const LaunchDMAData data);
+    // True if the copy was queued on the GPU instead of done at once
+    bool executeCopy(const LaunchDMAData data);
+    // `behind_gpu`: the copy is still on its way, the release follows it
+    void releaseSemaphore(const LaunchDMAData data, bool behind_gpu);
     // Pitch to pitch copy with component remapping (also used as a fill)
     void remapPitchCopy(const LaunchDMAData data);
 };

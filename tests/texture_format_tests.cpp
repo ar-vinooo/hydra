@@ -345,13 +345,16 @@ void testSurfaceFormatConversions() {
     check(toTextureFormat(DepthSurfaceFormat::Z24S8Unorm) ==
               TextureFormat::Z24Unorm_S8Uint,
           "ZT S8Z24 keeps the stencil in the high byte");
+    // clb197.h V8Z24 (0x18): the coverage byte has no host use, the depth
+    // is read like X8Z24
     check(toTextureFormat(DepthSurfaceFormat::Z24C8Unorm) ==
-                  TextureFormat::Invalid &&
-              toTextureFormat(DepthSurfaceFormat::Z24X8S8C8X16Unorm) ==
+              TextureFormat::Z24Unorm_X8Uint,
+          "ZT V8Z24 is read as a depth-only Z24 format");
+    check(toTextureFormat(DepthSurfaceFormat::Z24X8S8C8X16Unorm) ==
                   TextureFormat::Invalid &&
               toTextureFormat(static_cast<DepthSurfaceFormat>(0x1b)) ==
                   TextureFormat::Invalid,
-          "Coverage and unknown depth formats are reported as unsupported");
+          "X8Z24_X16V8S8 and unknown depth formats are reported as unsupported");
 
     std::cout << "PASS: render target and depth target format conversions\n";
 }

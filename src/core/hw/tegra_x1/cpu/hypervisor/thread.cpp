@@ -159,11 +159,9 @@ Thread::Thread(WallClock& wall_clock, Cpu& cpu_, IMmu* mmu,
 
     createVcpu();
 
-    // TODO: find out what this does
+    // PSTATE until the first run writes `state`: EL0t (M = 0) with D, A, I
+    // and F masked (0x3c0)
     setReg(HV_REG_CPSR, 0x3c0);
-
-    // HACK: set LR to loader return address
-    // SetReg(HV_REG_LR, 0xffff0000);
 }
 
 Thread::~Thread() { releaseVcpu(false); }
@@ -237,6 +235,8 @@ void Thread::createVcpu() {
 void Thread::releaseVcpu(bool save_state) {
     if (!has_vcpu)
         return;
+    // A new vCPU may run on a core with older translations
+    tlb_generation_seen = 0;
 
     // Only the owning thread may access the registers
     if (save_state) {
@@ -259,12 +259,14 @@ void Thread::run() {
 
         // Run
         deserializeState();
+        const bool perf = gpu::PerfStats::isEnabled();
+        const auto run_start = perf ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
         HV_ASSERT_SUCCESS(hv_vcpu_run(vcpu));
-        // Exited from the exception vector (kernel region) rather than from
-        // guest code. Comparing against the kernel page table's physical
-        // base would misclassify guest code mapped above 4 GiB.
-        exception = (getReg(HV_REG_PC) >= KERNEL_REGION_BASE);
-        serializeState();
+        if (perf)
+            countExit(run_start);
+        exception = (getReg(HV_REG_PC) >= cpu.getKernelPageTable().getBase());
+        serializeState(canSkipSimdOnExit());
 
         // Handle exit
         if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
@@ -283,9 +285,24 @@ void Thread::run() {
                 case ExceptionClass::SvcAarch64:
                     // Don't hold on to a vCPU while blocked if they run low
                     if (live_vcpu_count >= getVcpuReleaseThreshold() &&
-                        mayBlock(esr & 0xffff))
+                        mayBlock(esr & 0xffff)) {
+                        // The registers are recreated from `state`
+                        serializeSimd();
                         releaseVcpu();
-                    callbacks.svc_handler(this, esr & 0xffff);
+                    }
+                    if (perf) {
+                        const auto svc_id = (esr & 0xffff) & 0x7f;
+                        const auto svc_start = std::chrono::steady_clock::now();
+                        callbacks.svc_handler(this, esr & 0xffff);
+                        auto& stats = gpu::PerfStats::instance();
+                        stats.svc_count[svc_id]++;
+                        stats.svc_ns[svc_id] += static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - svc_start)
+                                .count());
+                    } else {
+                        callbacks.svc_handler(this, esr & 0xffff);
+                    }
                     break;
                 case ExceptionClass::TrappedMsrMrsSystem: {
                     instructionTrap(esr);
@@ -294,14 +311,28 @@ void Thread::run() {
                     break;
                 }
                 case ExceptionClass::DataAbortLowerEl: {
-                    // TODO: use the correct size
+                    // The access size, when the syndrome holds it (ISV,
+                    // SAS); pair and vector accesses do not report one
+                    const bool size_valid = (esr & (1u << 24)) != 0;
+                    const u64 access_size =
+                        size_valid ? (1ull << ((esr >> 22) & 0x3)) : 16;
                     if (far < ADDRESS_SPACE_SIZE &&
-                        MMU.trackWrite(ztd::Range<vaddr_t>::fromSize(far, 8)))
+                        MMU.trackWrite(
+                            ztd::Range<vaddr_t>::fromSize(far, access_size))) {
+                        // The page is writable now, this core may still
+                        // hold it read-only
+                        local_tlb_flush = true;
                         break;
+                    }
 
+                    // A real fault: the debugger may show every register
+                    serializeSimd();
                     bool far_valid = (esr & 0x00000400) == 0;
                     ASSERT_DEBUG(far_valid, Hypervisor, "FAR not valid");
 
+                    if (!CONFIG_INSTANCE.getRecoverFromSegfault() &&
+                        deliverUserException(esr, far))
+                        break;
                     if (CONFIG_INSTANCE.getRecoverFromSegfault()) {
                         LOG_ERROR(
                             Hypervisor,
@@ -318,6 +349,11 @@ void Thread::run() {
                     break;
                 }
                 default:
+                    // Undefined instructions, alignment faults, instruction
+                    // aborts, ...: Horizon hands them to the process
+                    serializeSimd();
+                    if (deliverUserException(esr, far))
+                        break;
                     LOG_ERROR(
                         Hypervisor,
                         "Unknown HVC code (EC: {}, ESR: 0x{:08x}, PC: "
@@ -334,10 +370,8 @@ void Thread::run() {
                     break;
                 }
 
-                // Set the PC to trampoline
-                // TODO: most of the time we can skip msr, find out when
-                constexpr u64 trampoline =
-                    KERNEL_REGION_BASE + EXCEPTION_TRAMPOLINE_OFFSET;
+                // Return through the trampoline, invalidating TLBs as needed
+                const auto trampoline = selectTrampoline();
                 if (has_vcpu)
                     setReg(HV_REG_PC, trampoline);
                 else
@@ -355,6 +389,9 @@ void Thread::run() {
                 LOG_FATAL(Hypervisor, "SMC");
                 break;
             case ExceptionClass::BrkAarch64:
+                // Without a debugger, BRK is a user exception on Horizon
+                if (deliverUserException(static_cast<u32>(syndrome), 0x0))
+                    break;
                 GET_CURRENT_PROCESS_DEBUGGER().breakOnThisThread(
                     "BRK instruction");
                 return;
@@ -457,6 +494,68 @@ void Thread::run() {
     }
 }
 
+void Thread::countExit(std::chrono::steady_clock::time_point run_start) {
+    auto& stats = gpu::PerfStats::instance();
+    stats.guest_run_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - run_start)
+            .count());
+    auto kind = gpu::CpuExit::Other;
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+        kind = gpu::CpuExit::VTimer;
+    } else if (exit->reason == HV_EXIT_REASON_EXCEPTION) {
+        const auto hv_ec = static_cast<ExceptionClass>(
+            (exit->exception.syndrome >> 26) & 0x3f);
+        if (hv_ec == ExceptionClass::DataAbortLowerEl) {
+            kind = gpu::CpuExit::Stage2;
+        } else if (hv_ec == ExceptionClass::HvcAarch64) {
+            const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+            switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+            case ExceptionClass::SvcAarch64:
+                kind = gpu::CpuExit::Svc;
+                break;
+            case ExceptionClass::TrappedMsrMrsSystem:
+                kind = gpu::CpuExit::SystemRegister;
+                break;
+            case ExceptionClass::DataAbortLowerEl:
+                kind = gpu::CpuExit::DataAbort;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    stats.cpu_exits[static_cast<usize>(kind)]++;
+}
+
+bool Thread::deliverUserException(u32 esr, u64 far) {
+    if (CONFIG_INSTANCE.getGdbEnabled() || !callbacks.user_exception)
+        return false;
+    GuestException guest_exception{.esr = esr, .far = far};
+    if (exception && has_vcpu) {
+        guest_exception.afsr0 =
+            static_cast<u32>(getSysReg(HV_SYS_REG_AFSR0_EL1));
+        guest_exception.afsr1 =
+            static_cast<u32>(getSysReg(HV_SYS_REG_AFSR1_EL1));
+    }
+    return callbacks.user_exception(this, guest_exception);
+}
+
+u64 Thread::selectTrampoline() {
+    const auto generation = getTlbGeneration();
+    uptr offset = EXCEPTION_TRAMPOLINE_OFFSET;
+    if (generation != tlb_generation_seen) {
+        // Read before invalidating: a change after this is seen next time
+        tlb_generation_seen = generation;
+        local_tlb_flush = false;
+        offset = EXCEPTION_TRAMPOLINE_SHARED_TLB_OFFSET;
+    } else if (local_tlb_flush) {
+        local_tlb_flush = false;
+        offset = EXCEPTION_TRAMPOLINE_LOCAL_TLB_OFFSET;
+    }
+    return KERNEL_REGION_BASE + offset;
+}
+
 void Thread::setupVTimer() {
     // The vtimer only preempts the guest and runs in host ticks. It compares
     // against the vCPU's virtual count (host count - vtimer offset), so the
@@ -473,7 +572,50 @@ void Thread::updateVTimer() {
     hv_vcpu_set_vtimer_mask(vcpu, false);
 }
 
-void Thread::serializeState() {
+bool Thread::canSkipSimdOnExit() {
+    static const bool disable_filter =
+        std::getenv("HYDRA_DISABLE_REGISTER_WRITE_FILTER") != nullptr;
+    // Without a baseline or filter every register is written back from `state`
+    if (disable_filter || !exit_register_state || !has_vcpu)
+        return false;
+    // The vCPU keeps the live SIMD registers; only exits whose handler may
+    // read them (debugging) need them in `state`
+    if (exit->reason == HV_EXIT_REASON_VTIMER_ACTIVATED)
+        return true;
+    if (exit->reason != HV_EXIT_REASON_EXCEPTION)
+        return false;
+    switch (static_cast<ExceptionClass>((exit->exception.syndrome >> 26) &
+                                        0x3f)) {
+    case ExceptionClass::DataAbortLowerEl: // Stage 2 memory tracking
+        return true;
+    case ExceptionClass::HvcAarch64:
+        break;
+    default:
+        return false;
+    }
+    const auto esr = static_cast<u32>(getSysReg(HV_SYS_REG_ESR_EL1));
+    switch (static_cast<ExceptionClass>((esr >> 26) & 0x3f)) {
+    case ExceptionClass::SvcAarch64:
+    case ExceptionClass::TrappedMsrMrsSystem: // CNTPCT_EL0/CNTFRQ_EL0 reads
+    case ExceptionClass::DataAbortLowerEl:    // Stage 1 write tracking
+        return true;
+    default:
+        return false;
+    }
+}
+
+void Thread::serializeSimd() {
+    if (!simd_stale)
+        return;
+    for (u8 i = 0; i < 32; i++)
+        state.v[i] = getSimdFpReg(i);
+    if (exit_register_state)
+        for (u8 i = 0; i < 32; i++)
+            exit_register_state->v[i] = state.v[i];
+    simd_stale = false;
+}
+
+void Thread::serializeState(bool skip_simd) {
     for (u8 i = 0; i < 29; i++)
         state.r[i] = getReg(hv_reg_t(HV_REG_X0 + i));
     state.fp = getReg(HV_REG_FP);
@@ -484,8 +626,13 @@ void Thread::serializeState() {
     else
         state.pc = getReg(HV_REG_PC);
     state.pstate = static_cast<u32>(getReg(HV_REG_CPSR));
-    for (u8 i = 0; i < 32; i++)
-        state.v[i] = getSimdFpReg(i);
+    if (!skip_simd) {
+        for (u8 i = 0; i < 32; i++)
+            state.v[i] = getSimdFpReg(i);
+        simd_stale = false;
+    } else {
+        simd_stale = true;
+    }
     state.fpcr = static_cast<u32>(getReg(HV_REG_FPCR));
     state.fpsr = static_cast<u32>(getReg(HV_REG_FPSR));
     exit_register_state = state;
@@ -565,7 +712,11 @@ void Thread::instructionTrap(u32 esr) {
 }
 
 void Thread::processMessages() {
+    // Checked on every VM exit; debugger messages are rare
+    if (!has_messages.load(std::memory_order_acquire))
+        return;
     std::scoped_lock lock(msg_mutex);
+    has_messages.store(false, std::memory_order_relaxed);
     while (!msg_queue.empty()) {
         auto message = msg_queue.front();
         msg_queue.pop();

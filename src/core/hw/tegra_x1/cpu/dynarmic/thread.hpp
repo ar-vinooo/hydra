@@ -37,6 +37,8 @@ class Thread final : public IThread, private Dynarmic::A64::UserCallbacks {
         serializeState();
     }
 
+    u64 getTpidr() override { return tpidr_el0; }
+
   private:
     vaddr_t tpidrro_el0;
     vaddr_t tpidr_el0{0};

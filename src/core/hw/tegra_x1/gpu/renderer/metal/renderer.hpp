@@ -15,9 +15,14 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/renderer.hpp"
 
+namespace hydra::hw::tegra_x1::gpu::renderer {
+class DrawQueue;
+}
+
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class CommandBuffer;
+class Shader;
 class RenderEncoder;
 class TextureView;
 class Sampler;
@@ -48,6 +53,7 @@ struct State {
     MTL::CullMode cull_mode{MTL::CullModeNone};
     MTL::Winding front_face_winding{MTL::WindingClockwise};
     MTL::DepthClipMode depth_clip_mode{MTL::DepthClipModeClip};
+    MTL::TriangleFillMode triangle_fill_mode{MTL::TriangleFillModeFill};
     MTL::Viewport viewports[VIEWPORT_COUNT];
     MTL::ScissorRect scissors[VIEWPORT_COUNT];
     BufferView index_buffer;
@@ -104,6 +110,7 @@ class Renderer : public IRenderer {
 
     // Clear
     void setClearState(const ClearState& clear_state) override {
+        syncDrawQueue();
         state.clear = clear_state;
     }
     void clearColor(ICommandBuffer* command_buffer, u32 render_target_id,
@@ -115,6 +122,7 @@ class Renderer : public IRenderer {
 
     // Shader
     u64 getAllocatedResourceBytes() const override { return device->currentAllocatedSize(); }
+    DrawQueue* getDrawQueue() override { return draw_queue.get(); }
     void setTitleId(u64 title_id) override;
     void logPassProfile(f64 frames) override;
     ShaderBase* createShader(const ShaderDescriptor& descriptor) override;
@@ -133,8 +141,14 @@ class Renderer : public IRenderer {
     void setCullState(bool enabled, engines::CullFaceMode mode,
                       engines::Winding front_face) override;
     void setDepthClamp(bool enabled) override {
+        syncDrawQueue();
         state.depth_clip_mode =
             enabled ? MTL::DepthClipModeClamp : MTL::DepthClipModeClip;
+    }
+    void setPolygonLines(bool enabled) override {
+        syncDrawQueue();
+        state.triangle_fill_mode =
+            enabled ? MTL::TriangleFillModeLines : MTL::TriangleFillModeFill;
     }
     void debugDumpTexture(ICommandBuffer* command_buffer, ITextureView* view,
                           const std::string& path) override;
@@ -176,9 +190,13 @@ class Renderer : public IRenderer {
     bool synchronize(ICommandBuffer* command_buffer) override;
     bool synchronizeGuestWrites(ICommandBuffer* command_buffer) override;
     void setOcclusionCounterEnabled(bool enabled) override {
+        syncDrawQueue();
         occlusion->setEnabled(enabled);
     }
-    void resetOcclusionCounter() override { occlusion->reset(); }
+    void resetOcclusionCounter() override {
+        syncDrawQueue();
+        occlusion->reset();
+    }
     void queueOcclusionReport(ICommandBuffer* command_buffer,
                               ReportPublisher publish,
                               std::vector<ztd::Range<uptr>> writes) override;
@@ -248,6 +266,9 @@ class Renderer : public IRenderer {
     std::unique_ptr<OcclusionCounter> occlusion;
     std::optional<u64> prepareOcclusionQuery(CommandBuffer* command_buffer);
 
+    // Encodes draws on a second thread, see DrawQueue
+    std::unique_ptr<DrawQueue> draw_queue;
+
     // Caches
     BinaryArchiveCache binary_archive_cache;
     ShaderLibraryCache shader_library_cache;
@@ -288,6 +309,34 @@ class Renderer : public IRenderer {
     // Helpers
     bool canDraw() const;
     void bindDrawState(CommandBuffer* command_buffer);
+    // Binds the resources `shader` declares from the bindings of `state_type`
+    // to the `host_type` stage (a geometry shader runs as a vertex function)
+    void bindStageResources(CommandBuffer* command_buffer, const Shader* shader,
+                            ShaderType state_type, ShaderType host_type);
+    // The vertex ids a draw uses, which index the vertex shader's captured
+    // records from the lowest (geometry.hpp). False if they cannot be read.
+    struct VertexRange {
+        u32 min_vertex;
+        u32 slots;
+        MTL::Buffer* index_buffer;
+        u64 index_offset;
+    };
+    std::optional<VertexRange> getDrawVertexRange(bool indexed, u32 start,
+                                                  u32 count, u32 base_vertex);
+    // Records the vertex shader's outputs for the draw (geometry.hpp)
+    void encodeVertexCapture(CommandBuffer* command_buffer,
+                             const VertexRange& range, MTL::Buffer* records,
+                             MTL::Buffer* params, bool indexed, u32 start,
+                             u32 count, u32 base_vertex, u32 base_instance);
+    // A draw with a geometry shader (see geometry.hpp)
+    void drawGeometry(CommandBuffer* command_buffer,
+                      engines::PrimitiveType primitive_type, u32 start,
+                      u32 count, bool indexed, u32 base_vertex,
+                      u32 base_instance, u32 instance_count);
+    // A draw of patches with tessellation (see tessellation.hpp)
+    void drawTessellation(CommandBuffer* command_buffer, u32 start, u32 count,
+                          bool indexed, u32 base_vertex, u32 base_instance,
+                          u32 instance_count);
 
   public:
     GETTER(device, getDevice);

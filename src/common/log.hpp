@@ -18,6 +18,15 @@
                         trimSourcePath(__FILE__), __LINE__, __func__,          \
                         __VA_ARGS__)
 
+// HYDRA_NO_LOGGING keeps the calls type-checked but compiles them out, so
+// their arguments are never evaluated. Fatal errors are still reported.
+#ifdef HYDRA_NO_LOGGING
+#define LOG_ENABLED(level, c, ...)                                             \
+    ((void)(false ? (void)LOG(level, c, __VA_ARGS__) : (void)0))
+#else
+#define LOG_ENABLED(level, c, ...) LOG(level, c, __VA_ARGS__)
+#endif
+
 #ifdef HYDRA_DEBUG
 #define LOG_DEBUG(c, ...)                                                      \
     {                                                                          \
@@ -28,11 +37,11 @@
 #define LOG_DEBUG(c, ...)
 #endif
 
-#define LOG_INFO(c, ...) LOG(Info, c, __VA_ARGS__)
+#define LOG_INFO(c, ...) LOG_ENABLED(Info, c, __VA_ARGS__)
 #define LOG_STUBBED(c, f, ...)                                                 \
-    LOG(Stub, c, f " stubbed" ZTD_PASS_VA_ARGS(__VA_ARGS__))
-#define LOG_WARN(c, ...) LOG(Warning, c, __VA_ARGS__)
-#define LOG_ERROR(c, ...) LOG(Error, c, __VA_ARGS__)
+    LOG_ENABLED(Stub, c, f " stubbed" ZTD_PASS_VA_ARGS(__VA_ARGS__))
+#define LOG_WARN(c, ...) LOG_ENABLED(Warning, c, __VA_ARGS__)
+#define LOG_ERROR(c, ...) LOG_ENABLED(Error, c, __VA_ARGS__)
 #ifdef HYDRA_DEBUG
 #define LOG_ERROR_ON_DEBUG(c, ...) LOG_ERROR(c, __VA_ARGS__)
 #else

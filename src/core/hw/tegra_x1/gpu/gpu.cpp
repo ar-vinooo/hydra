@@ -214,12 +214,14 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
         renderer->invalidateMemory(
             ztd::Range<uptr>::fromSize(reinterpret_cast<uptr>(ptr), size));
     };
-    const auto wait_for_gpu = [&] {
+    auto& channel = channelContext();
+    const auto wait_for_gpu = [&](CheckpointReason why) {
         if (tls_crnt_command_buffer == nullptr)
             return true;
-        renderer::ScopedCheckpointReason reason(
-            tls_crnt_command_buffer, CheckpointReason::PullerOther);
+        renderer::ScopedCheckpointReason reason(tls_crnt_command_buffer, why);
         const bool succeeded = renderer->synchronize(tls_crnt_command_buffer);
+        if (succeeded)
+            channel.idle_pending = false;
         if (!succeeded && tls_crnt_decode_state)
             tls_crnt_decode_state->fail(25);
         // What the guest is told next (semaphore, reference) includes the
@@ -305,7 +307,7 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             "semaphore_acquire", capture::currentGuestEventOrigin(),
             semaphore_address(), 4, 0, payload, operation);
         auto* ptr = resolve(sizeof(u32));
-        if (ptr == nullptr || !wait_for_gpu())
+        if (ptr == nullptr || !wait_for_gpu(CheckpointReason::PullerAcquire))
             return;
         while (!pfifo.isStopping()) {
             const u32 word = std::atomic_ref<u32>(
@@ -327,8 +329,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
 
     switch (method) {
     case 0x14: // NVB06F_SET_REFERENCE (byte offset 0x50)
-        if (wait_for_gpu())
-            puller_regs[method] = arg;
+        puller_regs[method] = arg;
+        channel.idle_pending = true;
         break;
     case 0x2: // NVB06F_NOP
         break;
@@ -350,7 +352,7 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
     case 0xd: { // MEM_OP_D: OPERATION[31:27]
         switch (arg >> 27) {
         case 0x5: // MEMBAR
-            wait_for_guest_writes();
+            wait_for_gpu(CheckpointReason::PullerMembar);
             break;
         case 0x9:  // MMU_TLB_INVALIDATE: mappings are looked up directly
         case 0xd:  // L2_PEERMEM_INVALIDATE
@@ -367,7 +369,7 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
         break;
     }
     case WAIT_FOR_IDLE:
-        wait_for_guest_writes();
+        wait_for_gpu(CheckpointReason::PullerWaitForIdle);
         break;
     case SEMAPHORE_TRIGGER: {
         const u32 payload = puller_regs[SEMAPHORE_SEQUENCE];
@@ -377,16 +379,9 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             break;
         case 0x2: { // RELEASE_SIZE: 0 is 16 bytes, 1 is four bytes.
             const u64 size = (arg & (1u << 24)) != 0 ? 4 : 16;
-            if ((arg & (1u << 20)) == 0 && tls_crnt_command_buffer != nullptr) {
-                if (queue_release(size, [payload](std::atomic_ref<u32> word) {
-                        word.store(payload, std::memory_order_release);
-                    }))
-                    capture::GuestEvents::instance().event(
-                        "semaphore_release", capture::currentGuestEventOrigin(),
-                        semaphore_address(), size, 0, payload, arg);
+            if ((arg & (1u << 20)) == 0 && !wait_for_gpu(CheckpointReason::PullerRelease))
                 break;
-            }
-            if ((arg & (1u << 20)) == 0 && !wait_for_gpu())
+            if (channel.idle_pending && !wait_for_gpu(CheckpointReason::PullerReference))
                 break;
             auto* ptr = resolve(sizeof(u32));
             auto* timestamp_ptr = ptr != nullptr && size == 16 ? resolve(sizeof(u64), 8) : nullptr;
@@ -416,39 +411,9 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                     tls_crnt_decode_state->fail(25);
                 break;
             }
-            const auto reduce = [reduction, is_signed,
-                                 payload](std::atomic_ref<u32> word) {
-                u32 old = word.load(std::memory_order_acquire);
-                while (true) {
-                    u32 value;
-                    switch (reduction) {
-                    case 0: // MIN
-                        value = is_signed ? static_cast<u32>(std::min(static_cast<i32>(old), static_cast<i32>(payload)))
-                                          : std::min(old, payload);
-                        break;
-                    case 1: // MAX
-                        value = is_signed ? static_cast<u32>(std::max(static_cast<i32>(old), static_cast<i32>(payload)))
-                                          : std::max(old, payload);
-                        break;
-                    case 2: value = old ^ payload; break;
-                    case 3: value = old & payload; break;
-                    case 4: value = old | payload; break;
-                    case 6: value = old >= payload ? 0u : old + 1; break;
-                    case 7: value = old == 0 || old > payload ? payload : old - 1; break;
-                    default: value = old + payload; break; // ADD wraps
-                    }
-                    if (word.compare_exchange_weak(old, value, std::memory_order_acq_rel))
-                        break;
-                }
-            };
-            if ((arg & (1u << 20)) == 0 && tls_crnt_command_buffer != nullptr) {
-                if (queue_release(4, reduce))
-                    capture::GuestEvents::instance().event(
-                        "semaphore_release", capture::currentGuestEventOrigin(),
-                        semaphore_address(), 4, 0, payload, arg);
+            if ((arg & (1u << 20)) == 0 && !wait_for_gpu(CheckpointReason::PullerReduction))
                 break;
-            }
-            if ((arg & (1u << 20)) == 0 && !wait_for_gpu())
+            if (channel.idle_pending && !wait_for_gpu(CheckpointReason::PullerReference))
                 break;
             auto* ptr = resolve(sizeof(u32));
             if (ptr == nullptr)
@@ -479,16 +444,7 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
         acquire(arg, 1, [&](u32 word) { return word == arg; });
         break;
     case SEMAPHORE_RELEASE:
-        if (tls_crnt_command_buffer != nullptr) {
-            if (queue_release(4, [arg](std::atomic_ref<u32> word) {
-                    word.store(arg, std::memory_order_release);
-                }))
-                capture::GuestEvents::instance().event(
-                    "semaphore_release", capture::currentGuestEventOrigin(),
-                    semaphore_address(), 4, 0, arg);
-            break;
-        }
-        if (!wait_for_gpu())
+        if (!wait_for_gpu(CheckpointReason::PullerRelease))
             break;
         if (auto* ptr = resolve(sizeof(u32))) {
             std::atomic_ref<u32>(*reinterpret_cast<u32*>(ptr))
@@ -509,6 +465,8 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
                 tls_crnt_decode_state->fail(25);
             break;
         }
+        if (!wait_for_gpu(CheckpointReason::PullerSyncpoint))
+            break;
         if (operation == 1) {
             // The increment tells that the preceding work completed
             if (!wait_for_gpu())

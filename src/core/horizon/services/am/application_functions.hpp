@@ -36,10 +36,12 @@ class IApplicationFunctions : public IService {
     result_t ensureSaveData(uuid_t user_id, u64* out_required_size);
     result_t getDesiredLanguage(LanguageCode* out_language_code);
     result_t setTerminateResult(result_t result);
-    result_t getDisplayVersion(DisplayVersion* out_version);
+    result_t getDisplayVersion(RequestContext* ctx,
+                               DisplayVersion* out_version);
     result_t extendSaveData(u128 user_id, i64 size, i64 journal_size,
                             result_t* out_result);                  // 3.0.0+
-    result_t getSaveDataSize(i64* out_size, i64* out_journal_size); // 3.0.0+
+    result_t getSaveDataSize(RequestContext* ctx, i64* out_size,
+                             i64* out_journal_size); // 3.0.0+
     STUB_REQUEST_COMMAND(beginBlockingHomeButton);
     STUB_REQUEST_COMMAND(endBlockingHomeButton);
     STUB_REQUEST_COMMAND(notifyRunning);

@@ -105,6 +105,7 @@ MTL::RenderPipelineState* ClearColorPipelineCache::createHot0(
     }
     setDepthStencilPixelFormat(pipeline_descriptor,
                                descriptor.depth_stencil_pixel_format);
+    pipeline_descriptor->setRasterSampleCount(descriptor.sample_count);
     auto color_attachment = pipeline_descriptor->colorAttachments()->object(
         descriptor.render_target_id);
 
@@ -140,6 +141,7 @@ u32 ClearColorPipelineCache::hashHot1(
     hash.add(descriptor.render_target_id);
     hash.add(descriptor.mask);
     hash.add(descriptor.depth_stencil_pixel_format);
+    hash.add(descriptor.sample_count);
     return hash.toHashCode();
 }
 
@@ -149,7 +151,8 @@ bool ClearColorPipelineCache::equals(const ClearColorPipelineDescriptor& a,
     return std::equal(std::begin(a.pixel_formats), std::end(a.pixel_formats),
                       std::begin(b.pixel_formats)) &&
            a.render_target_id == b.render_target_id && a.mask == b.mask &&
-           a.depth_stencil_pixel_format == b.depth_stencil_pixel_format;
+           a.depth_stencil_pixel_format == b.depth_stencil_pixel_format &&
+           a.sample_count == b.sample_count;
 }
 
 void ClearColorPipelineCache::destroyElement(

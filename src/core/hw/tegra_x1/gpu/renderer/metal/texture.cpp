@@ -10,6 +10,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/command_buffer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/maxwell_to_mtl.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/msaa_converter.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
 
@@ -191,14 +192,23 @@ bool copyRegion(BlitEncoder* encoder, MTL::Texture* src,
 
 Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
     : ITexture(descriptor) {
-    const auto type = descriptor.type;
+    // A multisampled texture has a texel per pixel, the guest surface a
+    // block of texels (its samples) per pixel
+    const bool multisampled = descriptor.isMultisampled();
+    auto type = descriptor.type;
+    if (multisampled)
+        type = descriptor.type == MTL::TextureType2DArray
+                   ? MTL::TextureType2DMultisampleArray
+                   : MTL::TextureType2DMultisample;
 
     MTL::TextureDescriptor* desc = MTL::TextureDescriptor::alloc()->init();
     desc->setTextureType(type);
-    desc->setWidth(descriptor.width);
-    desc->setHeight(descriptor.height);
+    desc->setWidth(multisampled ? descriptor.getPixelWidth() : descriptor.width);
+    desc->setHeight(multisampled ? descriptor.getPixelHeight() : descriptor.height);
     desc->setDepth(descriptor.depth);
-    desc->setMipmapLevelCount(descriptor.level_count);
+    desc->setMipmapLevelCount(multisampled ? 1 : descriptor.level_count);
+    if (multisampled)
+        desc->setSampleCount(getHostSampleCount(device, descriptor.sample_count));
     desc->setStorageMode(MTL::StorageModePrivate);
 
     switch (descriptor.type) {
@@ -229,7 +239,7 @@ Texture::Texture(MTL::Device* device, const TextureDescriptor& descriptor)
     // Color textures can also be written by compute shaders
     MTL::TextureUsage write_usage = 0;
     if (!pixel_format_info.has_depth && !pixel_format_info.has_stencil &&
-        !isTextureFormatCompressed(descriptor.format)) {
+        !isTextureFormatCompressed(descriptor.format) && !multisampled) {
         write_usage |= MTL::TextureUsageShaderWrite;
         if (pixel_format_info.pixel_format == MTL::PixelFormatR32Uint ||
             pixel_format_info.pixel_format == MTL::PixelFormatR32Sint)
@@ -268,6 +278,12 @@ Texture::~Texture() {
     texture->release();
     if (buffer_backing)
         buffer_backing->release();
+}
+
+std::shared_ptr<Texture> Texture::createScaledTexture() const {
+    auto scaled_descriptor = descriptor;
+    scaled_descriptor.sample_count = 1;
+    return std::make_shared<Texture>(texture->device(), scaled_descriptor);
 }
 
 ITextureView*
@@ -421,6 +437,21 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
                        const ztd::Range<u32> dst_layers) {
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
+    // Guest memory holds the samples as a larger image: upload that, then
+    // move its texels into the samples
+    if (descriptor.isMultisampled()) {
+        auto scaled = createScaledTexture();
+        auto& converter = MsaaConverter::get(texture->device());
+        if (dst_layers.getBegin() != 0 ||
+            dst_layers.getEnd() != descriptor.layer_count)
+            converter.expand(command_buffer_impl, texture, scaled->getTexture(),
+                             descriptor.sample_count);
+        scaled->copyFromHot2(command_buffer, src, dst_levels, dst_layers);
+        converter.pack(command_buffer_impl, scaled->getTexture(), texture,
+                       descriptor.sample_count);
+        command_buffer->retainResource(scaled);
+        return;
+    }
     const auto mtl_src = static_cast<const Buffer*>(src)->getBuffer();
 
     auto encoder = command_buffer_impl->getBlitCommandEncoder();
@@ -513,16 +544,17 @@ void Texture::copyDepthStencilFromBufferHot3(BlitEncoder* encoder,
         case TextureFormat::S8Uint_Z24Unorm: {
             u32 word;
             std::memcpy(&word, src + i * sizeof(word), sizeof(word));
-            depth[i] =
-                static_cast<f32>(word >> 8) / static_cast<f32>(0xffffffu);
+            // The nearest float, which the readback inverts exactly
+            depth[i] = static_cast<f32>(static_cast<f64>(word >> 8) /
+                                        static_cast<f64>(0xffffffu));
             stencil[i] = static_cast<u8>(word);
             break;
         }
         default: { // Z24Unorm_S8Uint, Z24Unorm_X8Uint
             u32 word;
             std::memcpy(&word, src + i * sizeof(word), sizeof(word));
-            depth[i] = static_cast<f32>(word & 0xffffffu) /
-                       static_cast<f32>(0xffffffu);
+            depth[i] = static_cast<f32>(static_cast<f64>(word & 0xffffffu) /
+                                        static_cast<f64>(0xffffffu));
             stencil[i] = descriptor.format == TextureFormat::Z24Unorm_S8Uint
                              ? static_cast<u8>(word >> 24)
                              : 0;
@@ -547,11 +579,54 @@ void Texture::copyDepthStencilFromBufferHot3(BlitEncoder* encoder,
     stencil_buffer->release();
 }
 
+namespace {
+
+// Copies between textures of different sample counts go through the single
+// sample form of the multisampled side. Returns nullopt when the counts match.
+template <typename Copy>
+std::optional<bool> copyAcrossSamples(ICommandBuffer* command_buffer,
+                                      Texture& dst, const Texture& src,
+                                      Copy&& copy) {
+    const auto& dst_descriptor = dst.getDescriptor();
+    const auto& src_descriptor = src.getDescriptor();
+    if (dst_descriptor.sample_count == src_descriptor.sample_count)
+        return std::nullopt;
+    auto* command_buffer_impl = static_cast<CommandBuffer*>(command_buffer);
+    auto& converter = MsaaConverter::get(dst.getTexture()->device());
+    if (src_descriptor.isMultisampled()) {
+        auto scaled = src.createScaledTexture();
+        converter.expand(command_buffer_impl,
+                         const_cast<MTL::Texture*>(src.getTexture()),
+                         scaled->getTexture(), src_descriptor.sample_count);
+        command_buffer->retainResource(scaled);
+        return copy(dst, *scaled);
+    }
+    // The samples outside the copy keep their contents
+    auto scaled = dst.createScaledTexture();
+    converter.expand(command_buffer_impl, dst.getTexture(), scaled->getTexture(),
+                     dst_descriptor.sample_count);
+    const bool copied = copy(*scaled, src);
+    converter.pack(command_buffer_impl, scaled->getTexture(), dst.getTexture(),
+                   dst_descriptor.sample_count);
+    command_buffer->retainResource(scaled);
+    return copied;
+}
+
+} // namespace
+
 // TODO: make sure source and destination sizes match
 bool Texture::copyFromHot4(ICommandBuffer* command_buffer, const ITexture* src,
                        const u32 src_level, const u32 src_layer,
                        const u32 dst_level, const u32 dst_layer,
                        const u32 level_count, const u32 layer_count) {
+    if (const auto copied = copyAcrossSamples(
+            command_buffer, *this, *static_cast<const Texture*>(src),
+            [&](Texture& to, const Texture& from) {
+                return to.copyFromHot4(command_buffer, &from, src_level,
+                                       src_layer, dst_level, dst_layer,
+                                       level_count, layer_count);
+            }))
+        return *copied;
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
     const auto mtl_src = static_cast<const Texture*>(src)->getTexture();
@@ -577,6 +652,14 @@ bool Texture::copyFromHot5(ICommandBuffer* command_buffer, const ITexture* src,
                        const u32 src_layer, const MTL::Origin dst_origin,
                        const u32 dst_level, const u32 dst_layer,
                        const MTL::Size size, const u32 layer_count) {
+    if (const auto copied = copyAcrossSamples(
+            command_buffer, *this, *static_cast<const Texture*>(src),
+            [&](Texture& to, const Texture& from) {
+                return to.copyFromHot5(command_buffer, &from, src_origin,
+                                       src_level, src_layer, dst_origin,
+                                       dst_level, dst_layer, size, layer_count);
+            }))
+        return *copied;
     const auto command_buffer_impl =
         static_cast<CommandBuffer*>(command_buffer);
     const auto mtl_src = static_cast<const Texture*>(src)->getTexture();

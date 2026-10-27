@@ -1,4 +1,6 @@
 #include "core/hw/tegra_x1/gpu/renderer/shader_decompiler/codegen/lang/msl/emitter.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/geometry.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/tessellation.hpp"
 #include "core/hw/tegra_x1/gpu/visual_diagnostics.hpp"
 
 #include "core/hw/tegra_x1/gpu/renderer/shader_cache.hpp"
@@ -44,6 +46,10 @@ MTL::TextureType toRendererTextureType(TextureType type) {
         return MTL::TextureTypeCubeArray;
     case TextureType::Buffer:
         return MTL::TextureTypeTextureBuffer;
+    case TextureType::_2DMS:
+        return MTL::TextureType2DMultisample;
+    case TextureType::_2DMSArray:
+        return MTL::TextureType2DMultisampleArray;
     default:
         return MTL::TextureType2D;
     }
@@ -71,6 +77,10 @@ std::string textureTypeToStr(TextureType type, bool is_depth) {
         return prefix + "cube_array";
     case TextureType::Buffer:
         return prefix + "_buffer";
+    case TextureType::_2DMS:
+        return prefix + "2d_ms";
+    case TextureType::_2DMSArray:
+        return prefix + "2d_ms_array";
     }
 }
 
@@ -544,6 +554,42 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
         }
     }
 
+    if (context.tess_control)
+        out_resource_mapping.tess_output_vertices = context.tess.output_vertices;
+
+    // What the renderer needs to run a geometry shader
+    if (context.geometry) {
+        out_resource_mapping.geometry_output = context.geo.output;
+        out_resource_mapping.geometry_max_output_vertices =
+            context.geo.max_output_vertices;
+        out_resource_mapping.geometry_invocations = context.geo.invocations;
+    }
+
+    // The record buffer and parameters of a capturing vertex shader take free
+    // slots below the vertex buffers
+    if (context.geometry_capture) {
+        std::set<u32> used;
+        for (u32 index = 0; index < CONST_BUFFER_BINDING_COUNT; index++)
+            if (out_resource_mapping.uniform_buffers[index] != invalid<u32>())
+                used.insert(index);
+        used.insert(out_resource_mapping.sampler_buffer_index);
+        for (const auto& buffer : out_resource_mapping.storage_buffers)
+            used.insert(buffer.host_index);
+        for (u32 index = 0; index < 15; index++) {
+            if (used.contains(index))
+                continue;
+            if (out_resource_mapping.capture_buffer_index == invalid<u32>())
+                out_resource_mapping.capture_buffer_index = index;
+            else if (out_resource_mapping.capture_params_index ==
+                     invalid<u32>()) {
+                out_resource_mapping.capture_params_index = index;
+                break;
+            }
+        }
+        ASSERT(out_resource_mapping.capture_params_index != invalid<u32>(),
+               ShaderDecompiler, "No buffer slots for the vertex capture");
+    }
+
     if (context.type == ShaderType::Vertex) {
         const auto& outputs = memory_analyzer.getOutputSVs();
         out_resource_mapping.writes_layer =
@@ -573,6 +619,48 @@ void MslEmitter::emitHeader() {
     out_resource_mapping.fragment_output_mask = context.fragment_output_mask;
     write("#include <metal_stdlib>");
     write("using namespace metal;");
+
+    // Geometry shader and tessellation emulation (geometry.hpp,
+    // tessellation.hpp)
+    if (context.geometry || context.tess_control)
+        write("{}", R"(
+            struct HydraGeometryParams {
+                uint primitive_count;
+                uint index_type;
+                uint first;
+                int base_vertex;
+                uint min_vertex;
+                uint vertex_count;
+            };
+            inline uint hydra_read_index(const device uchar* data, uint type, uint position) {
+                switch (type) {
+                case 0: return data[position];
+                case 1: return ((const device ushort*)data)[position];
+                case 2: return ((const device uint*)data)[position];
+                default: return position;
+                }
+            }
+            // Triangle i of n in a strip with adjacency (OpenGL 4.6 table
+            // 10.1), geometry shader input k
+            inline uint hydra_strip_adjacency(uint i, uint n, uint k) {
+                const uint only[6] = {0, 1, 2, 5, 4, 3};
+                if (n == 1) return only[k];
+                if (i == 0) {
+                    const uint first[6] = {0, 1, 2, 6, 4, 3};
+                    return first[k];
+                }
+                const bool odd = (i & 1u) != 0u;
+                const bool last = i == n - 1u;
+                const uint v1 = odd ? 2u * i + 2u : 2u * i;
+                const uint v2 = odd ? 2u * i : 2u * i + 2u;
+                const uint a23 = odd ? 2u * i + 3u : (last ? 2u * i + 5u : 2u * i + 6u);
+                const uint a31 = odd ? (last ? 2u * i + 5u : 2u * i + 6u) : 2u * i + 3u;
+                const uint vertices[6] = {v1, 2u * i - 2u, v2, a23, 2u * i + 4u, a31};
+                return vertices[k];
+            }
+        )");
+    if (context.geometry_capture)
+        write("struct HydraCaptureParams {{ uint min_vertex; }};");
 
     // Samplers of textures with emulated borders. The guest sampler is baked
     // into the shader, so the bound sampler of these bindings is unused. Per
@@ -774,6 +862,22 @@ void MslEmitter::emitHeader() {
         write("    if ((mask & 2u) != 0u) host_mask |= y_mask;");
         write("    return quad_shuffle_xor(v, host_mask);");
         write("}}");
+        // Value of guest quad lane `index`. Every quad shuffle uses a mask
+        // that is the same for all lanes; each lane then picks the neighbour
+        // in the direction of the requested lane.
+        write("inline uint hydra_quad_shuffle(uint v, uint index, float px, "
+              "float py) {{");
+        write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
+        write("    const ushort y_mask = x_mask ^ ushort(3);");
+        write("    const uint by_x = quad_shuffle_xor(v, x_mask);");
+        write("    const uint by_y = quad_shuffle_xor(v, y_mask);");
+        write("    const uint by_xy = quad_shuffle_xor(v, ushort(3));");
+        write("    const uint x_bit = px > quad_shuffle_xor(px, x_mask) ? 1u : 0u;");
+        write("    const uint y_bit = py > quad_shuffle_xor(py, y_mask) ? 1u : 0u;");
+        write("    const uint mask = (x_bit | (y_bit << 1)) ^ (index & 3u);");
+        write("    return mask == 0u ? v : mask == 1u ? by_x : mask == 2u ? "
+              "by_y : by_xy;");
+        write("}}");
         write("inline float hydra_swizzle_add(float a, float b, uint swizzle, "
               "float px, float py) {{");
         write("    const ushort x_mask = hydra_quad_host_mask_x(px);");
@@ -800,6 +904,22 @@ void MslEmitter::emitQuadShuffleXor(const ir::Value& dst, const ir::Value& src,
     storeValue(dst, "hydra_quad_shuffle_xor({}, {}, {})", getValueStr(src),
                getValueStr(mask),
                getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32));
+}
+
+void MslEmitter::emitQuadShuffle(const ir::Value& dst, const ir::Value& src,
+                                 const ir::Value& index) {
+    if (context.type != ShaderType::Fragment) {
+        // TODO: implement for other stages
+        storeValue(dst, "{}", getValueStr(src));
+        return;
+    }
+
+    storeValue(dst, "hydra_quad_shuffle({}, {}, {}, {})", getValueStr(src),
+               getValueStr(index),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x0, true},
+                                ir::ScalarType::F32),
+               getAttrMemoryStr({RZ, SV_POSITION_BASE + 0x4, true},
                                 ir::ScalarType::F32));
 }
 
@@ -841,7 +961,9 @@ void MslEmitter::emitDeclarations() {
     // Stage inputs
     switch (context.type) {
     case ShaderType::Vertex:
-        for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
+        for (u8 i = 0; i < VERTEX_ATTRIB_COUNT && !context.geometry &&
+                       !context.tess_control && !context.tess_eval;
+             i++) {
             const auto vertex_attrib_state = state.vertex_attrib_states[i];
             if (vertex_attrib_state.type == engines::VertexAttribType::None)
                 continue;
@@ -939,6 +1061,8 @@ void MslEmitter::emitDeclarations() {
         }
         if (context.fragment_depth_register != invalid<u32>())
             write("float depth [[depth(any)]];");
+        if (context.fragment_sample_mask_register != invalid<u32>())
+            write("uint sample_mask [[sample_mask]];");
         break;
     default:
         break;
@@ -950,6 +1074,39 @@ void MslEmitter::emitDeclarations() {
 }
 
 void MslEmitter::emitStateBindings() {
+    if (context.tess_control) {
+        // Input control point records, as a geometry shader's input
+        writeStatement("const device Reg* gs_input");
+        writeStatement("uint gs_slots[{}]", context.tess.input_vertices);
+        writeStatement("Reg gs_primitive_id");
+        writeStatement("Reg gs_zero");
+        writeStatement("device Reg* ts_control_points");
+        writeStatement("device Reg* ts_patches");
+        writeStatement("uint ts_patch");
+        writeStatement("uint ts_invocation");
+    }
+    if (context.tess_eval) {
+        writeStatement("const device Reg* ts_control_points");
+        writeStatement("const device Reg* ts_patches");
+        writeStatement("uint ts_patch");
+        writeStatement("Reg ts_primitive_id");
+    }
+    if (context.geometry) {
+        // Input vertex records and the slots of this primitive's vertices
+        writeStatement("const device Reg* gs_input");
+        writeStatement("uint gs_slots[{}]", std::max<u32>(context.geo.input_vertices, 1));
+        writeStatement("Reg gs_primitive_id");
+        writeStatement("Reg gs_zero");
+        writeStatement("uint gs_invocation");
+        // Emitted vertices and list indices of this invocation
+        writeStatement("device Reg* gs_output");
+        writeStatement("device uint* gs_indices");
+        writeStatement("uint gs_vertex_base");
+        writeStatement("uint gs_index_base");
+        writeStatement("uint gs_emitted");
+        writeStatement("uint gs_strip");
+        writeStatement("uint gs_index_count");
+    }
     // Local memory reads as zero until written, only initialized when used
     if (memory_analyzer.getUsesLocalMemory())
         writeStatement("Reg lmem[{}] = {{}}", local_word_count);
@@ -965,6 +1122,12 @@ void MslEmitter::emitStateBindings() {
     } else if (memory_analyzer.usesLaneId()) {
         // Vertex functions have no SIMD-group lane, they read lane 0
         writeStatement("uint lane");
+    }
+    if (context.type == ShaderType::Fragment) {
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            writeStatement("uint coverage_mask");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            writeStatement("uint sample_index");
     }
 
     // Storage buffers
@@ -991,7 +1154,8 @@ void MslEmitter::emitStateBindingAssignments() {
     // DEBUG: bisect switch, remove with the other HYDRA_NO_* switches
     static const bool no_vertex_swap =
         std::getenv("HYDRA_NO_VERTEX_SWAP") != nullptr;
-    if (context.type == ShaderType::Vertex && !no_vertex_swap) {
+    if (context.type == ShaderType::Vertex && !context.geometry &&
+        !context.tess_control && !context.tess_eval && !no_vertex_swap) {
         for (u8 i = 0; i < VERTEX_ATTRIB_COUNT; i++) {
             const auto& vertex_attrib_state = state.vertex_attrib_states[i];
             if (vertex_attrib_state.type == engines::VertexAttribType::None ||
@@ -1029,9 +1193,20 @@ void MslEmitter::emitStateBindingAssignments() {
 void MslEmitter::emitMainPrototype() {
     switch (context.type) {
     case ShaderType::Vertex:
+        // The post-tessellation vertex function
+        if (context.tess_eval)
+            writeRaw("[[patch({})]] ",
+                     context.tess.domain ==
+                             static_cast<u32>(tessellation::Domain::Quad)
+                         ? "quad"
+                         : "triangle");
         writeRaw("vertex ");
         break;
     case ShaderType::Fragment:
+        // Metal cannot test early when the shader writes the depth
+        if (state.early_fragment_tests &&
+            context.fragment_depth_register == invalid<u32>())
+            writeRaw("[[early_fragment_tests]] ");
         writeRaw("fragment ");
         break;
     case ShaderType::Compute:
@@ -1045,6 +1220,17 @@ void MslEmitter::emitMainPrototype() {
         writeRaw("void main_(uint3 __tid [[thread_position_in_threadgroup]], "
                  "uint3 __ctaid [[threadgroup_position_in_grid]], uint __lane "
                  "[[thread_index_in_simdgroup]]");
+    else if (context.geometry || context.tess_control)
+        writeRaw("void main_(uint vid [[vertex_id]]");
+    else if (context.tess_eval)
+        writeRaw("StageOut main_(uint __patch_id [[patch_id]], {} __coord "
+                 "[[position_in_patch]]",
+                 context.tess.domain ==
+                         static_cast<u32>(tessellation::Domain::Quad)
+                     ? "float2"
+                     : "float3");
+    else if (context.geometry_capture)
+        writeRaw("void main_(StageIn __in [[stage_in]]");
     else
         writeRaw("StageOut main_(StageIn __in [[stage_in]]");
 
@@ -1053,13 +1239,58 @@ void MslEmitter::emitMainPrototype() {
     // Input SVs
     switch (context.type) {
     case ShaderType::Vertex:
+        if (context.tess_control) {
+            ADD_ARG("const device Reg* __gs_input [[buffer({})]]",
+                    geometry::INPUT_BUFFER);
+            ADD_ARG("const device uchar* __gs_index_data [[buffer({})]]",
+                    geometry::INDEX_DATA_BUFFER);
+            ADD_ARG("device Reg* __ts_control_points [[buffer({})]]",
+                    tessellation::CONTROL_POINT_BUFFER);
+            ADD_ARG("device Reg* __ts_patches [[buffer({})]]",
+                    tessellation::PATCH_BUFFER);
+            ADD_ARG("constant HydraGeometryParams& __gs [[buffer({})]]",
+                    geometry::PARAMS_BUFFER);
+            break;
+        }
+        if (context.tess_eval) {
+            ADD_ARG("const device Reg* __ts_control_points [[buffer({})]]",
+                    tessellation::EVALUATION_CONTROL_POINT_BUFFER);
+            ADD_ARG("const device Reg* __ts_patches [[buffer({})]]",
+                    tessellation::PATCH_BUFFER);
+            break;
+        }
+        if (context.geometry) {
+            ADD_ARG("const device Reg* __gs_input [[buffer({})]]",
+                    geometry::INPUT_BUFFER);
+            ADD_ARG("const device uchar* __gs_index_data [[buffer({})]]",
+                    geometry::INDEX_DATA_BUFFER);
+            ADD_ARG("device Reg* __gs_output [[buffer({})]]",
+                    geometry::OUTPUT_BUFFER);
+            ADD_ARG("device uint* __gs_indices [[buffer({})]]",
+                    geometry::OUTPUT_INDEX_BUFFER);
+            ADD_ARG("constant HydraGeometryParams& __gs [[buffer({})]]",
+                    geometry::PARAMS_BUFFER);
+            break;
+        }
         ADD_ARG("uint iid [[instance_id]]");
         ADD_ARG("uint vid [[vertex_id]]");
+        if (context.geometry_capture) {
+            ADD_ARG("device Reg* __capture [[buffer({})]]",
+                    out_resource_mapping.capture_buffer_index);
+            ADD_ARG("constant HydraCaptureParams& __capture_params "
+                    "[[buffer({})]]",
+                    out_resource_mapping.capture_params_index);
+        }
         break;
     case ShaderType::Fragment: {
         const auto& inputs = memory_analyzer.getInputSVs();
         if (memory_analyzer.usesLaneId())
             ADD_ARG("uint __lane [[thread_index_in_simdgroup]]");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            ADD_ARG("uint __coverage_mask [[sample_mask]]");
+        // Reading the sample index makes the shader run once per sample
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            ADD_ARG("uint __sample_index [[sample_id]]");
         if (inputs.contains(SvSemantic::FrontFacing))
             ADD_ARG("bool __front_facing [[front_facing]]");
         if (inputs.contains(SvSemantic::PointCoord))
@@ -1127,8 +1358,11 @@ void MslEmitter::emitMainPrototype() {
     }
 
     // Output
-    write("StageOut __out = {{}};");
-    writeNewline();
+    if (!context.geometry && !context.geometry_capture &&
+        !context.tess_control) {
+        write("StageOut __out = {{}};");
+        writeNewline();
+    }
 
     if (context.type == ShaderType::Fragment &&
         state.visual_output == static_cast<uint32_t>(VisualDiagnostics::Output::Solid) &&
@@ -1149,12 +1383,23 @@ void MslEmitter::emitMainPrototype() {
             {"reason", "guest_depth_export_requires_guest_execution; output_only_override"}});
     }
     emitMainFunctionPrologue();
+    if (context.geometry)
+        emitGeometryPrologue();
+    if (context.tess_control)
+        emitTessControlPrologue();
+    if (context.tess_eval)
+        emitTessEvalPrologue();
     if (memory_analyzer.usesLaneId())
         writeStatement("state.lane = {}", context.type == ShaderType::Fragment
                                               ? "__lane"
                                               : "0u");
-    if (context.type == ShaderType::Fragment)
+    if (context.type == ShaderType::Fragment) {
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_COVERAGE_MASK))
+            writeStatement("state.coverage_mask = __coverage_mask");
+        if (memory_analyzer.getSystemRegisters().contains(SR_PIXEL_SAMPLE_INDEX))
+            writeStatement("state.sample_index = __sample_index");
         emitFragmentSystemValueInputs();
+    }
 }
 
 void MslEmitter::emitFragmentSystemValueInputs() {
@@ -1194,7 +1439,8 @@ u32 MslEmitter::getClipDistanceCount() const {
 }
 
 void MslEmitter::emitExitReturn() {
-    if (context.type == ShaderType::Compute) {
+    if (context.type == ShaderType::Compute || context.geometry ||
+        context.geometry_capture || context.tess_control) {
         writeStatement("return");
         return;
     }
@@ -1298,6 +1544,13 @@ void MslEmitter::emitExitReturn() {
         writeStatement("__out.depth = {}",
                        getRegisterStr(static_cast<u8>(context.fragment_depth_register),
                                       ir::ScalarType::F32));
+    }
+    // The covered samples are those of the rasterizer and the shader's mask
+    if (context.type == ShaderType::Fragment &&
+        context.fragment_sample_mask_register != invalid<u32>()) {
+        writeStatement("__out.sample_mask = {}",
+                       getRegisterStr(static_cast<u8>(context.fragment_sample_mask_register),
+                                      ir::ScalarType::U32));
     }
 
     // DEBUG: highlight
@@ -1671,6 +1924,8 @@ void MslEmitter::emitTextureSample(
         switch (type) {
         case TextureType::_2D:
         case TextureType::_2DArray:
+        case TextureType::_2DMS:
+        case TextureType::_2DMSArray:
             coord_count = 2;
             break;
         case TextureType::_3D:
@@ -1938,6 +2193,21 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
                     : "0u";
         break;
     case 0x1d: // Invocation info
+        // Geometry shaders: the vertices of an input primitive, tessellation
+        // shaders: the control points of an input patch (yuzu)
+        if (context.geometry) {
+            value = fmt::format("{}u", context.geo.input_vertices << 16);
+            break;
+        }
+        if (context.tess_control) {
+            value = fmt::format("{}u", context.tess.input_vertices << 16);
+            break;
+        }
+        if (context.tess_eval) {
+            value = fmt::format("{}u", context.tess.output_vertices << 16);
+            break;
+        }
+        [[fallthrough]];
     case 0x1e: // W scale factor XY
     case 0x1f: // W scale factor Z
         // Values the hardware reports for stages without these inputs
@@ -1947,8 +2217,12 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
     case 0x02: // Virtual configuration
     case 0x03: // Virtual ID
     case 0x0f: // Ordering ticket
-    case 0x10: // Primitive type
     case 0x11: // Invocation ID
+        value = context.geometry       ? "state.gs_invocation"
+                : context.tess_control ? "state.ts_invocation"
+                                       : "0u";
+        break;
+    case 0x10: // Primitive type
     case 0x14: // Shader type
     case 0x1c: // Affinity
     case 0x50: // Clock low
@@ -1974,6 +2248,12 @@ void MslEmitter::emitReadSystemRegister(const ir::Value& dst, u32 sr) {
         break;
     case 0x38: // Equal lane mask
         value = "(1u << state.lane)";
+        break;
+    case SR_PIXEL_COVERAGE_MASK:
+        value = context.type == ShaderType::Fragment ? "state.coverage_mask" : "0u";
+        break;
+    case SR_PIXEL_SAMPLE_INDEX:
+        value = context.type == ShaderType::Fragment ? "state.sample_index" : "0u";
         break;
     case 0x39: // Less
         value = "((1u << state.lane) - 1u)";
@@ -2093,6 +2373,271 @@ void MslEmitter::emitAtomicStorageCas(const ir::Value& dst, u32 binding,
                getStorageBufferName(binding), getBitwiseOperandStr(offset),
                getBitwiseOperandStr(size), getBitwiseOperandStr(compare),
                getBitwiseOperandStr(value));
+}
+
+void MslEmitter::emitGeometryPrologue() {
+    const u32 vertices = std::max<u32>(context.geo.input_vertices, 1);
+    const u32 max_vertices = context.geo.max_output_vertices;
+    const u32 max_indices = geometry::getMaxOutputIndices(
+        static_cast<geometry::Output>(context.geo.output), max_vertices);
+    writeStatement("const uint __primitive = vid / {}u", context.geo.invocations);
+    writeStatement("state.gs_invocation = vid % {}u", context.geo.invocations);
+    writeStatement("if (__primitive >= __gs.primitive_count) return");
+    writeStatement("state.gs_primitive_id._u32 = __primitive");
+    writeStatement("state.gs_zero._u32 = 0u");
+    writeStatement("state.gs_input = __gs_input");
+    writeStatement("state.gs_output = __gs_output");
+    writeStatement("state.gs_indices = __gs_indices");
+    writeStatement("state.gs_vertex_base = vid * {}u", max_vertices + 1);
+    writeStatement("state.gs_index_base = vid * {}u", max_indices);
+    writeStatement("state.gs_emitted = 0u");
+    writeStatement("state.gs_strip = 0u");
+    writeStatement("state.gs_index_count = 0u");
+
+    // Positions of the primitive's vertices in the draw (as OpenGL assembles
+    // geometry shader inputs)
+    std::vector<std::string> positions;
+    const auto i = std::string("__primitive");
+    switch (context.geo.input_primitive) {
+    case engines::PrimitiveType::Points:
+        positions = {i};
+        break;
+    case engines::PrimitiveType::Lines:
+        positions = {i + " * 2u", i + " * 2u + 1u"};
+        break;
+    case engines::PrimitiveType::LineLoop:
+        positions = {i, "(" + i + " + 1u) % __gs.vertex_count"};
+        break;
+    case engines::PrimitiveType::LineStrip:
+        positions = {i, i + " + 1u"};
+        break;
+    case engines::PrimitiveType::Triangles:
+        positions = {i + " * 3u", i + " * 3u + 1u", i + " * 3u + 2u"};
+        break;
+    case engines::PrimitiveType::TriangleStrip:
+        // Odd triangles swap their first two vertices to keep the winding
+        positions = {"(" + i + " & 1u) != 0u ? " + i + " + 1u : " + i,
+                     "(" + i + " & 1u) != 0u ? " + i + " : " + i + " + 1u",
+                     i + " + 2u"};
+        break;
+    case engines::PrimitiveType::TriangleFan:
+        positions = {"0u", i + " + 1u", i + " + 2u"};
+        break;
+    case engines::PrimitiveType::LinesAdjacency:
+        for (u32 k = 0; k < 4; k++)
+            positions.push_back(fmt::format("{} * 4u + {}u", i, k));
+        break;
+    case engines::PrimitiveType::LineStripAdjacency:
+        for (u32 k = 0; k < 4; k++)
+            positions.push_back(fmt::format("{} + {}u", i, k));
+        break;
+    case engines::PrimitiveType::TrianglesAdjacency:
+        for (u32 k = 0; k < 6; k++)
+            positions.push_back(fmt::format("{} * 6u + {}u", i, k));
+        break;
+    case engines::PrimitiveType::TriangleStripAdjacency:
+        // OpenGL 4.6 table 10.1, inputs ordered vertex 1, adjacent 1/2,
+        // vertex 2, adjacent 2/3, vertex 3, adjacent 3/1
+        for (u32 k = 0; k < 6; k++)
+            positions.push_back(fmt::format(
+                "hydra_strip_adjacency({}, __gs.primitive_count, {}u)", i, k));
+        break;
+    default:
+        SHADER_UNSUPPORTED("Geometry shader input primitive {}",
+                            context.geo.input_primitive);
+        for (u32 k = 0; k < vertices; k++)
+            positions.push_back(fmt::format("{} * {}u + {}u", i, vertices, k));
+        break;
+    }
+    for (u32 k = 0; k < vertices && k < positions.size(); k++) {
+        writeStatement("const uint __position{} = __gs.first + ({})", k,
+                       positions[k]);
+        // Capture slots: vertex ids, which include the base vertex of
+        // indexed draws, minus the lowest one
+        writeStatement(
+            "state.gs_slots[{0}] = (__gs.index_type == 3u ? __position{0} : "
+            "uint(int(hydra_read_index(__gs_index_data, __gs.index_type, "
+            "__position{0})) + __gs.base_vertex)) - __gs.min_vertex",
+            k);
+    }
+}
+
+std::string MslEmitter::getGeometryInputStr(const AMem amem, ir::Type type) {
+    const auto suffix = getTypeSuffixStr(type);
+    const u32 vertices =
+        context.tess_control ? context.tess.input_vertices : context.geo.input_vertices;
+    const u32 last_vertex = std::max<u32>(vertices, 1) - 1;
+    const auto slot = fmt::format("state.gs_slots[min({}, {}u)]",
+                                  getRegisterStr(amem.vertex), last_vertex);
+    if (amem.reg == RZ) {
+        if (amem.imm == SV_PRIMITIVE_ID_BASE)
+            return fmt::format("state.gs_primitive_id.{}", suffix);
+        if (amem.imm < geometry::RECORD_BASE || amem.imm >= geometry::RECORD_END)
+            return fmt::format("state.gs_zero.{}", suffix);
+        return fmt::format("state.gs_input[{} * {}u + {}u].{}", slot,
+                           geometry::RECORD_WORDS,
+                           (amem.imm - geometry::RECORD_BASE) / 4, suffix);
+    }
+    return fmt::format(
+        "state.gs_input[{} * {}u + min(({} + 0x{:x}u - {}u) >> 2u, {}u)].{}",
+        slot, geometry::RECORD_WORDS, getRegisterStr(amem.reg), amem.imm,
+        geometry::RECORD_BASE, geometry::RECORD_WORDS - 1, suffix);
+}
+
+void MslEmitter::emitTessControlPrologue() {
+    const u32 inputs = context.tess.input_vertices;
+    const u32 outputs = context.tess.output_vertices;
+    writeStatement("state.ts_patch = vid / {}u", outputs);
+    writeStatement("state.ts_invocation = vid % {}u", outputs);
+    writeStatement("if (state.ts_patch >= __gs.primitive_count) return");
+    writeStatement("state.gs_primitive_id._u32 = state.ts_patch");
+    writeStatement("state.gs_zero._u32 = 0u");
+    writeStatement("state.gs_input = __gs_input");
+    writeStatement("state.ts_control_points = __ts_control_points");
+    writeStatement("state.ts_patches = __ts_patches");
+    // Capture slots of the input control points, as for geometry shaders
+    for (u32 k = 0; k < inputs; k++) {
+        writeStatement("const uint __position{} = __gs.first + state.ts_patch * "
+                       "{}u + {}u",
+                       k, inputs, k);
+        writeStatement(
+            "state.gs_slots[{0}] = (__gs.index_type == 3u ? __position{0} : "
+            "uint(int(hydra_read_index(__gs_index_data, __gs.index_type, "
+            "__position{0})) + __gs.base_vertex)) - __gs.min_vertex",
+            k);
+    }
+}
+
+void MslEmitter::emitTessControlEpilogue() {
+    writeStatement("const uint __slot = state.ts_patch * {}u + state.ts_invocation",
+                   context.tess.output_vertices);
+    writeStatement("for (uint i = 0u; i < {}u; i++) state.ts_control_points["
+                   "__slot * {}u + i] = state.a_out[{}u + i]",
+                   geometry::RECORD_WORDS, geometry::RECORD_WORDS,
+                   geometry::RECORD_BASE / 4);
+}
+
+void MslEmitter::emitTessEvalPrologue() {
+    writeStatement("state.ts_patch = __patch_id");
+    writeStatement("state.ts_primitive_id._u32 = __patch_id");
+    writeStatement("state.ts_control_points = __ts_control_points");
+    writeStatement("state.ts_patches = __ts_patches");
+    // gl_TessCoord: u and v (a triangle's w is 1 - u - v)
+    writeStatement("{} = __coord.x",
+                   getAttrMemoryStr({RZ, SV_TESS_COORD_BASE, true},
+                                    ir::ScalarType::F32));
+    writeStatement("{} = __coord.y",
+                   getAttrMemoryStr({RZ, SV_TESS_COORD_BASE + 4, true},
+                                    ir::ScalarType::F32));
+}
+
+std::string MslEmitter::getPatchStr(const AMem amem, ir::Type type) {
+    const auto suffix = getTypeSuffixStr(type);
+    if (amem.reg == RZ)
+        return fmt::format("state.ts_patches[state.ts_patch * {}u + {}u].{}",
+                           tessellation::PATCH_WORDS,
+                           std::min<u64>(amem.imm / 4,
+                                         tessellation::PATCH_WORDS - 1),
+                           suffix);
+    return fmt::format(
+        "state.ts_patches[state.ts_patch * {}u + min(({} + 0x{:x}u) >> 2u, "
+        "{}u)].{}",
+        tessellation::PATCH_WORDS, getRegisterStr(amem.reg), amem.imm,
+        tessellation::PATCH_WORDS - 1, suffix);
+}
+
+std::string MslEmitter::getEvaluationInputStr(const AMem amem, ir::Type type) {
+    const auto suffix = getTypeSuffixStr(type);
+    const u32 last = std::max<u32>(context.tess.output_vertices, 1) - 1;
+    const auto base = fmt::format(
+        "(state.ts_patch * {}u + min({}, {}u)) * {}u",
+        context.tess.output_vertices, getRegisterStr(amem.vertex), last,
+        geometry::RECORD_WORDS);
+    if (amem.reg == RZ) {
+        if (amem.imm == SV_PRIMITIVE_ID_BASE)
+            return fmt::format("state.ts_primitive_id.{}", suffix);
+        // The tessellation coordinate and others are the function's own
+        if (amem.imm < geometry::RECORD_BASE || amem.imm >= geometry::RECORD_END)
+            return {};
+        return fmt::format("state.ts_control_points[{} + {}u].{}", base,
+                           (amem.imm - geometry::RECORD_BASE) / 4, suffix);
+    }
+    return fmt::format(
+        "state.ts_control_points[{} + min(({} + 0x{:x}u - {}u) >> 2u, {}u)].{}",
+        base, getRegisterStr(amem.reg), amem.imm, geometry::RECORD_BASE,
+        geometry::RECORD_WORDS - 1, suffix);
+}
+
+void MslEmitter::emitEmitVertex() {
+    if (!context.geometry) {
+        SHADER_UNSUPPORTED("Vertex emission outside a geometry shader");
+        return;
+    }
+    enterScope("if (state.gs_emitted < {}u)", context.geo.max_output_vertices);
+    writeStatement("const uint __slot = state.gs_vertex_base + state.gs_emitted");
+    writeStatement("for (uint i = 0u; i < {}u; i++) state.gs_output[__slot * "
+                   "{}u + i] = state.a_out[{}u + i]",
+                   geometry::RECORD_WORDS, geometry::RECORD_WORDS,
+                   geometry::RECORD_BASE / 4);
+    writeStatement("state.gs_strip++");
+    const auto index = std::string(
+        "state.gs_indices[state.gs_index_base + state.gs_index_count++]");
+    switch (static_cast<geometry::Output>(context.geo.output)) {
+    case geometry::Output::Points:
+        writeStatement("{} = __slot", index);
+        break;
+    case geometry::Output::LineStrip:
+        enterScope("if (state.gs_strip >= 2u)");
+        writeStatement("{} = __slot - 1u", index);
+        writeStatement("{} = __slot", index);
+        exitScopeEmpty();
+        break;
+    case geometry::Output::TriangleStrip:
+        // Every other triangle swaps its first two vertices to keep the
+        // winding of the strip
+        enterScope("if (state.gs_strip >= 3u)");
+        writeStatement("const bool __even = (state.gs_strip & 1u) == 0u");
+        writeStatement("{} = __even ? __slot - 1u : __slot - 2u", index);
+        writeStatement("{} = __even ? __slot - 2u : __slot - 1u", index);
+        writeStatement("{} = __slot", index);
+        exitScopeEmpty();
+        break;
+    default:
+        break;
+    }
+    writeStatement("state.gs_emitted++");
+    exitScopeEmpty();
+}
+
+void MslEmitter::emitEndPrimitive() {
+    if (context.geometry)
+        writeStatement("state.gs_strip = 0u");
+}
+
+void MslEmitter::emitGeometryEpilogue() {
+    // Index entries no primitive used point at a vertex outside the clip
+    // volume (w = -1)
+    const u32 max_vertices = context.geo.max_output_vertices;
+    const u32 max_indices = geometry::getMaxOutputIndices(
+        static_cast<geometry::Output>(context.geo.output), max_vertices);
+    writeStatement("const uint __dead = state.gs_vertex_base + {}u", max_vertices);
+    writeStatement("for (uint i = 0u; i < {}u; i++) state.gs_output[__dead * "
+                   "{}u + i]._u32 = 0u",
+                   geometry::RECORD_WORDS, geometry::RECORD_WORDS);
+    writeStatement("state.gs_output[__dead * {}u + {}u]._f32 = -1.0",
+                   geometry::RECORD_WORDS,
+                   (SV_POSITION_BASE + 12 - geometry::RECORD_BASE) / 4);
+    writeStatement("for (uint i = state.gs_index_count; i < {}u; i++) "
+                   "state.gs_indices[state.gs_index_base + i] = __dead",
+                   max_indices);
+}
+
+void MslEmitter::emitGeometryCapture() {
+    writeStatement("const uint __slot = vid - __capture_params.min_vertex");
+    writeStatement("for (uint i = 0u; i < {}u; i++) __capture[__slot * {}u + "
+                   "i] = state.a_out[{}u + i]",
+                   geometry::RECORD_WORDS, geometry::RECORD_WORDS,
+                   geometry::RECORD_BASE / 4);
 }
 
 void MslEmitter::emitBarrier() {

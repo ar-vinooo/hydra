@@ -52,6 +52,11 @@ class Builder {
         return addInstruction(Opcode::QuadShuffleXor, ScalarType::U32,
                               {src, mask});
     }
+    // Value of the pixel at quad lane `index` (x | (y << 1)) of the 2x2 quad
+    Value opQuadShuffle(const Value& src, const Value& index) {
+        return addInstruction(Opcode::QuadShuffle, ScalarType::U32,
+                              {src, index});
+    }
     // a * LUT_A[mode] + b * LUT_B[mode], mode = swizzle >> (quad lane * 2)
     Value opSwizzleAdd(const Value& src_a, const Value& src_b, u32 swizzle) {
         return addInstruction(Opcode::SwizzleAdd, ScalarType::F32,
@@ -552,6 +557,9 @@ class Builder {
                               {addr, value});
     }
     void opBarrier() { addInstructionWithDst(Opcode::Barrier); }
+    // Geometry shader output (OUT)
+    void opEmitVertex() { addInstructionWithDst(Opcode::EmitVertex); }
+    void opEndPrimitive() { addInstructionWithDst(Opcode::EndPrimitive); }
     // Raw sizes of images accessed as raw words (SULD.D, SUST.D); formatted
     // accesses convert the texel to or from channel values
     // Store of 4 raw register values, formatted or as raw words of the given

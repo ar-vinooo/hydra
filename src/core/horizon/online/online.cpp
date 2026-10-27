@@ -24,6 +24,7 @@
 
 #include "common/config.hpp"
 #include "common/toml_helper.hpp"
+#include "core/debugger/debugger_manager.hpp"
 
 namespace hydra::horizon::online {
 
@@ -234,7 +235,7 @@ std::map<std::string, u32> g_server_addresses;
 std::map<std::string, std::string> g_key_hashes;
 
 std::filesystem::path getOnlineDirectory() {
-    return std::filesystem::path(CONFIG_INSTANCE.getAppDataPath()) / "online";
+    return std::filesystem::path(::hydra::Config::getInstance().getAppDataPath()) / "online";
 }
 
 bool isValidNickname(std::string_view nickname) {
@@ -469,7 +470,10 @@ void claimNickname(const Config& config) {
         g_claim_pending = true;
     }
     std::thread([config] {
+        auto& debugger = GET_CURRENT_PROCESS_DEBUGGER();
+        debugger.registerThisThread("Online nickname");
         claimNicknameNow(config);
+        debugger.unregisterThisThread();
         {
             std::lock_guard lock(g_claim_mutex);
             g_claim_pending = false;

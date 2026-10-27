@@ -10,6 +10,12 @@ namespace hydra::hw::tegra_x1::gpu::renderer {
 
 class IRenderer;
 
+// Buffers up to this size are CPU snapshots of guest memory: an update
+// replaces the snapshot instead of copying on the GPU, which would end the
+// open render pass (storing and reloading its attachments). Unified memory
+// makes the copy cheap.
+constexpr u64 BUFFER_SNAPSHOT_MAX_SIZE = 1024 * 1024;
+
 struct BufferEntry {
     std::shared_ptr<BufferBase> buffer;
     ztd::Range<uptr> range;

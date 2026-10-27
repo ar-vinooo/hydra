@@ -105,7 +105,7 @@ SharedFontManager::SharedFontManager(System& system_)
     : system{system_}, shared_memory{new kernel::SharedMemory(
                            system.getCpu(), SHARED_MEMORY_SIZE)} {}
 
-SharedFontManager::~SharedFontManager() { delete shared_memory; }
+SharedFontManager::~SharedFontManager() { shared_memory->release(); }
 
 void SharedFontManager::loadFonts() {
     for (auto type = SharedFontType::JapanUsEurope;

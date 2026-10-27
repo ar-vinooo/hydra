@@ -62,10 +62,11 @@ class IMmu {
         setWriteTrackingEnabled(range, false);
     }
     virtual bool trackWrite(ztd::Range<vaddr_t> range);
+    // Called before each draw and dispatch
     virtual void flushTrackedPages();
-    // Applies GPU cache invalidations queued by trackWrite. Called by the
-    // GPU thread before it uses the caches, so CPU threads never wait on
-    // the cache locks a draw holds.
+    // Applies GPU cache invalidations queued by trackWrite and rearms the
+    // written pages. Called by the GPU thread before each PFIFO entry, so CPU
+    // threads never wait on the cache locks a draw holds.
     void applyPendingInvalidations();
     // Queues an invalidation of host memory changed outside the guest (e.g.
     // cleared by the host), applied like those of trackWrite

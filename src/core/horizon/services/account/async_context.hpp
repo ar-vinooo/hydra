@@ -16,7 +16,7 @@ class IAsyncContext : public IService {
 
   private:
     result_t result;
-    std::unique_ptr<kernel::Event> event;
+    kernel::AutoObjectPtr<kernel::Event> event;
 
     // Commands
     result_t getSystemEvent(kernel::Process* process,

@@ -9,6 +9,7 @@
 #include "core/horizon/services/audio/audio_out.hpp"
 #include "core/horizon/services/audio/audio_renderer.hpp"
 #include "core/horizon/services/mmnv/request.hpp"
+#include "core/horizon/services/nifm/general_service.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_as_gpu.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl.hpp"
 #include "core/horizon/services/nvdrv/ioctl/nvhost_ctrl_gpu.hpp"
@@ -555,13 +556,341 @@ void testAudioMixUpdates(System& system, kernel::Process* process) {
     }
 }
 
+namespace hydra::horizon::services::audio {
+struct AudioRendererTestAccess {
+    static void renderFrame(IAudioRenderer& renderer, std::vector<f32>& stereo) {
+        std::lock_guard lock(renderer.render_mutex);
+        renderer.renderFrame(stereo);
+    }
+};
+} // namespace hydra::horizon::services::audio
+
+// Update packets built like the client's, rendered frame by frame: splitters
+// route voices and mixes, stopping a voice depops it, volume changes ramp
+void testAudioRendererPipeline(System& system, kernel::Process* process) {
+    namespace hipc = kernel::hipc;
+    using services::audio::AudioRendererTestAccess;
+    constexpr u32 UNUSED_MIX = 0x7fffffff, UNUSED_SPLITTER = 0xffffffff;
+    vaddr_t guest;
+    const auto host = process->createMemory(
+        kernel::HEAP_REGION, 0x10000, kernel::MemoryType::Normal_4_0_0,
+        kernel::MemoryPermission::ReadWrite, guest);
+    auto* memory = reinterpret_cast<u8*>(host);
+    // A constant wave at half scale
+    constexpr u32 WAVE = 0x8000, WAVE_SAMPLES = 4800;
+    for (u32 i = 0; i < WAVE_SAMPLES; i++) {
+        const i16 sample = 16384;
+        std::memcpy(memory + WAVE + i * 2, &sample, 2);
+    }
+    const auto descriptor = [](vaddr_t address, u32 size) {
+        hipc::BufferDescriptor out{};
+        out.size_low = size;
+        out.address_low = static_cast<u32>(address);
+        out.address_mid = static_cast<u32>((address >> 32) & 0xf);
+        out.address_high = static_cast<u32>((address >> 36) & 0x3fffff);
+        return out;
+    };
+    struct Voice {
+        u8 play_state = 0; // started
+        f32 volume = 1.0f;
+        u32 mix = UNUSED_MIX;
+        u32 splitter = UNUSED_SPLITTER;
+        bool is_new = false;
+        bool send_wave = false;
+    };
+    struct Mix {
+        u32 id;
+        u32 dest_mix = UNUSED_MIX;
+        u32 dest_splitter = UNUSED_SPLITTER;
+        std::array<std::array<f32, 2>, 2> matrix{};
+    };
+    struct Destination {
+        u32 mix;
+        std::array<f32, 2> volume{};
+    };
+
+    services::audio::AudioRendererParameters params{};
+    params.sample_rate = 48000;
+    params.sample_count = 240;
+    params.mix_buffer_count = 4;
+    params.submix_count = 1;
+    params.voice_count = 1;
+    params.sink_count = 1;
+    params.splitter_count = 1;
+    params.splitter_destination_count = 2;
+    params.revision = makeMagic4('R', 'E', 'V', '6');
+
+    const auto update = [&](services::audio::IAudioRenderer& renderer,
+                            const Voice& voice, const std::vector<Mix>& mixes,
+                            const std::vector<Destination>& destinations,
+                            std::array<f32, 2> channel_mix,
+                            const std::vector<audio::dsp::effects::EffectInParameter>&
+                                effect_params = {}) {
+        std::vector<u8> packet(0x40);
+        const auto put = [&](usize at, const auto& value) {
+            if (packet.size() < at + sizeof(value))
+                packet.resize(at + sizeof(value));
+            std::memcpy(packet.data() + at, &value, sizeof(value));
+        };
+        const u32 pools = (params.effect_count + params.voice_count * 4) * 0x20;
+        const u32 channels = 0x70, voices = 0x170,
+                  mix_size = static_cast<u32>(mixes.size()) * 0x930, sinks = 0x140;
+        usize at = 0x40 + pools;
+        // Channel resource 0
+        put(at, u32{0});
+        put(at + 4, channel_mix[0]);
+        put(at + 8, channel_mix[1]);
+        put(at + 0x64, true);
+        at += channels;
+        // Voice 0: mono PCM16 at 48 kHz on channel resource 0
+        put(at + 8, voice.is_new);
+        put(at + 9, true);
+        put(at + 10, voice.play_state);
+        put(at + 11, u8{2});
+        put(at + 0xc, u32{48000});
+        put(at + 0x18, u32{1});
+        put(at + 0x1c, 1.0f);
+        put(at + 0x20, voice.volume);
+        put(at + 0x58, voice.mix);
+        put(at + 0x5c, voice.splitter);
+        // Wave buffer 0
+        put(at + 0x60, static_cast<u64>(guest + WAVE));
+        put(at + 0x68, u64{WAVE_SAMPLES * 2});
+        put(at + 0x70, u32{0});
+        put(at + 0x74, WAVE_SAMPLES);
+        put(at + 0x7a, !voice.send_wave);
+        put(at + 0x140, u32{0});
+        at += voices;
+        const u32 effects_size =
+            static_cast<u32>(params.effect_count * sizeof(audio::dsp::effects::EffectInParameter));
+        for (u32 e = 0; e < params.effect_count; e++) {
+            audio::dsp::effects::EffectInParameter effect{};
+            if (e < effect_params.size())
+                effect = effect_params[e];
+            put(at, effect);
+            at += sizeof(effect);
+        }
+        // Splitter 0 with its destinations
+        put(at, u32{0x48444E53});
+        put(at + 4, u32{1});
+        put(at + 8, static_cast<u32>(destinations.size()));
+        at += 0x20;
+        put(at, u32{0x49444E53});
+        put(at + 4, i32{0});
+        put(at + 8, u32{48000});
+        put(at + 0xc, static_cast<i32>(destinations.size()));
+        at += 0x10;
+        for (u32 d = 0; d < destinations.size(); d++)
+            put(at + d * 4, d);
+        at += destinations.size() * 4 + 0xc;
+        for (u32 d = 0; d < destinations.size(); d++) {
+            put(at, u32{0x44444E53});
+            put(at + 4, static_cast<i32>(d));
+            put(at + 8, destinations[d].volume[0]);
+            put(at + 0xc, destinations[d].volume[1]);
+            put(at + 0x68, destinations[d].mix);
+            put(at + 0x6c, true);
+            at += 0x70;
+        }
+        at = (at + 0xf) & ~usize{0xf};
+        // Mixes, then the device sink of the final mix
+        for (const auto& mix : mixes) {
+            put(at, 1.0f);
+            put(at + 4, u32{48000});
+            put(at + 8, u32{2});
+            put(at + 0xc, true);
+            put(at + 0x10, mix.id);
+            for (u32 src = 0; src < 2; src++)
+                for (u32 dst = 0; dst < 2; dst++)
+                    put(at + 0x24 + (src * 24 + dst) * 4, mix.matrix[src][dst]);
+            put(at + 0x924, mix.dest_mix);
+            put(at + 0x928, mix.dest_splitter);
+            at += 0x930;
+        }
+        put(at, u8{1});
+        put(at + 1, true);
+        put(at + 0x20 + 256, u32{2});
+        put(at + 0x20 + 260, u8{0});
+        put(at + 0x20 + 261, u8{1});
+        at += sinks;
+        put(0, params.revision);
+        put(8, pools);
+        put(0xc, voices);
+        put(0x10, channels);
+        put(0x14, effects_size);
+        put(0x18, mix_size);
+        put(0x1c, sinks);
+        put(0x3c, static_cast<u32>(at));
+        packet.resize(at);
+        std::memcpy(memory, packet.data(), packet.size());
+        alignas(16) std::array<u8, 0x2000> tls{};
+        const auto request = hipc::makeRequest(
+            tls.data(), {.type = static_cast<u32>(hipc::cmif::CommandType::Request),
+                         .num_send_buffers = 1, .num_recv_buffers = 2, .num_data_words = 8});
+        request.send_buffers[0] = descriptor(guest, static_cast<u32>(packet.size()));
+        request.recv_buffers[0] = descriptor(guest + 0x4000, 0x2000);
+        request.recv_buffers[1] = descriptor(guest + 0x6000, 0x1000);
+        const hipc::cmif::InHeader command{hipc::cmif::IN_HEADER_MAGIC, 0, 4, 0};
+        std::memcpy(hipc::cmif::alignDataStart(request.data_words), &command, sizeof(command));
+        renderer.handleRequest(system, process, reinterpret_cast<uptr>(tls.data()));
+        const auto response = hipc::parseRequest(tls.data());
+        hipc::cmif::OutHeader result;
+        std::memcpy(&result, hipc::cmif::alignDataStart(response.data.data_words), sizeof(result));
+        check(result.result == RESULT_SUCCESS, "Audio update with splitters is accepted");
+    };
+    const auto render = [&](services::audio::IAudioRenderer& renderer) {
+        std::vector<f32> stereo;
+        AudioRendererTestAccess::renderFrame(renderer, stereo);
+        check(stereo.size() == 480, "A frame has the renderer's sample count");
+        return stereo;
+    };
+    // The default quality filter passes DC at 0.99594 (its taps sum to
+    // 32635 / 32768)
+    const auto near = [](f32 value, f32 expected) {
+        return std::abs(value - expected) < 2e-3f;
+    };
+
+    // Voice -> splitter: destination 0 to the final mix (left at 0.5),
+    // destination 1 to the submix (right at 0.25), which routes to the final
+    // mix one to one
+    {
+        services::audio::IAudioRenderer renderer(system, params, 0);
+        const std::vector<Mix> mixes{
+            {.id = 0},
+            {.id = 1, .dest_mix = 0, .matrix = {{{1.0f, 0.0f}, {0.0f, 1.0f}}}}};
+        Voice voice{.splitter = 0, .is_new = true, .send_wave = true};
+        update(renderer, voice, mixes,
+               {{.mix = 0, .volume = {0.5f, 0.0f}},
+                {.mix = 1, .volume = {0.0f, 0.25f}}},
+               {0.0f, 0.0f});
+        const auto stereo = render(renderer);
+        check(near(stereo[478], 0.25f) && near(stereo[479], 0.125f),
+              "A voice splitter sends each destination its own volumes");
+
+        // Stopping the voice: what it left fades out instead of a click
+        voice = {.play_state = 1, .splitter = 0};
+        update(renderer, voice, mixes,
+               {{.mix = 0, .volume = {0.5f, 0.0f}},
+                {.mix = 1, .volume = {0.0f, 0.25f}}},
+               {0.0f, 0.0f});
+        const auto tail = render(renderer);
+        const f32 decay = 0.962189f;
+        check(near(tail[0], 0.25f * decay) && tail[2] < tail[0] &&
+                  std::abs(tail[478]) < 1e-3f,
+              "A stopped voice depops into its first splitter destination");
+    }
+
+    // Voice -> submix (channel volumes) -> splitter -> final mix right
+    {
+        services::audio::IAudioRenderer renderer(system, params, 0);
+        const std::vector<Mix> mixes{{.id = 0}, {.id = 1, .dest_splitter = 0}};
+        update(renderer, {.mix = 1, .is_new = true, .send_wave = true}, mixes,
+               {{.mix = 0, .volume = {0.0f, 0.5f}}}, {1.0f, 0.0f});
+        // The channel resource's volumes ramp in from zero over the first frame
+        render(renderer);
+        const auto stereo = render(renderer);
+        check(near(stereo[478], 0.0f) && near(stereo[479], 0.25f),
+              "A mix splitter routes its buffer to the destination mix");
+
+        // Volume changes ramp across the frame
+        update(renderer, {.volume = 0.0f, .mix = 1}, mixes,
+               {{.mix = 0, .volume = {0.0f, 0.5f}}}, {1.0f, 0.0f});
+        const auto ramp = render(renderer);
+        check(near(ramp[1], 0.25f) && near(ramp[241], 0.125f) &&
+                  ramp[479] < 0.002f,
+              "A voice volume change ramps over the frame");
+    }
+    // An aux effect on the final mix: the mix goes to the client's send ring
+    // in guest memory (int32, 16-bit scale), the mix takes the return ring
+    {
+        auto aux_params = params;
+        aux_params.effect_count = 1;
+        params = aux_params;
+        services::audio::IAudioRenderer renderer(system, params, 0);
+        constexpr u32 SEND = 0xa000, RETURN = 0xc000, STORAGE = 960;
+        std::memset(memory + SEND, 0, 0x4000);
+        audio::dsp::effects::EffectInParameter aux{};
+        aux.type = audio::dsp::effects::EffectType::AuxiliaryBuffer;
+        aux.is_new = 1;
+        aux.is_enabled = 1;
+        aux.mix_id = 0;
+        aux.buffer_base = guest + SEND;
+        aux.buffer_size = 0x4000;
+        aux.processing_order = 0;
+        audio::dsp::effects::AuxiliaryBufferParameter specific{};
+        specific.input[0] = 0;
+        specific.output[0] = 0;
+        specific.channel_count = 1;
+        specific.channel_count_max = 1;
+        specific.sample_rate = 48000;
+        specific.buffer_storage_size = STORAGE;
+        specific.send_buffer_info_address = guest + SEND;
+        specific.send_buffer_storage_address = guest + SEND + 0x80;
+        specific.return_buffer_info_address = guest + RETURN;
+        specific.return_buffer_storage_address = guest + RETURN + 0x80;
+        std::memcpy(aux.specific, &specific, sizeof(specific));
+        update(renderer, {.mix = 0, .is_new = true, .send_wave = true},
+               {{.id = 0}}, {}, {1.0f, 0.0f}, {aux});
+        // Status of effect 0, after the pool and voice statuses
+        const u8 status = memory[0x4000 + 0x40 +
+                                 (params.effect_count + params.voice_count * 4) * 0x10 +
+                                 params.voice_count * 0x10];
+        // An aux effect keeps its usage state Invalid until a frame used it:
+        // with the renderer not started its status is Disabled (StoreStatus)
+        check(status == 4, "A new aux effect of a stopped renderer reports Disabled");
+        render(renderer);
+        const auto stereo = render(renderer);
+        i32 sent;
+        std::memcpy(&sent, memory + SEND + 0x80 + 479 * 4, 4);
+        u32 write_offset;
+        std::memcpy(&write_offset, memory + SEND + 0x40 + 4, 4);
+        check(std::abs(sent - 16318) <= 40 && write_offset == 480,
+              "The aux effect sends the mix to the client's ring");
+        check(std::abs(stereo[478]) < 1e-6f,
+              "The aux effect's output is the (empty) return ring");
+    }
+    std::cout << "PASS: audio renderer splitters, depop, volume ramps and effects\n";
+}
+
 void testResolverAndCharacteristics(System& system, kernel::Process* process) {
+    {
+        class Nifm : public services::nifm::IGeneralService {
+          public:
+            using IGeneralService::requestImpl;
+        } nifm;
+        alignas(16) std::array<u8, 0x1000> tls{}, output{}, objects{}, copies{}, handles{};
+        std::array<u8, 8> client_id;
+        client_id.fill(0xa5);
+        const auto parsed = kernel::hipc::parseRequest(tls.data());
+        kernel::hipc::Streams streams(process->getMmu(), parsed, output.data(),
+                                     objects.data(), copies.data(), handles.data());
+        services::RequestContext context{system, process, streams};
+        streams.recv_list_streams = {ztd::io::MemoryStream(std::span(client_id))};
+        check(nifm.requestImpl(context, 1) == RESULT_SUCCESS,
+              "NIFM GetClientId command succeeds");
+        u32 id = 0;
+        std::memcpy(&id, client_id.data(), sizeof(id));
+        check(id != 0 && client_id[4] == 0xa5,
+              "NIFM writes a nonzero 32-bit ID to the pointer buffer");
+        client_id.fill(0xa5);
+        check(nifm.requestImpl(context, 1) == RESULT_SUCCESS,
+              "Repeated GetClientId succeeds");
+        u32 repeated_id = 0;
+        std::memcpy(&repeated_id, client_id.data(), sizeof(repeated_id));
+        check(repeated_id == id, "NIFM client identity is stable");
+        streams.recv_list_streams = {std::nullopt};
+        check(nifm.requestImpl(context, 1) != RESULT_SUCCESS,
+              "NIFM rejects a missing client ID output buffer");
+        std::cout << "PASS: NIFM client ID IPC buffer and stable identity\n";
+    }
     namespace hipc = kernel::hipc;
     services::socket::resolver::IResolver resolver;
     for (const u32 command : {6u, 12u}) {
         alignas(16) std::array<u8, 0x2000> tls{};
         const auto request = hipc::makeRequest(tls.data(),
             {.type = static_cast<u32>(hipc::cmif::CommandType::Request),
+             .num_send_buffers = command == 6 ? 3u : 4u,
+             .num_recv_buffers = 1,
              .num_data_words = 16});
         auto* data = hipc::cmif::alignDataStart(request.data_words);
         const hipc::cmif::InHeader input{hipc::cmif::IN_HEADER_MAGIC, 0, command, 0};
@@ -2652,6 +2981,8 @@ void testSemaphoreShutdown(System& system, kernel::Process* process) {
 int runSharedMemoryCases(System& system, const char* input_path, const char* output_path);
 void testSharedMemoryCleanup(System& system);
 void testStageAMemory(System& system);
+void testTlbMaintenance(System& system);
+void testUserException(System& system);
 int runDeviceSharedCases(System& system, const char* input_path, const char* output_path);
 
 int main(int argc, char** argv) {
@@ -2662,6 +2993,16 @@ int main(int argc, char** argv) {
             auto* process = system.getOs().getKernel().getProcessManager().createProcess("DLC service test");
             testInstalledDlc(system, process);
             testAddOnContentEvent(system, process);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-tlb-maintenance") {
+            System system(ui);
+            testTlbMaintenance(system);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--check-user-exception") {
+            System system(ui);
+            testUserException(system);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--check-stage-a-memory") {
@@ -2911,6 +3252,7 @@ int main(int argc, char** argv) {
                 testClockRequests(system, process);
                 testAddOnContentEvent(system, process);
                 testAudioMixUpdates(system, process);
+                testAudioRendererPipeline(system, process);
                 testAudioOutShutdown(system, process);
                 auto* thread = new kernel::HostThread(
                     process, 0x20, [&](const kernel::should_stop_fn_t& stop) {

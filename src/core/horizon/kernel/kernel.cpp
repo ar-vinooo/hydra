@@ -25,13 +25,18 @@ Kernel::Kernel(System& system_) : system{system_}, process_manager(system) {
 void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                             hw::tegra_x1::cpu::IThread* guest_thread, u64 id) {
     auto& state = guest_thread->getState();
+    // SetThreadPriority can only change the host QoS from the thread itself
+    if (crnt_thread)
+        crnt_thread->applyHostSchedulingIfChanged();
 
     i32 tmp_i32;
     u32 tmp_u32;
     u64 tmp_u64;
     uptr tmp_uptr;
-    // DEBUG: HYDRA_TRACE_SVC traces memory SVCs and failed SVCs
+    // DEBUG: HYDRA_TRACE_SVC traces memory SVCs, waits and failed SVCs
     static const bool trace_svc = std::getenv("HYDRA_TRACE_SVC") != nullptr;
+    static const bool trace_condvar =
+        trace_svc || std::getenv("HYDRA_TRACE_CONDVAR") != nullptr;
     const std::array<u64, 4> trace_args = {state.r[0], state.r[1], state.r[2],
                                            state.r[3]};
     switch (id) {
@@ -41,7 +46,8 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         break;
     case 0x2:
         state.r[0] = setMemoryPermission(
-            state.r[0], state.r[1], static_cast<MemoryPermission>(state.r[2]));
+            crnt_process, state.r[0], state.r[1],
+            static_cast<MemoryPermission>(state.r[2]));
         break;
     case 0x3:
         state.r[0] =
@@ -74,7 +80,8 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             crnt_process, state.r[1], state.r[2], state.r[3],
             std::bit_cast<i32>(static_cast<u32>(state.r[4])),
             std::bit_cast<i32>(static_cast<u32>(state.r[5])), thread);
-        state.r[1] = crnt_process->addHandleNoRetain(thread).getRaw();
+        if (state.r[0] == RESULT_SUCCESS)
+            state.r[1] = crnt_process->addHandleNoRetain(thread).getRaw();
         break;
     }
     case 0x9:
@@ -103,7 +110,7 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             LOG_INFO(Kernel, "SleepThread({}) from {}",
                      std::bit_cast<i64>(state.r[0]), frames);
         }
-        sleepThread(std::bit_cast<i64>(state.r[0]));
+        sleepThread(crnt_thread, std::bit_cast<i64>(state.r[0]));
         break;
     }
     case 0xc:
@@ -131,7 +138,7 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             std::bit_cast<i32>(static_cast<u32>(state.r[1])), state.r[2]);
         break;
     case 0x10:
-        getCurrentProcessorNumber(tmp_u32);
+        getCurrentProcessorNumber(crnt_thread, tmp_u32);
         state.r[0] = tmp_u32;
         break;
     case 0x11:
@@ -159,6 +166,7 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[0] = createTransferMemory(
             state.r[1], state.r[2], static_cast<MemoryPermission>(state.r[3]),
             tmem);
+        tmem->chargeTo(crnt_process->getResourceLimit());
         state.r[1] = crnt_process->addHandleNoRetain(tmem).getRaw();
         break;
     }
@@ -178,8 +186,8 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             sync_objs[i] =
                 crnt_process->getHandle<SynchronizationObject>(handles[i]);
 
-        // DEBUG: report guest waits that block for a long time
-        if (std::bit_cast<i64>(state.r[3]) < 0) {
+        // An infinite timeout is normal for vsync/event waits, not a stall.
+        if (trace_svc && std::bit_cast<i64>(state.r[3]) < 0) {
             std::string names;
             for (auto i = 0; i < num_handles; i++)
                 names += fmt::format(
@@ -222,8 +230,9 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             crnt_thread, crnt_process->getMmu()->unmapAddr(state.r[0]));
         break;
     case 0x1c:
-        // DEBUG: log every distinct guest call site of infinite condvar waits
-        if (std::bit_cast<i64>(state.r[3]) < 0) {
+        // Stack walks, formatting and the shared call-site lock are diagnostic
+        // work: keep them off the normal guest synchronization path.
+        if (trace_condvar && std::bit_cast<i64>(state.r[3]) < 0) {
             static std::mutex sites_mutex;
             static std::set<u64> sites;
             std::string frames = fmt::format("{:#x}", state.lr);
@@ -244,25 +253,20 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                          frames);
         }
         {
-            const u64 guest_cv = state.r[1];
             const i64 wait_timeout = std::bit_cast<i64>(state.r[3]);
             state.r[0] = waitProcessWideKeyAtomic(
                 crnt_process, crnt_thread,
                 crnt_process->getMmu()->unmapAddr(state.r[0]),
                 crnt_process->getMmu()->unmapAddr(state.r[1]),
                 static_cast<u32>(state.r[2]), wait_timeout);
-            (void)guest_cv;
         }
         break;
     case 0x1d: {
-        // DEBUG: trace condition variable signals
         const u64 guest_cv = state.r[0];
         const auto signal_count = std::bit_cast<i32>(static_cast<u32>(state.r[1]));
-        u64 woken = 0;
         state.r[0] = signalProcessWideKey(
             crnt_process, crnt_process->getMmu()->unmapAddr(guest_cv),
-            signal_count, &woken);
-        (void)woken;
+            signal_count);
         break;
     }
     case 0x1e:
@@ -283,6 +287,36 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             sendSyncRequest(crnt_process, crnt_thread,
                             crnt_process->getHandle<hipc::ClientSession>(
                                 static_cast<u32>(state.r[0])));
+        break;
+    case 0x22: { // SendSyncRequestWithUserBuffer
+        const vaddr_t buffer = state.r[0];
+        const u64 buffer_size = state.r[1];
+        state.r[0] = checkUserBuffer(buffer, buffer_size);
+        if (state.r[0] == RESULT_SUCCESS)
+            state.r[0] =
+                sendSyncRequest(crnt_process, crnt_thread,
+                                crnt_process->getHandle<hipc::ClientSession>(
+                                    static_cast<u32>(state.r[2])),
+                                buffer, buffer_size);
+        break;
+    }
+    case 0x23: { // SendAsyncRequestWithUserBuffer
+        Event* event = nullptr;
+        state.r[0] = sendAsyncRequestWithUserBuffer(
+            crnt_process,
+            crnt_process->getHandle<hipc::ClientSession>(
+                static_cast<u32>(state.r[3])),
+            state.r[1], state.r[2], event);
+        state.r[1] = event != nullptr
+                         ? crnt_process->addHandleNoRetain(event).getRaw()
+                         : 0;
+        break;
+    }
+    case 0x24:
+        state.r[0] = getProcessId(
+            crnt_process->getHandle<AutoObject>(static_cast<u32>(state.r[1])),
+            tmp_u64);
+        state.r[1] = tmp_u64;
         break;
     case 0x25:
         state.r[0] = getThreadId(
@@ -309,6 +343,33 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
                 crnt_process->getMmu()->unmapAddr(state.r[0])),
             state.r[1]);
         break;
+    case 0x28: // ReturnFromException
+        if (!crnt_process->leaveUserException(crnt_thread, *guest_thread)) {
+            // Not handling an exception
+            state.r[0] = MAKE_RESULT(Svc, Error::InvalidState);
+            break;
+        }
+        if (static_cast<result_t>(state.r[0]) != RESULT_SUCCESS) {
+            // The handler gave up: Horizon ends the process
+            LOG_ERROR(Kernel,
+                      "Unhandled user exception (handler result {:#x}) at PC "
+                      "{:#x}",
+                      static_cast<u32>(state.r[0]), state.pc);
+            DEBUGGER_MANAGER_INSTANCE.getDebugger(crnt_process)
+                .breakOnThisThread("Unhandled user exception");
+        }
+        break;
+    case 0x2a: // FlushEntireDataCache
+    case 0x2b: // FlushDataCache
+        // CPU writes reach the GPU through write tracking, not through
+        // the data cache: nothing to write back
+        state.r[0] = RESULT_SUCCESS;
+        break;
+    case 0x3c: // KernelDebug
+    case 0x3d: // ChangeKernelTraceState
+        // No-ops on retail kernels
+        state.r[0] = RESULT_SUCCESS;
+        break;
     case 0x29:
         state.r[0] = getInfo(
             crnt_process, static_cast<InfoType>(state.r[1]),
@@ -316,6 +377,18 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
             state.r[3], tmp_u64);
         state.r[1] = tmp_u64;
         break;
+    case 0x30: // GetResourceLimitLimitValue
+    case 0x31: // GetResourceLimitCurrentValue
+    case 0x37: { // GetResourceLimitPeakValue
+        i64 value = 0;
+        state.r[0] = getResourceLimitValue(
+            crnt_process->getHandle<ResourceLimit>(
+                static_cast<u32>(state.r[1])),
+            static_cast<LimitableResource>(state.r[2]), static_cast<u32>(id),
+            value);
+        state.r[1] = std::bit_cast<u64>(value);
+        break;
+    }
     case 0x2c:
         state.r[0] = mapPhysicalMemory(crnt_process, state.r[0], state.r[1]);
         break;
@@ -325,15 +398,22 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         break;
     case 0x32:
         state.r[0] = setThreadActivity(
+            crnt_thread,
             crnt_process->getHandle<IThread>(static_cast<u32>(state.r[0])),
             static_cast<ThreadActivity>(state.r[1]));
         break;
-    case 0x33:
-        state.r[0] = getThreadContext3(
-            crnt_process->getHandle<IThread>(static_cast<u32>(state.r[1])),
-            *reinterpret_cast<ThreadContext*>(
-                crnt_process->getMmu()->unmapAddr(state.r[0])));
+    case 0x33: {
+        auto* context = reinterpret_cast<ThreadContext*>(
+            crnt_process->getMmu()->unmapAddr(state.r[0]));
+        state.r[0] =
+            context == nullptr
+                ? MAKE_RESULT(Svc, Error::InvalidUserBuffer)
+                : getThreadContext3(crnt_thread,
+                                    crnt_process->getHandle<IThread>(
+                                        static_cast<u32>(state.r[1])),
+                                    *context);
         break;
+    }
     case 0x34:
         state.r[0] = waitForAddress(
             crnt_thread, crnt_process->getMmu()->unmapAddr(state.r[0]),
@@ -383,10 +463,44 @@ void Kernel::supervisorCall(Process* crnt_process, IThread* crnt_thread,
         state.r[1] = tmp_u32;
         break;
     }
+    case 0x44: { // ReplyAndReceiveWithUserBuffer
+        const vaddr_t buffer = state.r[1];
+        const u64 buffer_size = state.r[2];
+        state.r[0] = checkUserBuffer(buffer, buffer_size);
+        if (state.r[0] != RESULT_SUCCESS)
+            break;
+        const auto handles = reinterpret_cast<Handle*>(
+            crnt_process->getMmu()->unmapAddr(state.r[3]));
+        const auto num_handles = std::bit_cast<i64>(state.r[4]);
+        SynchronizationObject* sync_objs[num_handles];
+        for (auto i = 0; i < num_handles; i++)
+            sync_objs[i] =
+                crnt_process->getHandle<SynchronizationObject>(handles[i]);
+
+        state.r[0] = replyAndReceive(
+            crnt_thread, std::span(sync_objs, static_cast<usize>(num_handles)),
+            crnt_process->getHandle<hipc::ServerSession>(
+                static_cast<u32>(state.r[5])),
+            std::bit_cast<i64>(state.r[6]), tmp_u32,
+            crnt_process->getMmu()->unmapAddr(buffer), buffer_size);
+        state.r[1] = tmp_u32;
+        break;
+    }
+    case 0x45: { // CreateEvent
+        Event* event = nullptr;
+        state.r[0] = createEvent(crnt_process, event);
+        // The writable and readable ends are the same event
+        state.r[1] = crnt_process->addHandleNoRetain(event).getRaw();
+        state.r[2] = crnt_process->addHandle(event).getRaw();
+        break;
+    }
     case 0x4b: {
         CodeMemory* code_mem = nullptr;
-        state.r[0] = createCodeMemory(state.r[1], state.r[2], code_mem);
-        state.r[1] = crnt_process->addHandleNoRetain(code_mem).getRaw();
+        state.r[0] =
+            createCodeMemory(crnt_process, state.r[1], state.r[2], code_mem);
+        state.r[1] = code_mem != nullptr
+                         ? crnt_process->addHandleNoRetain(code_mem).getRaw()
+                         : 0;
         break;
     }
     case 0x4c:
@@ -456,17 +570,46 @@ result_t Kernel::setHeapSize(Process* crnt_process, u64 size, uptr& out_base) {
     return RESULT_SUCCESS;
 }
 
-result_t Kernel::setMemoryPermission(uptr addr, u64 size,
-                                     MemoryPermission perm) {
+result_t Kernel::checkMemoryRange(vaddr_t addr, u64 size) {
+    constexpr u64 PAGE_SIZE = 0x1000;
+    if (addr % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+    if (size == 0 || size % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    if (addr + size <= addr)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::setMemoryPermission(Process* crnt_process, vaddr_t addr,
+                                     u64 size, MemoryPermission perm) {
     LOG_DEBUG(
         Kernel,
         "SetMemoryPermission called (addr: 0x{:08x}, size: 0x{:08x}, perm: "
         "{})",
         addr, size, perm);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Kernel, "addr: 0x{:08x}, size: 0x{:08x}, perm: {}", addr, size, perm);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (perm != MemoryPermission::None && perm != MemoryPermission::Read &&
+        perm != MemoryPermission::ReadWrite)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+
+    // Only memory that may be reprotected (heap, code data, ...), with no
+    // attributes set
+    constexpr u32 FLAG_CAN_REPROTECT = ZTD_BIT(8);
+    auto* mmu = crnt_process->getMmu();
+    for (vaddr_t va = addr; va < addr + size;) {
+        const auto region = mmu->queryRegion(va);
+        if ((static_cast<u32>(region.state.type) & FLAG_CAN_REPROTECT) == 0 ||
+            region.state.attr != MemoryAttribute::None || region.size == 0)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        va = region.va + region.size;
+    }
+
+    mmu->protect(ztd::Range<vaddr_t>::fromSize(addr, size), perm);
 
     return RESULT_SUCCESS;
 }
@@ -544,11 +687,28 @@ result_t Kernel::createThread(Process* crnt_process, vaddr_t entry_point,
               "processor_id: {})",
               entry_point, args_addr, stack_top_addr, priority, processor_id);
 
-    // Thread
-    // TODO: processor ID
-    (void)processor_id;
+    // Validated like Horizon: the core and priority must be allowed by the
+    // process capabilities
+    if (processor_id == IDEAL_CORE_USE_PROCESS_VALUE)
+        processor_id = crnt_process->getIdealCore();
+    if (processor_id < 0 || processor_id >= CPU_CORE_COUNT ||
+        (crnt_process->getCoreMask() & (1ull << processor_id)) == 0) {
+        LOG_WARN(Kernel, "CreateThread: core {} not in core mask {:#x}",
+                 processor_id, crnt_process->getCoreMask());
+        return MAKE_RESULT(Svc, Error::InvalidCoreId);
+    }
+    if (priority < HIGHEST_THREAD_PRIORITY ||
+        priority > LOWEST_THREAD_PRIORITY ||
+        !crnt_process->isValidThreadPriority(priority)) {
+        LOG_WARN(Kernel, "CreateThread: priority {} outside {}-{}", priority,
+                 crnt_process->getHighestThreadPriority(),
+                 crnt_process->getLowestThreadPriority());
+        return MAKE_RESULT(Svc, Error::InvalidPriority);
+    }
+
     auto thread =
         new GuestThread(system, crnt_process, stack_top_addr, priority);
+    thread->setCoreAffinity(processor_id, 1ull << processor_id);
     thread->setEntryPoint(entry_point);
     thread->setArg(0, args_addr);
 
@@ -572,77 +732,107 @@ void Kernel::exitThread(IThread* crnt_thread) {
     crnt_thread->stop();
 }
 
-void Kernel::sleepThread(i64 nano) {
+void Kernel::sleepThread(IThread* crnt_thread, i64 nano) {
     LOG_DEBUG(Kernel, "SleepThread called (nano: {})", nano);
 
+    // 0, -1 and -2 yield (to the same priority, without and with core
+    // migration); the host scheduler decides for every core here
     if (nano == 0 || nano == -1 || nano == -2)
         std::this_thread::yield();
-    else
-        std::this_thread::sleep_for(std::chrono::nanoseconds(nano));
+    else if (nano > 0)
+        crnt_thread->sleep(nano);
 }
 
 result_t Kernel::getThreadPriority(IThread* thread, i32& out_priority) {
+    if (thread == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel, "GetThreadPriority called (thread: {})",
               thread->getDebugName());
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}", thread->getDebugName());
-
-    // HACK
-    out_priority = 0x20; // 0x0 - 0x3f, lower is higher priority
+    out_priority = thread->getPriority();
     return RESULT_SUCCESS;
 }
 
 result_t Kernel::setThreadPriority(IThread* thread, i32 priority) {
+    if (thread == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel, "SetThreadPriority called (thread: {}, priority: 0x{:x})",
               thread->getDebugName(), priority);
 
-    // TODO: implement
-    ONCE(LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}, priority: 0x{:x}",
-                                    thread->getDebugName(), priority));
+    if (priority < HIGHEST_THREAD_PRIORITY ||
+        priority > LOWEST_THREAD_PRIORITY)
+        return MAKE_RESULT(Svc, Error::InvalidPriority);
+    if (auto process = thread->getProcess();
+        process && !process->isValidThreadPriority(priority))
+        return MAKE_RESULT(Svc, Error::InvalidPriority);
 
+    thread->setPriority(priority);
     return RESULT_SUCCESS;
 }
 
 result_t Kernel::getThreadCoreMask(IThread* thread, i32& out_core_mask0,
                                    u64& out_core_mask1) {
-    // HACK: for botw
+    if (thread == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel, "GetThreadCoreMask called (thread: {})",
-              thread ? thread->getDebugName() : "null");
+              thread->getDebugName());
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}",
-                               thread ? thread->getDebugName() : "null");
-
-    // HACK
-    out_core_mask0 = 0x1;
-    out_core_mask1 = 0x2;
+    out_core_mask0 = thread->getIdealCore();
+    out_core_mask1 = thread->getAffinityMask();
     return RESULT_SUCCESS;
 }
 
 result_t Kernel::setThreadCoreMask(IThread* thread, i32 core_mask0,
                                    u64 core_mask1) {
+    if (thread == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel,
               "SetThreadCoreMask called (thread: {}, core mask 0: "
               "{:#x}, core mask 1: {:#x})",
               thread->getDebugName(), core_mask0, core_mask1);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Kernel, "thread: {}, core mask 0: {:#x}, core mask 1: {:#x}",
-        thread->getDebugName(), core_mask0, core_mask1);
+    // Validation follows Atmosphere's mesosphere (svc_thread.cpp,
+    // kern_k_thread.cpp)
+    auto ideal_core = core_mask0;
+    auto affinity_mask = core_mask1;
+    const auto process = thread->getProcess();
+    const u64 process_mask = process ? process->getCoreMask() : 0xf;
+    const auto valid_core = [](i32 core) {
+        return core >= 0 && core < CPU_CORE_COUNT;
+    };
+    if (ideal_core == IDEAL_CORE_USE_PROCESS_VALUE) {
+        ideal_core = process ? process->getIdealCore() : 0;
+        affinity_mask = 1ull << ideal_core;
+    } else {
+        if ((affinity_mask | process_mask) != process_mask)
+            return MAKE_RESULT(Svc, Error::InvalidCoreId);
+        if (affinity_mask == 0)
+            return MAKE_RESULT(Svc, Error::InvalidCombination);
+        if (valid_core(ideal_core)) {
+            if ((affinity_mask & (1ull << ideal_core)) == 0)
+                return MAKE_RESULT(Svc, Error::InvalidCombination);
+        } else if (ideal_core != IDEAL_CORE_NO_UPDATE &&
+                   ideal_core != IDEAL_CORE_DONT_CARE) {
+            return MAKE_RESULT(Svc, Error::InvalidCoreId);
+        }
+    }
+    if (ideal_core == IDEAL_CORE_NO_UPDATE) {
+        ideal_core = thread->getIdealCore();
+        if (ideal_core != IDEAL_CORE_DONT_CARE &&
+            (affinity_mask & (1ull << ideal_core)) == 0)
+            return MAKE_RESULT(Svc, Error::InvalidCombination);
+    }
 
+    thread->setCoreAffinity(ideal_core, affinity_mask);
     return RESULT_SUCCESS;
 }
 
-void Kernel::getCurrentProcessorNumber(u32& out_number) {
+void Kernel::getCurrentProcessorNumber(IThread* crnt_thread, u32& out_number) {
     LOG_DEBUG(Kernel, "GetCurrentProcessorNumber called");
 
-    // TODO: implement
-    LOG_FUNC_STUBBED(Kernel);
-
-    // HACK
-    out_number = 0;
+    // Hydra does not pin guest threads to cores: the thread reports the core
+    // the guest put it on, so per-core guest data stays consistent
+    out_number = crnt_thread ? crnt_thread->getCurrentCore() : 0;
 }
 
 result_t Kernel::signalEvent(Event* event) {
@@ -986,7 +1176,8 @@ result_t Kernel::connectToNamedPort(const std::string_view name,
 }
 
 result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
-                                 hipc::ClientSession* client_session) {
+                                 hipc::ClientSession* client_session,
+                                 vaddr_t buffer, u64 buffer_size) {
     if (client_session == nullptr) {
         LOG_WARN(Kernel, "SendSyncRequest called (INVALID_HANDLE)");
         return MAKE_RESULT(Svc, Error::InvalidHandle);
@@ -999,8 +1190,13 @@ result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
     crnt_thread->pause();
 
     // Send request
-    client_session->getParent()->getServerSide()->enqueueRequest(
-        crnt_process, crnt_thread, crnt_thread->getTlsPtr());
+    if (buffer != 0x0)
+        client_session->getParent()->getServerSide()->enqueueRequest(
+            crnt_process, crnt_thread,
+            crnt_process->getMmu()->unmapAddr(buffer), buffer_size);
+    else
+        client_session->getParent()->getServerSide()->enqueueRequest(
+            crnt_process, crnt_thread, crnt_thread->getTlsPtr());
 
     // Wait for response
     ASSERT_DEBUG(crnt_thread->processMessages(), Kernel,
@@ -1018,16 +1214,102 @@ result_t Kernel::sendSyncRequest(Process* crnt_process, IThread* crnt_thread,
     return res;
 }
 
+result_t Kernel::checkUserBuffer(vaddr_t buffer, u64 buffer_size) {
+    // Whole pages, as Horizon locks them for the request
+    constexpr u64 PAGE_SIZE = 0x1000;
+    if (buffer % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidAddress);
+    if (buffer_size == 0 || buffer_size % PAGE_SIZE != 0)
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+    if (buffer + buffer_size <= buffer)
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::sendAsyncRequestWithUserBuffer(
+    Process* crnt_process, hipc::ClientSession* client_session, vaddr_t buffer,
+    u64 buffer_size, Event*& out_event) {
+    LOG_DEBUG(Kernel,
+              "SendAsyncRequestWithUserBuffer called (buffer: {:#x}, size: "
+              "{:#x})",
+              buffer, buffer_size);
+
+    if (const auto res = checkUserBuffer(buffer, buffer_size);
+        res != RESULT_SUCCESS)
+        return res;
+    if (client_session == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+
+    // The reply signals the event; the client waits on it
+    out_event = new Event();
+    out_event->chargeTo(crnt_process->getResourceLimit());
+    client_session->getParent()->getServerSide()->enqueueRequest(
+        crnt_process, nullptr, crnt_process->getMmu()->unmapAddr(buffer),
+        buffer_size, out_event);
+
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::createEvent(Process* crnt_process, Event*& out_event) {
+    LOG_DEBUG(Kernel, "CreateEvent called");
+
+    out_event = new Event();
+    out_event->chargeTo(crnt_process->getResourceLimit());
+
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::getResourceLimitValue(ResourceLimit* resource_limit,
+                                       LimitableResource which, u32 kind,
+                                       i64& out_value) {
+    LOG_DEBUG(Kernel, "GetResourceLimitValue called (SVC {:#x}, which: {})",
+              kind, static_cast<u32>(which));
+
+    if (which >= LimitableResource::Count)
+        return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+    if (resource_limit == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+
+    switch (kind) {
+    case 0x30:
+        out_value = resource_limit->getLimitValue(which);
+        break;
+    case 0x31:
+        out_value = resource_limit->getCurrentValue(which);
+        break;
+    default:
+        out_value = resource_limit->getPeakValue(which);
+        break;
+    }
+
+    return RESULT_SUCCESS;
+}
+
+result_t Kernel::getProcessId(AutoObject* obj, u64& out_process_id) {
+    // A thread handle gives the ID of its process
+    Process* process = nullptr;
+    if (obj != nullptr) {
+        if (auto thread = obj->as<IThread>())
+            process = thread->getProcess();
+        else
+            process = obj->as<Process>();
+    }
+    if (process == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+    LOG_DEBUG(Kernel, "GetProcessId called (process: {})",
+              process->getDebugName());
+
+    out_process_id = process->getProcessId();
+    return RESULT_SUCCESS;
+}
+
 result_t Kernel::getThreadId(IThread* thread, u64& out_thread_id) {
+    if (thread == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel, "GetThreadId called (thread: {})",
               thread->getDebugName());
 
-    // TODO: implement
-    LOG_FUNC_STUBBED(Services);
-
-    // HACK
-    out_thread_id = std::bit_cast<u64>(thread);
-
+    out_thread_id = thread->getThreadId();
     return RESULT_SUCCESS;
 }
 
@@ -1084,8 +1366,11 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
 
     switch (info_type) {
     case InfoType::CoreMask:
-        // Hydra exposes four cores; thread affinity is not enforced
-        out_info = 0xf;
+        // From the process capabilities, cores 0-2 for most games
+        out_info = crnt_process->getCoreMask();
+        return RESULT_SUCCESS;
+    case InfoType::PriorityMask:
+        out_info = crnt_process->getPriorityMask();
         return RESULT_SUCCESS;
     case InfoType::AliasRegionAddress:
         out_info = ALIAS_REGION.getBegin();
@@ -1100,8 +1385,7 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
         out_info = HEAP_REGION.getSize();
         return RESULT_SUCCESS;
     case InfoType::TotalMemorySize:
-        // TODO: what should this be?
-        out_info = 3ull * 1024ull * 1024ull * 1024ull;
+        out_info = APPLICATION_MEMORY_SIZE;
         return RESULT_SUCCESS;
     case InfoType::UsedMemorySize:
         out_info =
@@ -1109,8 +1393,9 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
             std::min<u64>(crnt_process->getSystemResourceSize(), 64ull * 1024);
         return RESULT_SUCCESS;
     case InfoType::DebuggerAttached:
-        // TODO: make this configurable
-        out_info = static_cast<u64>(true);
+        // Retail consoles report no debugger, so games take their normal
+        // paths; with the GDB server one is attached
+        out_info = static_cast<u64>(CONFIG_INSTANCE.getGdbEnabled());
         return RESULT_SUCCESS;
     case InfoType::RandomEntropy:
         ASSERT_DEBUG(info_sub_type < crnt_process->getRandomEntropy().size(),
@@ -1141,14 +1426,21 @@ result_t Kernel::getInfo(Process* crnt_process, InfoType info_type,
     case InfoType::ProgramId:
         out_info = crnt_process->getTitleId();
         return RESULT_SUCCESS;
+    case InfoType::ResourceLimit:
+        // Only the current process's, with no handle
+        if (obj != nullptr)
+            return MAKE_RESULT(Svc, Error::InvalidHandle);
+        if (info_sub_type != 0)
+            return MAKE_RESULT(Svc, Error::InvalidCombination);
+        out_info =
+            crnt_process->addHandle(crnt_process->getResourceLimit()).getRaw();
+        return RESULT_SUCCESS;
     case InfoType::UserExceptionContextAddress:
-        LOG_NOT_IMPLEMENTED(Kernel, "UserExceptionContextAddress");
-        // HACK
-        out_info = 0;
+        out_info = crnt_process->getProcessLocalRegion();
         return RESULT_SUCCESS;
     case InfoType::TotalNonSystemMemorySize:
-        out_info = 3ull * 1024ull * 1024ull * 1024ull -
-                   crnt_process->getSystemResourceSize();
+        out_info =
+            APPLICATION_MEMORY_SIZE - crnt_process->getSystemResourceSize();
         return RESULT_SUCCESS;
     case InfoType::UsedNonSystemMemorySize:
         out_info = crnt_process->getUsedUserMemorySize();
@@ -1210,27 +1502,50 @@ result_t Kernel::checkPhysicalMemoryRange(vaddr_t addr, u64 size) {
     return RESULT_SUCCESS;
 }
 
-result_t Kernel::setThreadActivity(IThread* thread, ThreadActivity activity) {
+result_t Kernel::setThreadActivity(IThread* crnt_thread, IThread* thread,
+                                   ThreadActivity activity) {
+    // Validation follows mesosphere (svc_thread.cpp, KThread::SetActivity)
+    if (activity != ThreadActivity::Runnable &&
+        activity != ThreadActivity::Paused)
+        return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+    if (thread == nullptr || thread->getProcess() != crnt_thread->getProcess())
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+    if (thread == crnt_thread)
+        return MAKE_RESULT(Svc, Error::AlreadyExists); // Busy
     LOG_DEBUG(Kernel, "SetThreadActivity called (thread: {}, activity: {})",
               thread->getDebugName(), activity);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}, activity: {}",
-                               thread->getDebugName(), activity);
-
+    if (activity == ThreadActivity::Paused) {
+        if (thread->isSuspendRequested())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        thread->suspendActivity();
+    } else {
+        if (!thread->isSuspendRequested())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        thread->resumeActivity();
+    }
     return RESULT_SUCCESS;
 }
 
-result_t Kernel::getThreadContext3(IThread* thread,
+result_t Kernel::getThreadContext3(IThread* crnt_thread, IThread* thread,
                                    ThreadContext& out_thread_context) {
-    LOG_DEBUG(Kernel, "SetThreadActivity called (thread: {})",
+    if (thread == nullptr || thread->getProcess() != crnt_thread->getProcess())
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
+    if (thread == crnt_thread)
+        return MAKE_RESULT(Svc, Error::AlreadyExists); // Busy
+    LOG_DEBUG(Kernel, "GetThreadContext3 called (thread: {})",
               thread->getDebugName());
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(Kernel, "thread: {}", thread->getDebugName());
-
-    // HACK
-    out_thread_context = {};
+    if (!thread->isSuspendRequested())
+        return MAKE_RESULT(Svc, Error::InvalidState);
+    // Like Horizon, wait until the thread actually stopped. A running thread
+    // stops at its next VM exit, within one timer interrupt.
+    constexpr auto STOP_TIMEOUT = std::chrono::seconds(2);
+    if (!thread->waitForSuspendedContext(out_thread_context, STOP_TIMEOUT)) {
+        LOG_WARN(Kernel, "GetThreadContext3: {} did not stop",
+                 thread->getDebugName());
+        return MAKE_RESULT(Svc, Error::InvalidState);
+    }
     return RESULT_SUCCESS;
 }
 
@@ -1402,13 +1717,18 @@ result_t Kernel::acceptSession(hipc::ServerPort* server_port,
 result_t Kernel::replyAndReceive(IThread* crnt_thread,
                                  std::span<SynchronizationObject*> sync_objs,
                                  hipc::ServerSession* reply_target_session,
-                                 i64 timeout, u32& out_signalled_index) {
+                                 i64 timeout, u32& out_signalled_index,
+                                 uptr buffer, u64 buffer_size) {
+    if (buffer == 0x0) {
+        buffer = crnt_thread->getTlsPtr();
+        buffer_size = hipc::MSG_BUFFER_MAX_SIZE;
+    }
     LOG_DEBUG(Kernel, "ReplyAndReceive called (count: {}, timeout: {})",
               sync_objs.size(), timeout);
 
     if (reply_target_session != nullptr) {
         // Reply
-        reply_target_session->reply(crnt_thread->getTlsPtr());
+        reply_target_session->reply(buffer, buffer_size);
     }
 
     // Wait
@@ -1422,7 +1742,7 @@ result_t Kernel::replyAndReceive(IThread* crnt_thread,
         auto server_session = static_cast<hipc::ServerSession*>(sync_obj);
         if (server_session->isClientOpen()) {
             // Receive
-            server_session->receive(crnt_thread);
+            server_session->receive(buffer, buffer_size);
             return RESULT_SUCCESS;
         } else {
             return MAKE_RESULT(Svc, 123); // SessionClosed
@@ -1432,12 +1752,27 @@ result_t Kernel::replyAndReceive(IThread* crnt_thread,
     }
 }
 
-result_t Kernel::createCodeMemory(vaddr_t addr, u64 size,
-                                  CodeMemory*& out_code_memory) {
+result_t Kernel::createCodeMemory(Process* crnt_process, vaddr_t addr,
+                                  u64 size, CodeMemory*& out_code_memory) {
     LOG_DEBUG(Kernel, "CreateCodeMemory called (addr: 0x{:08x}, size: {})",
               addr, size);
 
-    out_code_memory = new CodeMemory(addr, size);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+    // Only memory that may back code memory (heap), with no attributes set
+    constexpr u32 FLAG_CAN_CODE_MEMORY = ZTD_BIT(25);
+    auto* mmu = crnt_process->getMmu();
+    for (vaddr_t va = addr; va < addr + size;) {
+        const auto region = mmu->queryRegion(va);
+        if ((static_cast<u32>(region.state.type) & FLAG_CAN_CODE_MEMORY) == 0 ||
+            region.state.attr != MemoryAttribute::None || region.size == 0)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryState);
+        va = region.va + region.size;
+    }
+
+    out_code_memory = new CodeMemory(crnt_process, addr, size);
 
     return RESULT_SUCCESS;
 }
@@ -1445,16 +1780,74 @@ result_t Kernel::createCodeMemory(vaddr_t addr, u64 size,
 result_t Kernel::controlCodeMemory(CodeMemory* code_memory,
                                    CodeMemoryOperation op, vaddr_t addr,
                                    u64 size, MemoryPermission perm) {
+    if (code_memory == nullptr)
+        return MAKE_RESULT(Svc, Error::InvalidHandle);
     LOG_DEBUG(Kernel,
               "ControlCodeMemory called (code memory: {}, op: {}, addr: "
               "0x{:08x}, size: {}, perm: {})",
               code_memory->getDebugName(), op, addr, size, perm);
 
-    // TODO: implement
-    LOG_FUNC_WITH_ARGS_STUBBED(
-        Kernel,
-        "code memory: {}, op: {}, addr: 0x{:08x}, size: 0x{:08x}, perm: {}",
-        code_memory->getDebugName(), op, addr, size, perm);
+    if (const auto res = checkMemoryRange(addr, size); res != RESULT_SUCCESS)
+        return res;
+    if (addr < ADDRESS_SPACE.getBegin() || addr + size > ADDRESS_SPACE.getEnd())
+        return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+    // The whole code memory is mapped at once
+    if (size != code_memory->getSize())
+        return MAKE_RESULT(Svc, Error::InvalidSize);
+
+    // Atmosphere allows these on the caller's own code memory, for JIT
+    auto* mmu = code_memory->getOwner()->getMmu();
+    const auto range = ztd::Range<vaddr_t>::fromSize(addr, size);
+    const auto source =
+        ztd::Range<vaddr_t>::fromSize(code_memory->getAddress(), size);
+    const auto is_free = [&] {
+        for (vaddr_t va = addr; va < addr + size;) {
+            const auto region = mmu->queryRegion(va);
+            if (region.state.type != MemoryType::Free || region.size == 0)
+                return false;
+            va = region.va + region.size;
+        }
+        return true;
+    };
+    switch (op) {
+    case CodeMemoryOperation::MapOwner: // Map, writable
+        if (perm != MemoryPermission::ReadWrite)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getMappedAddress() != 0x0 || !is_free())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        mmu->map(addr, source);
+        mmu->protect(range, MemoryPermission::ReadWrite);
+        code_memory->setMappedAddress(addr);
+        break;
+    case CodeMemoryOperation::MapSlave: // MapToOwner, readable or executable
+        if (perm != MemoryPermission::Read &&
+            perm != MemoryPermission::ReadExecute)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getOwnerMappedAddress() != 0x0 || !is_free())
+            return MAKE_RESULT(Svc, Error::InvalidState);
+        mmu->map(addr, source);
+        mmu->protect(range, perm);
+        code_memory->setOwnerMappedAddress(addr);
+        break;
+    case CodeMemoryOperation::UnmapOwner:
+        if (perm != MemoryPermission::None)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getMappedAddress() != addr)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+        mmu->unmap(range);
+        code_memory->setMappedAddress(0x0);
+        break;
+    case CodeMemoryOperation::UnmapSlave:
+        if (perm != MemoryPermission::None)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryPermissions);
+        if (code_memory->getOwnerMappedAddress() != addr)
+            return MAKE_RESULT(Svc, Error::InvalidMemoryRange);
+        mmu->unmap(range);
+        code_memory->setOwnerMappedAddress(0x0);
+        break;
+    default:
+        return MAKE_RESULT(Svc, Error::InvalidEnumValue);
+    }
 
     return RESULT_SUCCESS;
 }
@@ -1467,15 +1860,13 @@ result_t Kernel::getProcessList(u64* process_id_buffer,
               reinterpret_cast<void*>(process_id_buffer),
               process_id_buffer_size);
 
-    // TODO: is process_id_buffer_size in bytes or number of process IDs?
+    // The size is the maximum number of IDs (svcGetProcessList's
+    // max_out_count), not bytes
+    out_count = 0;
     for (auto it = process_manager.begin();
-         it != process_manager.end() && process_id_buffer_size >= sizeof(u64);
-         it++) {
-        // TODO: what is a process ID?
-        *process_id_buffer++ = reinterpret_cast<u64>(*it); // HACK
-        process_id_buffer_size -= sizeof(u64);
-        out_count++;
-    }
+         it != process_manager.end() && out_count < process_id_buffer_size;
+         it++)
+        process_id_buffer[out_count++] = (*it)->getProcessId();
 
     return RESULT_SUCCESS;
 }

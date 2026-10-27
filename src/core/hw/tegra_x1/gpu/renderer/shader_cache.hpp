@@ -2,6 +2,7 @@
 
 #include "core/hw/tegra_x1/gpu/engines/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -14,6 +15,23 @@ class IRenderer;
 
 struct GuestShaderState {
     u32 program_offset{0};
+    // VertexA: the program the vertex shader (VertexB) continues, with its
+    // header (set by the shader cache, null when the stage is disabled)
+    std::shared_ptr<const std::vector<u8>> vertex_a_code;
+    u32 vertex_a_program_offset{0};
+    // A geometry shader (emulated, see geometry.hpp): the input primitive of
+    // the draw (geometry_input_vertices is 0 for other stages)
+    u32 geometry_input_vertices{0};
+    engines::PrimitiveType geometry_input_primitive{
+        engines::PrimitiveType::Points};
+    // A vertex shader of a geometry pipeline writes its outputs to a buffer
+    bool geometry_capture{false};
+    // Tessellation (emulated, see tessellation.hpp): control points per
+    // input patch, those the control shader outputs (for the evaluation
+    // shader) and the domain
+    u32 tessellation_patch_size{0};
+    u32 tessellation_control_points{0};
+    u32 tessellation_domain{0};
     std::map<std::pair<u32, u32>, u32> branch_constants;
     std::map<u32, TextureFormat> buffer_texture_formats;
     // Sampled (non-buffer) textures with integer formats
@@ -55,6 +73,9 @@ struct GuestShaderState {
     u32 window_space_height{0};
     // Point sprite coordinates have their origin at the bottom
     bool point_coord_origin_bottom{false};
+    // Depth and stencil tests run before the fragment shader (and its
+    // discards), SET_API_MANDATED_EARLY_Z
+    bool early_fragment_tests{false};
     // Fixed function alpha test of render target 0 (Invalid when disabled)
     engines::CompareOp alpha_test_func{engines::CompareOp::Invalid};
     f32 alpha_test_ref{0.0f};
@@ -81,6 +102,9 @@ struct GuestShaderDescriptor {
     std::shared_ptr<const std::vector<u8>> code_snapshot;
     std::vector<u32> cache_key;
     u64 code_revision{0};
+    // VertexA program of a vertex shader (0 when the stage is disabled)
+    uptr vertex_a_gpu_addr{0};
+    u64 vertex_a_code_revision{0};
 };
 
 class ShaderCache
@@ -115,8 +139,19 @@ class ShaderCache
     struct CompiledVersion {
         std::shared_ptr<const std::vector<u8>> bytes;
         ShaderBase* shader;
+        std::shared_ptr<const std::vector<u8>> vertex_a_bytes{};
     };
     std::map<std::vector<u32>, std::vector<CompiledVersion>> compiled_versions;
+    // Reused under lookup_mutex; map entries own their copied keys.
+    std::vector<u32> lookup_key;
+    // The versions of the last key looked up per stage: consecutive draws
+    // mostly use the same shaders. Entries of compiled_versions are never
+    // erased, so the pointer stays valid.
+    struct LookupMemo {
+        std::vector<u32> key;
+        std::vector<CompiledVersion>* versions{nullptr};
+    };
+    std::array<LookupMemo, 8> lookup_memos;
     u64 next_code_revision{0};
     std::atomic<u64> instruction_epoch{0};
     std::mutex lookup_mutex;
