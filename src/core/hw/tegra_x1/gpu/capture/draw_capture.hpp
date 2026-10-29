@@ -27,7 +27,7 @@
 namespace hydra::hw::tegra_x1::gpu::capture {
 
 constexpr char MAGIC[8] = {'H', 'Y', 'D', 'R', 'A', 'C', 'A', 'P'};
-constexpr u32 VERSION = 5;
+constexpr u32 VERSION = 6;
 
 using Contents = std::vector<std::vector<u8>>;
 

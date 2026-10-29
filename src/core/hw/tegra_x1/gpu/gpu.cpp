@@ -306,7 +306,25 @@ void Gpu::pullerMethod(u32 method, u32 arg) {
             "semaphore_acquire", capture::currentGuestEventOrigin(),
             semaphore_address(), 4, 0, payload, operation);
         auto* ptr = resolve(sizeof(u32));
-        if (ptr == nullptr || !wait_for_gpu(CheckpointReason::PullerAcquire))
+        if (ptr == nullptr)
+            return;
+        // Already satisfied: the releases queued earlier in the stream landed
+        // (resolve waits for them), so the GPU only has to be waited for when
+        // its pending work may still produce the value.
+        // HYDRA_ACQUIRE_WAIT_FIRST waits for the GPU before every acquire.
+        static const bool wait_first =
+            std::getenv("HYDRA_ACQUIRE_WAIT_FIRST") != nullptr;
+        if (!wait_first) {
+            const u32 word = std::atomic_ref<u32>(
+                *reinterpret_cast<u32*>(ptr)).load(std::memory_order_acquire);
+            if (satisfied(word)) {
+                capture::GuestEvents::instance().event(
+                    "semaphore_acquired", capture::currentGuestEventOrigin(),
+                    semaphore_address(), 4, payload, word, operation);
+                return;
+            }
+        }
+        if (!wait_for_gpu(CheckpointReason::PullerAcquire))
             return;
         while (!pfifo.isStopping()) {
             const u32 word = std::atomic_ref<u32>(

@@ -42,6 +42,8 @@ class GMmu : public GenericMmu<GMmu, AddressSpace>,
     // Copy a contiguous guest range across separate host mappings, stopping
     // at the first unmapped address.
     std::vector<u8> readMappedBytes(uptr gpu_addr, usize max_size);
+    // Same into `out`, without allocating. Returns the bytes copied.
+    usize readMappedBytes(uptr gpu_addr, void* out, usize max_size);
 
     void mapImpl([[maybe_unused]] uptr base, [[maybe_unused]] AddressSpace as) {
     }

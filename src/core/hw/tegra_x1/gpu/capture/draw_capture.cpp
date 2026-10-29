@@ -206,12 +206,13 @@ void writeShader(Writer& w, const ShaderDescriptor& d) {
     writeMap(w, m.images);
     writeMap(w, m.image_types);
     w.put(m.writes_layer);
+    w.put(m.lod_bias_buffer_index);
     w.put<u64>(m.unsupported.size());
     for (const auto& text : m.unsupported)
         w.putString(text);
 }
 
-ShaderDescriptor readShader(Reader& r) {
+ShaderDescriptor readShader(Reader& r, u32 version) {
     ShaderDescriptor d;
     d.type = r.get<ShaderType>();
     d.backend = r.get<ShaderBackend>();
@@ -257,6 +258,8 @@ ShaderDescriptor readShader(Reader& r) {
         m.image_types[key] = r.get<MTL::TextureType>();
     }
     m.writes_layer = r.get<bool>();
+    if (version >= 6)
+        m.lod_bias_buffer_index = r.get<u32>();
     m.unsupported.resize(r.count());
     for (auto& text : m.unsupported)
         text = r.getString();
@@ -495,7 +498,7 @@ CaptureFile CaptureFile::deserialize(const std::vector<u8>& bytes) {
         b.bytes = r.getBytes();
     f.shaders.resize(r.count());
     for (auto& s : f.shaders)
-        s.descriptor = readShader(r);
+        s.descriptor = readShader(r, version);
     f.pipelines.resize(r.count());
     for (auto& p : f.pipelines) {
         for (auto& id : p.shaders)

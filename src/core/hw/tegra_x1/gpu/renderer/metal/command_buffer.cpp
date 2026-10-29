@@ -1259,37 +1259,51 @@ void CommandBuffer::setSamplerHot18(MTL::SamplerState* sampler,
     bound_sampler = sampler;
 }
 
-void CommandBuffer::setSamplerTable(const SamplerTable& table,
-                                    ShaderType shader_type, u32 index) {
+template <typename Bound>
+void CommandBuffer::setInlineTable(Bound& bound,
+                                   const decltype(Bound::table)& table,
+                                   ShaderType shader_type, u32 index) {
     ASSERT_DEBUG(index < BUFFER_COUNT, MetalRenderer, "Invalid buffer index {}",
                  index);
 
-    const auto stage = static_cast<u32>(shader_type);
-    auto& bound_buffer = encoder_state.render.buffers[stage][index];
-    auto& bound_table = encoder_state.render.sampler_tables[stage];
-    // A buffer bound at the index since replaced the table
-    if (bound_table.index == index &&
-        bound_buffer.buffer == SAMPLER_TABLE_BUFFER_STATE.buffer &&
-        bound_buffer.offset == SAMPLER_TABLE_BUFFER_STATE.offset &&
-        bound_table.table == table)
+    auto& bound_buffer =
+        encoder_state.render.buffers[static_cast<u32>(shader_type)][index];
+    if (bound.index == index &&
+        bound_buffer.buffer == Bound::BUFFER_STATE.buffer &&
+        bound_buffer.offset == Bound::BUFFER_STATE.offset &&
+        bound.table == table)
         return;
 
     switch (shader_type) {
     case ShaderType::Vertex:
         getRenderCommandEncoderUnchecked()->setVertexBytes(
-            table.ids.data(), table.getSize(), index);
+            table.getData(), table.getSize(), index);
         break;
     case ShaderType::Fragment:
         getRenderCommandEncoderUnchecked()->setFragmentBytes(
-            table.ids.data(), table.getSize(), index);
+            table.getData(), table.getSize(), index);
         break;
     default:
         LOG_ERROR(MetalRenderer, "Invalid shader type {}", shader_type);
         return;
     }
-    bound_buffer = SAMPLER_TABLE_BUFFER_STATE;
-    bound_table.index = index;
-    bound_table.table = table;
+    bound_buffer = Bound::BUFFER_STATE;
+    bound.index = index;
+    bound.table = table;
+}
+
+void CommandBuffer::setSamplerTable(const SamplerTable& table,
+                                    ShaderType shader_type, u32 index) {
+    setInlineTable(
+        encoder_state.render.sampler_tables[static_cast<u32>(shader_type)],
+        table, shader_type, index);
+}
+
+void CommandBuffer::setLodBiasTable(const LodBiasTable& table,
+                                    ShaderType shader_type, u32 index) {
+    setInlineTable(
+        encoder_state.render.lod_bias_tables[static_cast<u32>(shader_type)],
+        table, shader_type, index);
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

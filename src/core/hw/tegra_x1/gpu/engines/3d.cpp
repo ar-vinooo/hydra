@@ -876,9 +876,36 @@ void ThreeD::drawVertexElementsImpl(
             }
             if (count == 0)
                 return;
+            // The indices are read from host memory: they have to be mapped,
+            // and contiguous there
+            const uptr first_addr = index_buffer_addr + first_offset;
+            uptr base = 0;
+            const auto as = tls_crnt_gmmu->findAddr(first_addr, base);
+            if (!as || as->ptr == 0x0) {
+                ONCE(LOG_WARN(Engines, "Index buffer at unmapped address {:#x}",
+                              static_cast<u64>(first_addr)));
+                return;
+            }
+            const uptr ptr = tls_crnt_gmmu->unmapAddr(first_addr);
+            const u64 size = static_cast<u64>(count) * index_size;
+            const u64 mapped = as->size - (first_addr - base);
+            if (size > mapped) {
+                uptr last_base = 0;
+                const uptr last_addr = first_addr + size - 1;
+                const auto last = tls_crnt_gmmu->findAddr(last_addr, last_base);
+                if (!last || last->ptr == 0x0 ||
+                    last->ptr + (last_addr - last_base) != ptr + size - 1) {
+                    ONCE(LOG_WARN(Engines,
+                                  "Index buffer at {:#x} spans separate "
+                                  "mappings, drawing the mapped indices",
+                                  static_cast<u64>(first_addr)));
+                    count = static_cast<u32>(mapped / index_size);
+                    if (count == 0)
+                        return;
+                }
+            }
             range = ztd::Range<uptr>::fromSize(
-                tls_crnt_gmmu->unmapAddr(index_buffer_addr + first_offset),
-                static_cast<u64>(count) * index_size);
+                ptr, static_cast<u64>(count) * index_size);
         }
 
         index_buffer = gpu.getRenderer().getIndexCache().decode(
@@ -2030,9 +2057,11 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
     // that it accesses, rather than inspecting unrelated uniform data.
     const auto pool_addr = static_cast<u64>(regs.tex_header_pool);
     const auto stage_index = static_cast<u32>(stage) - 1;
-    if (pool_addr != 0) {
-        const auto* pool = reinterpret_cast<const TextureImageControl*>(
-            tls_crnt_gmmu->unmapAddr(pool_addr));
+    const auto* pool =
+        pool_addr != 0 ? reinterpret_cast<const TextureImageControl*>(
+                             tls_crnt_gmmu->unmapAddr(pool_addr))
+                       : nullptr;
+    if (pool != nullptr) {
         const auto& resource_mapping =
             active_shader->getDescriptor().resource_mapping;
         for (const auto& [index, renderer_index] : resource_mapping.textures) {
@@ -2052,11 +2081,11 @@ renderer::ShaderBase* ThreeD::getShader(ShaderStage stage,
             if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
                 static_cast<u64>(regs.tex_sampler_pool) != 0 &&
                 sampler <= regs.tex_sampler_pool_max_index) {
-                const auto bytes = tls_crnt_gmmu->readMappedBytes(
-                    static_cast<u64>(regs.tex_sampler_pool) + u64(sampler) * sizeof(TextureSamplerControl), sizeof(TextureSamplerControl));
-                if (bytes.size() == sizeof(TextureSamplerControl)) {
-                    TextureSamplerControl tsc{};
-                    std::memcpy(&tsc, bytes.data(), sizeof(tsc));
+                TextureSamplerControl tsc{};
+                if (tls_crnt_gmmu->readMappedBytes(
+                        static_cast<u64>(regs.tex_sampler_pool) +
+                            u64(sampler) * sizeof(TextureSamplerControl),
+                        &tsc, sizeof(tsc)) == sizeof(tsc)) {
                     specializeShaderSampler(descriptor.state, index, tsc,
                                             format, getTicLodRange(tic));
                 }

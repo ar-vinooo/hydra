@@ -620,6 +620,9 @@ struct ResourceMapping {
     // size of the texture, so nothing in its code tells the type
     std::set<u32> guessed_texture_types;
     u32 sampler_buffer_index{invalid<u32>()};
+    // Sampler LOD biases of the textures, by host texture index, read at run
+    // time (useDynamicLodBias)
+    u32 lod_bias_buffer_index{invalid<u32>()};
     // Fragment shader user inputs (bit per location)
     u32 stage_input_mask{0};
     // Storage images (surfaces), keyed like textures

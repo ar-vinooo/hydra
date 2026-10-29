@@ -4,6 +4,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/texture_events.hpp"
 #include "core/hw/tegra_x1/gpu/resource/range_set.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -518,11 +519,14 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
         return getTextureView(command_buffer, storage, mem, view_descriptor,
                               usage);
     }
-    epoch++;
+    // A view of an existing storage (another level or layer range) leaves the
+    // earlier lookups valid, like a storage found by its key: only new
+    // storages change the epoch. Engines memoize lookups while it stays.
 
     // Buffer subranges are not mip/layer views. Keep exact-sized storages;
     // overlapping GPU contents are synchronized by byte range in update().
     if (descriptor.type == MTL::TextureTypeTextureBuffer) {
+        epoch++;
         auto& storage =
             group.cache.insert(getFreeStorageKey(group, storage_hash));
         return getTexture(command_buffer, storage, mem, descriptor,
@@ -565,6 +569,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
             // Check if the base texture has enough levels
             const u32 min_levels = level + descriptor.level_count;
             if (other_descriptor.level_count < min_levels) {
+                epoch++;
                 // Keep what is needed from the old storage: removing it frees
                 // its slot, which the new storage may reuse
                 const auto old_base = storage.base;
@@ -590,11 +595,17 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                               usage);
 
                 // Copy the old storage to the new one, unless the guest
-                // overwrote all of what the GPU held in it
+                // overwrote all of what the GPU held in it. A storage the GPU
+                // never wrote only holds guest memory, which the new storage
+                // was just decoded from: its copy would put older contents
+                // over guest writes it did not upload yet.
                 bool old_fresh = false;
                 TextureStorage::forEachOutside(
                     old_stale_ranges, old_descriptor.getRange(),
                     [&](ztd::Range<uptr>) { old_fresh = true; });
+                if (useRangeTextureReload() &&
+                    old_gpu_written == TextureCacheTimePoint{})
+                    old_fresh = false;
                 if (old_fresh &&
                     !new_storage.base->copyFrom(command_buffer, old_base, 0, 0,
                                                 0, 0, old_descriptor.level_count,
@@ -610,6 +621,12 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
                     new_storage.cpu_modified_timestamp, old_cpu_modified);
                 new_storage.flushed_ranges = old_flushed_ranges;
                 new_storage.stale_ranges = old_stale_ranges;
+                // Guest writes the old storage did not upload yet: the copy
+                // brought its stale contents there, which the next update
+                // replaces
+                for (const auto& range : old_storage.dirty_ranges)
+                    new_storage.markDirty(range);
+                new_storage.full_reload |= old_storage.full_reload;
 
                 actual_storage = &new_storage;
             }
@@ -630,6 +647,7 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
     }
 
     // ---------------- New storage ----------------
+    epoch++;
 
     // Find overlapping storages
     struct OverlappingStorage {
@@ -704,6 +722,12 @@ TextureCache::addToMemory(ICommandBuffer* command_buffer, TextureMem& mem,
         overlapping_storage.storage.forEachFresh(
             other_descriptor.getRange(),
             [&](ztd::Range<uptr>) { fresh = true; });
+        // A storage the GPU never wrote only holds guest memory, possibly
+        // older than what the new storage was decoded from
+        if (useRangeTextureReload() &&
+            overlapping_storage.storage.gpu_written_timestamp ==
+                TextureCacheTimePoint{})
+            fresh = false;
         if (!fresh) {
             LOG_TEXTURE_EVENT("copy_skipped_stale_storage", descriptor,
                             fmt::format("old={:#x} {} {}", other_descriptor.ptr,
@@ -744,9 +768,11 @@ void TextureCache::updateStorage(ICommandBuffer* command_buffer,
             fmt::format("usage={} zero_fill={}", static_cast<u32>(usage),
                         zero_fill_decode));
         decodeTexture(command_buffer, storage);
+        storage.fresh_upload = !zero_fill_decode && useRangeTextureReload();
         zero_fill_decode = false;
     }
     update(command_buffer, storage, mem, usage);
+    storage.fresh_upload = false;
 }
 
 ITextureView*
@@ -1066,6 +1092,124 @@ void TextureCache::encodeTexture(ICommandBuffer* command_buffer,
     HYDRA_HOT_CALL(*this, texture_cache_encode_texture)(command_buffer, storage, range);
 }
 
+namespace {
+
+// Size of a level of one layer, packed linear
+u32 getPackedLevelSize(const TextureDescriptor& descriptor, u32 level) {
+    const auto dims = descriptor.getLevelDimensions(level);
+    const u32 stride = getTextureFormatStride(descriptor.format,
+                                              static_cast<u32>(dims.width));
+    const u32 rows = getTextureFormatRows(descriptor.format,
+                                          static_cast<u32>(dims.height));
+    return static_cast<u32>(dims.depth) * rows * stride;
+}
+
+// Guest memory of a level of a layer of a block linear texture. Levels and
+// layers are aligned to blocks there.
+ztd::Range<uptr> getGuestLevelRange(const TextureDescriptor& descriptor,
+                                    u32 layer, u32 level) {
+    const u32 layer_stride =
+        descriptor.layer_size != 0
+            ? descriptor.layer_size
+            : descriptor.getLevelOffset(descriptor.level_count);
+    const uptr begin = descriptor.ptr +
+                       static_cast<uptr>(layer) * layer_stride +
+                       descriptor.getLevelOffset(level);
+    return ztd::Range<uptr>(begin, begin + descriptor.getLevelSize(level));
+}
+
+// Decodes a level of a layer of a block linear texture into packed rows
+void decodeBlockLinearLevel(const TextureDescriptor& descriptor, u32 layer,
+                            u32 level, u8* out_data) {
+    const u8* in_data = reinterpret_cast<const u8*>(
+        getGuestLevelRange(descriptor, layer, level).getBegin());
+
+    // Calculate sizes
+    const auto dims = descriptor.getLevelDimensions(level);
+    const auto block_size_log2 = descriptor.getLevelBlockSizeLog2(level);
+    const u32 stride =
+        getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
+    const u32 rows =
+        getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
+    const u32 slice_stride = rows * stride;
+
+    // Convert
+    // The base level's rows are padded to whole blocks in X (TIC tile width
+    // spacing), e.g. 4000 byte rows take 64 GOBs, not 63. Mip levels aren't
+    // (like yuzu).
+    convertBlockLinearToLinear(
+        align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width)),
+        rows, static_cast<u32>(dims.depth),
+        static_cast<u32>(block_size_log2.height),
+        static_cast<u32>(block_size_log2.depth), in_data,
+        [=](const u8* in_gob, u32 gob_x, u32 gob_y, u32 gob_z) {
+            const u32 x = gob_x * GOB_WIDTH;
+            if (x >= stride)
+                return;
+            for (u32 local_y = 0; local_y < GOB_HEIGHT; local_y++) {
+                const u32 y = gob_y * GOB_HEIGHT + local_y;
+                if (y >= rows)
+                    break;
+
+                const usize crnt_offset =
+                    static_cast<usize>(gob_z) * slice_stride +
+                    static_cast<usize>(y) * stride + x;
+                std::memcpy(out_data + crnt_offset,
+                            in_gob + static_cast<usize>(local_y) * GOB_WIDTH,
+                            std::min(GOB_WIDTH, stride - x));
+            }
+        });
+}
+
+} // namespace
+
+bool TextureCache::decodeTextureRanges(
+    ICommandBuffer* command_buffer, TextureStorage& storage,
+    const std::vector<ztd::Range<uptr>>& ranges) {
+    const auto& descriptor = storage.base->getDescriptor();
+    // Linear textures are a single level and layer, buffers are not mipmapped
+    if (descriptor.is_linear || zero_fill_decode ||
+        descriptor.type == MTL::TextureTypeTextureBuffer) {
+        decodeTexture(command_buffer, storage);
+        return true;
+    }
+
+    ScopedGpuWork work(GpuWork::Texture);
+    const auto upload_start = PerfStats::isEnabled()
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    u64 uploaded = 0;
+    for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
+        for (u32 level = 0; level < descriptor.level_count; level++) {
+            const auto guest = getGuestLevelRange(descriptor, layer, level);
+            if (std::none_of(ranges.begin(), ranges.end(),
+                             [&](const auto& range) {
+                                 return range.intersects(guest);
+                             }))
+                continue;
+            const u32 size = getPackedLevelSize(descriptor, level);
+            auto tmp_buffer = renderer.allocateTextureUploadBuffer(size);
+            decodeBlockLinearLevel(descriptor, layer, level,
+                                   reinterpret_cast<u8*>(tmp_buffer->getPtr()));
+            storage.base->copyFrom(command_buffer, tmp_buffer,
+                                   ztd::Range<u32>(level, level + 1),
+                                   ztd::Range<u32>(layer, layer + 1));
+            renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);
+            uploaded += size;
+        }
+    }
+
+    if (PerfStats::isEnabled()) {
+        auto& stats = PerfStats::instance();
+        stats.texture_upload_bytes += uploaded;
+        stats.texture_upload_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - upload_start)
+                .count());
+    }
+    return uploaded != 0;
+}
+
 void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
                                  TextureStorage& storage) {
     ScopedGpuWork work(GpuWork::Texture);
@@ -1106,58 +1250,12 @@ void TextureCache::decodeTextureHot2(ICommandBuffer* command_buffer,
     } else {
         // Levels and layers are aligned to blocks in guest memory, but packed
         // in the output
-        const u32 layer_stride =
-            descriptor.layer_size != 0
-                ? descriptor.layer_size
-                : descriptor.getLevelOffset(descriptor.level_count);
         u32 offset = 0;
         for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
             for (u32 level = 0; level < descriptor.level_count; level++) {
-                const usize in_offset =
-                    static_cast<usize>(layer) * layer_stride +
-                    descriptor.getLevelOffset(level);
-
-                // Calculate sizes
-                const auto dims = descriptor.getLevelDimensions(level);
-                const auto block_size_log2 =
-                    descriptor.getLevelBlockSizeLog2(level);
-                const u32 stride =
-                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
-                const u32 rows =
-                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
-                const u32 slice_stride = rows * stride;
-
-                // Convert
-                // The base level's rows are padded to whole blocks in X
-                // (TIC tile width spacing), e.g. 4000 byte rows take 64 GOBs,
-                // not 63. Mip levels aren't (like yuzu).
-                convertBlockLinearToLinear(
-                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width)),
-                    rows,
-                    static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height), static_cast<u32>(block_size_log2.depth),
-                    in_data + in_offset,
-                    [=](const u8* in_gob, u32 gob_x, u32 gob_y, u32 gob_z) {
-                        const u32 x = gob_x * GOB_WIDTH;
-                        if (x >= stride)
-                            return;
-                        for (u32 local_y = 0; local_y < GOB_HEIGHT; local_y++) {
-                            const u32 y = gob_y * GOB_HEIGHT + local_y;
-                            if (y >= rows)
-                                break;
-
-                            const usize crnt_offset =
-                                offset +
-                                static_cast<usize>(gob_z) * slice_stride +
-                                static_cast<usize>(y) * stride + x;
-                            std::memcpy(out_data + crnt_offset,
-                                        in_gob + static_cast<usize>(local_y) *
-                                                     GOB_WIDTH,
-                                        std::min(GOB_WIDTH, stride - x));
-                        }
-                    });
-
-                // Add offset
-                offset += static_cast<u32>(dims.depth) * slice_stride;
+                decodeBlockLinearLevel(descriptor, layer, level,
+                                       out_data + offset);
+                offset += getPackedLevelSize(descriptor, level);
             }
         }
     }

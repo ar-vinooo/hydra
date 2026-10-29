@@ -2,6 +2,8 @@
 
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 
+#include <cstdlib>
+
 namespace hydra::hw::tegra_x1::cpu {
 class IMmu;
 }
@@ -15,6 +17,15 @@ class IRenderer;
 
 using TextureCacheClock = std::chrono::steady_clock;
 using TextureCacheTimePoint = TextureCacheClock::time_point;
+
+// A guest write to a texture reloads only the levels and layers it touched,
+// and a texture created from guest memory is not decoded a second time by the
+// update that follows. HYDRA_FULL_TEXTURE_RELOAD reloads whole textures.
+inline bool useRangeTextureReload() {
+    static const bool range =
+        std::getenv("HYDRA_FULL_TEXTURE_RELOAD") == nullptr;
+    return range;
+}
 
 struct TextureStorage {
     std::shared_ptr<void> base_owner;
@@ -42,6 +53,15 @@ struct TextureStorage {
     // over other textures that alias the memory. Reset by the next GPU write.
     std::vector<ztd::Range<uptr>> stale_ranges;
 
+    // Address ranges the guest wrote since the last upload from guest memory
+    // (useRangeTextureReload). When writes were not tracked by range,
+    // full_reload is set and the whole texture is uploaded again.
+    std::vector<ztd::Range<uptr>> dirty_ranges;
+    bool full_reload{false};
+    // Set while the update following the creation runs: the creation uploaded
+    // the guest memory already
+    bool fresh_upload{false};
+
     static void addRange(std::vector<ztd::Range<uptr>>& ranges,
                          ztd::Range<uptr> range) {
         if (range.getSize() == 0 || range.getBegin() > range.getEnd())
@@ -66,6 +86,7 @@ struct TextureStorage {
     }
 
     void markFlushed(ztd::Range<uptr> range) { addRange(flushed_ranges, range); }
+    void markDirty(ztd::Range<uptr> range) { addRange(dirty_ranges, range); }
     // The guest wrote over the range: nothing the GPU holds there is valid
     void markStale(ztd::Range<uptr> range) {
         addRange(stale_ranges, range);
@@ -344,6 +365,11 @@ class TextureCache {
     // Helpers
     static u32 getDataHash(const ITexture* texture);
     void decodeTexture(ICommandBuffer* command_buffer, TextureStorage& storage);
+    // Uploads the levels and layers of the storage the ranges touch from guest
+    // memory again. Returns whether it uploaded anything.
+    bool decodeTextureRanges(ICommandBuffer* command_buffer,
+                             TextureStorage& storage,
+                             const std::vector<ztd::Range<uptr>>& ranges);
     void encodeTexture(ICommandBuffer* command_buffer, TextureStorage& storage,
                        ztd::Range<uptr> range);
 

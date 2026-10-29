@@ -3132,6 +3132,14 @@ void testTextureLodSelection() {
             encoder->setFragmentSamplerState(
                 static_cast<metal::Sampler*>(selected_sampler)->getSampler(),
                 slot);
+            // The shader reads the sampler's LOD bias at run time
+            if (mapping.lod_bias_buffer_index != invalid<u32>()) {
+                std::vector<f32> biases(mapping.textures.size(), 0.0f);
+                biases[slot] = selected_sampler->getDescriptor().lod_bias;
+                encoder->setFragmentBytes(biases.data(),
+                                          biases.size() * sizeof(f32),
+                                          mapping.lod_bias_buffer_index);
+            }
             encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
                                     NS::UInteger(3));
             encoder->endEncoding();

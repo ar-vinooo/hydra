@@ -4,6 +4,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -12,6 +13,16 @@ namespace hydra::hw::tegra_x1::gpu::renderer {
 
 class ShaderBase;
 class IRenderer;
+
+// The shader reads sampler LOD biases at run time, from the samplers bound
+// with its textures (ResourceMapping::lod_bias_buffer_index): its variant only
+// depends on which textures have a bias, not on the values, which games change
+// with the render resolution. HYDRA_STATIC_LOD_BIAS bakes the values into the
+// shader instead (a shader and pipeline per value).
+inline bool useDynamicLodBias() {
+    static const bool dynamic = std::getenv("HYDRA_STATIC_LOD_BIAS") == nullptr;
+    return dynamic;
+}
 
 struct GuestShaderState {
     u32 program_offset{0};

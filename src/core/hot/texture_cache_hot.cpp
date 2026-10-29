@@ -94,6 +94,14 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
         if (mem.info.written_timestamp == TextureCacheTimePoint{}) {
             // Never rendered to, the whole memory needs to be updated
             mem.info.markModified();
+            // Only the parts of the textures the guest wrote are uploaded
+            // again
+            for (auto& [group_key, group] : mem.cache)
+                for (auto& [storage_key, storage] : group.cache)
+                    if (storage.base != nullptr)
+                        storage.markDirty(
+                            storage.base->getDescriptor().getRange().clampedTo(
+                                range));
             continue;
         }
 
@@ -123,8 +131,10 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                     // Once a later write back marks this target flushed, the
                     // stale bytes are only replaced by loading guest memory
                     if (storage.base->getDescriptor().getRange().intersects(
-                            range))
+                            range)) {
                         storage.cpu_modified_timestamp = now;
+                        storage.full_reload = true;
+                    }
                     continue;
                 }
                 if (debugFlag("s2_oldinval") &&
@@ -142,6 +152,9 @@ void TextureCache::invalidateMemoryImpl(ztd::Range<uptr> range) {
                             storage.base->getDescriptor().getRange().clampedTo(
                                 range));
                     storage.cpu_modified_timestamp = now;
+                    storage.markDirty(
+                        storage.base->getDescriptor().getRange().clampedTo(
+                            range));
                     LOG_TEXTURE_EVENT("guest_modified",
                                     storage.base->getDescriptor(),
                                     fmt::format("range={:#x}+{:#x}",
@@ -198,6 +211,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
         storage.flushed_timestamp = storage.gpu_written_timestamp;
         // Everything is in guest memory now: load it
         storage.cpu_modified_timestamp = TextureCacheClock::now();
+        storage.full_reload = true;
     }
     bool sync = false;
     bool uploaded_cpu = false;
@@ -263,8 +277,23 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                         storage.update_timestamp < mem.info.modified_timestamp,
                         storage.update_timestamp < storage.cpu_modified_timestamp,
                         storage.update_timestamp == TextureCacheTimePoint{}));
-        decodeTexture(command_buffer, storage);
-        uploaded_cpu = true;
+        // The creation uploaded the guest memory already. After an upload,
+        // only the levels and layers the guest wrote since are uploaded.
+        const bool range_reload =
+            useRangeTextureReload() && !force_reload &&
+            !storage.full_reload &&
+            storage.update_timestamp != TextureCacheTimePoint{};
+        if (storage.fresh_upload)
+            uploaded_cpu = true;
+        else if (range_reload)
+            uploaded_cpu = decodeTextureRanges(command_buffer, storage,
+                                               storage.dirty_ranges);
+        else {
+            decodeTexture(command_buffer, storage);
+            uploaded_cpu = true;
+        }
+        storage.dirty_ranges.clear();
+        storage.full_reload = false;
         // CPU uploads establish a baseline, but newer GPU writes into aliases
         // must still be applied before this texture is sampled.
         storage.update_timestamp = std::max(mem.info.modified_timestamp,

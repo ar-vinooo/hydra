@@ -29,6 +29,7 @@ class Sampler;
 class RenderPass;
 class Pipeline;
 struct SamplerTable;
+struct LodBiasTable;
 
 struct CombinedTextureSampler {
     const TextureView* texture_view{nullptr};
@@ -317,6 +318,9 @@ class Renderer : public IRenderer {
     // The samplers `shader` reads from its sampler table, from the bindings of
     // `state_type`
     SamplerTable getSamplerTable(const Shader* shader,
+                                 ShaderType state_type) const;
+    // The LOD biases of the samplers bound with those textures
+    LodBiasTable getLodBiasTable(const Shader* shader,
                                  ShaderType state_type) const;
     // The vertex ids a draw uses, which index the vertex shader's captured
     // records from the lowest (geometry.hpp). False if they cannot be read.

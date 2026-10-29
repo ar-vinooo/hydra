@@ -1476,6 +1476,24 @@ void Renderer::bindStageResources(CommandBuffer* command_buffer,
         command_buffer->setSamplerTable(getSamplerTable(shader, state_type),
                                         host_type,
                                         mapping.sampler_buffer_index);
+    if (mapping.lod_bias_buffer_index != invalid<u32>())
+        command_buffer->setLodBiasTable(getLodBiasTable(shader, state_type),
+                                        host_type,
+                                        mapping.lod_bias_buffer_index);
+}
+
+LodBiasTable Renderer::getLodBiasTable(const Shader* shader,
+                                       ShaderType state_type) const {
+    LodBiasTable table;
+    const auto type = static_cast<u32>(state_type);
+    for (const auto& [binding, index] :
+         shader->getDescriptor().resource_mapping.textures) {
+        (void)binding;
+        const auto sampler = state.textures[type][index].sampler;
+        table.set(index,
+                  sampler != nullptr ? sampler->getDescriptor().lod_bias : 0.0f);
+    }
+    return table;
 }
 
 SamplerTable Renderer::getSamplerTable(const Shader* shader,
@@ -1907,6 +1925,12 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     if (uses_sampler_table)
         sampler_table.count = static_cast<u32>(
             shader->getDescriptor().resource_mapping.textures.size());
+    const auto lod_bias_index =
+        shader->getDescriptor().resource_mapping.lod_bias_buffer_index;
+    LodBiasTable lod_biases;
+    if (lod_bias_index != invalid<u32>())
+        lod_biases.count = static_cast<u32>(
+            shader->getDescriptor().resource_mapping.textures.size());
 
     // Resources
     for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
@@ -1931,6 +1955,9 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                 ? static_cast<TextureView*>(binding.texture)->getTexture()
                 : nullptr,
             binding.index);
+        if (lod_bias_index != invalid<u32>() && binding.sampler != nullptr)
+            lod_biases.set(binding.index,
+                           binding.sampler->getDescriptor().lod_bias);
         if (uses_sampler_table)
             sampler_table.set(
                 binding.index,
@@ -1953,6 +1980,9 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         encoder->setBytes(
             sampler_table.ids.data(), sampler_table.getSize(),
             shader->getDescriptor().resource_mapping.sampler_buffer_index);
+    if (lod_bias_index != invalid<u32>())
+        encoder->setBytes(lod_biases.getData(), lod_biases.getSize(),
+                          lod_bias_index);
 
     encoder->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
                                   MTL::Size(block.width, block.height, block.depth));
@@ -2250,6 +2280,10 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
             command_buffer->setSamplerTable(
                 getSamplerTable(shader, ShaderType(shader_type)),
                 ShaderType(shader_type), mapping.sampler_buffer_index);
+        if (mapping.lod_bias_buffer_index != invalid<u32>())
+            command_buffer->setLodBiasTable(
+                getLodBiasTable(shader, ShaderType(shader_type)),
+                ShaderType(shader_type), mapping.lod_bias_buffer_index);
     }
     if (PerfStats::isEnabled())
         PerfStats::instance().draw_state_ns += static_cast<u64>(

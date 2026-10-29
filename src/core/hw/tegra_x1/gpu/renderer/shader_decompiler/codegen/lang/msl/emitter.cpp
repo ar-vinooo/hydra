@@ -536,6 +536,25 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
                ShaderDecompiler, "No buffer slot available for shader samplers");
     }
 
+    // Sampler LOD biases read at run time take the next free slot
+    if (useDynamicLodBias() &&
+        std::any_of(state.texture_lod_bias.begin(), state.texture_lod_bias.end(),
+                    [&](const auto& entry) {
+                        return memory_analyzer.getTextures().contains(
+                            entry.first);
+                    })) {
+        const u32 limit = context.type == ShaderType::Vertex ? 15 : 31;
+        for (u32 index = 0; index < limit; ++index) {
+            if (out_resource_mapping.uniform_buffers[index] == invalid<u32>() &&
+                index != out_resource_mapping.sampler_buffer_index) {
+                out_resource_mapping.lod_bias_buffer_index = index;
+                break;
+            }
+        }
+        ASSERT(out_resource_mapping.lod_bias_buffer_index != invalid<u32>(),
+               ShaderDecompiler, "No buffer slot available for LOD biases");
+    }
+
     // Storage buffers take the remaining buffer slots below the vertex buffers
     {
         const u32 limit = context.type == ShaderType::Vertex ? 15 : 31;
@@ -544,7 +563,8 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
             while (next_index < limit &&
                    (out_resource_mapping.uniform_buffers[next_index] !=
                         invalid<u32>() ||
-                    next_index == out_resource_mapping.sampler_buffer_index))
+                    next_index == out_resource_mapping.sampler_buffer_index ||
+                    next_index == out_resource_mapping.lod_bias_buffer_index))
                 next_index++;
             ASSERT(next_index < limit, ShaderDecompiler,
                    "No buffer slot available for storage buffer");
@@ -573,6 +593,7 @@ MslEmitter::MslEmitter(const DecompilerContext& context,
             if (out_resource_mapping.uniform_buffers[index] != invalid<u32>())
                 used.insert(index);
         used.insert(out_resource_mapping.sampler_buffer_index);
+        used.insert(out_resource_mapping.lod_bias_buffer_index);
         for (const auto& buffer : out_resource_mapping.storage_buffers)
             used.insert(buffer.host_index);
         for (u32 index = 0; index < 15; index++) {
@@ -1146,6 +1167,9 @@ void MslEmitter::emitStateBindings() {
                        textureDeclaration(state, const_buffer_index, info),
                        const_buffer_index);
         writeStatement("sampler samplr{}", const_buffer_index);
+        if (out_resource_mapping.lod_bias_buffer_index != invalid<u32>() &&
+            state.texture_lod_bias.contains(const_buffer_index))
+            writeStatement("float bias{}", const_buffer_index);
     }
 }
 
@@ -1187,6 +1211,10 @@ void MslEmitter::emitStateBindingAssignments() {
         else
             writeStatement("state.samplr{} = samplr{}", const_buffer_index,
                            const_buffer_index);
+        if (out_resource_mapping.lod_bias_buffer_index != invalid<u32>() &&
+            state.texture_lod_bias.contains(const_buffer_index))
+            writeStatement("state.bias{} = __lod_bias[{}]", const_buffer_index,
+                           out_resource_mapping.textures.at(const_buffer_index));
     }
 }
 
@@ -1324,6 +1352,9 @@ void MslEmitter::emitMainPrototype() {
     if (out_resource_mapping.sampler_buffer_index != invalid<u32>())
         ADD_ARG("constant HydraSamplers& __samplers [[buffer({})]]",
                 out_resource_mapping.sampler_buffer_index);
+    if (out_resource_mapping.lod_bias_buffer_index != invalid<u32>())
+        ADD_ARG("constant float* __lod_bias [[buffer({})]]",
+                out_resource_mapping.lod_bias_buffer_index);
     for (const auto& [const_buffer_index, info] :
          memory_analyzer.getTextures()) {
         const auto index = out_resource_mapping.textures[const_buffer_index];
@@ -1689,8 +1720,17 @@ void MslEmitter::emitTextureSample(
     const ir::Value& coords, const ir::Value& cmp_value, const ir::Value& lod,
     const ir::Value& ddx, const ir::Value& ddy, const ir::Value& offset,
     const ir::Value& offsets, u8 component) {
+    // The sampler's LOD bias: read at run time, or baked into the shader
     const auto bias_it = state.texture_lod_bias.find(const_buffer_index);
-    const float sampler_bias = bias_it == state.texture_lod_bias.end() ? 0.0f : bias_it->second;
+    const bool has_sampler_bias = bias_it != state.texture_lod_bias.end() &&
+                                  (out_resource_mapping.lod_bias_buffer_index !=
+                                       invalid<u32>() ||
+                                   bias_it->second != 0.0f);
+    const std::string sampler_bias =
+        !has_sampler_bias ? std::string()
+        : out_resource_mapping.lod_bias_buffer_index != invalid<u32>()
+            ? fmt::format("state.bias{}", const_buffer_index)
+            : getValueStr(ir::Value::createConstantF(bias_it->second));
     // Flags
     const auto is_array = isTextureArray(type);
     const auto is_buffer =
@@ -1973,12 +2013,12 @@ void MslEmitter::emitTextureSample(
             : coords.getType().getVectorType().getSize() == 1 ? "gradient1d"
             : coords.getType().getVectorType().getSize() == 2 ? "gradient2d"
                                                               : "gradient3d";
-        if (sampler_bias == 0.0f)
+        if (!has_sampler_bias)
             args += fmt::format(", {}({}, {})", gradient, normalize(ddx), normalize(ddy));
         else
             args += fmt::format(", {}(({}) * exp2({}), ({}) * exp2({}))", gradient,
-                                normalize(ddx), getValueStr(ir::Value::createConstantF(sampler_bias)),
-                                normalize(ddy), getValueStr(ir::Value::createConstantF(sampler_bias)));
+                                normalize(ddx), sampler_bias,
+                                normalize(ddy), sampler_bias);
         if (has_lod)
             args += fmt::format(", min_lod_clamp({})", getValueStr(lod));
     } else if (has_lod && !is_buffer) {
@@ -1991,18 +2031,19 @@ void MslEmitter::emitTextureSample(
             args += ", 0u";
         } else if (int_coords)
             args += fmt::format(", as_type<uint>({})", getValueStr(lod));
-        else if (sampler_bias != 0.0f)
+        else if (has_sampler_bias)
             // The sampler's LOD bias is added to an explicit LOD as well (the
             // Vulkan and OpenGL level-of-detail equations; LZ stays at zero)
             args += fmt::format(", level(({}) + {})", getValueStr(lod),
-                                getValueStr(ir::Value::createConstantF(sampler_bias)));
+                                sampler_bias);
         else
             args += fmt::format(", level({})", getValueStr(lod));
     } else if (!int_coords && any(flags & TextureSampleFlags::Bias) &&
                context.type == ShaderType::Fragment) {
-        args += fmt::format(", bias(({}) + {})", getValueStr(lod), getValueStr(ir::Value::createConstantF(sampler_bias)));
-    } else if (!int_coords && context.type == ShaderType::Fragment && sampler_bias != 0.0f) {
-        args += fmt::format(", bias({})", getValueStr(ir::Value::createConstantF(sampler_bias)));
+        args += fmt::format(", bias(({}) + {})", getValueStr(lod),
+                            has_sampler_bias ? sampler_bias : std::string("0.0"));
+    } else if (!int_coords && context.type == ShaderType::Fragment && has_sampler_bias) {
+        args += fmt::format(", bias({})", sampler_bias);
     } else if (!int_coords && context.type == ShaderType::Compute) {
         // There are no derivatives in compute kernels
         args += ", level(0.0)";

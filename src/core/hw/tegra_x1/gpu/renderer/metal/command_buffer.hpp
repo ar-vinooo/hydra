@@ -57,19 +57,42 @@ struct SamplerTable {
         count = std::max(count, index + 1);
     }
     usize getSize() const { return count * sizeof(MTL::ResourceID); }
+    const void* getData() const { return ids.data(); }
     bool operator==(const SamplerTable& other) const {
         return count == other.count &&
                std::memcmp(ids.data(), other.ids.data(), getSize()) == 0;
     }
 };
 
-// Buffer state of a slot bound to a sampler table
-constexpr MtlBufferState SAMPLER_TABLE_BUFFER_STATE{nullptr, invalid<u64>()};
+// Sampler LOD biases of a shader which reads them at run time (see
+// useDynamicLodBias), by host texture index
+struct LodBiasTable {
+    std::array<f32, TEXTURE_COUNT> values{};
+    u32 count{0};
 
-struct BoundSamplerTable {
-    u32 index{invalid<u32>()};
-    SamplerTable table{};
+    void set(u32 index, f32 bias) {
+        values[index] = bias;
+        count = std::max(count, index + 1);
+    }
+    usize getSize() const { return count * sizeof(f32); }
+    const void* getData() const { return values.data(); }
+    bool operator==(const LodBiasTable& other) const {
+        return count == other.count &&
+               std::memcmp(values.data(), other.values.data(), getSize()) == 0;
+    }
 };
+
+// Inline bytes bound at a buffer index. The buffer state of the index is then
+// {nullptr, `offset`}, which no buffer binding has: a buffer bound there
+// since replaced the table.
+template <typename Table, u64 offset>
+struct BoundInlineTable {
+    static constexpr MtlBufferState BUFFER_STATE{nullptr, offset};
+    u32 index{invalid<u32>()};
+    Table table{};
+};
+using BoundSamplerTable = BoundInlineTable<SamplerTable, invalid<u64>()>;
+using BoundLodBiasTable = BoundInlineTable<LodBiasTable, invalid<u64>() - 1>;
 
 struct EncoderRenderState {
     MTL::RenderPipelineState* pipeline{nullptr};
@@ -94,6 +117,8 @@ struct EncoderRenderState {
         samplers{};
     std::array<BoundSamplerTable, static_cast<usize>(ShaderType::Count)>
         sampler_tables{};
+    std::array<BoundLodBiasTable, static_cast<usize>(ShaderType::Count)>
+        lod_bias_tables{};
 };
 
 struct EncoderState {
@@ -232,11 +257,17 @@ class CommandBuffer final : public ICommandBuffer {
     void setTexture(MTL::Texture* texture, ShaderType shader_type, u32 index);
     void setSampler(MTL::SamplerState* sampler, ShaderType shader_type,
                     u32 index);
-    // Binds the table at buffer `index`, unless the same table already is
+    // Bind the table at buffer `index`, unless the same table already is
     void setSamplerTable(const SamplerTable& table, ShaderType shader_type,
+                         u32 index);
+    void setLodBiasTable(const LodBiasTable& table, ShaderType shader_type,
                          u32 index);
 
   private:
+    template <typename Bound>
+    void setInlineTable(Bound& bound, const decltype(Bound::table)& table,
+                        ShaderType shader_type, u32 index);
+
     // Completion handlers until the native command buffer is committed
     std::mutex pending_handlers_mutex;
     std::vector<GpuCompletionHandler> pending_handlers;

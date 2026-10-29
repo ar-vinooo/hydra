@@ -5,6 +5,7 @@
 #include "core/hw/tegra_x1/cpu/mmu.hpp"
 
 #include <atomic>
+#include <cstring>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -117,21 +118,28 @@ void GMmu::recycleZeroBlocks() {
 }
 
 std::vector<u8> GMmu::readMappedBytes(uptr gpu_addr, usize max_size) {
-    std::vector<u8> bytes;
-    bytes.reserve(max_size);
-    while (bytes.size() < max_size) {
+    std::vector<u8> bytes(max_size);
+    bytes.resize(readMappedBytes(gpu_addr, bytes.data(), max_size));
+    return bytes;
+}
+
+usize GMmu::readMappedBytes(uptr gpu_addr, void* out, usize max_size) {
+    auto* dst = static_cast<u8*>(out);
+    usize copied = 0;
+    while (copied < max_size) {
         uptr base;
         const auto as = findAddr(gpu_addr, base);
         if (!as || as->ptr == 0)
             break;
         const auto offset = gpu_addr - base;
-        const auto count = std::min<usize>(as->size - offset,
-                                           max_size - bytes.size());
-        const auto* ptr = reinterpret_cast<const u8*>(as->ptr + offset);
-        bytes.insert(bytes.end(), ptr, ptr + count);
+        const auto count =
+            std::min<usize>(as->size - offset, max_size - copied);
+        std::memcpy(dst + copied,
+                    reinterpret_cast<const u8*>(as->ptr + offset), count);
+        copied += count;
         gpu_addr += count;
     }
-    return bytes;
+    return copied;
 }
 
 bool GMmu::matchesMappings(

@@ -214,10 +214,12 @@ void buildShaderKey(const GuestShaderDescriptor& descriptor,
         }
     }
 
+    hash.add(useDynamicLodBias());
     hash.add(descriptor.state.texture_lod_bias.size());
     for (const auto& [index, bias] : descriptor.state.texture_lod_bias) {
         hash.add(index);
-        hash.add(bias);
+        if (!useDynamicLodBias())
+            hash.add(bias);
     }
 
     hash.add(descriptor.state.texture_type_hints.size());
