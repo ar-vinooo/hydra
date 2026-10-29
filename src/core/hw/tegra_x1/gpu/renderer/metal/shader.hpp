@@ -15,14 +15,18 @@ class Shader final : public ShaderBase {
 
   private:
     MTL::Function* function{nullptr};
-    MTL::ArgumentEncoder* sampler_encoder{nullptr};
     std::string cache_key;
     // Key of the MSL source in ShaderLibraryCache (empty for other backends)
     std::string library_key;
 
   public:
     GETTER(function, getFunction);
-    GETTER(sampler_encoder, getSamplerEncoder);
+    // The shader reads its samplers from a table at the sampler buffer index
+    // instead of sampler arguments (more than 16 textures, see SamplerTable)
+    bool usesSamplerTable() const {
+        return getDescriptor().resource_mapping.sampler_buffer_index !=
+               invalid<u32>();
+    }
     const std::string& getCacheKey() const { return cache_key; }
     const std::string& getLibraryKey() const { return library_key; }
 };

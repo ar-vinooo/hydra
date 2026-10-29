@@ -74,6 +74,11 @@ Renderer::Renderer()
     // parallel
     device->setShouldMaximizeConcurrentCompilation(true);
 
+    // Shaders with more than 16 textures read their samplers from a table of
+    // resource IDs the CPU writes directly (SamplerTable)
+    ASSERT(device->argumentBuffersSupport() == MTL::ArgumentBuffersTier2,
+           MetalRenderer, "Tier 2 argument buffers are required");
+
     // Resources
 
     // Depth stencil states
@@ -1454,7 +1459,7 @@ void Renderer::bindStageResources(CommandBuffer* command_buffer,
             static_cast<Buffer*>(buffer.getBase())->getBuffer(),
             buffer.getOffset(), host_type, storage.host_index);
     }
-    const auto sampler_encoder = shader->getSamplerEncoder();
+    const bool sampler_table = shader->usesSamplerTable();
     for (const auto& [binding, index] : mapping.textures) {
         (void)binding;
         const auto& texture = state.textures[type][index];
@@ -1463,23 +1468,27 @@ void Renderer::bindStageResources(CommandBuffer* command_buffer,
                                        : nullptr,
                                    host_type, index);
         if (texture.sampler != nullptr && index < SAMPLER_COUNT &&
-            sampler_encoder == nullptr)
+            !sampler_table)
             command_buffer->setSampler(texture.sampler->getSampler(), host_type,
                                        index);
     }
-    if (sampler_encoder == nullptr)
-        return;
-    auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
-    const auto native = static_cast<Buffer*>(buffer)->getBuffer();
-    sampler_encoder->setArgumentBuffer(native, 0);
-    for (const auto& [binding, index] : mapping.textures) {
+    if (sampler_table)
+        command_buffer->setSamplerTable(getSamplerTable(shader, state_type),
+                                        host_type,
+                                        mapping.sampler_buffer_index);
+}
+
+SamplerTable Renderer::getSamplerTable(const Shader* shader,
+                                       ShaderType state_type) const {
+    SamplerTable table;
+    const auto type = static_cast<u32>(state_type);
+    for (const auto& [binding, index] :
+         shader->getDescriptor().resource_mapping.textures) {
         (void)binding;
         const auto sampler = state.textures[type][index].sampler;
-        sampler_encoder->setSamplerState(
-            sampler != nullptr ? sampler->getSampler() : nullptr, index);
+        table.set(index, sampler != nullptr ? sampler->getSampler() : nullptr);
     }
-    command_buffer->setBuffer(native, 0, host_type, mapping.sampler_buffer_index);
-    retireTextureUploadBuffer(command_buffer, buffer);
+    return table;
 }
 
 std::optional<Renderer::VertexRange>
@@ -1882,10 +1891,10 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     for (const auto& binding : dispatch.storage_buffers)
         if (binding.index >= BUFFER_COUNT)
             return false;
-    const auto sampler_encoder = shader->getSamplerEncoder();
+    const bool uses_sampler_table = shader->usesSamplerTable();
     for (const auto& binding : dispatch.textures)
         if (binding.index >= TEXTURE_COUNT ||
-            (!sampler_encoder && binding.sampler &&
+            (!uses_sampler_table && binding.sampler &&
              binding.index >= SAMPLER_COUNT))
             return false;
     for (const auto& binding : dispatch.images)
@@ -1893,12 +1902,11 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
             return false;
     auto encoder = command_buffer_impl->getComputeCommandEncoder();
     encoder->setComputePipelineState(pipeline);
-    BufferBase* sampler_buffer = nullptr;
-    if (sampler_encoder != nullptr) {
-        sampler_buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
-        const auto native = static_cast<Buffer*>(sampler_buffer)->getBuffer();
-        sampler_encoder->setArgumentBuffer(native, 0);
-    }
+    // The shader's table covers all its textures, bound or not
+    SamplerTable sampler_table;
+    if (uses_sampler_table)
+        sampler_table.count = static_cast<u32>(
+            shader->getDescriptor().resource_mapping.textures.size());
 
     // Resources
     for (u32 i = 0; i < CONST_BUFFER_BINDING_COUNT; i++) {
@@ -1923,12 +1931,12 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                 ? static_cast<TextureView*>(binding.texture)->getTexture()
                 : nullptr,
             binding.index);
-        if (sampler_encoder != nullptr)
-            sampler_encoder->setSamplerState(
+        if (uses_sampler_table)
+            sampler_table.set(
+                binding.index,
                 binding.sampler != nullptr
                     ? static_cast<Sampler*>(binding.sampler)->getSampler()
-                    : nullptr,
-                binding.index);
+                    : nullptr);
         else if (binding.sampler != nullptr)
             encoder->setSamplerState(
                 static_cast<Sampler*>(binding.sampler)->getSampler(),
@@ -1941,12 +1949,10 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                 : nullptr,
             binding.index);
     }
-    if (sampler_buffer != nullptr) {
-        encoder->setBuffer(
-            static_cast<Buffer*>(sampler_buffer)->getBuffer(), 0,
+    if (uses_sampler_table)
+        encoder->setBytes(
+            sampler_table.ids.data(), sampler_table.getSize(),
             shader->getDescriptor().resource_mapping.sampler_buffer_index);
-        retireTextureUploadBuffer(command_buffer_impl, sampler_buffer);
-    }
 
     encoder->dispatchThreadgroups(MTL::Size(grid.width, grid.height, grid.depth),
                                   MTL::Size(block.width, block.height, block.depth));
@@ -2081,7 +2087,7 @@ void Renderer::setTextureHot49(CommandBuffer* command_buffer, ShaderType shader_
     const auto shader = static_cast<Shader*>(
         state.pipeline->getDescriptor().shaders[static_cast<u32>(shader_type)]);
     if (texture.sampler != nullptr && index < SAMPLER_COUNT &&
-        (shader == nullptr || shader->getSamplerEncoder() == nullptr))
+        (shader == nullptr || !shader->usesSamplerTable()))
         command_buffer->setSampler(texture.sampler->getSampler(), shader_type,
                                    index);
 }
@@ -2240,23 +2246,10 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
             (void)binding;
             setTexture(command_buffer, ShaderType(shader_type), index);
         }
-        if (shader->getSamplerEncoder() == nullptr)
-            continue;
-        const auto sampler_encoder = shader->getSamplerEncoder();
-        auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
-        const auto native = static_cast<Buffer*>(buffer)->getBuffer();
-        sampler_encoder->setArgumentBuffer(native, 0);
-        for (const auto& [binding, index] :
-             shader->getDescriptor().resource_mapping.textures) {
-            (void)binding;
-            const auto sampler = state.textures[shader_type][index].sampler;
-            sampler_encoder->setSamplerState(
-                sampler != nullptr ? sampler->getSampler() : nullptr, index);
-        }
-        command_buffer->setBuffer(
-            native, 0, ShaderType(shader_type),
-            shader->getDescriptor().resource_mapping.sampler_buffer_index);
-        retireTextureUploadBuffer(command_buffer, buffer);
+        if (shader->usesSamplerTable())
+            command_buffer->setSamplerTable(
+                getSamplerTable(shader, ShaderType(shader_type)),
+                ShaderType(shader_type), mapping.sampler_buffer_index);
     }
     if (PerfStats::isEnabled())
         PerfStats::instance().draw_state_ns += static_cast<u64>(

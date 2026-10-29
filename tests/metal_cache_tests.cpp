@@ -104,20 +104,31 @@ int main(int argc, char** argv) {
                   "Large shader did not use a sampler argument buffer");
             ShaderLibraryCache libraries(device, path / "sources");
             Shader shader(device, descriptor, libraries);
-            check(shader.getFunction() != nullptr &&
-                      shader.getSamplerEncoder() != nullptr,
+            check(shader.getFunction() != nullptr && shader.usesSamplerTable(),
                   "Generated 18-sampler shader failed to compile");
-            const auto argument_encoder = shader.getSamplerEncoder();
-            NS_STACK_SCOPED auto buffer = device->newBuffer(
-                argument_encoder->encodedLength(), MTL::ResourceStorageModeShared);
+            // The renderer binds the bytes of a SamplerTable: they have to
+            // match what Metal's argument encoder encodes
+            NS_STACK_SCOPED auto argument_encoder =
+                shader.getFunction()->newArgumentEncoder(
+                    descriptor.resource_mapping.sampler_buffer_index);
             NS_STACK_SCOPED auto sampler_desc = MTL::SamplerDescriptor::alloc()->init();
             sampler_desc->setSupportArgumentBuffers(true);
             NS_STACK_SCOPED auto sampler = device->newSamplerState(sampler_desc);
             check(sampler != nullptr, "Argument buffer sampler creation failed");
+            SamplerTable table;
+            for (u32 i = 0; i < 18; ++i)
+                table.set(i, sampler);
+            check(argument_encoder->encodedLength() == table.getSize(),
+                  "Sampler table size differs from the argument buffer");
+            NS_STACK_SCOPED auto buffer = device->newBuffer(
+                argument_encoder->encodedLength(), MTL::ResourceStorageModeShared);
             argument_encoder->setArgumentBuffer(buffer, 0);
             for (u32 i = 0; i < 18; ++i)
                 argument_encoder->setSamplerState(sampler, i);
-            std::cout << "PASS: generated 18-sampler shader and argument encoding\n";
+            check(std::memcmp(buffer->contents(), table.ids.data(),
+                              table.getSize()) == 0,
+                  "Sampler table layout differs from the argument buffer");
+            std::cout << "PASS: generated 18-sampler shader and sampler table layout\n";
             return 0;
         }
         if (mode == "depth-only") {

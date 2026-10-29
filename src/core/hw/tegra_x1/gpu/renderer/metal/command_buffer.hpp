@@ -7,6 +7,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/encoder.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/mtl4_context.hpp"
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -42,6 +43,34 @@ struct MtlBufferState {
     u64 offset{0};
 };
 
+// Samplers of a shader which reads them from a table (see
+// Shader::usesSamplerTable). With tier 2 argument buffers a sampler in an
+// argument buffer is its 64-bit resource ID, so the table is written directly
+// and bound as inline bytes: no argument encoder and no buffer per draw.
+struct SamplerTable {
+    std::array<MTL::ResourceID, TEXTURE_COUNT> ids{};
+    u32 count{0};
+
+    void set(u32 index, const MTL::SamplerState* sampler) {
+        ids[index] = sampler != nullptr ? sampler->gpuResourceID()
+                                        : MTL::ResourceID{0};
+        count = std::max(count, index + 1);
+    }
+    usize getSize() const { return count * sizeof(MTL::ResourceID); }
+    bool operator==(const SamplerTable& other) const {
+        return count == other.count &&
+               std::memcmp(ids.data(), other.ids.data(), getSize()) == 0;
+    }
+};
+
+// Buffer state of a slot bound to a sampler table
+constexpr MtlBufferState SAMPLER_TABLE_BUFFER_STATE{nullptr, invalid<u64>()};
+
+struct BoundSamplerTable {
+    u32 index{invalid<u32>()};
+    SamplerTable table{};
+};
+
 struct EncoderRenderState {
     MTL::RenderPipelineState* pipeline{nullptr};
     MTL::DepthStencilState* depth_stencil_state{nullptr};
@@ -63,6 +92,8 @@ struct EncoderRenderState {
     std::array<std::array<MTL::SamplerState*, TEXTURE_COUNT>,
                static_cast<usize>(ShaderType::Count)>
         samplers{};
+    std::array<BoundSamplerTable, static_cast<usize>(ShaderType::Count)>
+        sampler_tables{};
 };
 
 struct EncoderState {
@@ -201,6 +232,9 @@ class CommandBuffer final : public ICommandBuffer {
     void setTexture(MTL::Texture* texture, ShaderType shader_type, u32 index);
     void setSampler(MTL::SamplerState* sampler, ShaderType shader_type,
                     u32 index);
+    // Binds the table at buffer `index`, unless the same table already is
+    void setSamplerTable(const SamplerTable& table, ShaderType shader_type,
+                         u32 index);
 
   private:
     // Completion handlers until the native command buffer is committed
