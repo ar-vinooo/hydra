@@ -74,11 +74,6 @@ Renderer::Renderer()
     // parallel
     device->setShouldMaximizeConcurrentCompilation(true);
 
-    // Shaders with more than 16 textures read their samplers from a table of
-    // resource IDs the CPU writes directly (SamplerTable)
-    ASSERT(device->argumentBuffersSupport() == MTL::ArgumentBuffersTier2,
-           MetalRenderer, "Tier 2 argument buffers are required");
-
     // Resources
 
     // Depth stencil states
@@ -1473,13 +1468,37 @@ void Renderer::bindStageResources(CommandBuffer* command_buffer,
                                        index);
     }
     if (sampler_table)
-        command_buffer->setSamplerTable(getSamplerTable(shader, state_type),
-                                        host_type,
-                                        mapping.sampler_buffer_index);
+        bindSamplerTable(command_buffer, shader, state_type, host_type);
     if (mapping.lod_bias_buffer_index != invalid<u32>())
         command_buffer->setLodBiasTable(getLodBiasTable(shader, state_type),
                                         host_type,
                                         mapping.lod_bias_buffer_index);
+}
+
+void Renderer::bindSamplerTable(CommandBuffer* command_buffer,
+                                const Shader* shader, ShaderType state_type,
+                                ShaderType host_type) {
+    const auto& mapping = shader->getDescriptor().resource_mapping;
+    const auto sampler_encoder = shader->getSamplerEncoder();
+    if (sampler_encoder == nullptr) {
+        command_buffer->setSamplerTable(getSamplerTable(shader, state_type),
+                                        host_type, mapping.sampler_buffer_index);
+        return;
+    }
+    // Without tier 2 argument buffers Metal encodes the table
+    auto* buffer = allocateTextureUploadBuffer(sampler_encoder->encodedLength());
+    const auto native = static_cast<Buffer*>(buffer)->getBuffer();
+    sampler_encoder->setArgumentBuffer(native, 0);
+    const auto type = static_cast<u32>(state_type);
+    for (const auto& [binding, index] : mapping.textures) {
+        (void)binding;
+        const auto sampler = state.textures[type][index].sampler;
+        sampler_encoder->setSamplerState(
+            sampler != nullptr ? sampler->getSampler() : nullptr, index);
+    }
+    command_buffer->setBuffer(native, 0, host_type,
+                              mapping.sampler_buffer_index);
+    retireTextureUploadBuffer(command_buffer, buffer);
 }
 
 LodBiasTable Renderer::getLodBiasTable(const Shader* shader,
@@ -1922,6 +1941,7 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
     encoder->setComputePipelineState(pipeline);
     // The shader's table covers all its textures, bound or not
     SamplerTable sampler_table;
+    std::array<MTL::SamplerState*, TEXTURE_COUNT> sampler_states{};
     if (uses_sampler_table)
         sampler_table.count = static_cast<u32>(
             shader->getDescriptor().resource_mapping.textures.size());
@@ -1958,12 +1978,15 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
         if (lod_bias_index != invalid<u32>() && binding.sampler != nullptr)
             lod_biases.set(binding.index,
                            binding.sampler->getDescriptor().lod_bias);
-        if (uses_sampler_table)
-            sampler_table.set(
-                binding.index,
+        if (uses_sampler_table) {
+            const auto sampler =
                 binding.sampler != nullptr
                     ? static_cast<Sampler*>(binding.sampler)->getSampler()
-                    : nullptr);
+                    : nullptr;
+            sampler_states[binding.index] = sampler;
+            if (shader->getSamplerEncoder() == nullptr)
+                sampler_table.set(binding.index, sampler);
+        }
         else if (binding.sampler != nullptr)
             encoder->setSamplerState(
                 static_cast<Sampler*>(binding.sampler)->getSampler(),
@@ -1976,10 +1999,24 @@ bool Renderer::dispatchComputeHot41(ICommandBuffer* command_buffer,
                 : nullptr,
             binding.index);
     }
-    if (uses_sampler_table)
-        encoder->setBytes(
-            sampler_table.ids.data(), sampler_table.getSize(),
-            shader->getDescriptor().resource_mapping.sampler_buffer_index);
+    if (uses_sampler_table) {
+        const auto sampler_index =
+            shader->getDescriptor().resource_mapping.sampler_buffer_index;
+        if (const auto sampler_encoder = shader->getSamplerEncoder()) {
+            // Without tier 2 argument buffers Metal encodes the table
+            auto* buffer =
+                allocateTextureUploadBuffer(sampler_encoder->encodedLength());
+            const auto native = static_cast<Buffer*>(buffer)->getBuffer();
+            sampler_encoder->setArgumentBuffer(native, 0);
+            for (u32 i = 0; i < sampler_table.count; i++)
+                sampler_encoder->setSamplerState(sampler_states[i], i);
+            encoder->setBuffer(native, 0, sampler_index);
+            retireTextureUploadBuffer(command_buffer_impl, buffer);
+        } else {
+            encoder->setBytes(sampler_table.ids.data(), sampler_table.getSize(),
+                              sampler_index);
+        }
+    }
     if (lod_bias_index != invalid<u32>())
         encoder->setBytes(lod_biases.getData(), lod_biases.getSize(),
                           lod_bias_index);
@@ -2277,9 +2314,8 @@ void Renderer::bindDrawStateHot53(CommandBuffer* command_buffer) {
             setTexture(command_buffer, ShaderType(shader_type), index);
         }
         if (shader->usesSamplerTable())
-            command_buffer->setSamplerTable(
-                getSamplerTable(shader, ShaderType(shader_type)),
-                ShaderType(shader_type), mapping.sampler_buffer_index);
+            bindSamplerTable(command_buffer, shader, ShaderType(shader_type),
+                             ShaderType(shader_type));
         if (mapping.lod_bias_buffer_index != invalid<u32>())
             command_buffer->setLodBiasTable(
                 getLodBiasTable(shader, ShaderType(shader_type)),

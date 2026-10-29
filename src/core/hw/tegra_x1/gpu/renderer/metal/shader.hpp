@@ -15,12 +15,16 @@ class Shader final : public ShaderBase {
 
   private:
     MTL::Function* function{nullptr};
+    // Encodes the sampler table on devices without tier 2 argument buffers,
+    // where the CPU cannot write resource IDs directly. Null otherwise.
+    MTL::ArgumentEncoder* sampler_encoder{nullptr};
     std::string cache_key;
     // Key of the MSL source in ShaderLibraryCache (empty for other backends)
     std::string library_key;
 
   public:
     GETTER(function, getFunction);
+    GETTER(sampler_encoder, getSamplerEncoder);
     // The shader reads its samplers from a table at the sampler buffer index
     // instead of sampler arguments (more than 16 textures, see SamplerTable)
     bool usesSamplerTable() const {

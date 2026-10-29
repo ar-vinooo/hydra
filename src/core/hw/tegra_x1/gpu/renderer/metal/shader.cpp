@@ -94,12 +94,18 @@ Shader::Shader(MTL::Device* device, const ShaderDescriptor& descriptor,
 
     // Function
     function = library->newFunction(toNsString("main_"));
+    if (function != nullptr && usesSamplerTable() &&
+        device->argumentBuffersSupport() != MTL::ArgumentBuffersTier2)
+        sampler_encoder = function->newArgumentEncoder(
+            descriptor.resource_mapping.sampler_buffer_index);
     if (auto& visual = VisualDiagnostics::instance(); visual.selected())
         visual.event("metal_entry_point", {{"cache_key", cache_key}, {"main_available", function ? "1" : "0"}});
     library->release();
 }
 
 Shader::~Shader() {
+    if (sampler_encoder)
+        sampler_encoder->release();
     if (function)
         function->release();
 }

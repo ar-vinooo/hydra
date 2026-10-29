@@ -319,6 +319,9 @@ class Renderer : public IRenderer {
     // `state_type`
     SamplerTable getSamplerTable(const Shader* shader,
                                  ShaderType state_type) const;
+    // Binds the table of a shader which reads its samplers from one
+    void bindSamplerTable(CommandBuffer* command_buffer, const Shader* shader,
+                          ShaderType state_type, ShaderType host_type);
     // The LOD biases of the samplers bound with those textures
     LodBiasTable getLodBiasTable(const Shader* shader,
                                  ShaderType state_type) const;
