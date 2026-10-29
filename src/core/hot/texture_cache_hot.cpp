@@ -173,6 +173,181 @@ void TextureCache::markGpuWritesInGuestImpl(ztd::Range<uptr> range) {
     }
 }
 
+namespace {
+
+// Writes the packed levels and layers read back from a texture into guest
+// memory, except for the excluded ranges (already written back, or rewritten
+// by the guest since)
+void writeBackToGuest(const TextureDescriptor& descriptor,
+                      ztd::Range<uptr> range, const u8* in_data,
+                      const std::vector<ztd::Range<uptr>>& excluded) {
+    u8* out_data = reinterpret_cast<u8*>(descriptor.ptr);
+
+    if (descriptor.is_linear) {
+        // Linear textures often alias buffers the CPU also writes, so only
+        // the requested bytes are written back
+        const u32 stride =
+            getTextureFormatStride(descriptor.format, descriptor.width);
+        const u32 rows =
+            getTextureFormatRows(descriptor.format, descriptor.height);
+        for (u32 row = 0; row < rows; row++) {
+            const uptr row_begin =
+                descriptor.ptr +
+                static_cast<uptr>(row) * descriptor.linear_stride;
+            const uptr begin = std::max(row_begin, range.getBegin());
+            const uptr end = std::min(row_begin + stride, range.getEnd());
+            if (begin >= end)
+                continue;
+            TextureStorage::forEachOutside(
+                excluded, ztd::Range<uptr>(begin, end),
+                [&](ztd::Range<uptr> piece) {
+                    std::memcpy(reinterpret_cast<u8*>(piece.getBegin()),
+                                in_data + static_cast<usize>(row) * stride +
+                                    (piece.getBegin() - row_begin),
+                                piece.getSize());
+                    capture::GuestEvents::instance().memory(
+                        "memory_writeback", piece.getBegin(), piece.getSize(),
+                        0, capture::currentGuestEventOrigin());
+                });
+        }
+    } else {
+        const u32 layer_stride =
+            descriptor.layer_size != 0
+                ? descriptor.layer_size
+                : descriptor.getLevelOffset(descriptor.level_count);
+        u32 offset = 0;
+        for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
+            for (u32 level = 0; level < descriptor.level_count; level++) {
+                const usize out_offset =
+                    static_cast<usize>(layer) * layer_stride +
+                    descriptor.getLevelOffset(level);
+                const auto dims = descriptor.getLevelDimensions(level);
+                const auto block_size_log2 =
+                    descriptor.getLevelBlockSizeLog2(level);
+                const u32 stride =
+                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
+                const u32 rows =
+                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
+                const u8* level_data = in_data + offset;
+                const uptr level_begin = descriptor.ptr + out_offset;
+                const u32 level_size = descriptor.getLevelSize(level);
+                const uptr begin = std::max(level_begin, range.getBegin());
+                const uptr end =
+                    std::min(level_begin + level_size, range.getEnd());
+                if (begin >= end) {
+                    offset += static_cast<u32>(dims.depth) * rows * stride;
+                    continue;
+                }
+                // CPU page faults and DMA copies can request only a few bytes
+                // of a tiled surface. Retiling directly into guest memory
+                // overwrites unrelated CPU uploads and other texture mips.
+                // Preserve padding as well as bytes outside the request.
+                std::vector<u8> tiled(level_size);
+                std::memcpy(tiled.data(), out_data + out_offset, level_size);
+                auto* tiled_data = tiled.data();
+                const u32 tiled_stride =
+                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width));
+                convertLinearToBlockLinear(
+                    tiled_stride, rows, static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height),
+                    static_cast<u32>(block_size_log2.depth),
+                    [=](u32 gob_x, u32 gob_y, u32 gob_z, u8* out_gob) {
+                        const u64 gob_offset = getBlockLinearOffset(
+                            gob_x * GOB_WIDTH, gob_y * GOB_HEIGHT, gob_z,
+                            tiled_stride, rows, static_cast<u32>(block_size_log2.height),
+                            static_cast<u32>(block_size_log2.depth));
+                        convertBlockLinearToLinear(
+                            GOB_WIDTH, GOB_WIDTH, GOB_SIZE, GOB_HEIGHT, 1, 0, 0,
+                            tiled_data + gob_offset, out_gob);
+                        const u32 x = gob_x * GOB_WIDTH;
+                        if (x >= stride)
+                            return;
+                        for (u32 local_y = 0; local_y < GOB_HEIGHT; local_y++) {
+                            const u32 y = gob_y * GOB_HEIGHT + local_y;
+                            if (y >= rows)
+                                break;
+                            std::memcpy(out_gob + local_y * GOB_WIDTH,
+                                        level_data +
+                                            static_cast<usize>(gob_z) * rows *
+                                                stride +
+                                            static_cast<usize>(y) * stride + x,
+                                        std::min(GOB_WIDTH, stride - x));
+                        }
+                    },
+                    tiled.data());
+                TextureStorage::forEachOutside(
+                    excluded, ztd::Range<uptr>(begin, end),
+                    [&](ztd::Range<uptr> piece) {
+                        std::memcpy(reinterpret_cast<void*>(piece.getBegin()),
+                                    tiled.data() + (piece.getBegin() - level_begin),
+                                    piece.getSize());
+                        capture::GuestEvents::instance().memory(
+                            "memory_writeback", piece.getBegin(),
+                            piece.getSize(), 0,
+                            capture::currentGuestEventOrigin());
+                    });
+                offset += static_cast<u32>(dims.depth) * rows * stride;
+            }
+        }
+    }
+}
+
+// Readbacks encoded while a batch is open wait for the GPU once, when the
+// batch finishes, instead of once per texture. They are written to guest
+// memory in the order they were encoded.
+struct PendingWriteback {
+    TextureStorage* storage;
+    ztd::Range<uptr> range;
+    BufferBase* buffer;
+    std::vector<ztd::Range<uptr>> excluded;
+};
+thread_local std::vector<PendingWriteback>* tls_writeback_batch = nullptr;
+
+class WritebackBatch {
+  public:
+    WritebackBatch(IRenderer& renderer_, ICommandBuffer* command_buffer_)
+        : renderer{renderer_}, command_buffer{command_buffer_},
+          previous{tls_writeback_batch} {
+        tls_writeback_batch = &pending;
+    }
+    ~WritebackBatch() {
+        finish();
+        tls_writeback_batch = previous;
+    }
+    WritebackBatch(const WritebackBatch&) = delete;
+    WritebackBatch& operator=(const WritebackBatch&) = delete;
+
+    // Guest memory holds every readback encoded so far afterwards
+    void finish() {
+        if (pending.empty())
+            return;
+        {
+            ScopedCheckpointReason reason(command_buffer,
+                                          CheckpointReason::TextureReadback);
+            renderer.debugSyncCommandBuffer(command_buffer);
+        }
+        for (auto& writeback : pending) {
+            const auto& descriptor = writeback.storage->base->getDescriptor();
+            writeBackToGuest(
+                descriptor, writeback.range,
+                reinterpret_cast<const u8*>(writeback.buffer->getPtr()),
+                writeback.excluded);
+            writeback.storage->markFlushed(
+                writeback.range.clampedTo(descriptor.getRange()));
+            renderer.retireTextureUploadBuffer(command_buffer,
+                                               writeback.buffer);
+        }
+        pending.clear();
+    }
+
+  private:
+    IRenderer& renderer;
+    ICommandBuffer* command_buffer;
+    std::vector<PendingWriteback>* previous;
+    std::vector<PendingWriteback> pending;
+};
+
+} // namespace
+
 void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                           TextureStorage& storage, TextureMem& mem,
                           TextureUsage usage) {
@@ -315,6 +490,7 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
             std::sort(replay.begin(), replay.end(), [](const auto* a, const auto* b) {
                 return a->gpu_written_timestamp < b->gpu_written_timestamp;
             });
+            WritebackBatch batch(renderer, command_buffer);
             for (auto* candidate : replay) {
                 // A newer alias already flushed to guest must be replayed too:
                 // an older unflushed destination could otherwise overwrite it.
@@ -326,6 +502,8 @@ void TextureCache::updateImpl(ICommandBuffer* command_buffer,
                 for (const auto& previous : flushed)
                     candidate->markFlushed(previous);
             }
+            // The decode below reads what was written back
+            batch.finish();
             LOG_TEXTURE_EVENT("alias_via_guest", descriptor,
                             fmt::format("source={:#x} {} {}",
                                         source.base->getDescriptor().ptr,
@@ -614,6 +792,7 @@ void TextureCache::flushMemoryImpl(ICommandBuffer* command_buffer,
     std::sort(storages.begin(), storages.end(), [](const auto* a, const auto* b) {
         return a->gpu_written_timestamp < b->gpu_written_timestamp;
     });
+    WritebackBatch batch(renderer, command_buffer);
     for (auto* storage : storages)
         encodeTexture(command_buffer, *storage, range);
 }
@@ -681,119 +860,23 @@ void TextureCache::encodeTextureImpl(ICommandBuffer* command_buffer,
             seen.clear();
         }
     }
+    // The ranges to skip are those at encoding time: callers may change them
+    // before a batched write back happens
+    auto excluded = storage.flushed_ranges;
+    if (tls_writeback_batch != nullptr) {
+        tls_writeback_batch->push_back(
+            {&storage, range, tmp_buffer, std::move(excluded)});
+        return;
+    }
     {
         ScopedCheckpointReason reason(command_buffer,
                                       CheckpointReason::TextureReadback);
         renderer.debugSyncCommandBuffer(command_buffer);
     }
 
-    // Write the data in the guest layout
-    const u8* in_data = reinterpret_cast<const u8*>(tmp_buffer->getPtr());
-    u8* out_data = reinterpret_cast<u8*>(descriptor.ptr);
-    if (descriptor.is_linear) {
-        // Linear textures often alias buffers the CPU also writes, so only
-        // the requested bytes are written back
-        const u32 stride =
-            getTextureFormatStride(descriptor.format, descriptor.width);
-        const u32 rows =
-            getTextureFormatRows(descriptor.format, descriptor.height);
-        for (u32 row = 0; row < rows; row++) {
-            const uptr row_begin =
-                descriptor.ptr +
-                static_cast<uptr>(row) * descriptor.linear_stride;
-            const uptr begin = std::max(row_begin, range.getBegin());
-            const uptr end = std::min(row_begin + stride, range.getEnd());
-            if (begin >= end)
-                continue;
-            storage.forEachUnflushed(
-                ztd::Range<uptr>(begin, end), [&](ztd::Range<uptr> piece) {
-                    std::memcpy(reinterpret_cast<u8*>(piece.getBegin()),
-                                in_data + static_cast<usize>(row) * stride +
-                                    (piece.getBegin() - row_begin),
-                                piece.getSize());
-                    capture::GuestEvents::instance().memory(
-                        "memory_writeback", piece.getBegin(), piece.getSize(),
-                        0, capture::currentGuestEventOrigin());
-                });
-        }
-    } else {
-        const u32 layer_stride =
-            descriptor.layer_size != 0
-                ? descriptor.layer_size
-                : descriptor.getLevelOffset(descriptor.level_count);
-        offset = 0;
-        for (u32 layer = 0; layer < descriptor.layer_count; layer++) {
-            for (u32 level = 0; level < descriptor.level_count; level++) {
-                const usize out_offset =
-                    static_cast<usize>(layer) * layer_stride +
-                    descriptor.getLevelOffset(level);
-                const auto dims = descriptor.getLevelDimensions(level);
-                const auto block_size_log2 =
-                    descriptor.getLevelBlockSizeLog2(level);
-                const u32 stride =
-                    getTextureFormatStride(descriptor.format, static_cast<u32>(dims.width));
-                const u32 rows =
-                    getTextureFormatRows(descriptor.format, static_cast<u32>(dims.height));
-                const u8* level_data = in_data + offset;
-                const uptr level_begin = descriptor.ptr + out_offset;
-                const u32 level_size = descriptor.getLevelSize(level);
-                const uptr begin = std::max(level_begin, range.getBegin());
-                const uptr end =
-                    std::min(level_begin + level_size, range.getEnd());
-                if (begin >= end) {
-                    offset += static_cast<u32>(dims.depth) * rows * stride;
-                    continue;
-                }
-                // CPU page faults and DMA copies can request only a few bytes
-                // of a tiled surface. Retiling directly into guest memory
-                // overwrites unrelated CPU uploads and other texture mips.
-                // Preserve padding as well as bytes outside the request.
-                std::vector<u8> tiled(level_size);
-                std::memcpy(tiled.data(), out_data + out_offset, level_size);
-                auto* tiled_data = tiled.data();
-                const u32 tiled_stride =
-                    align(stride, GOB_WIDTH << static_cast<u32>(block_size_log2.width));
-                convertLinearToBlockLinear(
-                    tiled_stride, rows, static_cast<u32>(dims.depth), static_cast<u32>(block_size_log2.height),
-                    static_cast<u32>(block_size_log2.depth),
-                    [=](u32 gob_x, u32 gob_y, u32 gob_z, u8* out_gob) {
-                        const u64 gob_offset = getBlockLinearOffset(
-                            gob_x * GOB_WIDTH, gob_y * GOB_HEIGHT, gob_z,
-                            tiled_stride, rows, static_cast<u32>(block_size_log2.height),
-                            static_cast<u32>(block_size_log2.depth));
-                        convertBlockLinearToLinear(
-                            GOB_WIDTH, GOB_WIDTH, GOB_SIZE, GOB_HEIGHT, 1, 0, 0,
-                            tiled_data + gob_offset, out_gob);
-                        const u32 x = gob_x * GOB_WIDTH;
-                        if (x >= stride)
-                            return;
-                        for (u32 local_y = 0; local_y < GOB_HEIGHT; local_y++) {
-                            const u32 y = gob_y * GOB_HEIGHT + local_y;
-                            if (y >= rows)
-                                break;
-                            std::memcpy(out_gob + local_y * GOB_WIDTH,
-                                        level_data +
-                                            static_cast<usize>(gob_z) * rows *
-                                                stride +
-                                            static_cast<usize>(y) * stride + x,
-                                        std::min(GOB_WIDTH, stride - x));
-                        }
-                    },
-                    tiled.data());
-                storage.forEachUnflushed(
-                    ztd::Range<uptr>(begin, end), [&](ztd::Range<uptr> piece) {
-                        std::memcpy(reinterpret_cast<void*>(piece.getBegin()),
-                                    tiled.data() + (piece.getBegin() - level_begin),
-                                    piece.getSize());
-                        capture::GuestEvents::instance().memory(
-                            "memory_writeback", piece.getBegin(),
-                            piece.getSize(), 0,
-                            capture::currentGuestEventOrigin());
-                    });
-                offset += static_cast<u32>(dims.depth) * rows * stride;
-            }
-        }
-    }
+    writeBackToGuest(descriptor, range,
+                     reinterpret_cast<const u8*>(tmp_buffer->getPtr()),
+                     excluded);
     // What the GPU held in the range is in guest memory now
     storage.markFlushed(range.clampedTo(descriptor.getRange()));
     renderer.retireTextureUploadBuffer(command_buffer, tmp_buffer);

@@ -125,7 +125,120 @@ void testGpuOwnedAliasReplay() {
     std::cout << "PASS: GPU-owned mip/layout and different-width aliases replay in byte order\n";
 }
 
+// A buffer texture the CPU rewrote is uploaded into a new backing while a
+// render pass is open, instead of a blit that would end the pass (UE4 does
+// this dozens of times per frame inside its GBuffer pass)
+void testBufferTextureUploadKeepsRenderPass() {
+    std::vector<u32> memory(64);
+    for (u32 i = 0; i < memory.size(); i++)
+        memory[i] = i;
+    const auto address = reinterpret_cast<uptr>(memory.data());
+    const TextureDescriptor descriptor(address, MTL::TextureTypeTextureBuffer,
+                                       TextureFormat::R32Uint, true, 256, 64,
+                                       1, 1, 1, 1, 0, 0, 0);
+    metal::Renderer renderer;
+    auto& cache = renderer.getTextureCache();
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    auto* command_buffer = static_cast<metal::CommandBuffer*>(commands.get());
+    auto* view = static_cast<metal::TextureView*>(
+        cache.find(commands.get(), descriptor, TextureUsage::Read));
+    auto* base = static_cast<metal::Texture*>(view->getBase());
+    auto* first_native = view->getTexture();
+
+    // Autoreleased
+    auto* target_descriptor = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm,
+                                                    16, 16, false);
+    target_descriptor->setUsage(MTL::TextureUsageRenderTarget);
+    target_descriptor->setStorageMode(MTL::StorageModePrivate);
+    NS_STACK_SCOPED auto target =
+        renderer.getDevice()->newTexture(target_descriptor);
+    auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto* attachment = pass->colorAttachments()->object(0);
+    attachment->setTexture(target);
+    attachment->setLoadAction(MTL::LoadActionClear);
+    attachment->setStoreAction(MTL::StoreActionStore);
+    command_buffer->getRenderCommandEncoder(pass);
+    const auto render_encoders = command_buffer->getRenderEncoderCount();
+
+    for (u32 i = 0; i < memory.size(); i++)
+        memory[i] = 1000 + i;
+    cache.invalidateMemory(descriptor.getRange());
+    cache.find(commands.get(), descriptor, TextureUsage::Read);
+    check(command_buffer->hasOpenRenderPass() &&
+              command_buffer->getRenderEncoderCount() == render_encoders,
+          "A buffer texture upload keeps the render pass open");
+    check(view->getTexture() != first_native &&
+              view->getTexture()->buffer() == base->getBufferBacking(),
+          "Views of a renamed buffer texture use the new backing");
+    const auto* contents =
+        static_cast<const u32*>(base->getBufferBacking()->contents());
+    for (u32 i = 0; i < memory.size(); i++)
+        check(contents[i] == 1000 + i, "The new backing holds the new data");
+
+    // Without an open render pass the upload is a blit, into the new backing
+    command_buffer->getBlitCommandEncoder();
+    for (u32 i = 0; i < memory.size(); i++)
+        memory[i] = 2000 + i;
+    cache.invalidateMemory(descriptor.getRange());
+    cache.find(commands.get(), descriptor, TextureUsage::Read);
+    check(renderer.synchronize(commands.get()), "The blit upload completes");
+    contents = static_cast<const u32*>(base->getBufferBacking()->contents());
+    for (u32 i = 0; i < memory.size(); i++)
+        check(contents[i] == 2000 + i,
+              "A blit upload after a rename reaches the current backing");
+    commands.reset();
+    std::cout << "PASS: buffer texture uploads keep the render pass open\n";
+}
+
+// A write back of several rendered textures (UE4 keeps mip chains of tiny
+// render targets next to each other) waits for the GPU once, not once per
+// texture, and still writes every texture back
+void testBatchedWriteback() {
+    using hydra::hw::tegra_x1::gpu::CheckpointReason;
+    using hydra::hw::tegra_x1::gpu::PerfStats;
+    check(PerfStats::isEnabled(), "Perf stats count checkpoints");
+    constexpr u32 TEXTURE_COUNT = 6;
+    std::vector<u8> memory(TEXTURE_COUNT * 0x1000, 0);
+    const auto address = reinterpret_cast<uptr>(memory.data());
+    metal::Renderer renderer;
+    auto& cache = renderer.getTextureCache();
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    for (u32 i = 0; i < TEXTURE_COUNT; i++) {
+        const TextureDescriptor desc(address + i * 0x1000, MTL::TextureType2D,
+                                     TextureFormat::RGBA8Unorm, false, 0, 16,
+                                     16, 1, 1, 1, 0, 0, 0);
+        auto* view = cache.find(commands.get(), desc, TextureUsage::Write);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(
+            static_cast<metal::Texture*>(view->getBase())->getTexture());
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setStoreAction(MTL::StoreActionStore);
+        attachment->setClearColor(MTL::ClearColor(0.25, 0.5, 0.75, 1));
+        static_cast<metal::CommandBuffer*>(commands.get())
+            ->getRenderCommandEncoder(pass);
+    }
+    auto& waits = PerfStats::instance().checkpoint_count[static_cast<usize>(
+        CheckpointReason::TextureReadback)];
+    const u64 before = waits.load();
+    cache.flushMemory(commands.get(),
+                      ztd::Range<uptr>::fromSize(address, memory.size()));
+    check(waits.load() - before == 1,
+          "Write back of several textures waits for the GPU once");
+    for (u32 i = 0; i < TEXTURE_COUNT; i++) {
+        const u8* texel = memory.data() + i * 0x1000;
+        check(texel[0] == 64 && texel[1] == 128 && texel[2] == 191 &&
+                  texel[3] == 255,
+              "Every batched texture reaches guest memory");
+    }
+    commands.reset();
+    std::cout << "PASS: batched write back waits once for " << TEXTURE_COUNT
+              << " textures\n";
+}
+
 int main() {
+    // Before anything reads it: the batched write back test counts waits
+    setenv("HYDRA_PERF_STATS", "1", 0);
     try {
         // Exercise the real cache and Metal texture views, including
         // overlapping guest memory and contained mip levels from the CTR crash
@@ -138,6 +251,8 @@ int main() {
         runTextureFormatTests();
         runTextureCoherenceFuzz();
         testGpuOwnedAliasReplay();
+        testBatchedWriteback();
+        testBufferTextureUploadKeepsRenderPass();
         std::vector<u8> guest_memory(65536, 0);
         metal::Renderer renderer;
         std::unique_ptr<ICommandBuffer> commands(

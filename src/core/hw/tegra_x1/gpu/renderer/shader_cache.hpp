@@ -126,8 +126,25 @@ class ShaderCache
 
     static void destroyElement(ShaderBase* shader);
 
+    // The guest code a stage's last find() returned its shader for. While the
+    // code (and the shader's branch constants) stay the same, the engine can
+    // reuse that shader without a new lookup.
+    struct FoundSource {
+        ShaderBase* shader{nullptr};
+        std::shared_ptr<const std::vector<u8>> bytes;
+        std::shared_ptr<const std::vector<u8>> vertex_a_bytes;
+    };
+    const FoundSource& getLastFound(engines::ShaderStage stage) const {
+        return last_found[static_cast<u32>(stage) % last_found.size()];
+    }
+    static bool matchesSource(const FoundSource& source, uptr gpu_addr,
+                              uptr vertex_a_gpu_addr);
+    // DEBUG: edited MSL replaces guest shaders (HYDRA_SHADER_OVERRIDE_DIR)
+    static bool hasOverrides();
+
   private:
     IRenderer& renderer;
+    std::array<FoundSource, 8> last_found;
     std::map<std::vector<u32>, std::map<std::pair<u32, u32>, u32>> branch_dependencies;
     struct SourceVersion {
         std::shared_ptr<const std::vector<u8>> bytes;

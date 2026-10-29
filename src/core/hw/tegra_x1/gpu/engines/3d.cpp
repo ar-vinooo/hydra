@@ -1145,11 +1145,13 @@ bool ThreeD::prepareReportWrite(u64 address, usize size,
     if (!report)
         return false;
     writes.reserve(report->count);
-    // GPU written textures in the memory reach it before the report does,
-    // they would overwrite it otherwise. Flushing them also waits for the
-    // reports queued earlier to the same memory, which must land before the
-    // texture data. Without such textures nothing has to wait: the report is
-    // queued behind the earlier ones and lands after them, as on hardware.
+    // The report overwrites what GPU written textures hold in the memory, as
+    // a guest write would: those bytes are marked stale now, so no later
+    // write back of the textures puts their older data over the report.
+    // That needs no readback and no wait (UE4 places occlusion query reports
+    // inside the range of its HZB mip chain, ~150 per frame in Crash 4).
+    // Without such textures the report is just queued behind the earlier
+    // ones and lands after them, as on hardware.
     // DEBUG: HYDRA_REPORT_WRITE_WAIT=1 always waits, for comparisons
     static const bool always_wait =
         std::getenv("HYDRA_REPORT_WRITE_WAIT") != nullptr;
@@ -1159,8 +1161,10 @@ bool ThreeD::prepareReportWrite(u64 address, usize size,
                                             CheckpointReason::ReportWrite);
     for (usize i = 0; i < report->count; i++) {
         writes.push_back(getReportSpanRange(report->spans[i]));
-        if (always_wait || cache.hasUnflushedGpuWrites(writes.back()))
+        if (always_wait)
             cache.flushMemory(tls_crnt_command_buffer, writes.back());
+        else if (cache.hasUnflushedGpuWrites(writes.back()))
+            cache.invalidateMemory(writes.back());
     }
     return true;
 }
@@ -1178,13 +1182,44 @@ void ThreeD::queueCounterReport(u64 address, bool short_query) {
         tls_crnt_decode_state ? tls_crnt_decode_state->address_space
                               : std::shared_ptr<GMmu>{},
         address, size, short_query};
+    // DEBUG: performance statistics measure how late results reach the guest
+    const bool stats_enabled = PerfStats::isEnabled();
+    const auto queued_at = stats_enabled ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
+    const u64 queued_present =
+        stats_enabled ? PerfStats::instance().presents_total.load() : 0;
+    if (stats_enabled)
+        PerfStats::instance().occlusion_queries++;
     // The queue calls this on a thread of its own, once the GPU produced the
     // result. A failed submission has no result.
     gpu.getRenderer().queueOcclusionReport(
         tls_crnt_command_buffer,
-        [destination](std::optional<u64> value) {
+        [destination, stats_enabled, queued_at,
+         queued_present](std::optional<u64> value) {
             if (value)
                 destination.write(*value);
+            if (!stats_enabled)
+                return;
+            auto& stats = PerfStats::instance();
+            if (!value) {
+                stats.occlusion_failed++;
+                return;
+            }
+            const auto latency = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - queued_at)
+                    .count());
+            stats.occlusion_results++;
+            if (*value == 0)
+                stats.occlusion_zero++;
+            stats.occlusion_latency_ns += latency;
+            u64 max = stats.occlusion_latency_max_ns.load();
+            while (latency > max &&
+                   !stats.occlusion_latency_max_ns.compare_exchange_weak(
+                       max, latency)) {
+            }
+            if (stats.presents_total.load() != queued_present)
+                stats.occlusion_late++;
         },
         std::move(writes));
 }
@@ -2242,7 +2277,270 @@ u32 ThreeD::getGeometryLayerSource() {
     return source.value_or(0);
 }
 
+namespace {
+
+// Registers that change between draws without changing the pipeline: draw
+// parameters, buffer addresses, constant buffer uploads and bindings, reports,
+// macro and DMA methods. What the shaders read through constant buffers (branch
+// constants, texture handles) is compared by pipelineMemoMatches instead.
+constexpr usize REG_3D_COUNT = sizeof(Regs3D) / sizeof(u32);
+const std::array<bool, REG_3D_COUNT>& pipelineIndependentRegs() {
+    static const auto regs = [] {
+        std::array<bool, REG_3D_COUNT> independent{};
+        const auto mark = [&](u32 begin, u32 count) {
+            for (u32 i = begin; i < begin + count && i < REG_3D_COUNT; i++)
+                independent[i] = true;
+        };
+        mark(0x45, 4);   // MME instruction and start address RAM
+        mark(0x60, 0xe); // inline-to-memory (writes memory, not state)
+        mark(0x87, 1);   // INVALIDATE_SHADER_CACHES (code is compared)
+        mark(0xb2, 1);   // INCREMENT_SYNC_POINT
+        mark(0x35d, 2);  // vertex array start, DRAW_VERTEX_ARRAY count
+        mark(0x369, 1);  // INVALIDATE_SHADER_CACHES_NO_WFI
+        mark(0x485, 2);  // compact vertex array draw
+        mark(0x48f, 1);  // DRAW_AUTO
+        mark(0x4c1, 1);  // inline index (8-bit)
+        mark(0x50d, 2);  // base vertex and instance
+        mark(0x54c, 1);  // counter reset
+        mark(0x57a, 3);  // inline indices (32/16-bit)
+        mark(0x585, 2);  // END, BEGIN (the primitive is compared)
+        mark(0x5f2, 0xd); // index buffer, first/count, compact element draws
+        mark(0x674, 1);  // CLEAR_SURFACE
+        mark(0x6c0, 4);  // report semaphore
+        for (u32 i = 0; i < VERTEX_ARRAY_COUNT; i++)
+            mark(0x700 + i * 4 + 1, 2); // vertex array address (not config)
+        mark(0x7c0, VERTEX_ARRAY_COUNT * 2); // vertex array limits
+        mark(0x8c4, 1);  // FIRMWARE_CALL_4
+        mark(0x8e0, 0x14); // constant buffer selector and uploads
+        mark(0x900, 5 * 8); // constant buffer bindings
+        mark(0xd00, 0x100); // MME scratch
+        return independent;
+    }();
+    return regs;
+}
+
+} // namespace
+
+void ThreeD::writeReg(u32 reg, u32 value) {
+    if (reg < REG_3D_COUNT && regs_raw[reg] != value &&
+        !pipelineIndependentRegs()[reg]) {
+        pipeline_generation++;
+        if (PerfStats::isEnabled())
+            pipeline_dirty_writes[reg]++;
+    }
+    EngineWithRegsBase::writeReg(reg, value);
+}
+
+void ThreeD::collectPipelineTextureInputs(
+    ShaderStage stage, const renderer::ShaderBase& shader,
+    std::vector<PipelineTextureInput>& inputs) const {
+    // What getShader specializes a shader on (see the end of getShader)
+    inputs.clear();
+    const auto pool_addr = static_cast<u64>(regs.tex_header_pool);
+    if (pool_addr == 0)
+        return;
+    const auto* pool = reinterpret_cast<const TextureImageControl*>(
+        tls_crnt_gmmu->unmapAddr(pool_addr));
+    const auto stage_index = static_cast<u32>(stage) - 1;
+    for (const auto& [index, renderer_index] :
+         shader.getDescriptor().resource_mapping.textures) {
+        PipelineTextureInput input{};
+        input.index = index;
+        const auto handle = readTextureHandle(stage_index, index);
+        if (handle) {
+            input.handle = *handle;
+            input.flags = 1;
+            const auto image = getImageHandle(*handle);
+            if (image <= regs.tex_header_pool_max_index) {
+                const auto& tic = pool[image];
+                const auto lod = getTicLodRange(tic);
+                input.format_word = std::bit_cast<u32>(tic.format_word);
+                input.flags |= 2u | (static_cast<u32>(tic.hdr_version) << 4) |
+                               (static_cast<u32>(tic.normalized_coords) << 8) |
+                               (static_cast<u32>(tic.texture_type) << 12);
+                input.lod_min = lod.min;
+                input.lod_max = lod.max;
+                const auto sampler = getSamplerIndex(*handle);
+                if (tic.hdr_version != TicHdrVersion::_1DBuffer &&
+                    static_cast<u64>(regs.tex_sampler_pool) != 0 &&
+                    sampler <= regs.tex_sampler_pool_max_index) {
+                    const auto ptr = tls_crnt_gmmu->unmapAddr(
+                        static_cast<u64>(regs.tex_sampler_pool) +
+                        u64(sampler) * sizeof(TextureSamplerControl));
+                    if (ptr != 0) {
+                        input.flags |= 4;
+                        std::memcpy(input.sampler.data(),
+                                    reinterpret_cast<const void*>(ptr),
+                                    sizeof(input.sampler));
+                    }
+                }
+            }
+        }
+        inputs.push_back(input);
+    }
+}
+
+bool ThreeD::branchConstantsMatch(ShaderStage stage,
+                                  const renderer::ShaderBase& shader) const {
+    for (const auto& [location, value] :
+         shader.getDescriptor().resource_mapping.branch_constants) {
+        const auto [slot, word] = location;
+        if (slot >= CONST_BUFFER_BINDING_COUNT)
+            return false;
+        const auto range = getConstBuffer(static_cast<u32>(stage) - 1, slot,
+                                          (u64(word) + 1) * sizeof(u32));
+        if (range.getBegin() == 0 || word >= range.getSize() / sizeof(u32))
+            return false;
+        u32 current;
+        std::memcpy(&current,
+                    reinterpret_cast<const void*>(range.getBegin() +
+                                                  word * sizeof(u32)),
+                    sizeof(current));
+        if (current != value)
+            return false;
+    }
+    return true;
+}
+
+bool ThreeD::pipelineMemoMatches() {
+    auto& memo = pipeline_memo;
+    const bool stats = PerfStats::isEnabled();
+    if (memo.pipeline == nullptr)
+        return false;
+    if (memo.generation != pipeline_generation) {
+        if (stats)
+            PerfStats::instance().pipeline_memo_miss_regs++;
+        return false;
+    }
+    if (memo.primitive_type != regs.begin.primitive_type ||
+        memo.gmmu != tls_crnt_gmmu ||
+        memo.hot_generation != ::hydra::hot::generation()) {
+        if (stats)
+            PerfStats::instance().pipeline_memo_miss_state++;
+        return false;
+    }
+    for (u32 i = 0; i < memo.stages.size(); i++) {
+        const auto& stage_memo = memo.stages[i];
+        if (stage_memo.source.shader == nullptr)
+            continue;
+        const auto stage = static_cast<ShaderStage>(i);
+        if (!renderer::ShaderCache::matchesSource(stage_memo.source,
+                                                  stage_memo.gpu_addr,
+                                                  stage_memo.vertex_a_gpu_addr)) {
+            if (stats)
+                PerfStats::instance().pipeline_memo_miss_code++;
+            return false;
+        }
+        if (!branchConstantsMatch(stage, *stage_memo.source.shader)) {
+            if (stats)
+                PerfStats::instance().pipeline_memo_miss_constants++;
+            return false;
+        }
+        collectPipelineTextureInputs(stage, *stage_memo.source.shader,
+                                     pipeline_texture_scratch);
+        if (pipeline_texture_scratch != stage_memo.textures) {
+            if (stats)
+                PerfStats::instance().pipeline_memo_miss_textures++;
+            return false;
+        }
+    }
+    return true;
+}
+
+void ThreeD::recordPipelineMemo(renderer::PipelineBase* pipeline) {
+    auto& memo = pipeline_memo;
+    memo.pipeline = nullptr;
+    if (pipeline == nullptr)
+        return;
+    auto& cache = gpu.getRenderer().getShaderCache();
+    for (u32 i = 0; i < memo.stages.size(); i++) {
+        auto& stage_memo = memo.stages[i];
+        stage_memo = {};
+        const auto stage = static_cast<ShaderStage>(i);
+        if (stage == ShaderStage::VertexA)
+            continue;
+        auto* shader = getShaderUnchecked(stage);
+        if (shader == nullptr)
+            continue;
+        // Only shaders the cache just returned for this stage can be checked
+        // against their code (not generated ones)
+        const auto& found = cache.getLastFound(stage);
+        if (found.shader != shader)
+            return;
+        const auto& program = regs.shader_programs[i];
+        stage_memo.source = found;
+        stage_memo.gpu_addr =
+            static_cast<u64>(regs.shader_program_region) + program.offset;
+        if (stage == ShaderStage::VertexB) {
+            const auto& vertex_a =
+                regs.shader_programs[static_cast<usize>(ShaderStage::VertexA)];
+            if (vertex_a.config.enable)
+                stage_memo.vertex_a_gpu_addr =
+                    static_cast<u64>(regs.shader_program_region) +
+                    vertex_a.offset;
+        }
+        collectPipelineTextureInputs(stage, *shader, stage_memo.textures);
+    }
+    std::copy(std::begin(active_shaders), std::end(active_shaders),
+              memo.active_shaders.begin());
+    memo.generation = pipeline_generation;
+    memo.primitive_type = regs.begin.primitive_type;
+    memo.gmmu = tls_crnt_gmmu;
+    memo.hot_generation = ::hydra::hot::generation();
+    memo.geometry_active = geometry_active;
+    memo.tessellation_active = tessellation_active;
+    memo.tessellation_control_points = tessellation_control_points;
+    memo.pipeline = pipeline;
+}
+
 renderer::PipelineBase* ThreeD::getPipeline() {
+    static const bool disabled =
+        std::getenv("HYDRA_DISABLE_PIPELINE_MEMO") != nullptr;
+    auto& visual = VisualDiagnostics::instance();
+    const bool usable = !disabled && !visual.active() && !visual.selected() &&
+                        !renderer::ShaderCache::hasOverrides();
+    if (usable && pipelineMemoMatches()) {
+        const auto& memo = pipeline_memo;
+        std::copy(memo.active_shaders.begin(), memo.active_shaders.end(),
+                  std::begin(active_shaders));
+        geometry_active = memo.geometry_active;
+        tessellation_active = memo.tessellation_active;
+        tessellation_control_points = memo.tessellation_control_points;
+        if (PerfStats::isEnabled())
+            PerfStats::instance().pipeline_memo_hits++;
+        return memo.pipeline;
+    }
+    // DEBUG: name the registers that dirtied the pipeline most
+    if (PerfStats::isEnabled()) {
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(2)) {
+            last = now;
+            std::vector<std::pair<u32, u32>> top;
+            for (u32 i = 0; i < pipeline_dirty_writes.size(); i++)
+                if (pipeline_dirty_writes[i] != 0)
+                    top.emplace_back(pipeline_dirty_writes[i], i);
+            std::sort(top.rbegin(), top.rend());
+            std::string list;
+            for (usize i = 0; i < std::min<usize>(top.size(), 10); i++)
+                list += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
+            LOG_INFO(Engines, "PIPELINE DIRTY registers (method: changes):{}",
+                     list);
+            pipeline_dirty_writes.fill(0);
+        }
+    }
+    auto* pipeline = buildPipeline();
+    if (usable)
+        recordPipelineMemo(pipeline);
+    else {
+        pipeline_memo.pipeline = nullptr;
+        if (PerfStats::isEnabled())
+            PerfStats::instance().pipeline_memo_off++;
+    }
+    return pipeline;
+}
+
+renderer::PipelineBase* ThreeD::buildPipeline() {
     renderer::PipelineDescriptor descriptor{};
 
     // Tessellation is emulated for patches (tessellation.hpp)

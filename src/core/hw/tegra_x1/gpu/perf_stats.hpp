@@ -112,10 +112,28 @@ struct PerfStats {
     std::atomic<u64> compute_dispatches{0};
     std::atomic<u64> compute_threads{0};
     std::atomic<u64> frames{0};
+    // Never reset: occlusion results measure their latency in presents
+    std::atomic<u64> presents_total{0};
+    std::atomic<u64> pipeline_memo_hits{0};
+    std::atomic<u64> pipeline_memo_miss_regs{0};
+    std::atomic<u64> pipeline_memo_miss_state{0}; // primitive, MMU, module
+    std::atomic<u64> pipeline_memo_miss_code{0};
+    std::atomic<u64> pipeline_memo_miss_constants{0};
+    std::atomic<u64> pipeline_memo_miss_textures{0};
+    std::atomic<u64> pipeline_memo_off{0};
+    std::atomic<u64> occlusion_queries{0};
+    std::atomic<u64> occlusion_results{0};
+    std::atomic<u64> occlusion_zero{0};
+    std::atomic<u64> occlusion_failed{0};
+    std::atomic<u64> occlusion_latency_ns{0};
+    std::atomic<u64> occlusion_latency_max_ns{0};
+    std::atomic<u64> occlusion_late{0}; // landed one or more presents later
     std::atomic<u64> texture_upload_ns{0};
     std::atomic<u64> texture_upload_bytes{0};
     std::atomic<u64> upload_buffers_created{0};
     std::atomic<u64> upload_buffers_reused{0};
+    std::atomic<u64> upload_buffers_dropped{0};
+    std::atomic<u64> snapshots_released_unretired{0};
     std::atomic<u64> draw_state_ns{0};
     std::atomic<u64> draw_prepare_ns{0};
     std::atomic<u64> draw_command_ns{0};

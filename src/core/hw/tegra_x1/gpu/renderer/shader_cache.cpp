@@ -351,6 +351,8 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
         return shader;
     };
     std::scoped_lock lock(lookup_mutex);
+    auto& found = last_found[static_cast<u32>(descriptor.stage) % last_found.size()];
+    found = {};
     static const bool reuse_lookup =
         std::getenv("HYDRA_DISABLE_SHADER_LOOKUP_REUSE") == nullptr;
     // Warm hits need an exact key and current code/constants, but no owned
@@ -398,6 +400,7 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
             });
         if (constants_match) {
             auto* shader = version->shader;
+            found = {shader, version->bytes, version->vertex_a_bytes};
             // Retain all historical artifacts, but validate the last hit first.
             if (reuse_lookup && version != versions.begin())
                 std::rotate(versions.begin(), version, std::next(version));
@@ -470,6 +473,7 @@ ShaderBase* ShaderCache::findHot0(const GuestShaderDescriptor& descriptor) {
     }
     auto* shader = CacheBase<ShaderCache, ShaderBase*, GuestShaderDescriptor, true, true>::find(actual);
     if (shader) {
+        found = {shader, actual.code_snapshot, actual.state.vertex_a_code};
         versions.push_back(
             {actual.code_snapshot, shader, actual.state.vertex_a_code});
         if (reuse_lookup)
@@ -585,5 +589,23 @@ bool ShaderCache::equals(const GuestShaderDescriptor& a,
 }
 
 void ShaderCache::destroyElement(ShaderBase* shader) { delete shader; }
+
+bool ShaderCache::matchesSource(const FoundSource& source, uptr gpu_addr,
+                                uptr vertex_a_gpu_addr) {
+    if (source.shader == nullptr || !source.bytes)
+        return false;
+    if (!matchesMappedCode(
+            gpu_addr, *source.bytes,
+            source.shader->getDescriptor().resource_mapping.code_read_size))
+        return false;
+    if (vertex_a_gpu_addr == 0)
+        return true;
+    return source.vertex_a_bytes &&
+           matchesMappedCode(vertex_a_gpu_addr, *source.vertex_a_bytes);
+}
+
+bool ShaderCache::hasOverrides() {
+    return ShaderOverrides::instance().any.load();
+}
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer

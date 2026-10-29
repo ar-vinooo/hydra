@@ -59,6 +59,8 @@ class UploadBufferPool {
                 return;
             }
         }
+        if (PerfStats::isEnabled())
+            PerfStats::instance().upload_buffers_dropped++;
         buffer->release();
     }
 

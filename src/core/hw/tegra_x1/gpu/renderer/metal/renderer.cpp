@@ -61,7 +61,8 @@ Renderer::Renderer()
     : device{MTL::CreateSystemDefaultDevice()},
       command_queue{device->newCommandQueue()},
       mtl4_context{std::shared_ptr<Mtl4Context>(createMtl4Context(device))},
-      upload_buffer_pool(std::make_shared<UploadBufferPool>(device)),
+      upload_buffer_pool(
+          std::make_shared<UploadBufferPool>(device, 64 * 1024 * 1024, 4096)),
       completions(std::make_shared<CompletionQueue>()),
       occlusion(std::make_unique<OcclusionCounter>(device, completions)),
       binary_archive_cache(device), shader_library_cache(device),

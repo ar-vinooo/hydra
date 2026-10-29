@@ -1,11 +1,14 @@
 #pragma once
 
+#include <atomic>
+
 #include "core/hw/tegra_x1/gpu/renderer/metal/const.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/texture.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 class BlitEncoder;
+class CommandBuffer;
 
 class Texture final : public ITexture {
   public:
@@ -35,10 +38,21 @@ class Texture final : public ITexture {
     // stores it (pixels as blocks of samples), see MsaaConverter
     std::shared_ptr<Texture> createScaledTexture() const;
 
+    // Changes when the native texture is replaced, views recreate theirs
+    u32 getGeneration() const {
+        return generation.load(std::memory_order_acquire);
+    }
+
   private:
     MTL::Texture* texture;
     MTL::Buffer* buffer_backing = nullptr;
+    // The backing came from the snapshot buffer pool (renamed)
+    bool backing_pooled = false;
+    std::atomic<u32> generation{0};
     MTL::ComputePipelineState* byte_copy_pipeline = nullptr;
+
+    bool renameBufferBacking(CommandBuffer* command_buffer,
+                             MTL::Buffer* src);
 
     void copyDepthStencilFromBuffer(BlitEncoder* encoder,
                                     const u8* src, const MTL::Size dims,

@@ -24,7 +24,10 @@ void commitManagedSubmission(
     commands->addCompletedHandler(
         [work = std::move(work), resources = std::move(resources)](
             MTL::CommandBuffer* completed) mutable {
+            tls_releasing_completed_resources =
+                completed->status() == MTL::CommandBufferStatusCompleted;
             resources.clear();
+            tls_releasing_completed_resources = false;
             work->finish(completed->status() == MTL::CommandBufferStatusCompleted);
         });
     commands->commit();
@@ -37,7 +40,9 @@ void commitManagedSubmission(
     commands.addCompletedHandler(
         [work = std::move(work), resources = std::move(resources)](
             const GpuCompletion& completion) mutable {
+            tls_releasing_completed_resources = completion.succeeded;
             resources.clear();
+            tls_releasing_completed_resources = false;
             work->finish(completion.succeeded);
         });
     commands.commitNative();
@@ -91,8 +96,7 @@ void CommandBuffer::commitSubmission() {
                 completion.succeeded ? 1 : 0, wrapper);
         });
     }
-    commitManagedSubmission(*this, completions, std::move(retained_resources));
-    retained_resources.clear();
+    commitManagedSubmission(*this, completions, takeRetainedResources());
 }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

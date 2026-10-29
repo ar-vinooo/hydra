@@ -6,7 +6,29 @@
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
 
 TextureView::TextureView(Texture* base, const TextureViewDescriptor& descriptor)
-    : ITextureView(base, descriptor) {
+    : ITextureView(base, descriptor), base_generation{base->getGeneration()} {
+    texture = createNative();
+}
+
+TextureView::~TextureView() { texture->release(); }
+
+const Texture* TextureView::getBaseImpl() const {
+    return static_cast<const Texture*>(getBase());
+}
+
+void TextureView::refresh() const {
+    base_generation = getBaseImpl()->getGeneration();
+    // Created before the old view is released, so it cannot get its address:
+    // binding caches compare native pointers. Encoded commands retain the
+    // old view.
+    auto* old = texture;
+    texture = createNative();
+    old->release();
+}
+
+MTL::Texture* TextureView::createNative() const {
+    const auto* base = getBaseImpl();
+    const auto& descriptor = getDescriptor();
     const auto& pixel_format_info = toMtlPixelFormatInfo(descriptor.format);
 
     // Swizzle: guest components are stored in the host channels given by the
@@ -54,13 +76,11 @@ TextureView::TextureView(Texture* base, const TextureViewDescriptor& descriptor)
         }
     }
 
-    texture = base->getTexture()->newTextureView(
+    return base->getTexture()->newTextureView(
         pixel_format, type,
         NS::Range(descriptor.levels.getBegin(), descriptor.levels.getSize()),
         NS::Range(descriptor.layers.getBegin(), descriptor.layers.getSize()),
         swizzle_channels_mtl);
 }
-
-TextureView::~TextureView() { texture->release(); }
 
 } // namespace hydra::hw::tegra_x1::gpu::renderer::metal

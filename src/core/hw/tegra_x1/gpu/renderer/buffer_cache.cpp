@@ -1,6 +1,7 @@
 #include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
 
 #include "core/hw/tegra_x1/gpu/gpu.hpp"
+#include "core/hw/tegra_x1/gpu/perf_stats.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/buffer_base.hpp"
 
 #ifdef ZTD_PLATFORM_APPLE
@@ -23,8 +24,14 @@ std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
     return std::shared_ptr<BufferBase>(snapshot, [pool](BufferBase* buffer) {
         // CPU views may outlive the command buffer that created a snapshot.
         // Retire only at the last CPU release, on the current ordered GPU
-        // command buffer. Without a GPU-thread context, release normally.
-        if (tls_crnt_command_buffer != nullptr) {
+        // command buffer. A completed submission dropping its retained
+        // references recycles directly: every command that encoded the
+        // snapshot retained it. Otherwise, release normally.
+        if (metal::tls_releasing_completed_resources) {
+            auto* native_buffer =
+                static_cast<metal::Buffer*>(buffer)->getBuffer();
+            pool->recycle(native_buffer->retain());
+        } else if (tls_crnt_command_buffer != nullptr) {
             auto* native_buffer =
                 static_cast<metal::Buffer*>(buffer)->getBuffer();
             native_buffer->retain();
@@ -37,6 +44,8 @@ std::shared_ptr<BufferBase> ownSnapshot(BufferBase* snapshot) {
                         else
                             native_buffer->release();
                     });
+        } else if (PerfStats::isEnabled()) {
+            PerfStats::instance().snapshots_released_unretired++;
         }
         delete buffer;
     });

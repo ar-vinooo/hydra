@@ -2,6 +2,10 @@
 #include "core/hw/tegra_x1/gpu/capture/guest_events.hpp"
 
 #include <condition_variable>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -835,9 +839,62 @@ void CommandBuffer::profileRenderPass(MTL::RenderPassDescriptor* descriptor) {
     attachment->setEndOfFragmentSampleIndex(sample + 1);
 }
 
+namespace {
+
+// DEBUG: who ends render passes with blits (HYDRA_PERF_STATS). Every pass
+// resumed afterwards loads and stores all of its attachments again.
+void recordRenderPassBreak() {
+    void* frames[8];
+    const int count = backtrace(frames, 8);
+    std::string key;
+    // 0: this, 1: the blit encoder getter, 2: its wrapper
+    for (int i = 3, named = 0; i < count && named < 4; i++) {
+        Dl_info info;
+        if (dladdr(frames[i], &info) == 0 || info.dli_sname == nullptr)
+            continue;
+        int status = 0;
+        char* demangled =
+            abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+        std::string name = status == 0 ? demangled : info.dli_sname;
+        std::free(demangled);
+        name = name.substr(0, name.find('('));
+        name = name.substr(name.rfind("::") == std::string::npos
+                               ? 0
+                               : name.rfind("::") + 2);
+        // Skip the hot reload trampolines
+        if (name.find("Hot") != std::string::npos)
+            continue;
+        if (!key.empty())
+            key += " < ";
+        key += name;
+        named++;
+    }
+    static std::mutex mutex;
+    static std::map<std::string, u64> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lock(mutex);
+    counts[key]++;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2))
+        return;
+    last = now;
+    std::vector<std::pair<u64, std::string>> sorted;
+    for (const auto& [name, n] : counts)
+        sorted.emplace_back(n, name);
+    std::sort(sorted.rbegin(), sorted.rend());
+    for (usize i = 0; i < std::min<usize>(sorted.size(), 8); i++)
+        LOG_INFO(MetalRenderer, "RENDER PASS BREAK by blit: {}x {}",
+                 sorted[i].first, sorted[i].second);
+    counts.clear();
+}
+
+} // namespace
+
 BlitEncoder* CommandBuffer::getBlitCommandEncoderHot3() {
     if (encoder_type == EncoderType::Blit)
         return getBlitCommandEncoderUnchecked();
+    if (encoder_type == EncoderType::Render && PerfStats::isEnabled())
+        recordRenderPassBreak();
 
     endEncoding();
 

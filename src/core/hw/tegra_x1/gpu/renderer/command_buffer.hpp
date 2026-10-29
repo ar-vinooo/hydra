@@ -1,10 +1,12 @@
 #pragma once
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "core/hw/tegra_x1/gpu/renderer/const.hpp"
@@ -53,6 +55,14 @@ class ICommandBuffer {
         if (!owner)
             return;
         std::scoped_lock lock(retained_mutex);
+        // Consecutive draws retain mostly the same owners: a direct mapped
+        // filter of recent ones skips the hash lookup. An owner in it is in
+        // the map, which keeps it alive, so its address cannot be reused.
+        auto& recent = recent_retained[(reinterpret_cast<uptr>(owner.get()) >> 4) %
+                                       recent_retained.size()];
+        if (recent == owner.get())
+            return;
+        recent = owner.get();
         retained_resources.try_emplace(owner.get(), owner);
     }
 
@@ -74,8 +84,17 @@ class ICommandBuffer {
     }
     std::vector<std::function<void(bool)>> completion_callbacks;
     std::vector<std::function<void(bool)>> gpu_completion_callbacks;
+    // Hands the retained owners over (to the submission that keeps them
+    // until the GPU is done)
+    std::unordered_map<const void*, std::shared_ptr<void>>
+    takeRetainedResources() {
+        std::scoped_lock lock(retained_mutex);
+        recent_retained.fill(nullptr);
+        return std::exchange(retained_resources, {});
+    }
     std::mutex retained_mutex;
     std::unordered_map<const void*, std::shared_ptr<void>> retained_resources;
+    std::array<const void*, 64> recent_retained{};
 };
 
 // Names the waits for the host GPU done in its scope in HYDRA_PERF_STATS

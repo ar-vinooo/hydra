@@ -13,8 +13,12 @@
 #include "core/hw/tegra_x1/gpu/renderer/metal/msaa_converter.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/renderer.hpp"
 #include "core/hw/tegra_x1/gpu/renderer/metal/texture_view.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/metal/upload_buffer_pool.hpp"
+#include "core/hw/tegra_x1/gpu/renderer/buffer_cache.hpp"
 
 namespace hydra::hw::tegra_x1::gpu::renderer::metal {
+
+std::shared_ptr<UploadBufferPool> snapshotBufferPool(MTL::Device* device);
 
 namespace {
 
@@ -276,8 +280,57 @@ Texture::~Texture() {
     if (byte_copy_pipeline)
         byte_copy_pipeline->release();
     texture->release();
+    // Pooled backings are not recycled here: the GPU may still read them
     if (buffer_backing)
         buffer_backing->release();
+}
+
+bool Texture::renameBufferBacking(CommandBuffer* command_buffer,
+                                  MTL::Buffer* src) {
+    // Metal 4 command buffers do not retain what they use
+    if (command_buffer->usesMetal4() || src->contents() == nullptr ||
+        buffer_backing->length() > BUFFER_SNAPSHOT_MAX_SIZE)
+        return false;
+    auto pool = snapshotBufferPool(texture->device());
+    auto* backing = pool->acquire(buffer_backing->length());
+    std::memcpy(backing->contents(), src->contents(), descriptor.size);
+    std::memset(static_cast<u8*>(backing->contents()) + descriptor.size, 0,
+                backing->length() - descriptor.size);
+
+    auto* desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureTypeTextureBuffer);
+    desc->setPixelFormat(texture->pixelFormat());
+    desc->setWidth(texture->width());
+    desc->setUsage(texture->usage());
+    desc->setStorageMode(MTL::StorageModeShared);
+    auto* renamed =
+        backing->newTexture(desc, 0, texture->bufferBytesPerRow());
+    desc->release();
+    if (renamed == nullptr) {
+        pool->recycle(backing);
+        return false;
+    }
+
+    // Draws queued for encoding bind the old contents
+    syncDrawQueue();
+    // Encoded commands retain the old texture and backing (Metal 3)
+    texture->release();
+    texture = renamed;
+    if (backing_pooled) {
+        command_buffer->addCompletedHandler(
+            [pool, old = buffer_backing](const GpuCompletion& completion) {
+                if (completion.succeeded)
+                    pool->recycle(old);
+                else
+                    old->release();
+            });
+    } else {
+        buffer_backing->release();
+    }
+    buffer_backing = backing;
+    backing_pooled = true;
+    generation.fetch_add(1, std::memory_order_release);
+    return true;
 }
 
 std::shared_ptr<Texture> Texture::createScaledTexture() const {
@@ -454,9 +507,18 @@ void Texture::copyFromHot2(ICommandBuffer* command_buffer, const BufferBase* src
     }
     const auto mtl_src = static_cast<const Buffer*>(src)->getBuffer();
 
+    const bool expanded = getHostTextureFormat(descriptor.format) != descriptor.format;
+    // A blit would end the open render pass, and the pass resumed after it
+    // loads and stores all of its attachments again: UE4 rewrites dozens of
+    // small buffer textures per frame between the draws of its GBuffer pass.
+    // The new contents go to a new backing instead (like a buffer mirror).
+    if (buffer_backing && !expanded &&
+        command_buffer_impl->hasOpenRenderPass() &&
+        renameBufferBacking(command_buffer_impl, mtl_src))
+        return;
+
     auto encoder = command_buffer_impl->getBlitCommandEncoder();
 
-    const bool expanded = getHostTextureFormat(descriptor.format) != descriptor.format;
     if (buffer_backing && !expanded) {
         encoder->copyFromBuffer(mtl_src, 0, buffer_backing, 0, descriptor.size);
         return;

@@ -869,6 +869,57 @@ class ThreeD : public EngineWithRegsBase<Regs3D>,
              std::unique_ptr<renderer::ShaderBase>>
         geometry_passthroughs;
     renderer::PipelineBase* getPipeline();
+    renderer::PipelineBase* buildPipeline();
+
+    // Dirty tracking of the pipeline, like Ryujinx's StateUpdater: the last
+    // pipeline is reused while no register it depends on changed and what the
+    // shaders read from memory (their code, branch constants and the texture
+    // and sampler descriptors they are specialized on) stays the same.
+    // DEBUG: HYDRA_DISABLE_PIPELINE_MEMO=1 looks every pipeline up
+    void writeReg(u32 reg, u32 value);
+    u64 pipeline_generation{1};
+    struct PipelineTextureInput {
+        u32 index{0};
+        u32 handle{0};
+        u32 format_word{0};
+        u32 flags{0};
+        u32 lod_min{0};
+        u32 lod_max{0};
+        std::array<u32, 8> sampler{};
+        bool operator==(const PipelineTextureInput&) const = default;
+    };
+    struct PipelineStageMemo {
+        renderer::ShaderCache::FoundSource source;
+        uptr gpu_addr{0};
+        uptr vertex_a_gpu_addr{0};
+        std::vector<PipelineTextureInput> textures;
+    };
+    struct PipelineMemo {
+        renderer::PipelineBase* pipeline{nullptr};
+        u64 generation{0};
+        PrimitiveType primitive_type{};
+        const GMmu* gmmu{nullptr};
+        u64 hot_generation{0};
+        std::array<renderer::ShaderBase*,
+                   static_cast<usize>(renderer::ShaderType::Count)>
+            active_shaders{};
+        bool geometry_active{false};
+        bool tessellation_active{false};
+        u32 tessellation_control_points{0};
+        std::array<PipelineStageMemo, static_cast<usize>(ShaderStage::Count)>
+            stages;
+    } pipeline_memo;
+    std::vector<PipelineTextureInput> pipeline_texture_scratch;
+    bool pipelineMemoMatches();
+    void recordPipelineMemo(renderer::PipelineBase* pipeline);
+    void collectPipelineTextureInputs(
+        ShaderStage stage, const renderer::ShaderBase& shader,
+        std::vector<PipelineTextureInput>& inputs) const;
+    bool branchConstantsMatch(ShaderStage stage,
+                              const renderer::ShaderBase& shader) const;
+    // DEBUG: performance statistics name the registers that dirty it
+    std::array<u32, sizeof(Regs3D) / sizeof(u32)> pipeline_dirty_writes{};
+
     renderer::BufferView getVertexBuffer(u32 vertex_array_index) const;
     bool isVertexArrayInstanced(u32 vertex_array_index) const;
 

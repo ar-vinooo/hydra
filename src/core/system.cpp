@@ -595,6 +595,7 @@ void System::progressFrame(u32 width, u32 height,
     if (acquired && hw::tegra_x1::gpu::PerfStats::isEnabled()) {
         auto& stats = hw::tegra_x1::gpu::PerfStats::instance();
         stats.frames++;
+        stats.presents_total++;
         static auto last = std::chrono::steady_clock::now();
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration<f64>(now - last).count();
@@ -648,11 +649,52 @@ void System::progressFrame(u32 width, u32 height,
                      draw_command_ms, draw_apply_ms);
             LOG_INFO(Other,
                      "UPLOAD: {:.2f} ms/frame | {:.1f} MiB/s | buffers {} new, "
-                     "{} reused",
+                     "{} reused, {} dropped by a full pool, {} snapshots "
+                     "released without a command buffer",
                      upload_ms,
                      static_cast<f64>(upload_bytes) / (1024.0 * 1024.0) /
                          elapsed,
-                     buffers_created, buffers_reused);
+                     buffers_created, buffers_reused,
+                     stats.upload_buffers_dropped.exchange(0),
+                     stats.snapshots_released_unretired.exchange(0));
+            LOG_INFO(Other,
+                     "PIPELINE MEMO: {} hits | misses: {} registers, {} "
+                     "primitive/MMU/module, {} code, {} constants, {} textures "
+                     "| {} uncached",
+                     stats.pipeline_memo_hits.exchange(0),
+                     stats.pipeline_memo_miss_regs.exchange(0),
+                     stats.pipeline_memo_miss_state.exchange(0),
+                     stats.pipeline_memo_miss_code.exchange(0),
+                     stats.pipeline_memo_miss_constants.exchange(0),
+                     stats.pipeline_memo_miss_textures.exchange(0),
+                     stats.pipeline_memo_off.exchange(0));
+            {
+                const auto queries = stats.occlusion_queries.exchange(0);
+                const auto results = stats.occlusion_results.exchange(0);
+                const auto latency_ns = stats.occlusion_latency_ns.exchange(0);
+                LOG_INFO(
+                    Other,
+                    "OCCLUSION: {:.1f} queries/frame | {} results, {:.1f}% zero, "
+                    "{} failed | latency avg {:.2f} ms, max {:.2f} ms | "
+                    "{:.1f}% landed after a later present",
+                    static_cast<f64>(queries) / std::max(frames, 1.0), results,
+                    results ? 100.0 *
+                                  static_cast<f64>(
+                                      stats.occlusion_zero.exchange(0)) /
+                                  static_cast<f64>(results)
+                            : 0.0,
+                    stats.occlusion_failed.exchange(0),
+                    results ? static_cast<f64>(latency_ns) / 1e6 /
+                                  static_cast<f64>(results)
+                            : 0.0,
+                    static_cast<f64>(stats.occlusion_latency_max_ns.exchange(0)) /
+                        1e6,
+                    results ? 100.0 *
+                                  static_cast<f64>(
+                                      stats.occlusion_late.exchange(0)) /
+                                  static_cast<f64>(results)
+                            : 0.0);
+            }
             LOG_INFO(Other, "TEXTURE: {} synchronization scans, {} skipped",
                      stats.texture_sync_scans.exchange(0),
                      stats.texture_sync_skips.exchange(0));

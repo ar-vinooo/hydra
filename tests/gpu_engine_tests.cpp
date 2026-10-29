@@ -71,6 +71,7 @@ struct ThreeDTestAccess {
         target.tile_mode.is_linear = 1;
         target.array_mode.layers = 1;
         engine.regs.depth_target_enabled = 0;
+        engine.pipeline_generation++;
     }
     static renderer::PipelineBase* pipeline(ThreeD& engine) {
         return engine.getPipeline();
@@ -82,12 +83,15 @@ struct ThreeDTestAccess {
         auto& program = engine.regs.shader_programs[static_cast<u32>(stage)];
         program.config.enable = enable;
         program.offset = offset;
+        engine.pipeline_generation++;
     }
     static void primitive(ThreeD& engine, PrimitiveType type) {
         engine.regs.begin.primitive_type = type;
+        engine.pipeline_generation++;
     }
     static void raw(ThreeD& engine, u32 reg, u32 value) {
         engine.regs_raw[reg] = value;
+        engine.pipeline_generation++;
     }
     static renderer::DrawState drawState(ThreeD& engine) {
         return engine.prepareDrawState();
@@ -101,12 +105,14 @@ struct ThreeDTestAccess {
     static void fixedAttributes(ThreeD& engine) {
         for (auto& attribute : engine.regs.vertex_attrib_states)
             attribute.is_fixed = true;
+        engine.pipeline_generation++;
     }
     static u32 samplerIndex(const ThreeD& engine, u32 handle) {
         return engine.getSamplerIndex(handle);
     }
     static void setColorWriteMask(ThreeD& engine, u32 index, ColorWriteMask mask) {
         engine.regs.color_write_masks[index] = mask;
+        engine.pipeline_generation++;
     }
     static ColorWriteMask colorWriteMask(const ThreeD& engine, u32 index) {
         return engine.getColorWriteMask(index);
@@ -121,6 +127,17 @@ struct ThreeDTestAccess {
             tls_crnt_gmmu->getResourceLifetime(), resource::ResourceKind::AddressSpace, tls_crnt_gmmu);
         engine.render_target_memo_key.swap(engine.render_target_key);
         return pass;
+    }
+    // The last pipeline can be reused for the next draw (see getPipeline)
+    static bool pipelineMemoMatches(ThreeD& engine) {
+        return engine.pipelineMemoMatches();
+    }
+    static std::vector<ThreeD::PipelineTextureInput>
+    pipelineTextureInputs(ThreeD& engine, ShaderStage stage,
+                          const renderer::ShaderBase& shader) {
+        std::vector<ThreeD::PipelineTextureInput> inputs;
+        engine.collectPipelineTextureInputs(stage, shader, inputs);
+        return inputs;
     }
     static command_ir::StageBindings fragmentBindings(ThreeD& engine,
                                                      renderer::ShaderBase* shader) {
@@ -3005,6 +3022,79 @@ void testReportsLandBeforeLaterWrites() {
     std::cout << "PASS: reports land before later writes to their memory\n";
 }
 
+// A report into the memory of a render target the GPU wrote (UE4 occlusion
+// queries inside its HZB range) replaces those bytes like a guest write: no
+// readback for the report, and no later write back puts texels over it
+void testReportIntoRenderTarget() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    Gpu gpu;
+    auto& renderer = static_cast<metal::Renderer&>(gpu.getRenderer());
+    auto& engine = gpu.get3DEngine();
+    auto& cache = renderer.getTextureCache();
+    alignas(0x1000) static std::array<u8, 0x1000> memory;
+    memory.fill(0);
+    GMmu gmmu(nullptr);
+    constexpr u64 SURFACE = 0x600000;
+    constexpr u64 REPORT_OFFSET = 0x200;
+    gmmu.map(SURFACE, {reinterpret_cast<uptr>(memory.data()), memory.size()});
+    std::unique_ptr<ICommandBuffer> commands(renderer.createCommandBuffer());
+    tls_crnt_command_buffer = commands.get();
+    tls_crnt_gmmu = &gmmu;
+    const TextureDescriptor descriptor(reinterpret_cast<uptr>(memory.data()),
+                                       MTL::TextureType2D,
+                                       TextureFormat::RGBA8Unorm, false, 0, 16,
+                                       16, 1, 1, 1, 0, 0, 0);
+    {
+        std::scoped_lock lock(cache.getMutex());
+        auto* view = cache.find(commands.get(), descriptor, TextureUsage::Write);
+        auto* pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+        auto* attachment = pass->colorAttachments()->object(0);
+        attachment->setTexture(
+            static_cast<metal::Texture*>(view->getBase())->getTexture());
+        attachment->setLoadAction(MTL::LoadActionClear);
+        attachment->setStoreAction(MTL::StoreActionStore);
+        attachment->setClearColor(MTL::ClearColor(0.25, 0.5, 0.75, 1));
+        static_cast<metal::CommandBuffer*>(commands.get())
+            ->getRenderCommandEncoder(pass);
+    }
+    // Release a word into the middle of the render target
+    engine.method(0x6c0, static_cast<u32>((SURFACE + REPORT_OFFSET) >> 32));
+    engine.method(0x6c1, static_cast<u32>(SURFACE + REPORT_OFFSET));
+    engine.method(0x6c2, 0x22222222);
+    engine.method(0x6c3, 1u << 28);
+    {
+        const auto& storage = cache.getMemory(0).getTextureGroup(0).getStorage(0);
+        const auto report = ztd::Range<uptr>::fromSize(
+            reinterpret_cast<uptr>(memory.data()) + REPORT_OFFSET, sizeof(u32));
+        bool stale = false;
+        for (const auto& range : storage.stale_ranges)
+            stale |= range.intersects(report);
+        expect(stale, "A report marks the texels it overwrites stale");
+        expect(memory[0] == 0,
+               "A report into a render target reads nothing back");
+    }
+    renderer.flushReports(commands.get(),
+                          ztd::Range<uptr>::fromSize(
+                              reinterpret_cast<uptr>(memory.data()),
+                              memory.size()));
+    {
+        std::scoped_lock lock(cache.getMutex());
+        cache.flushMemory(commands.get(), descriptor.getRange());
+    }
+    u32 word;
+    std::memcpy(&word, memory.data() + REPORT_OFFSET, sizeof(word));
+    expect(word == 0x22222222,
+           "A later write back of the render target keeps the report");
+    expect(memory[0] == 64 && memory[1] == 128 && memory[2] == 191 &&
+               memory[3] == 255,
+           "The rest of the render target is written back");
+    commands.reset();
+    tls_crnt_command_buffer = nullptr;
+    tls_crnt_gmmu = nullptr;
+    std::cout << "PASS: reports into render targets replace their texels\n";
+}
+
 // What tells the guest that earlier work is done (a released semaphore, a
 // syncpoint, a wait for idle) comes after the reports of that work
 void testSignalsFollowQueuedReports() {
@@ -3792,6 +3882,145 @@ void testEnginePipelineStages() {
     }
     std::cout << "PASS: the engine builds VertexA, geometry and tessellation "
                  "pipelines from guest programs\n";
+}
+
+
+// The pipeline of the previous draw is reused while nothing it depends on
+// changed: registers outside the draw parameters, the shader code in memory
+// and the texture descriptors the shaders are specialized on
+void testPipelineMemo() {
+    using namespace hydra::hw::tegra_x1::gpu::renderer;
+    NS_STACK_SCOPED auto pool = NS::AutoreleasePool::alloc()->init();
+    OcclusionRig rig(32);
+    auto& engine = rig.engine;
+    constexpr u64 PRED_PT = 7ull << 16;
+    constexpr u64 RZ_A = 0xffull << 8;
+    const auto mov32i = [](u32 dst, u32 value) {
+        return 0x0100000000000000ull | (u64(value) << 20) | (0xfull << 12) |
+               PRED_PT | dst;
+    };
+    const u64 ast_position = 0xeff0000000000000ull | (3ull << 47) |
+                             (0xffull << 39) | (0x70ull << 20) | PRED_PT | RZ_A;
+    const u64 exit = 0xe30000000007000full;
+    const auto binary = [&](u32 type, std::map<u32, u32> header_words,
+                            std::vector<u64> instructions) {
+        std::vector<u32> header(0x50 / 4, 0);
+        header[0] = 1 | (3u << 5) | (type << 10);
+        for (const auto& [index, value] : header_words)
+            header[index] |= value;
+        std::vector<u8> bytes(reinterpret_cast<const u8*>(header.data()),
+                              reinterpret_cast<const u8*>(header.data()) + 0x50);
+        for (usize i = 0; i < instructions.size(); i++) {
+            if (i % 3 == 0) {
+                const u64 sched = 0x001f8000fc0007e0ull;
+                bytes.insert(bytes.end(), reinterpret_cast<const u8*>(&sched),
+                             reinterpret_cast<const u8*>(&sched) + 8);
+            }
+            bytes.insert(bytes.end(),
+                         reinterpret_cast<const u8*>(&instructions[i]),
+                         reinterpret_cast<const u8*>(&instructions[i]) + 8);
+        }
+        bytes.resize(0x1000, 0);
+        return bytes;
+    };
+    const u32 one = std::bit_cast<u32>(1.0f);
+    std::vector<u8> code = binary(1, {}, {mov32i(0, 0), mov32i(1, 0), mov32i(2, 0),
+                                          mov32i(3, one), ast_position, exit});
+    const auto fragment = binary(5, {{0x48 / 4, 0xf}},
+                                 {mov32i(0, one), mov32i(1, 0), mov32i(2, 0),
+                                  mov32i(3, one), exit});
+    code.insert(code.end(), fragment.begin(), fragment.end());
+
+    constexpr u64 REGION = 0x40000000;
+    rig.gmmu.map(REGION, {reinterpret_cast<uptr>(code.data()), code.size()});
+    engines::ThreeDTestAccess::colorTarget(
+        engine, reinterpret_cast<uptr>(rig.image_memory.data()));
+    engines::ThreeDTestAccess::fixedAttributes(engine);
+    engines::ThreeDTestAccess::program(engine, engines::ShaderStage::VertexB,
+                                       REGION, 0x0);
+    engines::ThreeDTestAccess::program(engine, engines::ShaderStage::Fragment,
+                                       REGION, 0x1000);
+    engines::ThreeDTestAccess::primitive(engine, engines::PrimitiveType::Triangles);
+    const auto fragment_of = [](PipelineBase* pipeline) {
+        return pipeline->getDescriptor()
+            .shaders[static_cast<u32>(ShaderType::Fragment)];
+    };
+
+    auto* first = engines::ThreeDTestAccess::pipeline(engine);
+    expect(first != nullptr, "The memo test pipeline is created");
+    expect(engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "An unchanged state reuses the last pipeline");
+
+    // Draw parameters do not change the pipeline
+    engine.method(0x50d, 7); // base vertex
+    engine.method(0x50e, 2); // base instance
+    expect(engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "Draw parameter registers keep the pipeline");
+
+    // SET_ANTI_ALIAS_ALPHA_CONTROL changes it
+    constexpr u32 REG_ANTI_ALIAS_ALPHA_CONTROL = 0x153c / 4;
+    engine.method(REG_ANTI_ALIAS_ALPHA_CONTROL, 1);
+    expect(!engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "A pipeline register written with a new value dirties it");
+    auto* coverage = engines::ThreeDTestAccess::pipeline(engine);
+    expect(coverage != first && coverage->getDescriptor().alpha_to_coverage,
+           "The rebuilt pipeline has the new state");
+    engine.method(REG_ANTI_ALIAS_ALPHA_CONTROL, 1);
+    expect(engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "Writing the same value again keeps it");
+    engine.method(REG_ANTI_ALIAS_ALPHA_CONTROL, 0);
+    expect(engines::ThreeDTestAccess::pipeline(engine) == first,
+           "The previous state finds its pipeline again");
+
+    // The guest rewrites the fragment shader without any register write
+    const u64 red_zero = mov32i(0, 0);
+    std::memcpy(code.data() + 0x1000 + 0x50 + 8, &red_zero, sizeof(red_zero));
+    expect(!engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "Changed shader code in memory dirties the pipeline");
+    auto* recoded = engines::ThreeDTestAccess::pipeline(engine);
+    expect(fragment_of(recoded) != fragment_of(first),
+           "The rebuilt pipeline uses the new shader code");
+    expect(engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "The new code is reused afterwards");
+
+    // A program offset written through its method dirties the pipeline
+    engine.method(0x800 + static_cast<u32>(engines::ShaderStage::Fragment) * 0x10 + 1,
+                  0x0);
+    expect(!engines::ThreeDTestAccess::pipelineMemoMatches(engine),
+           "A new program offset dirties the pipeline");
+    engine.method(0x800 + static_cast<u32>(engines::ShaderStage::Fragment) * 0x10 + 1,
+                  0x1000);
+
+    // Texture descriptors the shader specializes on are compared, other TIC
+    // fields (the address) are not
+    std::vector<engines::TextureImageControl> tic_pool(4);
+    constexpr u64 POOL = 0x50000000;
+    rig.gmmu.map(POOL, {reinterpret_cast<uptr>(tic_pool.data()),
+                        tic_pool.size() * sizeof(engines::TextureImageControl)});
+    engine.method(0x55d, static_cast<u32>(POOL >> 32));
+    engine.method(0x55e, static_cast<u32>(POOL));
+    engine.method(0x55f, 3);
+    ShaderDescriptor sampled_descriptor{};
+    sampled_descriptor.type = ShaderType::Fragment;
+    sampled_descriptor.resource_mapping.textures[makeConstantTextureIndex(1)] = 0;
+    const ShaderBase sampled(sampled_descriptor);
+    const auto inputs = [&] {
+        return engines::ThreeDTestAccess::pipelineTextureInputs(
+            engine, engines::ShaderStage::Fragment, sampled);
+    };
+    tic_pool[1].hdr_version = engines::TicHdrVersion::BlockLinear;
+    tic_pool[1].normalized_coords = 1;
+    const auto before = inputs();
+    expect(before.size() == 1, "The sampled texture is an input");
+    tic_pool[1].addr_lo = 0x1234;
+    expect(inputs() == before, "The texture address is not an input");
+    tic_pool[1].normalized_coords = 0;
+    expect(inputs() != before, "Unnormalized coordinates are an input");
+    tic_pool[1].normalized_coords = 1;
+    tic_pool[1].format_word = std::bit_cast<hydra::hw::tegra_x1::gpu::ImageFormatWord>(0x12345u);
+    expect(inputs() != before, "The texture format is an input");
+    std::cout << "PASS: the engine reuses the last pipeline until its state, "
+                 "shader code or texture descriptors change\n";
 }
 
 // SET_FRONT_POLYGON_MODE LINE draws triangle edges only (Metal fill mode)
@@ -6043,6 +6272,7 @@ int main(int argc, char** argv) {
         testManagedMetalSubmissions();
         testReportCallbackOrdering();
         testReportsLandBeforeLaterWrites();
+        testReportIntoRenderTarget();
         testSignalsFollowQueuedReports();
         testShaderInvalidationWaitsOnlyForGuestWrites();
         testReportSemaphoreReductionAndAcquire();
@@ -6053,6 +6283,7 @@ int main(int argc, char** argv) {
         testGeometryDrawCommand();
         testTessellationDrawCommand();
         testEnginePipelineStages();
+        testPipelineMemo();
         testIndexDecoding();
         testPrimitiveRestart();
         testInlineIndices();

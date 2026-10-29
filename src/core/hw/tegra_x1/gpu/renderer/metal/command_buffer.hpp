@@ -20,6 +20,10 @@ class UploadBufferPool;
 struct Mtl4Submission;
 
 // How the GPU finished a command buffer
+// Set while a completed submission drops the resources it retained: the GPU
+// has finished every command that used them
+inline thread_local bool tls_releasing_completed_resources = false;
+
 struct GpuCompletion {
     bool succeeded;
     // Seconds, in the host's GPU timeline
@@ -174,6 +178,9 @@ class CommandBuffer final : public ICommandBuffer {
     void setVisibilitySource(
         std::function<MTL::Buffer*(CommandBuffer&)> source) {
         visibility_source = std::move(source);
+    }
+    bool hasOpenRenderPass() const {
+        return encoder_type == EncoderType::Render;
     }
     bool hasRenderPass(MTL::RenderPassDescriptor* descriptor) const {
         return encoder_type == EncoderType::Render &&
